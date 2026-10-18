@@ -11,16 +11,40 @@ import threading
 import tkinter as tk
 from tkinter import messagebox
 
-CONBROKER = ["sudo", "-u", "uaih3k9x", "-H",
-             "/home/uaih3k9x/conbroker/.venv/bin/python",
-             "/home/uaih3k9x/conbroker/conbroker.py"]
+import json as _json
+
+SERIAL_CONF = "/opt/pxe/serial.conf"
+_SERIAL_DEFAULT = {"user": "ops", "conbroker_home": "/home/ops/conbroker"}
+
+
+def serial_conf_read(path=None):
+    """部署配置: 串口服务以哪个用户跑 conbroker (GUI 是 root, 须降权对齐数据目录)."""
+    if path is None:
+        path = SERIAL_CONF
+    cfg = dict(_SERIAL_DEFAULT)
+    try:
+        cfg.update(_json.load(open(path)))
+    except (OSError, ValueError):
+        pass
+    home = cfg["conbroker_home"].rstrip("/")
+    cfg["bin"] = f"{home}/.venv/bin/python"
+    cfg["script"] = f"{home}/conbroker.py"
+    return cfg
+
+
+def _conbroker_cmd():
+    c = serial_conf_read()
+    return ["sudo", "-u", c["user"], "-H", c["bin"], c["script"]]
+
+
+# CONBROKER 不做模块级缓存: serial.conf 可能在运行中被改 (Kiosk 里保存)
 
 BAUDS = ["9600", "115200", "57600", "38400", "4800"]
 
 
 def _run(args, timeout=8):
     try:
-        r = subprocess.run(CONBROKER + args, capture_output=True,
+        r = subprocess.run(_conbroker_cmd() + args, capture_output=True,
                            text=True, timeout=timeout)
         return r.stdout + (("\n[stderr] " + r.stderr) if r.stderr.strip() else "")
     except Exception as e:
@@ -149,7 +173,7 @@ class SerialPanel(tk.Frame):
             return
         self._append(f"[开服务] {port} @ {self.baud_var.get()}", "cmd")
         # serve 是常驻前台设计: nohup+setsid 丢后台, 立刻返回, 用 list 验证
-        cmd = (CONBROKER + ["serve", port, "-b", self.baud_var.get()])
+        cmd = (_conbroker_cmd() + ["serve", port, "-b", self.baud_var.get()])
         subprocess.Popen(["nohup", "setsid"] + cmd,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL)

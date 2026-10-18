@@ -1,5 +1,7 @@
 """serial_panel 测试: 列表解析与命令构造, 不碰真串口."""
 
+import json
+
 import pytest
 import serial_panel as sp
 
@@ -12,7 +14,8 @@ def test_run_passes_args_to_conbroker(monkeypatch):
     monkeypatch.setattr(sp.subprocess, "run",
                         lambda cmd, **kw: captured.update(cmd=list(cmd)) or FakeResult())
     out = sp._run(["list"])
-    assert captured["cmd"] == sp.CONBROKER + ["list"]
+    assert captured["cmd"] == sp._conbroker_cmd() + ["list"]
+    assert captured["cmd"][0:2] == ["sudo", "-u"]
     assert "OK" in out
 
 
@@ -39,8 +42,6 @@ def test_bauds_default_9600():
 
 def test_conbroker_command_shapes_subcommand_first():
     # 参数形状按接入文档: 子命令在前, 口在后
-    assert sp.CONBROKER[-2:] == ["/home/uaih3k9x/conbroker/.venv/bin/python",
-                                 "/home/uaih3k9x/conbroker/conbroker.py"]
     assert ["serve", "ttyUSB0", "-b", "9600"][0] == "serve"
     assert ["send", "ttyUSB0", "display vlan"][0] == "send"
     assert ["send", "ttyUSB0", "--raw", "\\x03"][0] == "send"
@@ -48,6 +49,24 @@ def test_conbroker_command_shapes_subcommand_first():
     assert ["stop", "ttyUSB0"][0] == "stop"
 
 
-def test_kiosk_runs_conbroker_as_uaih3k9x():
-    # Kiosk 是 root, 必须以 uaih3k9x 身份跑, HOME/数据目录才对齐
-    assert sp.CONBROKER[:3] == ["sudo", "-u", "uaih3k9x", "-H"][:3]
+def test_serial_conf_default_is_generic():
+    # 仓库默认配置不含任何个人路径
+    c = sp.serial_conf_read(path="/nonexistent")
+    assert c["user"] == "ops"
+    assert "uaih3k9x" not in json.dumps(c)
+
+
+def test_serial_conf_custom(tmp_path):
+    p = tmp_path / "serial.conf"
+    p.write_text(json.dumps({"user": "alice", "conbroker_home": "/srv/cb"}))
+    c = sp.serial_conf_read(path=str(p))
+    assert c["bin"] == "/srv/cb/.venv/bin/python"
+    assert c["script"] == "/srv/cb/conbroker.py"
+
+
+def test_conbroker_cmd_uses_conf(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "SERIAL_CONF", str(tmp_path / "s.conf"))
+    (tmp_path / "s.conf").write_text(json.dumps({"user": "alice", "conbroker_home": "/srv/cb"}))
+    cmd = sp._conbroker_cmd()
+    assert cmd[:3] == ["sudo", "-u", "alice", "-H"][:3]
+    assert cmd[4] == "/srv/cb/.venv/bin/python"      # [3] 是 -H
