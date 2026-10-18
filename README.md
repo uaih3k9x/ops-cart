@@ -1,44 +1,81 @@
-# ops-cart — 运维推车全家桶
+# ops-cart
 
-X 光机智能识别盒改造的**硬件级自动化运维推车**:能看(UVC 采集)、能操作(CH9329 键鼠注入)、
-能装机(自研 PXE)、能淦交换机(conbroker 串口)。运行于 Rocky Linux 9(推车 `rocky9`),
-纯 SSH/终端使用,无桌面依赖(除 Kiosk GUI)。
+> 硬件级自动化运维推车 —— 装机、KVM、串口、以及替你蹲机房的那台机器。
+
+一台二手 X 光智能识别盒,改造成了远程运维车:目标机器没系统、没网络、
+卡在 BIOS,它都能到场处理。**人在被窝,车在机房。**
+
+系统全部自研:一个跨平台 PXE 服务端、一套带键鼠透传的车机界面、
+一个 CH9329 注入协议栈、以及串口会话面板。零厂商依赖,
+零闭源驱动,零 Windows。
+
+```
+目标机器 ◄── HDMI ── 采集 ────┐
+目标机器 ◄── USB ─── CH9329 ──┤ 推车 (Linux) ── tailnet ──► 你 (任意位置)
+交换机   ◄── 串口 ── FT232R ──┘
+```
 
 ## 组成
 
 | 文件 | 职责 |
 |---|---|
-| `pxeserver.py` + `test_pxeserver.py` | 自研 PXE 服务端:DHCP(67) + proxyDHCP(4011) + TFTP(69),单文件跨平台(Win/Linux),21 测 |
-| `kiosk.py` | 车机全屏 GUI(Tkinter,无 WM 直跑):状态板 / PXE 开关 / 双网卡配置 / UVC 预览 / 键鼠透传 / 串口会话 / KS 编辑 / 奶龙屏保 |
-| `kiosk_core.py` + `test_kiosk_core.py` | Kiosk 可测核心层:服务状态 / nmcli 命令生成 / PXE 配置渲染 / **KS 编辑(读、写、备份轮换、hash、校验)**,19 测 |
-| `serial_panel.py` + `test_serial_panel.py` | Kiosk 串口会话面板,后端走 conbroker(子命令在前,root 下以 uaih3k9x 身份跑),6 测 |
-| `ks_panel.py` | Kiosk Kickstart 编辑面板(表单改主机名/密码 + 全文编辑 + 备份 + 校验) |
-| `ch9329.py` + `test_ch9329.py` | CH9329 键鼠注入(帧 `57 AB … SUM`,校验含帧头;键盘 8 字节 + 鼠标 5 字节报告),12 测 |
-| `setup-cart.sh` | 推车部署:挂 ISO → 提取引导文件 → 铺 HTTP 仓库(幂等) |
-| `setup.ps1` / `config-net.ps1` / `start-pxe.ps1` / `http-serve.bat` / `http80-serve.bat` | 备用机(Windows 备用装机头)侧部署件 |
-| `grub.cfg` | PXE 引导菜单(HTTP 快速通道优先,TFTP 兜底) |
-| `ks.cfg.example` | Kickstart 模板(**真实 ks.cfg 不进 git**,hash 用 Kiosk 面板或 `openssl passwd -6` 生成) |
-| `kiosk-launcher` | `/usr/local/bin/kiosk` 启动器(xinit 直跑,退出回终端,**刻意不自启**) |
-| `smoke-kiosk.sh` | Xvfb 无头冒烟测试 |
+| [`pxeserver.py`](pxeserver.py) | PXE 服务端:DHCP(67) + proxyDHCP(4011) + TFTP(69),单文件,Windows/Linux 通用 |
+| [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter,无 WM 直跑):状态板、双网卡配置、UVC 预览、键鼠透传(VMware 式 Ctrl+Alt 释放)、串口会话、KS 编辑、屏保 |
+| [`kiosk_core.py`](kiosk_core.py) | GUI 可测核心层:nmcli 命令生成、服务状态、PXE 配置渲染、Kickstart 编辑引擎 |
+| [`serial_panel.py`](serial_panel.py) | 串口会话面板(人在不在都能操作 console) |
+| [`ks_panel.py`](ks_panel.py) | Kickstart 编辑面板:主机名/root 密码表单化,保存自动轮换备份,破坏性指令前置校验 |
+| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈:键盘 8 字节 / 鼠标 5 字节报告,组合键与长按 |
+| `test_*.py` | **58 个测试**,协议层全部离线可测,不碰硬件也能全绿 |
 
-## 推车部署布局(`/opt/pxe/`)
-
-代码全部 scp 到 `/opt/pxe/`;systemd 三件套(`pxe-server` / `pxe-http-repo` / `pxe-http-boot`)
-开机自启;`/usr/local/bin/kiosk` 手动启动;`/usr/local/bin/ch9329.py` CLI。
-
-## 开发循环
+## 快速开始
 
 ```bash
-cd ~/code/pxeserver
-python3 -m pytest -q                 # 全部测试 (58 个)
-# 改完 → scp 到推车 /opt/pxe/ → 实机验证 (GUI 类 bug 单测抓不到, 必须实机)
+# 离线全测(无需任何硬件)
+python3 -m pytest -q
+
+# CH9329 注入(串口线 + CH9329 板)
+python3 ch9329.py --port /dev/ttyACM0 info
+python3 ch9329.py --port /dev/ttyACM0 type "hello from cart"
+python3 ch9329.py --port /dev/ttyACM0 combo ctrl alt delete
+
+# PXE 服务端(目标机器网线直插,全自动装 Rocky 9)
+python3 pxeserver.py serve --ip 192.168.200.1 \
+    --pool 192.168.200.10,192.168.200.20 --tftp-root /opt/pxe/tftp
 ```
 
-## 工程文档
+推车整机布局:代码部署在 `/opt/pxe/`,systemd 三件套
+(`pxe-server` / `pxe-http-repo` / `pxe-http-boot`)开机自启;
+终端键入 `kiosk` 进入车机界面。同一套代码亦可在 Windows 上跑
+(`setup.ps1` / `start-pxe.ps1`),单文件跨平台是设计目标之一。
 
-`~/code/CiderVapourized/推车工程文档.md` — 硬件/网络/PXE 使用流程/风险纪律/采购清单全在内。
+## 协议栈
 
-## 相关
+```
+CH9329 帧:  57 AB ADDR CMD LEN DATA... SUM    —— 校验为整帧求和, 含帧头
+键盘报告:   [modifier, 0, key×6]              —— 8 字节
+鼠标报告:   [buttons, dx, dy, wheel, 0]      —— 5 字节, 相对位移 int8
+```
 
-- conbroker(串口共享+留言板):`~/code/conbroker/`,接入文档在 `接入文档-rocky推车.md`
-- 目标机器固件的 PXE 三怪癖(option 60 / proxyDHCP 4011 / grub 走 80 端口拉大 initrd)已内置于 pxeserver.py
+datasheet 不写"校验含帧头"这件事 —— 真机的应答帧会。
+
+## 设计原则
+
+- **车是外设,脑在远端**:采集和注入在车上,OCR 与决策可以放在
+  tailnet 任意一端。断网时本地 tesseract 降级兜底,不是瘫。
+- **三层物理优先**:键鼠走 USB、画面走 HDMI、console 走串口 ——
+  这三条不依赖任何网络,机房网络怎么炸都不断。
+- **单测覆盖协议,实机验证行为**:今天所有 GUI 层 bug(参数顺序、
+  前后台混淆、先清后取)都是实机暴露的,单测绿不代表能跑。
+- **危险动作前置**:Lan1 永不进交换机(rogue DHCP)、改管理口必弹
+  警告、`clearpart --all` 必亮校验条、备份轮换永远先于写入。
+
+## 已实测
+
+- 全自动 PXE 装 Rocky 9.8(目标机器:UEFI + AMI 固件,含全部三怪癖)
+- CH9329 打字/组合键注入上屏
+- Kiosk Xvfb 无头冒烟 + 实机运行
+- Kickstart 编辑面板:改主机名、root 密码 hash、备份与恢复
+
+## License
+
+MIT
