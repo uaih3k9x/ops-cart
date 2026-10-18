@@ -1,0 +1,175 @@
+"""kiosk_core 测试: 纯函数与配置读写, 不碰真机服务."""
+
+import json
+
+import pytest
+
+import kiosk_core as kc
+
+
+def test_default_conf_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(kc, "PXE_CONF", str(tmp_path / "pxe.conf"))
+    cfg = kc.pxe_conf_read()          # 不存在 -> 默认
+    assert cfg == kc.DEFAULT_PXE_CONF
+    cfg["pool_end"] = "192.168.200.99"
+    kc.pxe_conf_write(cfg)
+    assert kc.pxe_conf_read()["pool_end"] == "192.168.200.99"
+
+
+def test_conf_read_merges_missing_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(kc, "PXE_CONF", str(tmp_path / "pxe.conf"))
+    (tmp_path / "pxe.conf").write_text(json.dumps({"ip": "10.1.1.1/24"}))
+    cfg = kc.pxe_conf_read()
+    assert cfg["ip"] == "10.1.1.1/24"
+    assert cfg["pool_start"] == kc.DEFAULT_PXE_CONF["pool_start"]
+
+
+def test_render_pxe_service():
+    cfg = {"ip": "172.16.0.1", "pool_start": "172.16.0.50", "pool_end": "172.16.0.60"}
+    line = kc.render_pxe_service(cfg)
+    assert line.startswith("/usr/bin/python3 /opt/pxe/pxeserver.py serve")
+    assert "--ip 172.16.0.1" in line
+    assert "--pool 172.16.0.50,172.16.0.60" in line
+    assert "--tftp-root /opt/pxe/tftp" in line
+
+
+def test_apply_pxe_conf_validates_cidr(tmp_path, monkeypatch):
+    monkeypatch.setattr(kc, "PXE_CONF", str(tmp_path / "pxe.conf"))
+    ok, msg = kc.apply_pxe_conf({"ip": "192.168.200.1", "pool_start": "a", "pool_end": "b"})
+    assert not ok and "CIDR" in msg
+
+
+def test_apply_pxe_conf_writes_conf_and_unit(tmp_path, monkeypatch):
+    conf_path = tmp_path / "pxe.conf"
+    unit_path = tmp_path / "pxe-server.service"
+    monkeypatch.setattr(kc, "PXE_CONF", str(conf_path))
+    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (0, ""))
+    cfg = {"ip": "192.168.78.1/24", "prefix": 24,
+           "pool_start": "192.168.78.10", "pool_end": "192.168.78.20"}
+    ok, msg = kc.apply_pxe_conf(cfg, unit_path=str(unit_path))
+    assert ok
+    assert json.loads(conf_path.read_text())["ip"] == "192.168.78.1/24"
+    assert "ExecStart=" in unit_path.read_text()
+
+
+def test_nmcli_set_static_builds_correct_cmd():
+    cmds = kc.nmcli_set_static("Lan1-pxe", "192.168.99.5/24", "192.168.99.254", "203.0.113.41")
+    assert cmds[0][:6] == ["nmcli", "con", "mod", "Lan1-pxe", "ipv4.method", "manual"]
+    assert "192.168.99.5/24" in cmds[0]
+    assert cmds[0][-1] == "203.0.113.41"      # dns
+    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == "192.168.99.254"
+    assert cmds[1] == ["nmcli", "con", "up", "Lan1-pxe"]
+
+
+def test_nmcli_set_static_empty_gateway_dns():
+    cmds = kc.nmcli_set_static("x", "10.0.0.1/24")
+    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == ""
+    assert "ipv4.dns" not in cmds[0]
+
+
+def test_nmcli_set_dhcp_clears_static():
+    cmds = kc.nmcli_set_dhcp("enp3s0")
+    m = cmds[0]
+    assert m[m.index("ipv4.method") + 1] == "auto"
+    assert m[m.index("ipv4.addresses") + 1] == ""
+    assert m[m.index("ipv4.gateway") + 1] == ""
+
+
+def test_services_status_shape(monkeypatch):
+    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (0, "enabled" if cmd[1] == "is-enabled" else "active"))
+    st = kc.services_status(("pxe-server",))
+    assert st["pxe-server"] == (True, True)
+
+
+def test_nics_status_marks_no_carrier(monkeypatch):
+    def fake_run(cmd, timeout=5):
+        if cmd[:2] == ["ip", "-4"]:
+            return 0, "eno1            UP      192.168.200.1/24"
+        if cmd[0] == "nmcli":
+            return 0, "manual"
+        return 1, ""   # carrier 文件读不到 = 没插线
+    monkeypatch.setattr(kc, "run", fake_run)
+    nics = kc.nics_status()
+    assert nics[0]["ip"] == "192.168.200.1/24"
+    assert nics[0]["link"] is False
+    assert nics[0]["method"] == "manual"
+
+
+def test_screensaver_due_basic():
+    assert kc.screensaver_due(100.0, 200.0, 180) is False   # 空闲100s, 不到180
+    assert kc.screensaver_due(100.0, 280.0, 180) is True   # 空闲180s, 该出
+    assert kc.screensaver_due(100.0, 400.0, 180, showing=True) is False  # 已在屏保, 不重复触发
+
+
+# ---- Kickstart 编辑
+
+KS_SAMPLE = """#version=RHEL9
+text
+reboot
+lang en_US.UTF-8
+rootpw --iscrypted $6$old$hash
+network --bootproto=dhcp --device=link --activate --hostname rocky9
+clearpart --all --initlabel
+autopart --type=lvm
+"""
+
+
+def test_ks_roundtrip_and_backup_rotation(tmp_path, monkeypatch):
+    import kiosk_core as kc
+    p = str(tmp_path / "ks.cfg")
+    kc.ks_write(KS_SAMPLE, path=p)                      # 首次写, 无备份可做
+    kc.ks_write(KS_SAMPLE.replace("rocky9", "x1"), path=p)  # 第二次, 产生 1 份备份
+    kc.ks_write(KS_SAMPLE, path=p)                      # 第三次, 2 份
+    import glob
+    assert len(glob.glob(p + ".bak-*")) == 2
+    assert kc.ks_read(p).startswith("#version=RHEL9")
+
+
+def test_ks_write_backup_prunes_old(tmp_path):
+    import glob
+    import kiosk_core as kc
+    p = str(tmp_path / "ks.cfg")
+    for i in range(8):
+        kc.ks_write(f"rev{i}\n", path=p)
+    assert len(glob.glob(p + ".bak-*")) == kc.KS_BACKUPS
+
+
+def test_ks_set_rootpw(tmp_path):
+    import kiosk_core as kc
+    new = kc.ks_set_rootpw(KS_SAMPLE, "$6$salt$newhash")
+    assert "rootpw --iscrypted $6$salt$newhash" in new
+    assert "old" not in new
+
+
+def test_ks_set_rootpw_rejects_plain():
+    import kiosk_core as kc
+    with pytest.raises(ValueError):
+        kc.ks_set_rootpw(KS_SAMPLE, "plainpassword")
+
+
+def test_ks_set_hostname(tmp_path):
+    import kiosk_core as kc
+    new = kc.ks_set_hostname(KS_SAMPLE, "lab-node-01")
+    assert "--hostname lab-node-01" in new
+    assert "rocky9" not in new
+
+
+def test_ks_set_hostname_rejects_bad():
+    import kiosk_core as kc
+    with pytest.raises(ValueError):
+        kc.ks_set_hostname(KS_SAMPLE, "bad host; name")
+
+
+def test_ks_hash_password_openssl(monkeypatch):
+    import kiosk_core as kc
+    class FakeR:
+        returncode = 0; stdout = "$6$abc$xyz\n"; stderr = ""
+    monkeypatch.setattr(kc.subprocess, "run", lambda *a, **k: FakeR())
+    assert kc.ks_hash_password("pw") == "$6$abc$xyz"
+
+
+def test_ks_validate_warns_on_destructive():
+    import kiosk_core as kc
+    warns = kc.ks_validate(KS_SAMPLE)
+    assert any("clearpart" in w for w in warns)
+    assert kc.ks_validate("text\nreboot\nrootpw --iscrypted $6$a$b\n") == []
