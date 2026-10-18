@@ -1,0 +1,31 @@
+#version=RHEL9
+# Rocky 9.8 unattended install, TEMPLATE: hash 用 Kiosk 面板或 openssl passwd -6 生成
+text
+reboot
+lang en_US.UTF-8
+keyboard us
+timezone Asia/Shanghai --utc
+
+rootpw --iscrypted __PUT_SHA512_HASH_HERE__
+
+network --bootproto=dhcp --device=link --activate --hostname rocky9
+
+selinux --enforcing
+firewall --enabled --service=ssh
+firstboot --disable
+
+# DANGER: wipes ALL disks (approved by 9x)
+zerombr
+clearpart --all --initlabel
+bootloader --timeout=1
+autopart --type=lvm
+
+%packages
+@core
+%end
+
+%post --log=/root/ks-post.log
+# Allow root password ssh for first-login verification (default is prohibit-password).
+# 9x: tighten this after taking over the machine.
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+%end

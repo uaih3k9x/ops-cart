@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pcapng
+*.etl
+ks.cfg
+.DS_Store

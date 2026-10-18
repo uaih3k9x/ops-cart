@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""运维推车 Kiosk GUI v2 (Tkinter + X, 无 WM 直跑).
+
+v2: overrideredirect 全屏铺满; UVC 预览(mpv 嵌入); CH9329 键鼠透传
+(点击画面捕获, Ctrl+Alt 释放, VMware 风格). 终端 root 敲 `kiosk` 启动.
+"""
+
+import os
+import subprocess
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+
+import kiosk_core as kc
+from ch9329 import Ch9329, KEYS
+from serial_panel import SerialPanel
+from ks_panel import KsPanel
+
+FONT = ("Noto Sans CJK SC", 13)
+FONT_BIG = ("Noto Sans CJK SC", 15)
+FONT_MONO = ("Noto Sans Mono CJK SC", 13)
+VIDEO_DEV = "/dev/video0"
+CH9329_PORT = "/dev/ttyACM0"
+SCREENSAVER_IMG = "/opt/pxe/nailong.png"
+IDLE_SECONDS = 180
+
+# Tk keysym -> ch9329 键名
+KEYSYM_SPECIAL = {
+    "Return": "enter", "KP_Enter": "enter", "Escape": "esc",
+    "BackSpace": "backspace", "Tab": "tab", "space": "space",
+    "Delete": "delete", "Insert": "insert", "Home": "home", "End": "end",
+    "Prior": "pgup", "Next": "pgdn", "Left": "left", "Right": "right",
+    "Up": "up", "Down": "down",
+    "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4", "F5": "f5", "F6": "f6",
+    "F7": "f7", "F8": "f8", "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
+    "KP_1": "1", "KP_2": "2", "KP_3": "3", "KP_4": "4", "KP_5": "5",
+    "KP_6": "6", "KP_7": "7", "KP_8": "8", "KP_9": "9", "KP_0": "0",
+    "KP_Add": "+", "KP_Subtract": "-", "KP_Multiply": "*", "KP_Divide": "/",
+    "KP_Decimal": ".", "KP_Delete": "delete",
+}
+MODIFIER_KEYS = {"Control_L": "ctrl", "Control_R": "ctrl", "Shift_L": "shift",
+                 "Shift_R": "shift", "Alt_L": "alt", "Alt_R": "alt",
+                 "Super_L": "gui", "Super_R": "gui"}
+
+
+class Kiosk(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("运维推车控制台")
+        # 无 WM 环境: overrideredirect + 手动铺满, 不依赖 -fullscreen
+        self.overrideredirect(True)
+        self._fill_screen()
+        self.configure(bg="#10141c", cursor="arrow")
+
+        self.mpv = None
+        self.video_frame = None
+        self.passthrough = False
+        self._mods = set()
+        self._mouse_acc = [0, 0, 0]      # dx, dy, wheel
+        self._mouse_btn = 0
+        self._last_pos = None
+        try:
+            self.ch = Ch9329(CH9329_PORT, log=lambda *a: None)
+        except OSError:
+            self.ch = None
+
+        self._build()
+        self._screensaver_win = None
+        self._last_input = time.time()
+        self._img = None
+        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
+            self.bind_all(seq, self._note_input, add="+")
+        self.after(5000, self._screensaver_tick)
+        self.after(100, self.refresh)
+
+    def _fill_screen(self):
+        self.update_idletasks()
+        w, h = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+0+0")
+
+    # ------------------------------------------------------------ UI
+
+    def _build(self):
+        top = tk.Frame(self, bg="#10141c")
+        top.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(top, text="🛒 运维推车控制台", font=FONT_BIG,
+                 bg="#10141c", fg="#e8eaf0").pack(side="left")
+        self.banner = tk.Label(top, text="", font=FONT_BIG, bg="#10141c", fg="#ffb86c")
+        self.banner.pack(side="left", padx=20)
+        self.clock = tk.Label(top, font=FONT, bg="#10141c", fg="#8b93a7")
+        self.clock.pack(side="right")
+        tk.Button(top, text="退出到终端", font=FONT, command=self.quit_kiosk,
+                  bg="#2a3347", fg="#e8eaf0", activebackground="#3a4560",
+                  relief="flat", padx=14, pady=4, cursor="hand2").pack(
+                  side="right", padx=10)
+
+        body = tk.Frame(self, bg="#10141c")
+        body.pack(fill="both", expand=True, padx=12, pady=6)
+        self.body = body
+
+        # 左: 状态板 (预览/串口模式下换成对应面板)
+        self.status_wrap = tk.Frame(body, bg="#161b26")
+        self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.serial_panel = None
+        tk.Label(self.status_wrap, text="状态", font=FONT_BIG, bg="#161b26",
+                 fg="#8b93a7", anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        self.status_text = tk.Text(self.status_wrap, font=FONT_MONO, bg="#161b26",
+                                   fg="#c8cede", relief="flat", wrap="word",
+                                   state="disabled", padx=12, pady=6)
+        self.status_text.pack(fill="both", expand=True, padx=4, pady=(0, 10))
+
+        btns = tk.Frame(body, bg="#10141c")
+        btns.pack(side="right", fill="y")
+
+        def big(text, cmd, bg="#1f2a3d", fg="#e8eaf0"):
+            b = tk.Button(btns, text=text, font=FONT_BIG, command=cmd, bg=bg,
+                          fg=fg, activebackground="#3a4560", relief="flat",
+                          cursor="hand2", padx=30, pady=14)
+            b.pack(fill="x", pady=6)
+            return b
+
+        self.btn_video = big("UVC 预览:  开 / 关", self.toggle_preview)
+        self.btn_serial = big("串口会话:  开 / 关", self.toggle_serial)
+        self.btn_ks = big("Kickstart 编辑", self.toggle_ks)
+        big("PXE 装机服务:  开 / 关", self.toggle_pxe)
+        big("LAN1 装机口配置", self.cfg_lan1)
+        big("LAN2 管理口配置", self.cfg_lan2)
+        big("重启推车", lambda: self.confirm_power(False), bg="#4a3320")
+        big("关机", lambda: self.confirm_power(True), bg="#47202a", fg="#ffb3bd")
+
+    # ------------------------------------------------------------ 状态刷新
+
+    def refresh(self):
+        def work():
+            svcs = kc.services_status()
+            nics = kc.nics_status()
+            misc = kc.misc_status()
+            lines = []
+            for n, (en, ac) in svcs.items():
+                lines.append(f"{'● 正常' if ac else '● 停止':<8} {n}"
+                             + ("  (未自启)" if not en else ""))
+            lines.append("")
+            for nic in nics:
+                lines.append(f"{nic['role']}  {nic['name']}")
+                lines.append(f"    {nic['ip']:<20} {nic['method']}"
+                             f"  {'已插线' if nic['link'] else '未插线'}")
+            lines.append("")
+            lines.append(f"tailscale: {misc['tailscale_ip']}")
+            lines.append(f"CH9329 键鼠线: {'已连接' if misc['ch9329'] else '未连接'}")
+            lines.append(misc["uptime"])
+            self.after(0, lambda: self._render(lines))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
+        self.after(2000, self.refresh)
+
+    def _render(self, lines):
+        if self.status_text.winfo_ismapped():
+            self.status_text.config(state="normal")
+            self.status_text.delete("1.0", "end")
+            for ln in lines:
+                tag = "ok" if ln.startswith("● 正常") else (
+                      "bad" if ln.startswith("● 停止") else None)
+                self.status_text.insert("end", ln + "\n", tag or ())
+            self.status_text.config(state="disabled")
+            self.status_text.tag_config("ok", foreground="#7ee787")
+            self.status_text.tag_config("bad", foreground="#ff7b72")
+
+    def toggle_serial(self):
+        if self.serial_panel:
+            self._stop_preview()          # 互斥: 预览与串口不同时占左侧
+            self.serial_panel.destroy()
+            self.serial_panel = None
+            self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
+            self.banner.config(text="")
+        else:
+            self._stop_preview()
+            self.status_wrap.pack_forget()
+            self.serial_panel = SerialPanel(self.body)
+            self.serial_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
+            self.banner.config(text="串口会话 · conbroker (display 类只读命令可直接发, 改配置先问 9x)")
+
+    def toggle_ks(self):
+        if getattr(self, "ks_panel", None):
+            self._stop_preview()
+            if self.serial_panel:
+                self.toggle_serial()
+            self.ks_panel.destroy()
+            self.ks_panel = None
+            self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
+            self.banner.config(text="")
+        else:
+            self._stop_preview()
+            if self.serial_panel:
+                self.toggle_serial()
+            self.status_wrap.pack_forget()
+            self.ks_panel = KsPanel(self.body)
+            self.ks_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
+            self.banner.config(text="Kickstart 编辑 · 保存自动备份, 修改立即对下次装机生效")
+
+    # ------------------------------------------------------------ UVC 预览
+
+    def toggle_preview(self):
+        if self.video_frame:
+            self._stop_preview()
+        else:
+            self._start_preview()
+
+    def _start_preview(self):
+        if not os.path.exists(VIDEO_DEV):
+            messagebox.showwarning("UVC 预览", f"未检测到采集设备 {VIDEO_DEV}")
+            return
+        self.status_wrap.pack_forget()
+        self.video_frame = tk.Frame(self.body, container=True, bg="#000000")
+        self.video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.video_frame.bind("<Button-1>", lambda e: self._engage_passthrough())
+        self.update_idletasks()
+        wid = self.video_frame.winfo_id()
+        self.mpv = subprocess.Popen(
+            ["mpv", f"--wid={wid}", "--no-osc", "--no-input-default-bindings",
+             "--input-vo-keyboard=no", "--really-quiet", "--fs=no", VIDEO_DEV],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.banner.config(text="预览中 · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
+
+    def _stop_preview(self):
+        self._release_passthrough()
+        if self.mpv:
+            self.mpv.terminate()
+            self.mpv = None
+        if self.video_frame:
+            self.video_frame.destroy()
+            self.video_frame = None
+        self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.banner.config(text="")
+
+    # ------------------------------------------------------------ 键鼠透传
+
+    def _engage_passthrough(self):
+        if self.passthrough:
+            return
+        if not self.ch:
+            messagebox.showwarning("键鼠透传", f"CH9329 未连接 ({CH9329_PORT})")
+            return
+        self.passthrough = True
+        self._mods.clear()
+        self._last_pos = None
+        self.video_frame.grab_set_global()
+        self.video_frame.config(cursor="none")
+        for seq in ("<Motion>", "<Button-1>", "<Button-2>", "<Button-3>",
+                    "<ButtonRelease-1>", "<ButtonRelease-2>", "<ButtonRelease-3>",
+                    "<MouseWheel>", "<Key>", "<KeyRelease>"):
+            self.video_frame.bind(seq, self._on_passthrough_event)
+        self.banner.config(text="🔒 透传中 · Ctrl+Alt 释放")
+        self.after(16, self._flush_mouse)
+
+    def _release_passthrough(self):
+        if not self.passthrough:
+            return
+        self.passthrough = False
+        try:
+            self.video_frame.grab_release()
+            self.video_frame.config(cursor="arrow")
+        except tk.TclError:
+            pass
+        self.banner.config(text="预览中 · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
+        self.ch and self.ch.send_mouse(0, 0, 0, 0)   # 松开所有键
+
+    def _on_passthrough_event(self, ev):
+        if ev.type == "6":            # Motion
+            pos = (ev.x_root, ev.y_root)
+            if self._last_pos:
+                self._mouse_acc[0] += pos[0] - self._last_pos[0]
+                self._mouse_acc[1] += pos[1] - self._last_pos[1]
+            self._last_pos = pos
+        elif ev.type in ("4", "5"):   # ButtonPress / Release
+            bit = {"1": 0x01, "2": 0x04, "3": 0x02}[ev.num]   # 左/中/右
+            if ev.type == "4":
+                self._mouse_btn |= bit
+            else:
+                self._mouse_btn &= ~bit & 0xFF
+        elif ev.type == "38":         # MouseWheel
+            self._mouse_acc[2] += max(-1, min(1, ev.delta // 120))
+        elif ev.type == "2":          # KeyPress
+            self._on_key(ev, True)
+        elif ev.type == "31":         # KeyRelease
+            self._on_key(ev, False)
+
+    def _on_key(self, ev, down):
+        mod = MODIFIER_KEYS.get(ev.keysym)
+        if mod:
+            if down:
+                self._mods.add(mod)
+            else:
+                self._mods.discard(mod)
+            # Ctrl+Alt 同按 -> 释放透传
+            if down and {"ctrl", "alt"} <= self._mods:
+                self._release_passthrough()
+            return
+        if not down:
+            self.ch and self.ch._send_raw(
+                self.ch.build_frame(0x02, b"\x00" * 8)) if hasattr(self.ch, "build_frame") else None
+            return
+        key = None
+        if len(ev.char) == 1 and ev.char in KEYS:
+            key = ev.char
+        elif ev.keysym in KEYSYM_SPECIAL:
+            key = KEYSYM_SPECIAL[ev.keysym]
+        if key and self.ch:
+            names = list(self._mods) + [key]
+            try:
+                self.ch.send_keys(names, press_ms=20)
+            except ValueError:
+                pass
+
+    def _flush_mouse(self):
+        if not self.passthrough:
+            return
+        dx, dy, wheel = self._mouse_acc
+        if dx or dy or wheel or self._mouse_btn:
+            self.ch and self.ch.send_mouse(self._mouse_btn, dx, dy, wheel)
+            self._mouse_acc = [0, 0, 0]
+        self.after(16, self._flush_mouse)
+
+    # ------------------------------------------------------------ 原有动作
+
+    def toggle_pxe(self):
+        _, active = kc.services_status(("pxe-server",))["pxe-server"]
+        verb = "停止" if active else "启动"
+        if not messagebox.askyesno("确认", f"确定要{verb} PXE 装机服务?"):
+            return
+        subprocess.run(["systemctl", "stop" if active else "start",
+                        "pxe-server", "pxe-http-repo", "pxe-http-boot"],
+                       capture_output=True)
+
+    def cfg_lan1(self):
+        cfg = kc.pxe_conf_read()
+        ip = simpledialog.askstring("LAN1 装机口", "PXE 网卡地址 (CIDR):",
+                                    initialvalue=f"{cfg['ip']}/{cfg['prefix']}")
+        if not ip:
+            return
+        pool_s = simpledialog.askstring("地址池", "起始:", initialvalue=cfg["pool_start"]) or ""
+        pool_e = simpledialog.askstring("地址池", "结束:", initialvalue=cfg["pool_end"]) or ""
+        ip_body, _, prefix = ip.partition("/")
+        new_cfg = {"ip": ip_body, "prefix": int(prefix or 24),
+                   "pool_start": pool_s, "pool_end": pool_e}
+        for cmd in kc.nmcli_set_static(kc.LAN1_CON, ip_body + "/" + (prefix or "24")):
+            subprocess.run(cmd, capture_output=True)
+        ok, msg = kc.apply_pxe_conf(new_cfg)
+        (messagebox.showinfo if ok else messagebox.showerror)(
+            "LAN1", "已应用:\n" + kc.render_pxe_service(new_cfg) if ok else f"失败: {msg}")
+
+    def cfg_lan2(self):
+        warn = ("注意: LAN2 是管理口(远程/SSH/tailscale 走这里)!\n"
+                "修改后当前远程连接会断, 请确保你人在车边操作.\n\n要继续吗?")
+        if not messagebox.askyesno("LAN2 管理口", warn, icon="warning"):
+            return
+        nics = {n["name"]: n for n in kc.nics_status()}
+        nic = nics["enp3s0"]
+        if messagebox.askyesno("LAN2", f"当前: {nic['ip']} ({nic['method']})\n\n改为 DHCP(自动获取)?"):
+            cmds = kc.nmcli_set_dhcp(kc.LAN2_CON)
+        else:
+            ip = simpledialog.askstring("静态 IP", "IP/前缀:", initialvalue=nic["ip"])
+            gw = simpledialog.askstring("网关", "网关(可空):")
+            dns = simpledialog.askstring("DNS", "DNS(可空):")
+            if not ip:
+                return
+            cmds = kc.nmcli_set_static(kc.LAN2_CON, ip, gw or "", dns or "")
+        for cmd in cmds:
+            subprocess.run(cmd, capture_output=True)
+        messagebox.showinfo("LAN2", "已下发, 状态见左侧(远程会断属正常)")
+
+    def confirm_power(self, off):
+        verb = "关机" if off else "重启"
+        if messagebox.askyesno("确认", f"确定要{verb}推车?", icon="warning"):
+            kc.power(off)
+
+    # ------------------------------------------------------------ 屏保 (奶龙)
+
+    def _note_input(self, _event=None):
+        self._last_input = time.time()
+        if self._screensaver_win:
+            self._hide_screensaver()
+
+    def _screensaver_tick(self):
+        if kc.screensaver_due(self._last_input, time.time(),
+                              IDLE_SECONDS, showing=bool(self._screensaver_win)):
+            self._show_screensaver()
+        self.after(5000, self._screensaver_tick)
+
+    def _show_screensaver(self):
+        import os
+        if not os.path.exists(SCREENSAVER_IMG):
+            return
+        try:
+            if self._img is None:
+                self._img = tk.PhotoImage(file=SCREENSAVER_IMG)
+        except tk.TclError:
+            return
+        w = tk.Toplevel(self)
+        w.overrideredirect(True)
+        w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        w.configure(bg="#000000")
+        tk.Label(w, image=self._img, bg="#000000").place(relx=0.5, rely=0.5, anchor="center")
+        w.attributes("-topmost", True)
+        w.bind("<Any-KeyPress>", self._note_input, add="+")
+        w.bind("<Any-Motion>", self._note_input, add="+")
+        w.bind("<Button>", self._note_input, add="+")
+        self._screensaver_win = w
+
+    def _hide_screensaver(self):
+        if self._screensaver_win:
+            self._screensaver_win.destroy()
+            self._screensaver_win = None
+        self._last_input = time.time()
+
+    def quit_kiosk(self):
+        self._stop_preview()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = Kiosk()
+    app.mainloop()

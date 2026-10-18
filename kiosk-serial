@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Kiosk 一键串口工具: 后台开服务(如果没开) -> 发命令/看输出/停服务
+# 用法: kiosk-serial <port> <start|send|tail|stop> [参数...]
+# 例: kiosk-serial /dev/ttyUSB0 start -b 9600
+#     kiosk-serial /dev/ttyUSB0 send "display vlan"
+#     kiosk-serial /dev/ttyUSB0 tail 80
+PORT="$1"; ACT="${2:-list}"; shift 2 2>/dev/null; shift 2>/dev/null
+case "$ACT" in
+  start|stop|list) ARGS="$PORT $ACT $*" ;;
+  send) ARGS="$PORT send '$1' ${2:-} ${3:-}" ;;
+  tail) ARGS="$PORT tail -n ${1:-80}" ;;
+  *) ARGS="$ACT" ;;
+esac
+cd /root/conbroker && exec .venv/bin/python conbroker.py $ARGS
