@@ -173,3 +173,53 @@ def test_ks_validate_warns_on_destructive():
     warns = kc.ks_validate(KS_SAMPLE)
     assert any("clearpart" in w for w in warns)
     assert kc.ks_validate("text\nreboot\nrootpw --iscrypted $6$a$b\n") == []
+
+
+# ---------------------------------------------------------- PIN 锁屏
+
+def test_pin_hash_verify_roundtrip():
+    h = kc.pin_hash("114514")
+    assert h.startswith("pbkdf2$") and "114514" not in h
+    assert kc.pin_verify("114514", h)
+    assert not kc.pin_verify("114515", h)
+
+
+def test_pin_hash_is_salted():
+    assert kc.pin_hash("1234") != kc.pin_hash("1234")
+
+
+def test_pin_verify_rejects_garbage():
+    assert not kc.pin_verify("1234", "")
+    assert not kc.pin_verify("1234", "plain-text")
+
+
+def test_pin_conf_roundtrip_and_mode(tmp_path):
+    p = tmp_path / "kiosk.conf"
+    assert kc.pin_conf_read(str(p)) is None          # 没设过 PIN
+    kc.pin_set("114514", str(p))
+    assert kc.pin_verify("114514", kc.pin_conf_read(str(p)))
+    assert oct(p.stat().st_mode & 0o777) == "0o600"
+
+
+def test_pin_set_rejects_bad_pin(tmp_path):
+    import pytest
+    for bad in ("", "12", "abc123", "1" * 13):
+        with pytest.raises(ValueError):
+            kc.pin_set(bad, str(tmp_path / "k.conf"))
+
+
+def test_pin_gate_lockout_after_failures():
+    h = kc.pin_hash("114514")
+    g = kc.PinGate(h, max_fails=3, lock_s=60)
+    assert g.attempt("0000", now=0) == "bad"
+    assert g.attempt("0000", now=1) == "bad"
+    assert g.attempt("0000", now=2) == "locked"       # 第 3 次错 → 冷却
+    assert g.attempt("114514", now=30) == "locked"    # 冷却中，对的也不收
+    assert g.attempt("114514", now=63) == "ok"        # 冷却过了
+    assert g.attempt("0000", now=64) == "bad"         # 成功后计数清零
+
+
+def test_pin_gate_open_when_no_pin():
+    g = kc.PinGate(None)
+    assert not g.required
+    assert g.attempt("", now=0) == "ok"

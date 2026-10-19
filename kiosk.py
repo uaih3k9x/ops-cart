@@ -66,6 +66,10 @@ class Kiosk(tk.Tk):
             self.ch = None
 
         self._build()
+        self.gate = kc.PinGate(kc.pin_conf_read())
+        self._lock_win = None
+        if self.gate.required:
+            self.after(200, self.lock)
         self._screensaver_win = None
         self._last_input = time.time()
         self._img = None
@@ -372,8 +376,66 @@ class Kiosk(tk.Tk):
 
     def confirm_power(self, off):
         verb = "关机" if off else "重启"
+        if not self._confirm_pin(verb):
+            return
         if messagebox.askyesno("确认", f"确定要{verb}推车?", icon="warning"):
             kc.power(off)
+
+    # ------------------------------------------------------------ PIN 锁屏
+
+    def lock(self):
+        """全屏锁屏; 已锁则只提到最前."""
+        if self._lock_win:
+            self._lock_win.lift()
+            return
+        self._release_passthrough()
+        w = tk.Toplevel(self, bg="#10141c")
+        w.overrideredirect(True)
+        w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        w.attributes("-topmost", True)
+        box = tk.Frame(w, bg="#10141c")
+        box.place(relx=0.5, rely=0.45, anchor="center")
+        tk.Label(box, text="🛒 运维推车已锁定", font=FONT_BIG, bg="#10141c",
+                 fg="#e8eaf0").pack(pady=(0, 16))
+        self._pin_var = tk.StringVar()
+        e = tk.Entry(box, textvariable=self._pin_var, show="•", font=("Noto Sans Mono CJK SC", 22),
+                     width=10, justify="center", bg="#1f2a3d", fg="#e8eaf0",
+                     insertbackground="#e8eaf0", relief="flat")
+        e.pack(ipady=8)
+        e.bind("<Return>", lambda _e: self._try_unlock())
+        self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg="#10141c", fg="#8b93a7")
+        self._lock_msg.pack(pady=12)
+        self._lock_win = w
+        w.after(100, lambda: (w.focus_force(), e.focus_set()))
+        try:
+            w.grab_set()
+        except tk.TclError:
+            pass
+
+    def _try_unlock(self):
+        pin = self._pin_var.get()
+        self._pin_var.set("")
+        r = self.gate.attempt(pin)
+        if r == "ok":
+            self._lock_win.destroy()
+            self._lock_win = None
+            self._last_input = time.time()
+        elif r == "locked":
+            left = max(1, int(self.gate.locked_until - time.time()))
+            self._lock_msg.config(text=f"错误次数过多，{left} 秒后再试", fg="#ff7b72")
+        else:
+            self._lock_msg.config(text="PIN 不对", fg="#ff7b72")
+
+    def _confirm_pin(self, what):
+        if not self.gate.required:
+            return True
+        pin = simpledialog.askstring("验证 PIN", f"{what}前请输入 PIN:", show="•", parent=self)
+        if pin is None:
+            return False
+        r = self.gate.attempt(pin)
+        if r != "ok":
+            messagebox.showerror("PIN", "PIN 不对" if r == "bad" else "错误次数过多，稍后再试")
+        return r == "ok"
 
     # ------------------------------------------------------------ 屏保 (奶龙)
 
@@ -412,9 +474,13 @@ class Kiosk(tk.Tk):
         if self._screensaver_win:
             self._screensaver_win.destroy()
             self._screensaver_win = None
+            if self.gate.required:      # 屏保醒来即锁屏
+                self.lock()
         self._last_input = time.time()
 
     def quit_kiosk(self):
+        if not self._confirm_pin("退出到终端"):
+            return
         self._stop_preview()
         self.destroy()
 

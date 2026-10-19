@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""设置 / 修改 Kiosk 锁屏 PIN (root 运行). 只存加盐哈希到 /opt/pxe/kiosk.conf."""
+import getpass
+import os
+import sys
+
+sys.path.insert(0, "/opt/pxe")
+import kiosk_core as kc  # noqa: E402
+
+if os.geteuid() != 0:
+    sys.exit("请用 root 运行: sudo kiosk-setpin")
+a = getpass.getpass("新 PIN (4-12 位数字): ")
+if a != getpass.getpass("再输一次: "):
+    sys.exit("两次不一致, 未修改")
+try:
+    kc.pin_set(a)
+except ValueError as e:
+    sys.exit(str(e))
+print("已设置; 下次锁屏 / 重启 Kiosk 起生效")
