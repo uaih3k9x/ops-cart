@@ -1,0 +1,16 @@
+[Unit]
+Description=运维推车 Kiosk (开机直进车机界面, PIN 锁屏)
+After=systemd-user-sessions.service network-online.target
+# 连续崩 3 次就不再拉起, tty1 永远留作后路
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+WorkingDirectory=/opt/pxe
+ExecStart=/usr/bin/xinit /usr/bin/python3 /opt/pxe/kiosk.py -- /usr/bin/X :0 vt7 -br -nolisten tcp
+ExecStopPost=/usr/bin/chvt 1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

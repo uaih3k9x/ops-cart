@@ -1,5 +1,8 @@
 #!/bin/bash
-# 运维推车 Kiosk: 从终端手动启动, 退出后回终端. 刻意不自启.
+# 运维推车 Kiosk: 装了 kiosk.service 就交给 systemd 起 (开机自启 + PIN 锁屏), 否则直接 xinit.
 if [ $EUID -ne 0 ]; then echo '请 root 运行 (kiosk 需要改网络/电源权限)'; exit 1; fi
+if systemctl cat kiosk.service >/dev/null 2>&1; then
+    exec systemctl restart kiosk.service
+fi
 cd /opt/pxe
 exec xinit /usr/bin/python3 /opt/pxe/kiosk.py -- /usr/bin/X :0 vt7 -br -nolisten tcp

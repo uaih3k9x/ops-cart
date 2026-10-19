@@ -221,3 +221,81 @@ def ks_validate(text):
     if not text.strip():
         warns.append("内容为空")
     return warns
+
+
+# ------------------------------------------------------------ PIN 锁屏
+# 防"路过的人顺手按两下": 只存加盐 PBKDF2 哈希, 连续输错冷却.
+
+KIOSK_CONF = "/opt/pxe/kiosk.conf"
+_PIN_ITERS = 200_000
+
+
+def pin_hash(pin, salt=None):
+    import hashlib as _hl
+    import secrets as _se
+    salt = salt or _se.token_hex(16)
+    dk = _hl.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), _PIN_ITERS)
+    return f"pbkdf2${_PIN_ITERS}${salt}${dk.hex()}"
+
+
+def pin_verify(pin, stored):
+    import hashlib as _hl
+    import hmac as _hm
+    try:
+        tag, iters, salt, want = stored.split("$")
+        if tag != "pbkdf2":
+            return False
+        dk = _hl.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), int(iters))
+    except (ValueError, AttributeError):
+        return False
+    return _hm.compare_digest(dk.hex(), want)
+
+
+def pin_conf_read(path=None):
+    """返回存储的 PIN 哈希; 没设过返回 None (= 不上锁)."""
+    try:
+        return json.load(open(path or KIOSK_CONF)).get("pin") or None
+    except (OSError, ValueError):
+        return None
+
+
+def pin_set(pin, path=None):
+    if not (pin.isdigit() and 4 <= len(pin) <= 12):
+        raise ValueError("PIN 须为 4-12 位数字")
+    path = path or KIOSK_CONF
+    try:
+        cfg = json.load(open(path))
+    except (OSError, ValueError):
+        cfg = {}
+    cfg["pin"] = pin_hash(pin)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+
+
+class PinGate:
+    """PIN 校验 + 连续输错冷却. attempt() 返回 'ok' / 'bad' / 'locked'."""
+
+    def __init__(self, stored, max_fails=5, lock_s=60):
+        self.stored, self.max_fails, self.lock_s = stored, max_fails, lock_s
+        self.fails, self.locked_until = 0, 0.0
+
+    @property
+    def required(self):
+        return bool(self.stored)
+
+    def attempt(self, pin, now=None):
+        now = time.time() if now is None else now
+        if not self.required:
+            return "ok"
+        if now < self.locked_until:
+            return "locked"
+        if pin_verify(pin, self.stored):
+            self.fails = 0
+            return "ok"
+        self.fails += 1
+        if self.fails >= self.max_fails:
+            self.fails, self.locked_until = 0, now + self.lock_s
+            return "locked"
+        return "bad"
