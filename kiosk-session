@@ -1,0 +1,8 @@
+#!/bin/bash
+# xinit 会话: 先起 ibus (XIM, 给聊天框打拼音), 再跑 kiosk. 由 kiosk-launcher 经 dbus-run-session 调用.
+export XMODIFIERS=@im=ibus GTK_IM_MODULE=ibus QT_IM_MODULE=ibus
+if command -v ibus-daemon >/dev/null; then
+    ibus-daemon --xim --daemonize --replace
+    for _ in $(seq 20); do ibus engine libpinyin 2>/dev/null && break; sleep 0.3; done
+fi
+exec /usr/bin/python3 /opt/pxe/kiosk.py

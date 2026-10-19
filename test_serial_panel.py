@@ -70,3 +70,74 @@ def test_conbroker_cmd_uses_conf(tmp_path, monkeypatch):
     cmd = sp._conbroker_cmd()
     assert cmd[:3] == ["sudo", "-u", "alice", "-H"][:3]
     assert cmd[4] == "/srv/cb/.venv/bin/python"      # [3] 是 -H
+
+
+# ---------------------------------------------------------- 分屏: 实时控制台 + 聊天
+
+def test_data_dir_explicit_and_default(tmp_path):
+    assert sp.data_dir({"user": "x", "data_dir": "/srv/d"}) == "/srv/d"
+    # 没写 data_dir: 用该用户家目录下的 .conbroker (与 conbroker 的 HOME 默认一致)
+    import pwd
+    me = pwd.getpwuid(__import__("os").getuid()).pw_name
+    assert sp.data_dir({"user": me}).endswith("/.conbroker")
+
+
+def test_broker_port_reads_state_file(tmp_path):
+    (tmp_path / "run").mkdir()
+    # conbroker 的 safe(): 非 [A-Za-z0-9_.-] 换成 _
+    (tmp_path / "run" / "_dev_ttyUSB0.json").write_text(json.dumps({"port": 41303}))
+    assert sp.broker_port(str(tmp_path), "/dev/ttyUSB0") == 41303
+    assert sp.broker_port(str(tmp_path), "/dev/ttyS9") is None
+
+
+def test_key_bytes_printable_and_specials():
+    assert sp.key_bytes("a", "a", 0) == b"a"
+    assert sp.key_bytes("Return", "\r", 0) == b"\r"
+    assert sp.key_bytes("BackSpace", "\x08", 0) == b"\x7f"
+    assert sp.key_bytes("Tab", "\t", 0) == b"\t"
+    assert sp.key_bytes("Up", "", 0) == b"\x1b[A"
+    assert sp.key_bytes("question", "?", 1) == b"?"
+
+
+def test_key_bytes_ctrl_letters():
+    CTRL = 0x4
+    assert sp.key_bytes("c", "\x03", CTRL) == b"\x03"
+    assert sp.key_bytes("z", "\x1a", CTRL) == b"\x1a"
+    assert sp.key_bytes("bracketright", "\x1d", CTRL) is None   # Ctrl+] 留给面板自己, 不进串口
+
+
+def test_key_bytes_ignores_modifiers_alone():
+    assert sp.key_bytes("Shift_L", "", 1) is None
+    assert sp.key_bytes("Control_L", "", 0) is None
+
+
+def test_term_feed_strips_ansi_and_cr():
+    t = sp.TermFeed()
+    assert t.feed(b"\x1b[1mHi\x1b[0m\r\n<HUAWEI>") == [("text", "Hi\n<HUAWEI>")]
+
+
+def test_term_feed_backspace_and_pager_erase():
+    t = sp.TermFeed()
+    assert t.feed(b"ab\x08") == [("text", "ab"), ("bs", 1)]
+    # 华为翻页: "---- More ----" 后跟 ESC[nD + n 个空格 + ESC[nD 擦掉, 光标左移按退格算
+    assert t.feed(b"---- More ----\x1b[14D" + b" " * 14 + b"\x1b[14D") == [
+        ("text", "---- More ----"), ("bs", 14), ("text", " " * 14), ("bs", 14)]
+
+
+def test_term_feed_escape_split_across_chunks():
+    t = sp.TermFeed()
+    assert t.feed(b"x\x1b[1") == [("text", "x")]
+    assert t.feed(b"6D") == [("bs", 16)]
+
+
+def test_term_feed_utf8_split_across_chunks():
+    t = sp.TermFeed()
+    raw = "中".encode()
+    assert t.feed(raw[:2]) == []
+    assert t.feed(raw[2:]) == [("text", "中")]
+
+
+def test_parse_chat_line():
+    assert sp.parse_chat_line("[2026-10-19 10:21:05 Claude] 收到") == ("10:21", "Claude", "收到")
+    assert sp.parse_chat_line("[2026-10-19 10:22:00 op] 已切 U6") == ("10:22", "op", "已切 U6")
+    assert sp.parse_chat_line("garbage") is None
