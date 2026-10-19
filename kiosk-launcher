@@ -2,4 +2,4 @@
 # 运维推车 Kiosk: 从终端手动启动, 退出后回终端. 刻意不自启.
 if [ $EUID -ne 0 ]; then echo '请 root 运行 (kiosk 需要改网络/电源权限)'; exit 1; fi
 cd /opt/pxe
-exec xinit /usr/bin/dbus-run-session /opt/pxe/kiosk-session -- /usr/bin/X :0 vt7 -br -nolisten tcp
+exec xinit /usr/bin/python3 /opt/pxe/kiosk.py -- /usr/bin/X :0 vt7 -br -nolisten tcp
