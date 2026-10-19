@@ -2,7 +2,7 @@
 """Kiosk 串口面板: 嵌入 kiosk.py 的小部件, 后端走 conbroker.
 
 左宽右窄分屏: 左边实时控制台 (直连 conbroker 的 human 通道, 键盘直通串口),
-右边和 Claude 的留言板 (chat.log, 输入框可用 ibus 拼音).
+右边和 Claude 的留言板 (chat.log). Tk 8.6 接不上 ibus 的 XIM, 聊天先用英文/拼音.
 开停服务/留言经 conbroker 命令行; 控制台只连它的本地 socket, 不直接碰串口设备.
 """
 
@@ -226,7 +226,6 @@ class SerialPanel(tk.Frame):
         self.console.pack(fill="both", expand=True)
         self.console.tag_config("mark", foreground="#7ec8e3")
         self.console.bind("<Key>", self._on_console_key)
-        self.console.bind("<FocusIn>", lambda e: self._use_im(False))
         self.console.bind("<<Paste>>", self._on_paste)
         pane.add(left, stretch="always", minsize=400)
 
@@ -248,25 +247,17 @@ class SerialPanel(tk.Frame):
                                    highlightbackground=BG2, highlightcolor="#26577c")
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())
-        self.chat_entry.bind("<FocusIn>", lambda e: self._use_im(True))
         _btn(row, "发送", self.chat_send, bg="#26577c").pack(side="left", padx=(6, 0))
         pane.add(right, stretch="never", minsize=260, width=CHAT_WIDTH)
 
         for w in (self.console, self.chat_entry, self.chat_log):
             w.bind("<F2>", self._toggle_focus)
 
-    # ------------------------------------------------------------ 焦点/输入法
+    # ------------------------------------------------------------ 焦点
 
     def _toggle_focus(self, _e=None):
         (self.chat_entry if self.focus_get() is self.console else self.console).focus_set()
         return "break"
-
-    def _use_im(self, on):
-        # 控制台按键要原样进串口, 不能被拼音截走; 聊天框才开输入法
-        try:
-            self.tk.call("tk", "useinputmethods", "-displayof", self, int(on))
-        except tk.TclError:
-            pass
 
     # ------------------------------------------------------------ 控制台
 
