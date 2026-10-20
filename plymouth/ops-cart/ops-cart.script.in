@@ -1,0 +1,72 @@
+# ops-cart boot splash: white background, big logo, board name, "Step n/3".
+# NOTE: inside fun, globals need the "global." prefix. ASCII only: initramfs has no CJK font. @BOARD@ / @TITLE@ are filled by install.sh.
+
+global.board = "@BOARD@";
+global.title = "@TITLE@";
+
+Window.SetBackgroundTopColor(1, 1, 1);
+Window.SetBackgroundBottomColor(1, 1, 1);
+global.W = Window.GetWidth();
+global.H = Window.GetHeight();
+
+fun center(sprite, img, y) {
+    sprite.SetImage(img);
+    sprite.SetPosition(Window.GetX() + (global.W - img.GetWidth()) / 2, Window.GetY() + y, 1);
+}
+
+# logo.png if present, else the title in big letters
+global.logo_img = Image("logo.png");
+if (!global.logo_img || global.logo_img.GetWidth() < 1)
+    global.logo_img = Image.Text(global.title, 0.08, 0.08, 0.1, 1, "Sans Bold 64");
+else if (global.logo_img.GetWidth() > global.W * 0.5)
+    global.logo_img = global.logo_img.Scale(global.W * 0.5, global.logo_img.GetHeight() * (global.W * 0.5) / global.logo_img.GetWidth());
+global.logo = Sprite();
+center(global.logo, global.logo_img, global.H * 0.40 - global.logo_img.GetHeight() / 2);
+
+global.board_sprite = Sprite();
+center(global.board_sprite, Image.Text(global.board, 0.35, 0.35, 0.38, 1, "Sans 20"), global.H * 0.40 + global.logo_img.GetHeight() / 2 + 24);
+
+global.step_sprite = Sprite();
+global.status_sprite = Sprite();
+global.bar_bg = Sprite();
+global.bar = Sprite();
+global.bar_w = global.W * 0.3;
+global.bar_y = global.H * 0.82;
+global.bar_bg.SetImage(Image("bar-bg.png").Scale(global.bar_w, 4));
+global.bar_bg.SetPosition(Window.GetX() + (global.W - global.bar_w) / 2, Window.GetY() + global.bar_y, 1);
+
+global.step = 0;
+global.last_status = "";
+
+fun show_step(n, text) {
+    if (n != global.step) {
+        global.step = n;
+        center(global.step_sprite, Image.Text("Step " + n + "/3   " + text, 0.15, 0.15, 0.18, 1, "Sans 16"), global.bar_y - 46);
+    }
+}
+
+# Step 1 = initramfs, Step 2 = after initrd-switch-root (or progress > 50%). Step 3 is the kiosk self-check page.
+fun progress_cb(duration, progress) {
+    if (progress > 0.5)
+        show_step(2, "Starting system services");
+    w = global.bar_w * progress;
+    if (w < 1) w = 1;
+    global.bar.SetImage(Image("bar-fg.png").Scale(w, 4));
+    global.bar.SetPosition(Window.GetX() + (global.W - global.bar_w) / 2, Window.GetY() + global.bar_y, 2);
+}
+Plymouth.SetBootProgressFunction(progress_cb);
+
+fun status_cb(status) {
+    global.last_status = status;
+    if (status.SubString(0, 18) == "initrd-switch-root" || global.step == 2)
+        show_step(2, "Starting system services");
+    center(global.status_sprite, Image.Text(status, 0.6, 0.6, 0.63, 1, "Sans 11"), global.bar_y + 16);
+}
+Plymouth.SetUpdateStatusFunction(status_cb);
+
+fun message_cb(text) {
+    center(global.status_sprite, Image.Text(text, 0.75, 0.2, 0.2, 1, "Sans 12"), global.bar_y + 16);
+}
+Plymouth.SetMessageFunction(message_cb);
+
+show_step(1, "Loading system");

@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=OPS-CART
+Description=Arcade-style (white, big logo, staged) boot splash for ops-cart
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/ops-cart
+ScriptFile=/usr/share/plymouth/themes/ops-cart/ops-cart.script
