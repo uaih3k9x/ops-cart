@@ -229,6 +229,16 @@ def notice_read(path=NOTICE_PATH, max_lines=12, max_chars=400):
     return "\n".join(lines).strip()[:max_chars]
 
 
+def notice_font_px(text, width, height, lo=24, hi=220):
+    """公告字号(像素): 塞满 width x height 的最大值. 中文 1 字宽, ASCII 0.6, 行高 1.3."""
+    lines = text.splitlines()
+    if not lines:
+        return lo
+    units = max(sum(0.6 if ord(c) < 128 else 1 for c in l) for l in lines) or 1
+    px = int(min(width / units, height / (len(lines) * 1.3)))
+    return max(lo, min(hi, px))
+
+
 def pxe_conf_read():
     try:
         with open(PXE_CONF) as f:
