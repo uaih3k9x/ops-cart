@@ -139,6 +139,16 @@ def temp_level(c):
     return "hot" if c >= 85 else "warn" if c >= 70 else "ok"
 
 
+NOTICE_PATH = "/opt/pxe/notice.txt"
+
+
+def notice_read(path=NOTICE_PATH, max_lines=12, max_chars=400):
+    """锁屏公告牌. 文件不存在/全空返回 ""; 去首尾空行, 限行数和字数."""
+    text = _read(path) or ""
+    lines = text.splitlines()[:max_lines]
+    return "\n".join(lines).strip()[:max_chars]
+
+
 def pxe_conf_read():
     try:
         with open(PXE_CONF) as f:
