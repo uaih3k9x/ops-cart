@@ -132,6 +132,7 @@ class Kiosk(tk.Tk):
         big("PXE 装机服务:  开 / 关", self.toggle_pxe)
         big("LAN1 装机口配置", self.cfg_lan1)
         big("LAN2 管理口配置", self.cfg_lan2)
+        big("锁屏", self.lock_now)
         big("重启推车", lambda: self.confirm_power(False), bg="#4a3320")
         big("关机", lambda: self.confirm_power(True), bg="#47202a", fg="#ffb3bd")
 
@@ -439,6 +440,12 @@ class Kiosk(tk.Tk):
             w.grab_set()
         except tk.TclError:
             pass
+
+    def lock_now(self):
+        if not self.gate.required:
+            messagebox.showinfo("锁屏", "还没设 PIN, 先在终端跑 sudo kiosk-setpin")
+            return
+        self.lock()
 
     def _lock_tick(self):
         """锁屏每秒刷新时钟和公告; 解锁后自动停."""
