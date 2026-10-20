@@ -90,7 +90,7 @@ class Kiosk(tk.Tk):
     def _build(self):
         top = tk.Frame(self, bg="#10141c")
         top.pack(fill="x", padx=12, pady=(10, 4))
-        tk.Label(top, text="🛒 运维推车控制台", font=FONT_BIG,
+        tk.Label(top, text="运维推车控制台", font=FONT_BIG,
                  bg="#10141c", fg="#e8eaf0").pack(side="left")
         self.banner = tk.Label(top, text="", font=FONT_BIG, bg="#10141c", fg="#ffb86c")
         self.banner.pack(side="left", padx=20)
@@ -412,24 +412,42 @@ class Kiosk(tk.Tk):
         w.overrideredirect(True)
         w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
         w.attributes("-topmost", True)
+        # 上: 时钟; 中: 公告牌(/opt/pxe/notice.txt, 推车客串引导牌); 下: PIN
+        self._lock_clock = tk.Label(w, font=("Noto Sans CJK SC", 64), bg="#10141c", fg="#e8eaf0")
+        self._lock_clock.place(relx=0.5, rely=0.13, anchor="center")
+        self._lock_date = tk.Label(w, font=FONT_BIG, bg="#10141c", fg="#8b93a7")
+        self._lock_date.place(relx=0.5, rely=0.23, anchor="center")
+        self._lock_notice = tk.Label(w, font=("Noto Sans CJK SC", 28), bg="#10141c", fg="#ffb86c",
+                                     justify="center", wraplength=int(self.winfo_screenwidth() * 0.8))
+        self._lock_notice.place(relx=0.5, rely=0.48, anchor="center")
         box = tk.Frame(w, bg="#10141c")
-        box.place(relx=0.5, rely=0.45, anchor="center")
-        tk.Label(box, text="🛒 运维推车已锁定", font=FONT_BIG, bg="#10141c",
-                 fg="#e8eaf0").pack(pady=(0, 16))
+        box.place(relx=0.5, rely=0.8, anchor="center")
+        tk.Label(box, text="运维推车已锁定", font=FONT_BIG, bg="#10141c",
+                 fg="#e8eaf0").pack(pady=(0, 12))
         self._pin_var = tk.StringVar()
-        e = tk.Entry(box, textvariable=self._pin_var, show="•", font=("Noto Sans Mono CJK SC", 22),
-                     width=10, justify="center", bg="#1f2a3d", fg="#e8eaf0",
+        e = tk.Entry(box, textvariable=self._pin_var, show="*", font=("Noto Sans Mono CJK SC", 22),
+                     width=14, justify="center", bg="#1f2a3d", fg="#e8eaf0",
                      insertbackground="#e8eaf0", relief="flat")
         e.pack(ipady=8)
         e.bind("<Return>", lambda _e: self._try_unlock())
         self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg="#10141c", fg="#8b93a7")
         self._lock_msg.pack(pady=12)
         self._lock_win = w
+        self._lock_tick()
         w.after(100, lambda: (w.focus_force(), e.focus_set()))
         try:
             w.grab_set()
         except tk.TclError:
             pass
+
+    def _lock_tick(self):
+        """锁屏每秒刷新时钟和公告; 解锁后自动停."""
+        if not self._lock_win:
+            return
+        self._lock_clock.config(text=time.strftime("%H:%M"))
+        self._lock_date.config(text=time.strftime("%Y-%m-%d  星期") + "一二三四五六日"[time.localtime().tm_wday])
+        self._lock_notice.config(text=kc.notice_read())
+        self._lock_win.after(1000, self._lock_tick)
 
     def _try_unlock(self):
         pin = self._pin_var.get()
@@ -464,7 +482,8 @@ class Kiosk(tk.Tk):
             self._hide_screensaver()
 
     def _screensaver_tick(self):
-        if kc.screensaver_due(self._last_input, time.time(),
+        signage = self._lock_win is not None and kc.notice_read() != ""   # 当引导牌时不放屏保
+        if not signage and kc.screensaver_due(self._last_input, time.time(),
                               IDLE_SECONDS, showing=bool(self._screensaver_win)):
             self._show_screensaver()
         self.after(5000, self._screensaver_tick)

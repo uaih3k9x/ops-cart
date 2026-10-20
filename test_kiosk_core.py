@@ -285,3 +285,24 @@ def test_fans_to_show_keeps_fans_seen_spinning():
     assert shown == [("fan2", 2689)] and seen == {"fan2"}
     # 转过的风扇停了也要继续显示(0 RPM 才能报警)
     assert kc.fans_to_show([("fan1", 0), ("fan2", 0)], seen) == [("fan2", 0)]
+
+
+def test_notice_read_missing_and_blank(tmp_path):
+    assert kc.notice_read(str(tmp_path / "nope.txt")) == ""
+    p = tmp_path / "n.txt"
+    p.write_text("\n  \n")
+    assert kc.notice_read(str(p)) == ""
+
+
+def test_notice_read_strips_and_limits(tmp_path):
+    p = tmp_path / "n.txt"
+    p.write_text("\n445C 机房 → 左转\n\n" + "\n".join(f"l{i}" for i in range(30)) + "\n")
+    text = kc.notice_read(str(p), max_lines=5)
+    assert text.splitlines()[0] == "445C 机房 → 左转"
+    assert len(text.splitlines()) == 5
+
+
+def test_notice_read_limits_chars(tmp_path):
+    p = tmp_path / "n.txt"
+    p.write_text("长" * 1000)
+    assert len(kc.notice_read(str(p), max_chars=300)) == 300
