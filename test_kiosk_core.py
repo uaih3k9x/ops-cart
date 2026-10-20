@@ -351,6 +351,79 @@ def test_selftest_pxe_running_and_no_sensors():
     assert rows["CPU"]["state"] == "--" and rows["FAN"]["state"] == "--"
 
 
+def _ctx(**kw):
+    ctx = dict(nics=NICS_OK, misc=MISC_OK, svcs={"pxe-server": (True, False)},
+               temps=[("CPU", 45.0)], fans=[("fan2", 2689)],
+               exists=lambda p: True, ping=lambda h: True, pci=lambda vid, did: [])
+    ctx.update(kw)
+    return ctx
+
+
+def test_selftest_run_follows_plan_order_and_labels():
+    plan = [{"check": "cpu"}, {"check": "lan", "label": "MGMT", "iface": "enp3s0"}]
+    rows = kc.selftest_run(plan, _ctx())
+    assert [(r["label"], r["state"]) for r in rows] == [("CPU", "OK"), ("MGMT", "OK")]
+
+
+def test_selftest_run_isolates_crashing_check():
+    def boom(ctx):
+        raise RuntimeError("x")
+    rows = kc.selftest_run([{"check": "boom", "label": "BOOM"}, {"check": "cpu"}], _ctx(),
+                           checks=dict(kc.CHECKS, boom=boom))
+    assert rows[0] == {"label": "BOOM", "state": "FAIL", "detail": "ERROR"}
+    assert rows[1]["state"] == "OK"
+
+
+def test_selftest_run_unknown_check():
+    rows = kc.selftest_run([{"check": "nope"}], _ctx())
+    assert rows == [{"label": "NOPE", "state": "FAIL", "detail": "UNKNOWN CHECK"}]
+
+
+def test_check_serial_uses_dev_param():
+    seen = []
+    ctx = _ctx(exists=lambda p: seen.append(p) or False)
+    assert kc.check_serial(ctx, dev="/dev/ttyS1") == ("--", "NOT CONNECTED")
+    assert seen == ["/dev/ttyS1"]
+
+
+def test_check_ping():
+    assert kc.check_ping(_ctx(), host="100.100.100.8") == ("OK", "100.100.100.8")
+    assert kc.check_ping(_ctx(ping=lambda h: False), host="nas") == ("WARN", "UNREACHABLE")
+
+
+def test_check_pci_counts_and_driver():
+    found = [{"slot": "02:00.0", "driver": None}, {"slot": "04:00.0", "driver": None}]
+    ctx = _ctx(pci=lambda v, d: found)
+    assert kc.check_pci(ctx, id="12ab:0710", count=2) == ("OK", "x2 NO DRIVER")
+    assert kc.check_pci(ctx, id="12ab:0710", count=3) == ("FAIL", "x2 / 3")
+    assert kc.check_pci(ctx, id="12ab:0710", driver="sc0710")[0] == "WARN"
+    assert kc.check_pci(_ctx(), id="12ab:0710") == ("FAIL", "NOT FOUND")
+    ok = _ctx(pci=lambda v, d: [{"slot": "02:00.0", "driver": "sc0710"}])
+    assert kc.check_pci(ok, id="12ab:0710", driver="sc0710") == ("OK", "x1 sc0710")
+
+
+def test_pci_devices_reads_sysfs(tmp_path):
+    for slot, dev, drv in (("0000:02:00.0", "0x0710", None), ("0000:01:00.0", "0x0fc8", "nouveau")):
+        d = tmp_path / slot
+        d.mkdir()
+        (d / "vendor").write_text("0x12ab\n" if dev == "0x0710" else "0x10de\n")
+        (d / "device").write_text(dev + "\n")
+        if drv:
+            (tmp_path / drv).mkdir()
+            (d / "driver").symlink_to(tmp_path / drv)
+    assert kc.pci_devices("12ab", "0710", root=str(tmp_path)) == [{"slot": "0000:02:00.0", "driver": None}]
+    assert kc.pci_devices("10de", "0fc8", root=str(tmp_path))[0]["driver"] == "nouveau"
+
+
+def test_selftest_plan_read(tmp_path):
+    assert kc.selftest_plan_read(str(tmp_path / "missing.json")) == kc.DEFAULT_PLAN
+    p = tmp_path / "s.json"
+    p.write_text('[{"check": "cpu"}]')
+    assert kc.selftest_plan_read(str(p)) == [{"check": "cpu"}]
+    p.write_text("{broken")
+    assert kc.selftest_plan_read(str(p)) == kc.DEFAULT_PLAN
+
+
 def test_selftest_line_format():
     line = kc.selftest_line({"label": "LAN2", "state": "OK", "detail": "1.2.3.4"}, width=20)
     assert line.startswith("LAN2 ") and ". OK" in line and line.endswith("1.2.3.4")

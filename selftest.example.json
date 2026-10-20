@@ -1,0 +1,11 @@
+[
+  {"check": "lan",       "label": "LAN2",       "iface": "enp3s0"},
+  {"check": "tailscale"},
+  {"check": "serial",    "label": "CONSOLE",    "dev": "/dev/ttyUSB0"},
+  {"check": "ch9329",    "label": "CH9329"},
+  {"check": "pxe",       "label": "LAN1 / PXE", "iface": "eno1"},
+  {"check": "cpu"},
+  {"check": "fan"},
+  {"check": "pci",       "label": "CAPTURE",    "id": "12ab:0710", "count": 1},
+  {"check": "ping",      "label": "NAS",        "host": "192.168.1.10"}
+]

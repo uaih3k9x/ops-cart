@@ -174,44 +174,140 @@ def branding_read(d=BRANDING_DIR):
     return b
 
 
-def selftest_rows(nics, misc, svcs, temps, fans, serial_ok):
-    """街机式开机自检的每一行 {label, state, detail}; state: OK / WARN / FAIL / --(没接, 不算故障)."""
-    by = {n["name"]: n for n in nics}
-    rows = []
+# 自检 = 一张计划表(/opt/pxe/selftest.json, 没有就用 DEFAULT_PLAN) x 一组检查函数.
+# 检查函数: (ctx, **参数) -> (state, detail); state: OK / WARN / FAIL / --(没接, 不算故障).
+# ctx 是开机时采一次的快照 + 几个探测函数, 测试里整个换掉.
 
-    def add(label, state, detail=""):
-        rows.append({"label": label, "state": state, "detail": detail})
+def check_lan(ctx, iface="enp3s0"):
+    nic = {n["name"]: n for n in ctx["nics"]}.get(iface, {})
+    if not nic.get("link"):
+        return "FAIL", "NO LINK"
+    if nic.get("ip", "-") == "-":
+        return "WARN", "NO ADDRESS"
+    return "OK", nic["ip"].split("/")[0]
 
-    lan2 = by.get("enp3s0", {})
-    if not lan2.get("link"):
-        add("LAN2", "FAIL", "NO LINK")
-    elif lan2.get("ip", "-") == "-":
-        add("LAN2", "WARN", "NO ADDRESS")
-    else:
-        add("LAN2", "OK", lan2["ip"].split("/")[0])
-    ts = misc.get("tailscale_ip", "-")
-    add("TAILSCALE", "OK" if ts != "-" else "WARN", ts if ts != "-" else "OFFLINE")
-    add("CONSOLE", "OK" if serial_ok else "--", "ttyUSB0" if serial_ok else "NOT CONNECTED")
-    add("CH9329", "OK" if misc.get("ch9329") else "--", "ttyACM0" if misc.get("ch9329") else "NOT CONNECTED")
-    pxe_on = svcs.get("pxe-server", (False, False))[1]
-    lan1 = by.get("eno1", {})
-    if pxe_on:
-        add("LAN1 / PXE", "OK", "RUNNING")
-    else:
-        add("LAN1 / PXE", "--", "LINK UP / STANDBY" if lan1.get("link") else "STANDBY")
-    cpu = dict(temps).get("CPU")
+
+def check_tailscale(ctx):
+    ts = ctx["misc"].get("tailscale_ip", "-")
+    return ("OK", ts) if ts != "-" else ("WARN", "OFFLINE")
+
+
+def check_serial(ctx, dev="/dev/ttyUSB0"):
+    return ("OK", os.path.basename(dev)) if ctx["exists"](dev) else ("--", "NOT CONNECTED")
+
+
+def check_ch9329(ctx):
+    return ("OK", "ttyACM0") if ctx["misc"].get("ch9329") else ("--", "NOT CONNECTED")
+
+
+def check_pxe(ctx, iface="eno1"):
+    if ctx["svcs"].get("pxe-server", (False, False))[1]:
+        return "OK", "RUNNING"
+    nic = {n["name"]: n for n in ctx["nics"]}.get(iface, {})
+    return "--", "LINK UP / STANDBY" if nic.get("link") else "STANDBY"
+
+
+def check_cpu(ctx):
+    cpu = dict(ctx["temps"]).get("CPU")
     if cpu is None:
-        add("CPU", "--", "NO SENSOR")
-    else:
-        add("CPU", {"ok": "OK", "warn": "WARN", "hot": "FAIL"}[temp_level(cpu)], f"{cpu:.0f}°C")
+        return "--", "NO SENSOR"
+    return {"ok": "OK", "warn": "WARN", "hot": "FAIL"}[temp_level(cpu)], f"{cpu:.0f}°C"
+
+
+def check_fan(ctx):
+    fans = ctx["fans"]
     if not fans:
-        add("FAN", "--", "NO SENSOR")
-    elif all(rpm == 0 for _, rpm in fans):
-        add("FAN", "FAIL", "STOPPED")
-    else:
-        add("FAN", "OK", " / ".join(str(rpm) for _, rpm in fans if rpm))
-        rows[-1]["detail"] += " RPM"
+        return "--", "NO SENSOR"
+    if all(rpm == 0 for _, rpm in fans):
+        return "FAIL", "STOPPED"
+    return "OK", " / ".join(str(rpm) for _, rpm in fans if rpm) + " RPM"
+
+
+def check_ping(ctx, host):
+    return ("OK", host) if ctx["ping"](host) else ("WARN", "UNREACHABLE")
+
+
+def check_pci(ctx, id, count=1, driver=None):
+    """PCI 卡在不在(vendor:device); 给了 driver 就要求已绑定."""
+    vid, did = id.split(":")
+    found = ctx["pci"](vid, did)
+    if not found:
+        return "FAIL", "NOT FOUND"
+    if len(found) < count:
+        return "FAIL", f"x{len(found)} / {count}"
+    bound = {d["driver"] for d in found} - {None}
+    if driver and driver not in bound:
+        return "WARN", f"x{len(found)} NO {driver.upper()}"
+    return "OK", f"x{len(found)} " + (", ".join(sorted(bound)) if bound else "NO DRIVER")
+
+
+CHECKS = {"lan": check_lan, "tailscale": check_tailscale, "serial": check_serial,
+          "ch9329": check_ch9329, "pxe": check_pxe, "cpu": check_cpu, "fan": check_fan,
+          "ping": check_ping, "pci": check_pci}
+
+DEFAULT_PLAN = [{"check": "lan", "label": "LAN2", "iface": "enp3s0"},
+                {"check": "tailscale"},
+                {"check": "serial", "label": "CONSOLE"},
+                {"check": "ch9329", "label": "CH9329"},
+                {"check": "pxe", "label": "LAN1 / PXE", "iface": "eno1"},
+                {"check": "cpu"},
+                {"check": "fan"}]
+
+SELFTEST_PLAN = "/opt/pxe/selftest.json"
+
+
+def selftest_plan_read(path=SELFTEST_PLAN):
+    try:
+        with open(path) as f:
+            plan = json.load(f)
+        return plan if isinstance(plan, list) else DEFAULT_PLAN
+    except (OSError, ValueError):
+        return DEFAULT_PLAN
+
+
+def selftest_run(plan, ctx, checks=CHECKS):
+    """按计划逐项跑; 单项抛异常只把那一行标 FAIL, 不拖垮整页."""
+    rows = []
+    for item in plan:
+        params = {k: v for k, v in item.items() if k not in ("check", "label")}
+        label = item.get("label", item.get("check", "?").upper())
+        fn = checks.get(item.get("check"))
+        if fn is None:
+            state, detail = "FAIL", "UNKNOWN CHECK"
+        else:
+            try:
+                state, detail = fn(ctx, **params)
+            except Exception:
+                state, detail = "FAIL", "ERROR"
+        rows.append({"label": label, "state": state, "detail": detail})
     return rows
+
+
+def pci_devices(vid, did, root="/sys/bus/pci/devices"):
+    """[{slot, driver}], vid/did 是不带 0x 的十六进制."""
+    out = []
+    for slot in sorted(os.listdir(root)):
+        d = os.path.join(root, slot)
+        if (_read(os.path.join(d, "vendor")) or "").lower() == "0x" + vid.lower() and \
+           (_read(os.path.join(d, "device")) or "").lower() == "0x" + did.lower():
+            drv = os.path.join(d, "driver")
+            out.append({"slot": slot, "driver": os.path.basename(os.readlink(drv)) if os.path.islink(drv) else None})
+    return out
+
+
+def selftest_context():
+    """真机快照. SMART 要 sudo 且慢, 自检不读."""
+    return {"nics": nics_status(), "misc": misc_status(), "svcs": services_status(),
+            "temps": temps_status(smart=lambda: None), "fans": fans_status(),
+            "exists": os.path.exists, "pci": pci_devices,
+            "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0}
+
+
+def selftest_rows(nics, misc, svcs, temps, fans, serial_ok):
+    """旧接口: 默认计划 + 给定快照."""
+    ctx = {"nics": nics, "misc": misc, "svcs": svcs, "temps": temps, "fans": fans,
+           "exists": lambda p: serial_ok, "ping": lambda h: False, "pci": lambda v, d: []}
+    return selftest_run(DEFAULT_PLAN, ctx)
 
 
 def selftest_line(row, width=24):
