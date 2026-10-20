@@ -383,3 +383,16 @@ def test_version_string_dirty_and_missing(tmp_path):
     assert kc.version_string(str(tmp_path)) == "Ver 1.00.00"
     (tmp_path / "BUILD").write_text("13 abc1234-dirty")
     assert kc.version_string(str(tmp_path)) == "Ver 1.00.00   Build 0013 (abc1234-dirty)"
+
+
+def test_notice_font_px_fills_box():
+    # 中文一格=1 字宽, ASCII 0.6; 行高 1.3
+    px = kc.notice_font_px("请前往446上课", 1000, 1000)    # 5 中文 + 3 数字 = 6.8 字宽
+    assert px == int(1000 / 6.8)
+
+
+def test_notice_font_px_limited_by_height_and_clamped():
+    assert kc.notice_font_px("一\n二\n三\n四", 2000, 520) == int(520 / (4 * 1.3))
+    assert kc.notice_font_px("短", 5000, 5000) == 220       # 上限
+    assert kc.notice_font_px("长" * 400, 800, 400) == 24    # 下限
+    assert kc.notice_font_px("", 800, 400) == 24

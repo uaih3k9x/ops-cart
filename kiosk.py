@@ -484,8 +484,8 @@ class Kiosk(tk.Tk):
         self._lock_clock.place(relx=0.5, rely=0.13, anchor="center")
         self._lock_date = tk.Label(w, font=FONT_BIG, bg="#10141c", fg="#8b93a7")
         self._lock_date.place(relx=0.5, rely=0.23, anchor="center")
-        self._lock_notice = tk.Label(w, font=("Noto Sans CJK SC", 28), bg="#10141c", fg="#ffb86c",
-                                     justify="center", wraplength=int(self.winfo_screenwidth() * 0.8))
+        self._lock_notice = tk.Label(w, font=("Noto Sans CJK SC", 28, "bold"), bg="#10141c", fg="#ffb86c",
+                                     justify="center", wraplength=int(self.winfo_screenwidth() * 0.92))
         self._lock_notice.place(relx=0.5, rely=0.48, anchor="center")
         box = tk.Frame(w, bg="#10141c")
         box.place(relx=0.5, rely=0.8, anchor="center")
@@ -519,7 +519,10 @@ class Kiosk(tk.Tk):
             return
         self._lock_clock.config(text=time.strftime("%H:%M"))
         self._lock_date.config(text=time.strftime("%Y-%m-%d  星期") + "一二三四五六日"[time.localtime().tm_wday])
-        self._lock_notice.config(text=kc.notice_read())
+        text = kc.notice_read()
+        if text != self._lock_notice.cget("text"):     # 字号自适应: 时钟和 PIN 之间那块塞满
+            px = kc.notice_font_px(text, self.winfo_screenwidth() * 0.9, self.winfo_screenheight() * 0.36)
+            self._lock_notice.config(text=text, font=("Noto Sans CJK SC", -px, "bold"))
         self._lock_win.after(1000, self._lock_tick)
 
     def _try_unlock(self):
