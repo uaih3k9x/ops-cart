@@ -70,9 +70,9 @@ class Kiosk(tk.Tk):
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read())
         self._lock_win = None
-        if self.gate.required:
-            self.after(200, self.lock)
         self._screensaver_win = None
+        self._boot_win = None
+        self.after(200, self._boot_selftest)
         self._last_input = time.time()
         self._img = None
         for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
@@ -400,6 +400,61 @@ class Kiosk(tk.Tk):
             return
         if messagebox.askyesno("确认", f"确定要{verb}推车?", icon="warning"):
             kc.power(off)
+
+    # ------------------------------------------------------------ 开机自检(街机风)
+
+    def _boot_selftest(self):
+        """全屏: Logo/标题 + 自检逐行出现; 完了进锁屏. 换皮见 /opt/pxe/branding/."""
+        b = kc.branding_read()
+        w = tk.Toplevel(self, bg="#000000")
+        w.overrideredirect(True)
+        w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        w.attributes("-topmost", True)
+        self._boot_win = w
+        top = tk.Frame(w, bg="#000000")
+        top.place(relx=0.5, rely=0.22, anchor="center")
+        if b["logo"]:
+            try:
+                img = tk.PhotoImage(file=b["logo"])
+                k = max(1, img.width() // 480)
+                self._boot_logo = img.subsample(k, k) if k > 1 else img
+                tk.Label(top, image=self._boot_logo, bg="#000000").pack(pady=(0, 10))
+            except tk.TclError:
+                pass
+        tk.Label(top, text=b["title"], font=("Noto Sans CJK SC", 40, "bold"),
+                 bg="#000000", fg="#ffffff").pack()
+        tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg="#000000", fg="#8b93a7").pack()
+        box = tk.Frame(w, bg="#000000")
+        box.place(relx=0.5, rely=0.62, anchor="center")
+
+        def work():
+            temps = kc.temps_status(smart=lambda: None)
+            rows = kc.selftest_rows(kc.nics_status(), kc.misc_status(), kc.services_status(),
+                                    temps, kc.fans_status(), os.path.exists("/dev/ttyUSB0"))
+            self.after(0, lambda: self._boot_show(box, rows, 0))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _boot_show(self, box, rows, i):
+        if i < len(rows):
+            r = rows[i]
+            color = {"OK": "#7ee787", "WARN": "#f0b429", "FAIL": "#ff7b72"}.get(r["state"], "#8b93a7")
+            tk.Label(box, text=kc.selftest_line(r, width=26), font=FONT_MONO, bg="#000000",
+                     fg=color, anchor="w", width=56).pack(anchor="w")
+            self.after(300, lambda: self._boot_show(box, rows, i + 1))
+            return
+        failed = any(r["state"] == "FAIL" for r in rows)
+        tk.Label(box, text="SELF CHECK FAILED" if failed else "SYSTEM READY", font=FONT_BIG,
+                 bg="#000000", fg="#ff7b72" if failed else "#7ee787").pack(pady=(14, 0))
+        self.after(6000 if failed else 2000, self._boot_done)
+
+    def _boot_done(self):
+        if self._boot_win:
+            self._boot_win.destroy()
+            self._boot_win = None
+        self._last_input = time.time()
+        if self.gate.required:
+            self.lock()
 
     # ------------------------------------------------------------ PIN 锁屏
 

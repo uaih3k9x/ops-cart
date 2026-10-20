@@ -139,6 +139,70 @@ def temp_level(c):
     return "hot" if c >= 85 else "warn" if c >= 70 else "ok"
 
 
+# ---------------------------------------------------------------- 开机自检 / 品牌
+
+BRANDING_DIR = "/opt/pxe/branding"     # 不进仓库; 放 branding.json + logo.png 换皮
+BRANDING_DEFAULT = {"title": "OPS-CART", "subtitle": "SYSTEM STARTUP"}
+
+
+def branding_read(d=BRANDING_DIR):
+    """{"title", "subtitle", "logo"(路径或 None)}; 缺文件/坏 JSON 用默认."""
+    b = dict(BRANDING_DEFAULT)
+    try:
+        with open(f"{d}/branding.json") as f:
+            b.update({k: v for k, v in json.load(f).items() if isinstance(v, str)})
+    except (OSError, ValueError):
+        pass
+    logo = f"{d}/logo.png"
+    b["logo"] = logo if os.path.exists(logo) else None
+    return b
+
+
+def selftest_rows(nics, misc, svcs, temps, fans, serial_ok):
+    """街机式开机自检的每一行 {label, state, detail}; state: OK / WARN / FAIL / --(没接, 不算故障)."""
+    by = {n["name"]: n for n in nics}
+    rows = []
+
+    def add(label, state, detail=""):
+        rows.append({"label": label, "state": state, "detail": detail})
+
+    lan2 = by.get("enp3s0", {})
+    if not lan2.get("link"):
+        add("LAN2", "FAIL", "NO LINK")
+    elif lan2.get("ip", "-") == "-":
+        add("LAN2", "WARN", "NO ADDRESS")
+    else:
+        add("LAN2", "OK", lan2["ip"].split("/")[0])
+    ts = misc.get("tailscale_ip", "-")
+    add("TAILSCALE", "OK" if ts != "-" else "WARN", ts if ts != "-" else "OFFLINE")
+    add("CONSOLE", "OK" if serial_ok else "--", "ttyUSB0" if serial_ok else "NOT CONNECTED")
+    add("CH9329", "OK" if misc.get("ch9329") else "--", "ttyACM0" if misc.get("ch9329") else "NOT CONNECTED")
+    pxe_on = svcs.get("pxe-server", (False, False))[1]
+    lan1 = by.get("eno1", {})
+    if pxe_on:
+        add("LAN1 / PXE", "OK", "RUNNING")
+    else:
+        add("LAN1 / PXE", "--", "LINK UP / STANDBY" if lan1.get("link") else "STANDBY")
+    cpu = dict(temps).get("CPU")
+    if cpu is None:
+        add("CPU", "--", "NO SENSOR")
+    else:
+        add("CPU", {"ok": "OK", "warn": "WARN", "hot": "FAIL"}[temp_level(cpu)], f"{cpu:.0f}°C")
+    if not fans:
+        add("FAN", "--", "NO SENSOR")
+    elif all(rpm == 0 for _, rpm in fans):
+        add("FAN", "FAIL", "STOPPED")
+    else:
+        add("FAN", "OK", " / ".join(str(rpm) for _, rpm in fans if rpm))
+        rows[-1]["detail"] += " RPM"
+    return rows
+
+
+def selftest_line(row, width=24):
+    """"LAN2 ............ OK   192.168.99.228\""""
+    return f"{row['label'] + ' ':.<{width}} {row['state']:<4} {row['detail']}".rstrip()
+
+
 NOTICE_PATH = "/opt/pxe/notice.txt"
 
 
