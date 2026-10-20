@@ -315,6 +315,29 @@ def selftest_line(row, width=24):
     return f"{row['label'] + ' ':.<{width}} {row['state']:<4} {row['detail']}".rstrip()
 
 
+_CTRL_KEYS = {"Control_L", "Control_R"}
+_ALT_KEYS = {"Alt_L", "Alt_R", "Meta_L", "Meta_R"}     # 没有 WM 时 Alt 常报成 Meta
+
+
+def is_release_combo(keysym, state):
+    """透传中按下的这个键 + 已按住的修饰位(X state: Ctrl=0x4, Alt=0x8) 是否凑成 Ctrl+Alt."""
+    return (keysym in _ALT_KEYS and state & 0x4) or (keysym in _CTRL_KEYS and state & 0x8)
+
+
+def video_devices(root="/dev"):
+    try:
+        names = [n for n in os.listdir(root) if n.startswith("video") and n[5:].isdigit()]
+    except OSError:
+        return []
+    return [os.path.join(root, n) for n in sorted(names, key=lambda n: int(n[5:]))]
+
+
+def next_video_device(devs, current):
+    if not devs:
+        return current
+    return devs[(devs.index(current) + 1) % len(devs)] if current in devs else devs[0]
+
+
 NOTICE_PATH = "/opt/pxe/notice.txt"
 
 

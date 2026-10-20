@@ -41,7 +41,7 @@ KEYSYM_SPECIAL = {
     "KP_Decimal": ".", "KP_Delete": "delete",
 }
 MODIFIER_KEYS = {"Control_L": "ctrl", "Control_R": "ctrl", "Shift_L": "shift",
-                 "Shift_R": "shift", "Alt_L": "alt", "Alt_R": "alt",
+                 "Shift_R": "shift", "Alt_L": "alt", "Alt_R": "alt", "Meta_L": "alt", "Meta_R": "alt",
                  "Super_L": "gui", "Super_R": "gui"}
 
 
@@ -79,6 +79,9 @@ class Kiosk(tk.Tk):
         self._img = None
         for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
             self.bind_all(seq, self._note_input, add="+")
+        # 透传的键盘走全局: Tk 把按键投给有焦点的窗口, 不是嵌着 mpv 的那个 Frame
+        self.bind_all("<KeyPress>", lambda e: self.passthrough and self._on_key(e, True), add="+")
+        self.bind_all("<KeyRelease>", lambda e: self.passthrough and self._on_key(e, False), add="+")
         self.after(5000, self._screensaver_tick)
         self.after(100, self.refresh)
 
@@ -131,6 +134,8 @@ class Kiosk(tk.Tk):
             return b
 
         self.btn_video = big("UVC 预览:  开 / 关", self.toggle_preview)
+        self.video_dev = (kc.video_devices() or [VIDEO_DEV])[0]
+        self.btn_src = big(f"画面源:  {os.path.basename(self.video_dev)}", self.switch_source)
         self.btn_serial = big("串口会话:  开 / 关", self.toggle_serial)
         self.btn_ks = big("Kickstart 编辑", self.toggle_ks)
         big("PXE 装机服务:  开 / 关", self.toggle_pxe)
@@ -229,6 +234,14 @@ class Kiosk(tk.Tk):
 
     # ------------------------------------------------------------ UVC 预览
 
+    def switch_source(self):
+        """video0 -> video1 -> ... 轮换; 正在预览就换源重开."""
+        self.video_dev = kc.next_video_device(kc.video_devices(), self.video_dev)
+        self.btn_src.config(text=f"画面源:  {os.path.basename(self.video_dev)}")
+        if self.video_frame:
+            self._stop_preview()
+            self._start_preview()
+
     def toggle_preview(self):
         if self.video_frame:
             self._stop_preview()
@@ -236,8 +249,8 @@ class Kiosk(tk.Tk):
             self._start_preview()
 
     def _start_preview(self):
-        if not os.path.exists(VIDEO_DEV):
-            messagebox.showwarning("UVC 预览", f"未检测到采集设备 {VIDEO_DEV}")
+        if not os.path.exists(self.video_dev):
+            messagebox.showwarning("UVC 预览", f"未检测到采集设备 {self.video_dev}")
             return
         self.status_wrap.pack_forget()
         self.video_frame = tk.Frame(self.body, container=True, bg="#000000")
@@ -247,9 +260,9 @@ class Kiosk(tk.Tk):
         wid = self.video_frame.winfo_id()
         self.mpv = subprocess.Popen(
             ["mpv", f"--wid={wid}", "--no-osc", "--no-input-default-bindings",
-             "--input-vo-keyboard=no", "--really-quiet", "--fs=no", VIDEO_DEV],
+             "--input-vo-keyboard=no", "--really-quiet", "--fs=no", self.video_dev],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.banner.config(text="预览中 · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
+        self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
 
     def _stop_preview(self):
         self._release_passthrough()
@@ -277,8 +290,9 @@ class Kiosk(tk.Tk):
         self.video_frame.config(cursor="none")
         for seq in ("<Motion>", "<Button-1>", "<Button-2>", "<Button-3>",
                     "<ButtonRelease-1>", "<ButtonRelease-2>", "<ButtonRelease-3>",
-                    "<MouseWheel>", "<Key>", "<KeyRelease>"):
+                    "<MouseWheel>"):
             self.video_frame.bind(seq, self._on_passthrough_event)
+        self.focus_force()
         self.banner.config(text="🔒 透传中 · Ctrl+Alt 释放")
         self.after(16, self._flush_mouse)
 
@@ -291,7 +305,7 @@ class Kiosk(tk.Tk):
             self.video_frame.config(cursor="arrow")
         except tk.TclError:
             pass
-        self.banner.config(text="预览中 · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
+        self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
         self.ch and self.ch.send_mouse(0, 0, 0, 0)   # 松开所有键
 
     def _on_passthrough_event(self, ev):
@@ -309,10 +323,6 @@ class Kiosk(tk.Tk):
                 self._mouse_btn &= ~bit & 0xFF
         elif ev.type == "38":         # MouseWheel
             self._mouse_acc[2] += max(-1, min(1, ev.delta // 120))
-        elif ev.type == "2":          # KeyPress
-            self._on_key(ev, True)
-        elif ev.type == "31":         # KeyRelease
-            self._on_key(ev, False)
 
     def _on_key(self, ev, down):
         mod = MODIFIER_KEYS.get(ev.keysym)
@@ -321,8 +331,8 @@ class Kiosk(tk.Tk):
                 self._mods.add(mod)
             else:
                 self._mods.discard(mod)
-            # Ctrl+Alt 同按 -> 释放透传
-            if down and {"ctrl", "alt"} <= self._mods:
+            # Ctrl+Alt 同按 -> 释放透传(看 X 的修饰位, 不全靠自己记的按下集合)
+            if down and ({"ctrl", "alt"} <= self._mods or kc.is_release_combo(ev.keysym, ev.state)):
                 self._release_passthrough()
             return
         if not down:
