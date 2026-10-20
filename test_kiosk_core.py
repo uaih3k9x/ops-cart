@@ -469,3 +469,28 @@ def test_notice_font_px_limited_by_height_and_clamped():
     assert kc.notice_font_px("短", 5000, 5000) == 220       # 上限
     assert kc.notice_font_px("长" * 400, 800, 400) == 24    # 下限
     assert kc.notice_font_px("", 800, 400) == 24
+
+
+# ---------------------------------------------------------------- 透传释放 / 画面源
+
+def test_release_combo_by_keysym_and_state():
+    assert kc.is_release_combo("Alt_L", 0x4)          # 先按 Ctrl 再按 Alt
+    assert kc.is_release_combo("Control_L", 0x8)      # 先按 Alt 再按 Ctrl
+    assert kc.is_release_combo("Meta_L", 0x4)         # 无 WM 时 Alt 常报成 Meta
+    assert not kc.is_release_combo("Alt_L", 0)
+    assert not kc.is_release_combo("a", 0xC)
+
+
+def test_video_devices_sorted_numerically(tmp_path):
+    for n in ("video10", "video1", "video0", "vbi0"):
+        (tmp_path / n).touch()
+    assert kc.video_devices(str(tmp_path)) == [str(tmp_path / f"video{i}") for i in (0, 1, 10)]
+    assert kc.video_devices(str(tmp_path / "none")) == []
+
+
+def test_next_video_device_cycles():
+    devs = ["/dev/video0", "/dev/video1"]
+    assert kc.next_video_device(devs, "/dev/video0") == "/dev/video1"
+    assert kc.next_video_device(devs, "/dev/video1") == "/dev/video0"
+    assert kc.next_video_device(devs, "/dev/video9") == "/dev/video0"
+    assert kc.next_video_device([], "/dev/video0") == "/dev/video0"
