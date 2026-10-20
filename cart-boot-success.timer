@@ -1,0 +1,8 @@
+[Unit]
+Description=60 s after boot: if kiosk is alive, tell GRUB this boot succeeded
+
+[Timer]
+OnBootSec=60
+
+[Install]
+WantedBy=timers.target

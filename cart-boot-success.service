@@ -1,0 +1,8 @@
+[Unit]
+Description=Mark boot successful for GRUB menu auto-hide (kiosk is up)
+Requisite=kiosk.service
+After=kiosk.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/grub2-editenv - set boot_success=1
