@@ -5,3 +5,4 @@ __pycache__/
 ks.cfg
 .DS_Store
 branding/
+BUILD

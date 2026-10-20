@@ -369,3 +369,17 @@ def test_branding_defaults_and_override(tmp_path):
 def test_branding_bad_json_falls_back(tmp_path):
     (tmp_path / "branding.json").write_text("{oops")
     assert kc.branding_read(str(tmp_path))["title"] == "OPS-CART"
+
+
+def test_version_string(tmp_path):
+    (tmp_path / "VERSION").write_text("1.00.00\n")
+    (tmp_path / "BUILD").write_text("12 4265fc8\n")
+    assert kc.version_string(str(tmp_path)) == "Ver 1.00.00   Build 0012 (4265fc8)"
+
+
+def test_version_string_dirty_and_missing(tmp_path):
+    assert kc.version_string(str(tmp_path)) == "Ver dev"
+    (tmp_path / "VERSION").write_text("1.00.00")
+    assert kc.version_string(str(tmp_path)) == "Ver 1.00.00"
+    (tmp_path / "BUILD").write_text("13 abc1234-dirty")
+    assert kc.version_string(str(tmp_path)) == "Ver 1.00.00   Build 0013 (abc1234-dirty)"

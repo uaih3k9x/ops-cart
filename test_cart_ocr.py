@@ -49,9 +49,11 @@ def test_find_text_tolerates_ocr_spaces():
 def test_ocr_image_end_to_end(tmp_path):
     import subprocess
     img = tmp_path / "t.png"
-    subprocess.run(["convert", "-size", "640x120", "xc:white", "-fill", "black",
-                    "-pointsize", "28", "-annotate", "+20+60", "Boot Manager",
-                    str(img)], check=True)
+    r = subprocess.run(["convert", "-size", "640x120", "xc:white", "-fill", "black",
+                        "-pointsize", "28", "-annotate", "+20+60", "Boot Manager", str(img)],
+                       capture_output=True)
+    if r.returncode != 0:
+        pytest.skip("ImageMagick 画不了字(缺默认字体), 生成不了测试图")
     hit = co.find_text(co.ocr_image(str(img)), "Boot Manager")
     assert hit is not None and hit["x"] < 100
 
