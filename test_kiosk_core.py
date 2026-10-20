@@ -306,3 +306,66 @@ def test_notice_read_limits_chars(tmp_path):
     p = tmp_path / "n.txt"
     p.write_text("长" * 1000)
     assert len(kc.notice_read(str(p), max_chars=300)) == 300
+
+
+# ---------------------------------------------------------------- 开机自检 / 品牌
+
+NICS_OK = [{"name": "eno1", "role": "PXE 装机口", "ip": "-", "link": False},
+           {"name": "enp3s0", "role": "管理口", "ip": "192.168.9.228/24", "link": True}]
+MISC_OK = {"tailscale_ip": "100.64.0.10", "ch9329": False, "uptime": "up 1 min"}
+
+
+def _rows(**kw):
+    args = dict(nics=NICS_OK, misc=MISC_OK, svcs={"pxe-server": (True, False)},
+                temps=[("CPU", 45.0)], fans=[("fan2", 2689), ("fan3", 2500)], serial_ok=True)
+    args.update(kw)
+    return {r["label"]: r for r in kc.selftest_rows(**args)}
+
+
+def test_selftest_all_good():
+    rows = _rows()
+    assert rows["LAN2"]["state"] == "OK" and rows["LAN2"]["detail"] == "192.168.9.228"
+    assert rows["TAILSCALE"]["state"] == "OK"
+    assert rows["CONSOLE"]["state"] == "OK"
+    assert rows["CH9329"]["state"] == "--"          # 没插不算故障
+    assert rows["LAN1 / PXE"]["state"] == "--"
+    assert rows["CPU"]["detail"] == "45°C" and rows["CPU"]["state"] == "OK"
+    assert rows["FAN"]["detail"] == "2689 / 2500 RPM"
+    assert not any(r["state"] == "FAIL" for r in rows.values())
+
+
+def test_selftest_failures():
+    nics = [NICS_OK[0], dict(NICS_OK[1], link=False, ip="-")]
+    rows = _rows(nics=nics, temps=[("CPU", 90.0)], fans=[("fan2", 0)],
+                 misc=dict(MISC_OK, tailscale_ip="-"))
+    assert rows["LAN2"]["state"] == "FAIL"
+    assert rows["TAILSCALE"]["state"] == "WARN"
+    assert rows["CPU"]["state"] == "FAIL"
+    assert rows["FAN"]["state"] == "FAIL"
+
+
+def test_selftest_pxe_running_and_no_sensors():
+    nics = [dict(NICS_OK[0], link=True, ip="192.168.77.1/24"), NICS_OK[1]]
+    rows = _rows(nics=nics, svcs={"pxe-server": (True, True)}, temps=[], fans=[])
+    assert rows["LAN1 / PXE"]["state"] == "OK" and "RUNNING" in rows["LAN1 / PXE"]["detail"]
+    assert rows["CPU"]["state"] == "--" and rows["FAN"]["state"] == "--"
+
+
+def test_selftest_line_format():
+    line = kc.selftest_line({"label": "LAN2", "state": "OK", "detail": "1.2.3.4"}, width=20)
+    assert line.startswith("LAN2 ") and ". OK" in line and line.endswith("1.2.3.4")
+
+
+def test_branding_defaults_and_override(tmp_path):
+    assert kc.branding_read(str(tmp_path))["title"] == "OPS-CART"
+    assert kc.branding_read(str(tmp_path))["logo"] is None
+    (tmp_path / "branding.json").write_text('{"title": "ILLUSION", "subtitle": "x"}')
+    (tmp_path / "logo.png").write_bytes(b"png")
+    b = kc.branding_read(str(tmp_path))
+    assert b["title"] == "ILLUSION" and b["subtitle"] == "x"
+    assert b["logo"] == str(tmp_path / "logo.png")
+
+
+def test_branding_bad_json_falls_back(tmp_path):
+    (tmp_path / "branding.json").write_text("{oops")
+    assert kc.branding_read(str(tmp_path))["title"] == "OPS-CART"
