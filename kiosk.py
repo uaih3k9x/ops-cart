@@ -20,6 +20,7 @@ from ks_panel import KsPanel
 FONT = ("Noto Sans CJK SC", 13)
 FONT_BIG = ("Noto Sans CJK SC", 15)
 FONT_MONO = ("Noto Sans Mono CJK SC", 13)
+BOOT_BG = "#ffffff"     # 开机自检页白底, 接 Plymouth 的白底
 VIDEO_DEV = "/dev/video0"
 CH9329_PORT = "/dev/ttyACM0"
 SCREENSAVER_IMG = "/opt/pxe/nailong.png"
@@ -407,28 +408,28 @@ class Kiosk(tk.Tk):
     def _boot_selftest(self):
         """全屏: Logo/标题 + 自检逐行出现; 完了进锁屏. 换皮见 /opt/pxe/branding/."""
         b = kc.branding_read()
-        w = tk.Toplevel(self, bg="#000000")
+        w = tk.Toplevel(self, bg=BOOT_BG)
         w.overrideredirect(True)
         w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
         w.attributes("-topmost", True)
         self._boot_win = w
-        top = tk.Frame(w, bg="#000000")
+        top = tk.Frame(w, bg=BOOT_BG)
         top.place(relx=0.5, rely=0.22, anchor="center")
         if b["logo"]:
             try:
                 img = tk.PhotoImage(file=b["logo"])
-                k = max(1, img.width() // 480)
+                k = max(1, -(-img.width() // 320))     # 缩到 320 px 以内
                 self._boot_logo = img.subsample(k, k) if k > 1 else img
-                tk.Label(top, image=self._boot_logo, bg="#000000").pack(pady=(0, 10))
+                tk.Label(top, image=self._boot_logo, bg=BOOT_BG).pack(pady=(0, 10))
             except tk.TclError:
                 pass
         tk.Label(top, text=b["title"], font=("Noto Sans CJK SC", 40, "bold"),
-                 bg="#000000", fg="#ffffff").pack()
-        tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg="#000000", fg="#8b93a7").pack()
-        box = tk.Frame(w, bg="#000000")
+                 bg=BOOT_BG, fg="#14161a").pack()
+        tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg=BOOT_BG, fg="#6b7280").pack()
+        box = tk.Frame(w, bg=BOOT_BG)
         box.place(relx=0.5, rely=0.62, anchor="center")
-        tk.Label(box, text="Step 3/3   System check", font=FONT_BIG, bg="#000000",
-                 fg="#e8eaf0", anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
+        tk.Label(box, text="Step 3/3   System check", font=FONT_BIG, bg=BOOT_BG,
+                 fg="#2a2e36", anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
 
         def work():
             temps = kc.temps_status(smart=lambda: None)
@@ -441,14 +442,14 @@ class Kiosk(tk.Tk):
     def _boot_show(self, box, rows, i):
         if i < len(rows):
             r = rows[i]
-            color = {"OK": "#7ee787", "WARN": "#f0b429", "FAIL": "#ff7b72"}.get(r["state"], "#8b93a7")
-            tk.Label(box, text=kc.selftest_line(r, width=26), font=FONT_MONO, bg="#000000",
+            color = {"OK": "#15803d", "WARN": "#b45309", "FAIL": "#dc2626"}.get(r["state"], "#9ca3af")
+            tk.Label(box, text=kc.selftest_line(r, width=26), font=FONT_MONO, bg=BOOT_BG,
                      fg=color, anchor="w", width=56).pack(anchor="w")
             self.after(300, lambda: self._boot_show(box, rows, i + 1))
             return
         failed = any(r["state"] == "FAIL" for r in rows)
         tk.Label(box, text="SELF CHECK FAILED" if failed else "SYSTEM READY", font=FONT_BIG,
-                 bg="#000000", fg="#ff7b72" if failed else "#7ee787").pack(pady=(14, 0))
+                 bg=BOOT_BG, fg="#dc2626" if failed else "#15803d").pack(pady=(14, 0))
         self.after(6000 if failed else 2000, self._boot_done)
 
     def _boot_done(self):

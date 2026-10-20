@@ -1,5 +1,5 @@
 #!/bin/bash
-# 安装 ops-cart 开机画面. 品牌素材取 /opt/pxe/branding/ (branding.json 的 title/board, logo.png), 没有就用默认.
+# 安装 ops-cart 开机画面. 品牌素材取 /opt/pxe/branding/ (branding.json 的 title/board, logo.png, spinner.gif), 没有就用默认.
 # 用法: sudo ./install.sh [--no-rebuild]    (不带参数会重建当前内核 initramfs)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -27,7 +27,17 @@ PY
 TITLE=${V[0]}; BOARD=${V[1]}
 mkdir -p "$T"
 install -m 644 ops-cart/ops-cart.plymouth "$T/"
-sed -e "s|@TITLE@|$TITLE|" -e "s|@BOARD@|$BOARD|" ops-cart/ops-cart.script.in > "$T/ops-cart.script"
+# 转圈圈: spinner.gif -> spin-0.png ..., 节拍按 GIF 帧间隔(厘秒)换算成 Plymouth 刷新(约 50 次/秒)
+rm -f "$T"/spin-*.png
+SPIN_N=0; SPIN_TICKS=2
+if [ -f "$B/spinner.gif" ]; then
+    convert "$B/spinner.gif" -coalesce -resize 36x36 "$T/spin-%d.png"
+    SPIN_N=$(ls "$T"/spin-*.png | wc -l)
+    D=$(identify -format "%T\n" "$B/spinner.gif" | head -1)
+    SPIN_TICKS=$(( D / 2 > 0 ? D / 2 : 1 ))
+fi
+sed -e "s|@TITLE@|$TITLE|" -e "s|@BOARD@|$BOARD|" -e "s|@SPIN_N@|$SPIN_N|" -e "s|@SPIN_TICKS@|$SPIN_TICKS|" \
+    ops-cart/ops-cart.script.in > "$T/ops-cart.script"
 if [ -f "$B/logo.png" ]; then install -m 644 "$B/logo.png" "$T/logo.png"; else rm -f "$T/logo.png"; fi
 if [ "${1:-}" = "--no-rebuild" ]; then plymouth-set-default-theme ops-cart; else plymouth-set-default-theme -R ops-cart; fi
-echo "theme installed: title='$TITLE' board='$BOARD' logo=$([ -f "$T/logo.png" ] && echo yes || echo no)"
+echo "theme installed: title='$TITLE' board='$BOARD' logo=$([ -f "$T/logo.png" ] && echo yes || echo no) spinner=$SPIN_N frames/${SPIN_TICKS} ticks"

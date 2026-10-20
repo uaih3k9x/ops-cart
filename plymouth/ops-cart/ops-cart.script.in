@@ -3,6 +3,8 @@
 
 global.board = "@BOARD@";
 global.title = "@TITLE@";
+global.spin_n = @SPIN_N@;          # spinner frames spin-0.png .. (0 = none)
+global.spin_ticks = @SPIN_TICKS@;  # refresh ticks (~50/s) per frame
 
 Window.SetBackgroundTopColor(1, 1, 1);
 Window.SetBackgroundBottomColor(1, 1, 1);
@@ -38,12 +40,29 @@ global.bar_bg.SetPosition(Window.GetX() + (global.W - global.bar_w) / 2, Window.
 global.step = 0;
 global.last_status = "";
 
+global.spin = Sprite();
+for (i = 0; i < global.spin_n; i++)
+    global.spin_frames[i] = Image("spin-" + i + ".png");
+
 fun show_step(n, text) {
     if (n != global.step) {
         global.step = n;
-        center(global.step_sprite, Image.Text("Step " + n + "/3   " + text, 0.15, 0.15, 0.18, 1, "Sans 16"), global.bar_y - 46);
+        img = Image.Text("Step " + n + "/3   " + text, 0.15, 0.15, 0.18, 1, "Sans 16");
+        center(global.step_sprite, img, global.bar_y - 46);
+        # spinner sits left of the step text
+        global.spin.SetPosition(Window.GetX() + (global.W - img.GetWidth()) / 2 - 48,
+                                Window.GetY() + global.bar_y - 46 + (img.GetHeight() - 36) / 2, 2);
     }
 }
+
+global.tick = 0;
+fun refresh_cb() {
+    if (global.spin_n > 0) {
+        global.tick++;
+        global.spin.SetImage(global.spin_frames[Math.Int(global.tick / global.spin_ticks) % global.spin_n]);
+    }
+}
+Plymouth.SetRefreshFunction(refresh_cb);
 
 # Step 1 = initramfs, Step 2 = after initrd-switch-root (or progress > 50%). Step 3 is the kiosk self-check page.
 fun progress_cb(duration, progress) {
