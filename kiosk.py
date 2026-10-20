@@ -98,6 +98,8 @@ class Kiosk(tk.Tk):
         self.banner.pack(side="left", padx=20)
         self.clock = tk.Label(top, font=FONT, bg="#10141c", fg="#8b93a7")
         self.clock.pack(side="right")
+        tk.Label(top, text=kc.version_string(), font=FONT, bg="#10141c",
+                 fg="#5d6873").pack(side="right", padx=16)
         tk.Button(top, text="退出到终端", font=FONT, command=self.quit_kiosk,
                   bg="#2a3347", fg="#e8eaf0", activebackground="#3a4560",
                   relief="flat", padx=14, pady=4, cursor="hand2").pack(
@@ -426,6 +428,7 @@ class Kiosk(tk.Tk):
         tk.Label(top, text=b["title"], font=("Noto Sans CJK SC", 40, "bold"),
                  bg=BOOT_BG, fg="#14161a").pack()
         tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg=BOOT_BG, fg="#6b7280").pack()
+        tk.Label(top, text=kc.version_string(), font=FONT_MONO, bg=BOOT_BG, fg="#9ca3af").pack(pady=(6, 0))
         box = tk.Frame(w, bg=BOOT_BG)
         box.place(relx=0.5, rely=0.62, anchor="center")
         tk.Label(box, text="Step 3/3   System check", font=FONT_BIG, bg=BOOT_BG,

@@ -139,6 +139,22 @@ def temp_level(c):
     return "hot" if c >= 85 else "warn" if c >= 70 else "ok"
 
 
+# ---------------------------------------------------------------- 版本号
+
+APP_DIR = "/opt/pxe"
+
+
+def version_string(d=APP_DIR):
+    """"Ver 1.00.00   Build 0012 (4265fc8)". VERSION 手动维护(进仓库); BUILD 由 stamp-build.sh 部署时生成."""
+    ver = _read(f"{d}/VERSION")
+    if not ver:
+        return "Ver dev"
+    build = (_read(f"{d}/BUILD") or "").split()
+    if len(build) != 2 or not build[0].isdigit():
+        return f"Ver {ver}"
+    return f"Ver {ver}   Build {int(build[0]):04d} ({build[1]})"
+
+
 # ---------------------------------------------------------------- 开机自检 / 品牌
 
 BRANDING_DIR = "/opt/pxe/branding"     # 不进仓库; 放 branding.json + logo.png 换皮
