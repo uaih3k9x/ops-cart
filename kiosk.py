@@ -435,9 +435,7 @@ class Kiosk(tk.Tk):
                  fg="#2a2e36", anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
 
         def work():
-            temps = kc.temps_status(smart=lambda: None)
-            rows = kc.selftest_rows(kc.nics_status(), kc.misc_status(), kc.services_status(),
-                                    temps, kc.fans_status(), os.path.exists("/dev/ttyUSB0"))
+            rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
             self.after(0, lambda: self._boot_show(box, rows, 0))
 
         threading.Thread(target=work, daemon=True).start()

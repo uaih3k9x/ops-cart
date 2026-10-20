@@ -45,7 +45,9 @@ python3 pxeserver.py serve --ip 192.168.77.1 \
 
 推车整机布局:代码部署在 `/opt/pxe/`,systemd 三件套
 (`pxe-server` / `pxe-http-repo` / `pxe-http-boot`)开机自启;
-终端键入 `kiosk` 进入车机界面。同一套代码亦可在 Windows 上跑
+终端键入 `kiosk` 进入车机界面。
+开机自检的项目在 `/opt/pxe/selftest.json` 里配(照 [`selftest.example.json`](selftest.example.json) 改网卡名、串口、PCI 卡 ID、要 ping 的主机),
+没这个文件就用内置的默认七项;新检查写成 `kiosk_core.check_xxx(ctx, **参数)` 再登记进 `CHECKS`。同一套代码亦可在 Windows 上跑
 (`setup.ps1` / `start-pxe.ps1`),单文件跨平台是设计目标之一。
 
 ## 协议栈
