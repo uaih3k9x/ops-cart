@@ -61,6 +61,84 @@ def misc_status():
     return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up or "-"}
 
 
+HWMON = "/sys/class/hwmon"
+# hwmon 驱动名 -> (显示名, 取哪个 label; None = 第一个 temp)
+TEMP_SOURCES = (("coretemp", "CPU", "Package id 0"),
+                ("nouveau", "显卡", None),
+                ("acpitz", "主板", None))
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _hwmon_temp(d, label):
+    """d 目录下 label 对应的温度(°C); label=None 取 temp1."""
+    for i in range(1, 32):
+        raw = _read(f"{d}/temp{i}_input")
+        if raw is None:
+            continue
+        if label is None or _read(f"{d}/temp{i}_label") == label:
+            return int(raw) / 1000
+    return None
+
+
+def smart_temp(dev="/dev/sda"):
+    """SSD 温度(°C), 读不到返回 None. 需要 root (kiosk.service 以 root 跑)."""
+    rc, out = run(["smartctl", "-j", "-A", dev])
+    try:
+        return json.loads(out)["temperature"]["current"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def temps_status(root=HWMON, smart=smart_temp):
+    """[(显示名, °C)] 按 TEMP_SOURCES 顺序, 再加 SSD; 缺的跳过."""
+    found = {}
+    if os.path.isdir(root):
+        for e in sorted(os.listdir(root)):
+            name = _read(f"{root}/{e}/name")
+            for drv, shown, label in TEMP_SOURCES:
+                if name == drv and shown not in found:
+                    t = _hwmon_temp(f"{root}/{e}", label)
+                    if t is not None:
+                        found[shown] = t
+    result = [(shown, found[shown]) for _, shown, _ in TEMP_SOURCES if shown in found]
+    ssd = smart()
+    if ssd is not None:
+        result.append(("SSD", float(ssd)))
+    return result
+
+
+def fans_status(root=HWMON):
+    """[(fanN, RPM)] 来自 it87 系 SuperIO (IT8625E, 树外 it87 驱动 + DKMS)."""
+    result = []
+    if os.path.isdir(root):
+        for e in sorted(os.listdir(root)):
+            if not (_read(f"{root}/{e}/name") or "").startswith("it8"):
+                continue
+            for i in range(1, 9):
+                raw = _read(f"{root}/{e}/fan{i}_input")
+                if raw is not None:
+                    result.append((f"fan{i}", int(raw)))
+    return result
+
+
+def fans_to_show(fans, seen):
+    """只显示转过的风扇; seen 记住它们, 之后掉到 0 也照样显示(好报警)."""
+    seen.update(n for n, rpm in fans if rpm > 0)
+    return [(n, rpm) for n, rpm in fans if n in seen]
+
+
+def temp_level(c):
+    """<70 ok, 70~85 warn, >=85 hot."""
+    return "hot" if c >= 85 else "warn" if c >= 70 else "ok"
+
+
 def pxe_conf_read():
     try:
         with open(PXE_CONF) as f:

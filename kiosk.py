@@ -56,6 +56,8 @@ class Kiosk(tk.Tk):
         self.mpv = None
         self.video_frame = None
         self.passthrough = False
+        self._ssd, self._ssd_ts = None, 0.0
+        self._fans_seen = set()
         self._mods = set()
         self._mouse_acc = [0, 0, 0]      # dx, dy, wheel
         self._mouse_btn = 0
@@ -140,6 +142,11 @@ class Kiosk(tk.Tk):
             svcs = kc.services_status()
             nics = kc.nics_status()
             misc = kc.misc_status()
+            now = time.time()
+            if now - self._ssd_ts > 60:          # smartctl 一分钟读一次就够
+                self._ssd, self._ssd_ts = kc.smart_temp(), now
+            temps = kc.temps_status(smart=lambda: self._ssd)
+            fans = kc.fans_to_show(kc.fans_status(), self._fans_seen)
             lines = []
             for n, (en, ac) in svcs.items():
                 lines.append(f"{'● 正常' if ac else '● 停止':<8} {n}"
@@ -153,6 +160,12 @@ class Kiosk(tk.Tk):
             lines.append(f"tailscale: {misc['tailscale_ip']}")
             lines.append(f"CH9329 键鼠线: {'已连接' if misc['ch9329'] else '未连接'}")
             lines.append(misc["uptime"])
+            if temps:
+                lines.append("")
+                for name, c in temps:
+                    lines.append((f"{name:<6}{c:>5.0f}°C", "t_" + kc.temp_level(c)))
+            for name, rpm in fans:
+                lines.append((f"{name:<6}{rpm:>5} RPM", "t_ok" if rpm else "t_hot"))
             self.after(0, lambda: self._render(lines))
 
         threading.Thread(target=work, daemon=True).start()
@@ -164,12 +177,18 @@ class Kiosk(tk.Tk):
             self.status_text.config(state="normal")
             self.status_text.delete("1.0", "end")
             for ln in lines:
+                if isinstance(ln, tuple):       # (文本, tag)
+                    self.status_text.insert("end", ln[0] + "\n", ln[1])
+                    continue
                 tag = "ok" if ln.startswith("● 正常") else (
                       "bad" if ln.startswith("● 停止") else None)
                 self.status_text.insert("end", ln + "\n", tag or ())
             self.status_text.config(state="disabled")
             self.status_text.tag_config("ok", foreground="#7ee787")
             self.status_text.tag_config("bad", foreground="#ff7b72")
+            self.status_text.tag_config("t_ok", foreground="#9aa5b0")
+            self.status_text.tag_config("t_warn", foreground="#f0b429")
+            self.status_text.tag_config("t_hot", foreground="#ff7b72")
 
     def toggle_serial(self):
         if self.serial_panel:

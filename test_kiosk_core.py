@@ -223,3 +223,65 @@ def test_pin_gate_open_when_no_pin():
     g = kc.PinGate(None)
     assert not g.required
     assert g.attempt("", now=0) == "ok"
+
+
+def _hwmon(root, idx, name, temps):
+    d = root / f"hwmon{idx}"
+    d.mkdir()
+    (d / "name").write_text(name + "\n")
+    for i, (label, milli) in enumerate(temps, 1):
+        (d / f"temp{i}_input").write_text(f"{milli}\n")
+        if label:
+            (d / f"temp{i}_label").write_text(label + "\n")
+
+
+def test_temps_status_picks_cpu_package_gpu_board(tmp_path):
+    _hwmon(tmp_path, 0, "acpitz", [(None, 27800)])
+    _hwmon(tmp_path, 1, "coretemp", [("Package id 0", 56000), ("Core 0", 53000)])
+    _hwmon(tmp_path, 2, "nouveau", [(None, 36000)])
+    assert kc.temps_status(str(tmp_path), smart=lambda: None) == [
+        ("CPU", 56.0), ("显卡", 36.0), ("主板", 27.8)]
+
+
+def test_temps_status_adds_ssd_and_skips_missing(tmp_path):
+    _hwmon(tmp_path, 0, "coretemp", [("Package id 0", 61000)])
+    assert kc.temps_status(str(tmp_path), smart=lambda: 38) == [
+        ("CPU", 61.0), ("SSD", 38.0)]
+    assert kc.temps_status(str(tmp_path / "nope"), smart=lambda: None) == []
+
+
+def test_smart_temp_parses_smartctl_json(monkeypatch):
+    out = json.dumps({"temperature": {"current": 41}})
+    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (0, out))
+    assert kc.smart_temp() == 41
+    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (1, "boom"))
+    assert kc.smart_temp() is None
+
+
+def test_temp_level_thresholds():
+    assert kc.temp_level(69.9) == "ok"
+    assert kc.temp_level(70) == "warn"
+    assert kc.temp_level(85) == "hot"
+
+
+def _fans(root, idx, name, fans):
+    d = root / f"hwmon{idx}"
+    d.mkdir()
+    (d / "name").write_text(name + "\n")
+    for n, rpm in fans.items():
+        (d / f"fan{n}_input").write_text(f"{rpm}\n")
+
+
+def test_fans_status_reads_it87_family(tmp_path):
+    _hwmon(tmp_path, 0, "coretemp", [("Package id 0", 50000)])
+    _fans(tmp_path, 1, "it8625", {1: 0, 2: 2689, 3: 2500})
+    assert kc.fans_status(str(tmp_path)) == [("fan1", 0), ("fan2", 2689), ("fan3", 2500)]
+    assert kc.fans_status(str(tmp_path / "nope")) == []
+
+
+def test_fans_to_show_keeps_fans_seen_spinning():
+    seen = set()
+    shown = kc.fans_to_show([("fan1", 0), ("fan2", 2689)], seen)
+    assert shown == [("fan2", 2689)] and seen == {"fan2"}
+    # 转过的风扇停了也要继续显示(0 RPM 才能报警)
+    assert kc.fans_to_show([("fan1", 0), ("fan2", 0)], seen) == [("fan2", 0)]
