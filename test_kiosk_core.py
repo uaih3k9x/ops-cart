@@ -494,3 +494,18 @@ def test_next_video_device_cycles():
     assert kc.next_video_device(devs, "/dev/video1") == "/dev/video0"
     assert kc.next_video_device(devs, "/dev/video9") == "/dev/video0"
     assert kc.next_video_device([], "/dev/video0") == "/dev/video0"
+
+
+# ---------------------------------------------------------------- CH9329 串口定位
+
+def test_ch9329_port_prefers_stable_by_id(tmp_path):
+    byid = tmp_path / "by-id"
+    byid.mkdir()
+    (byid / "usb-1a86_USB_Single_Serial_CAPSN019212-if00").touch()
+    (byid / "usb-0403_FT232R_XYZ-if00-port0").touch()          # FTDI console 线不算
+    got = kc.ch9329_port(str(byid / "usb-1a86_*-if00"), fallback="/dev/ttyACM0")
+    assert got == str(byid / "usb-1a86_USB_Single_Serial_CAPSN019212-if00")
+
+
+def test_ch9329_port_fallback_when_absent(tmp_path):
+    assert kc.ch9329_port(str(tmp_path / "none-*"), fallback="/dev/ttyACM0") == "/dev/ttyACM0"

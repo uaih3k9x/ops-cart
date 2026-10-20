@@ -22,7 +22,6 @@ FONT_BIG = ("Noto Sans CJK SC", 15)
 FONT_MONO = ("Noto Sans Mono CJK SC", 13)
 BOOT_BG = "#ffffff"     # 开机自检页白底, 接 Plymouth 的白底
 VIDEO_DEV = "/dev/video0"
-CH9329_PORT = "/dev/ttyACM0"
 SCREENSAVER_IMG = "/opt/pxe/nailong.png"
 IDLE_SECONDS = 180
 
@@ -63,10 +62,8 @@ class Kiosk(tk.Tk):
         self._mouse_acc = [0, 0, 0]      # dx, dy, wheel
         self._mouse_btn = 0
         self._last_pos = None
-        try:
-            self.ch = Ch9329(CH9329_PORT, log=lambda *a: None)
-        except OSError:
-            self.ch = None
+        self.ch, self._ch_dev = None, None
+        self._ensure_ch()
 
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read())
@@ -260,7 +257,10 @@ class Kiosk(tk.Tk):
         wid = self.video_frame.winfo_id()
         self.mpv = subprocess.Popen(
             ["mpv", f"--wid={wid}", "--no-osc", "--no-input-default-bindings",
-             "--input-vo-keyboard=no", "--really-quiet", "--fs=no", self.video_dev],
+             "--input-vo-keyboard=no", "--really-quiet", "--fs=no",
+             # 透传要看着画面操作: 不缓冲, 来一帧显示一帧
+             "--profile=low-latency", "--untimed", "--cache=no",
+             "--demuxer-lavf-o-add=fflags=+nobuffer", self.video_dev],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
 
@@ -277,11 +277,37 @@ class Kiosk(tk.Tk):
 
     # ------------------------------------------------------------ 键鼠透传
 
+    def _ensure_ch(self):
+        """CH9329 串口按 by-id 找; 重插后 ttyACMn 变了就重连. 返回能不能用."""
+        dev = os.path.realpath(kc.ch9329_port())
+        if self.ch and dev == self._ch_dev:
+            return True
+        if self.ch:
+            try:
+                self.ch.close()
+            except OSError:
+                pass
+        try:
+            self.ch, self._ch_dev = Ch9329(dev, log=lambda *a: None), dev
+        except OSError:
+            self.ch, self._ch_dev = None, None
+        return self.ch is not None
+
+    def _ch_send(self, fn, *args, **kw):
+        """发送失败(线被拔)就丢掉句柄, 下次进透传再重连; 不让异常打断 Tk 的定时循环."""
+        if not self.ch:
+            return
+        try:
+            getattr(self.ch, fn)(*args, **kw)
+        except OSError:
+            self.ch, self._ch_dev = None, None
+            self.banner.config(text="CH9329 断开 · 重新单击画面重连")
+
     def _engage_passthrough(self):
         if self.passthrough:
             return
-        if not self.ch:
-            messagebox.showwarning("键鼠透传", f"CH9329 未连接 ({CH9329_PORT})")
+        if not self._ensure_ch():
+            messagebox.showwarning("键鼠透传", f"CH9329 未连接 ({kc.ch9329_port()})")
             return
         self.passthrough = True
         self._mods.clear()
@@ -306,7 +332,7 @@ class Kiosk(tk.Tk):
         except tk.TclError:
             pass
         self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
-        self.ch and self.ch.send_mouse(0, 0, 0, 0)   # 松开所有键
+        self._ch_send("send_mouse", 0, 0, 0, 0)   # 松开所有键
 
     def _on_passthrough_event(self, ev):
         if ev.type == "6":            # Motion
@@ -344,11 +370,10 @@ class Kiosk(tk.Tk):
             key = ev.char
         elif ev.keysym in KEYSYM_SPECIAL:
             key = KEYSYM_SPECIAL[ev.keysym]
-        if key and self.ch:
-            names = list(self._mods) + [key]
+        if key:
             try:
-                self.ch.send_keys(names, press_ms=20)
-            except ValueError:
+                self._ch_send("send_keys", list(self._mods) + [key], press_ms=20)
+            except ValueError:      # 组合里有 CH9329 不认的键
                 pass
 
     def _flush_mouse(self):
@@ -356,7 +381,7 @@ class Kiosk(tk.Tk):
             return
         dx, dy, wheel = self._mouse_acc
         if dx or dy or wheel or self._mouse_btn:
-            self.ch and self.ch.send_mouse(self._mouse_btn, dx, dy, wheel)
+            self._ch_send("send_mouse", self._mouse_btn, dx, dy, wheel)
             self._mouse_acc = [0, 0, 0]
         self.after(16, self._flush_mouse)
 

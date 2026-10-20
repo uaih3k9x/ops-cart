@@ -54,9 +54,18 @@ def nics_status():
     return result
 
 
+CH9329_BY_ID = "/dev/serial/by-id/usb-1a86_*-if00"   # CH343 串口; 重插后 ttyACMn 会变, by-id 不变
+
+
+def ch9329_port(pattern=CH9329_BY_ID, fallback="/dev/ttyACM0"):
+    import glob
+    hits = sorted(glob.glob(pattern))
+    return hits[0] if hits else fallback
+
+
 def misc_status():
     _, ts_ip = run(["tailscale", "ip", "-4"])
-    ch = subprocess.run(["ls", "/dev/ttyACM0"], capture_output=True).returncode == 0
+    ch = os.path.exists(ch9329_port())
     _, up = run(["uptime", "-p"])
     return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up or "-"}
 
@@ -197,7 +206,8 @@ def check_serial(ctx, dev="/dev/ttyUSB0"):
 
 
 def check_ch9329(ctx):
-    return ("OK", "ttyACM0") if ctx["misc"].get("ch9329") else ("--", "NOT CONNECTED")
+    return ("OK", os.path.basename(os.path.realpath(ch9329_port()))) if ctx["misc"].get("ch9329") \
+        else ("--", "NOT CONNECTED")
 
 
 def check_pxe(ctx, iface="eno1"):
