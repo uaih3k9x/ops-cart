@@ -72,7 +72,8 @@ class Kiosk(tk.Tk):
         self._lock_win = None
         self._screensaver_win = None
         self._boot_win = None
-        self.after(200, self._boot_selftest)
+        self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
+        self.after(50, self._boot_selftest)
         self._last_input = time.time()
         self._img = None
         for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
@@ -426,6 +427,8 @@ class Kiosk(tk.Tk):
         tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg="#000000", fg="#8b93a7").pack()
         box = tk.Frame(w, bg="#000000")
         box.place(relx=0.5, rely=0.62, anchor="center")
+        tk.Label(box, text="Step 3/3   System check", font=FONT_BIG, bg="#000000",
+                 fg="#e8eaf0", anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
 
         def work():
             temps = kc.temps_status(smart=lambda: None)
@@ -449,12 +452,16 @@ class Kiosk(tk.Tk):
         self.after(6000 if failed else 2000, self._boot_done)
 
     def _boot_done(self):
-        if self._boot_win:
-            self._boot_win.destroy()
-            self._boot_win = None
+        """先盖锁屏, 再撤自检页, 最后在锁屏底下放出主界面 -- 中间不留空档."""
         self._last_input = time.time()
         if self.gate.required:
             self.lock()
+        if self._boot_win:
+            self._boot_win.destroy()
+            self._boot_win = None
+        self.deiconify()
+        if self._lock_win:
+            self._lock_win.lift()
 
     # ------------------------------------------------------------ PIN 锁屏
 
