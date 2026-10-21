@@ -74,11 +74,11 @@ def test_dedup_same_code():
 
 
 def test_mouse_report_frame():
-    frame = ch9329.build_frame(ch9329.CMD_SEND_DATA,
-                               bytes([0x01, 0x00, 0x05, 0x00, 0x00]))
-    body = bytes([0x00, 0x02, 0x05, 0x01, 0x00, 0x05, 0x00, 0x00])
+    """相对鼠标走 CMD_SEND_MS_REL_DATA(0x05), 数据 5 字节且首字节固定 0x01.
+    2026-10-21 实机: 之前误用 0x02(键盘通道)发 5 字节, 一动鼠标目标机就乱输入."""
+    frame = ch9329.build_frame(ch9329.CMD_SEND_MS_REL, bytes([0x01, 0x00, 0x05, 0x00, 0x00]))
+    body = bytes([0x00, 0x05, 0x05, 0x01, 0x00, 0x05, 0x00, 0x00])
     assert frame == b"\x57\xab" + body + bytes([ch9329.checksum(b"\x57\xab" + body)])
-    assert len(frame) == 11
 
 
 def test_mouse_i8_clamps():
@@ -92,9 +92,11 @@ def test_mouse_i8_clamps():
     import types
     dev = FakeDev()
     ch9329.Ch9329.send_mouse(dev, buttons=2, dx=300, dy=-300, wheel=1)
-    rep = dev.sent[0][5:10]   # 帧头2+addr+cmd+len = 偏移5
-    assert rep[0] == 0x02                     # 右键
-    assert rep[1] == 127                      # dx 截 127
-    assert rep[2] == 0x81                     # dy -127 -> 0x81
-    assert rep[3] == 0x01                     # 滚轮
-    assert rep[4] == 0x00
+    f = dev.sent[0]
+    assert f[3] == 0x05 and f[4] == 5         # 相对鼠标命令, 5 字节
+    rep = f[5:10]                             # 帧头2+addr+cmd+len = 偏移5
+    assert rep[0] == 0x01                     # 相对鼠标固定首字节
+    assert rep[1] == 0x02                     # 右键
+    assert rep[2] == 127                      # dx 截 127
+    assert rep[3] == 0x81                     # dy -127 -> 0x81
+    assert rep[4] == 0x01                     # 滚轮

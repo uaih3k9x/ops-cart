@@ -22,7 +22,8 @@ import time
 
 HEADER = b"\x57\xab"
 CMD_GET_INFO = 0x01
-CMD_SEND_DATA = 0x02
+CMD_SEND_DATA = 0x02      # 普通键盘数据, 8 字节
+CMD_SEND_MS_REL = 0x05    # 相对鼠标, 5 字节: 0x01, 按键, dx, dy, 滚轮
 
 # HID modifier 位
 MOD = {"ctrl": 0x01, "shift": 0x02, "alt": 0x04, "gui": 0x08}
@@ -136,8 +137,8 @@ class Ch9329:
         def i8(v):
             v = max(-127, min(127, int(v)))
             return v & 0xFF
-        report = bytes([buttons & 0x07, i8(dx), i8(dy), i8(wheel), 0x00])
-        return self._send_raw(build_frame(CMD_SEND_DATA, report))
+        report = bytes([0x01, buttons & 0x07, i8(dx), i8(dy), i8(wheel)])
+        return self._send_raw(build_frame(CMD_SEND_MS_REL, report))
 
     def type_text(self, text, press_ms=30):
         """逐字符打字 (US 键盘布局)."""
