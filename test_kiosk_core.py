@@ -628,3 +628,69 @@ def test_combo_rearms_after_all_keys_up():
                  ("alt", False), ("ctrl", False)]:
         r.key(k, d)
     assert [r.key("ctrl", True), r.key("alt", True), r.key("ctrl", False)] == [False, False, True]
+
+
+# ------------------------------------------------------------ 透传键盘: 物理键码同步按住/松开 (2026-10-21)
+# X 键码 = evdev + 8; 不看 keysym (Shift+1 会变 exclam、受输入法影响), 直接映射到 HID usage
+
+def test_xkeycode_maps_to_hid():
+    k = kc.X_KEYCODE_HID
+    assert k[38] == ("key", 0x04) and k[24] == ("key", 0x14)      # a, q
+    assert k[10] == ("key", 0x1E) and k[9] == ("key", 0x29)       # 1, Esc
+    assert k[119] == ("key", 0x4C) and k[111] == ("key", 0x52)    # Delete, Up
+    assert k[23] == ("key", 0x2B) and k[65] == ("key", 0x2C)      # Tab, Space
+    assert k[37] == ("mod", 0x01) and k[50] == ("mod", 0x02)      # Ctrl_L, Shift_L
+    assert k[64] == ("mod", 0x04) and k[133] == ("mod", 0x08)     # Alt_L, Super_L
+    assert k[105] == ("mod", 0x10) and k[108] == ("mod", 0x40)    # Ctrl_R, Alt_R
+
+
+def test_mod_names_for_release_combo():
+    assert kc.mod_name(37) == "ctrl" and kc.mod_name(105) == "ctrl"
+    assert kc.mod_name(64) == "alt" and kc.mod_name(108) == "alt"
+    assert kc.mod_name(50) == "shift" and kc.mod_name(133) == "gui"
+    assert kc.mod_name(38) is None
+
+
+def test_hid_keyboard_holds_alt_while_tabbing():
+    kb = kc.HidKeyboard()
+    assert kb.press(64) == bytes([0x04, 0, 0, 0, 0, 0, 0, 0])
+    assert kb.press(23) == bytes([0x04, 0, 0x2B, 0, 0, 0, 0, 0])
+    assert kb.release(23) == bytes([0x04, 0, 0, 0, 0, 0, 0, 0])
+    assert kb.press(23) == bytes([0x04, 0, 0x2B, 0, 0, 0, 0, 0])     # Alt 一直按着, 再切一次
+    assert kb.release(23)[2] == 0
+    assert kb.release(64) == bytes(8)
+
+
+def test_hid_keyboard_ignores_repeat_unknown_and_overflow():
+    kb = kc.HidKeyboard()
+    assert kb.press(38) is not None
+    assert kb.press(38) is None            # X 自动重复: 状态没变不重发
+    assert kb.press(999) is None and kb.release(999) is None
+    for code in (24, 25, 26, 27, 28):      # q w e r t -> 加上 a 一共 6 个
+        assert kb.press(code) is not None
+    assert kb.press(29) is None            # 第 7 个普通键丢掉
+    assert kb.release_all() == bytes(8)
+
+
+# ------------------------------------------------------------ 绝对鼠标坐标 (2026-10-21)
+
+def test_abs_point_same_aspect():
+    assert kc.abs_point(0, 0, 1600, 900, 1920, 1080) == (0, 0)
+    assert kc.abs_point(1599, 899, 1600, 900, 1920, 1080) == (4095, 4095)
+    assert kc.abs_point(800, 450, 1600, 900, 1920, 1080) == (2049, 2050)
+
+
+def test_abs_point_letterbox():
+    # 1600x1000 的框放 16:9 画面: 实际 1600x900, 上下各 50 黑边
+    assert kc.abs_point(0, 50, 1600, 1000, 1920, 1080) == (0, 0)
+    assert kc.abs_point(0, 40, 1600, 1000, 1920, 1080) is None           # 点在黑边上
+    assert kc.abs_point(1599, 949, 1600, 1000, 1920, 1080) == (4095, 4095)
+    # 4:3 画面放宽框: 左右黑边
+    assert kc.abs_point(100, 300, 1600, 900, 1024, 768) is None
+    assert kc.abs_point(200, 0, 1600, 900, 1024, 768) == (0, 0)
+
+
+def test_parse_v4l2_size():
+    out = "Format Video Capture:\n\tWidth/Height      : 1920/1080\n\tPixel Format      : 'MJPG'\n"
+    assert kc.parse_v4l2_size(out) == (1920, 1080)
+    assert kc.parse_v4l2_size("garbage") is None

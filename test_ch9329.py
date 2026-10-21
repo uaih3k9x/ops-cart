@@ -100,3 +100,32 @@ def test_mouse_i8_clamps():
     assert rep[2] == 127                      # dx 截 127
     assert rep[3] == 0x81                     # dy -127 -> 0x81
     assert rep[4] == 0x01                     # 滚轮
+
+
+def test_send_report_raw_keyboard_frame():
+    """按住/松开同步要直接发 8 字节键盘报告, 不走 send_keys 的按下即抬起."""
+    class FakeDev:
+        def __init__(self):
+            self.sent = []
+        def _send_raw(self, frame):
+            self.sent.append(frame)
+            return b""
+    dev = FakeDev()
+    rep = bytes([0x04, 0, 0x2B, 0, 0, 0, 0, 0])
+    ch9329.Ch9329.send_report(dev, rep)
+    assert dev.sent == [ch9329.build_frame(ch9329.CMD_SEND_DATA, rep)]
+
+
+def test_abs_mouse_frame_and_clamp():
+    """绝对鼠标: CMD_SEND_MS_ABS=0x04, 数据 [0x02, 按键, xL, xH, yL, yH, 滚轮], 坐标 0~4095."""
+    class FakeDev:
+        def __init__(self):
+            self.sent = []
+        def _send_raw(self, frame):
+            self.sent.append(frame)
+            return b""
+    dev = FakeDev()
+    ch9329.Ch9329.send_mouse_abs(dev, 1, 2048, 5000, -3)
+    f = dev.sent[0]
+    assert f[3] == 0x04 and f[4] == 7
+    assert f[5:12] == bytes([0x02, 0x01, 0x00, 0x08, 0xFF, 0x0F, 0xFD])   # y 夹到 4095, 滚轮 -3 原样
