@@ -371,13 +371,13 @@ def test_selftest_run_isolates_crashing_check():
         raise RuntimeError("x")
     rows = kc.selftest_run([{"check": "boom", "label": "BOOM"}, {"check": "cpu"}], _ctx(),
                            checks=dict(kc.CHECKS, boom=boom))
-    assert rows[0] == {"label": "BOOM", "state": "FAIL", "detail": "ERROR"}
+    assert rows[0] == {"label": "BOOM", "state": "FAIL", "detail": "ERROR", "check": "boom"}
     assert rows[1]["state"] == "OK"
 
 
 def test_selftest_run_unknown_check():
     rows = kc.selftest_run([{"check": "nope"}], _ctx())
-    assert rows == [{"label": "NOPE", "state": "FAIL", "detail": "UNKNOWN CHECK"}]
+    assert rows == [{"label": "NOPE", "state": "FAIL", "detail": "UNKNOWN CHECK", "check": "nope"}]
 
 
 def test_check_serial_uses_dev_param():
@@ -803,3 +803,66 @@ def test_menu_keeps_every_existing_action():
 def test_menu_main_keeps_hot_buttons():
     main = [it.get("do") for it in kc.MENU["main"]]
     assert "toggle_preview" in main and "toggle_serial" in main and "lock_now" in main
+
+
+# ------------------------------------------------------------ 状态板 = 实时自检 (2026-10-21)
+# 状态板和开机自检共用 CHECKS + selftest.json, 以后加检查项只改计划表
+
+def test_check_service_states():
+    svcs = {"pxe-server": (True, True), "pxe-http-repo": (True, False), "webkiosk": (False, False)}
+    ctx = _ctx(svcs=svcs)
+    assert kc.check_service(ctx, unit="pxe-server") == ("OK", "RUNNING")
+    # 开了自启却没跑: 提醒 (LAN1 没插线时 http 服务就会这样); 标了 required 才算故障
+    assert kc.check_service(ctx, unit="pxe-http-repo") == ("WARN", "NOT RUNNING")
+    assert kc.check_service(ctx, unit="pxe-http-repo", required=True) == ("FAIL", "NOT RUNNING")
+    assert kc.check_service(ctx, unit="webkiosk") == ("--", "OFF")              # 没打算跑, 不算故障
+    assert kc.check_service(ctx, unit="nope") == ("--", "OFF")
+
+
+def test_check_wifi():
+    st = lambda **k: (lambda: {"ssid": "CAMPUSNET", "signal": 68, "ip": "10.0.0.5/20", "egress": False, **k})
+    assert kc.check_wifi(_ctx(wifi=st())) == ("OK", "CAMPUSNET 68% STANDBY")
+    assert kc.check_wifi(_ctx(wifi=st(egress=True))) == ("WARN", "CAMPUSNET 68% IN USE")   # 网线断了在顶班
+    assert kc.check_wifi(_ctx(wifi=lambda: {"ssid": None})) == ("--", "NOT CONNECTED")
+
+
+def test_check_signal_by_friendly_name():
+    nodes = [{"dev": "/dev/video2", "friendly": "SC0710 卡1", "key": "0000:02:00.0", "name": "SC0710:RAW"},
+             {"dev": "/dev/video3", "friendly": "SC0710 卡2", "key": "0000:05:00.0", "name": "SC0710:RAW"}]
+    sig = {"/dev/video2": False, "/dev/video3": True}
+    ctx = _ctx(videos=lambda: nodes, signal=sig.get)
+    assert kc.check_signal(ctx, match="卡2") == ("OK", "SIGNAL video3")
+    assert kc.check_signal(ctx, match="卡1") == ("--", "NO SIGNAL video2")         # 没接线不算故障
+    assert kc.check_signal(ctx, match="卡9") == ("FAIL", "NOT FOUND")
+
+
+def test_status_board_lines_tags_by_state():
+    rows = [{"label": "LAN2", "state": "FAIL", "detail": "NO LINK"},
+            {"label": "WIFI", "state": "WARN", "detail": "CAMPUSNET 68% IN USE"},
+            {"label": "TAILSCALE", "state": "OK", "detail": "100.100.100.10"},
+            {"label": "CONSOLE", "state": "--", "detail": "NOT CONNECTED"}]
+    lines = kc.status_board_lines(rows, temps=[("CPU", 57.0)], fans=[("fan2", 2393)], uptime="up 1 hour")
+    assert [t for _, t in lines[:4]] == ["bad", "t_warn", "ok", "dim"]
+    assert lines[0][0].startswith("LAN2 ") and lines[0][0].endswith("FAIL NO LINK")
+    texts = [t for t, _ in lines]
+    assert "up 1 hour" in texts and any("CPU" in t and "57°C" in t for t in texts)
+    assert any("fan2" in t and "2393" in t for t in texts)
+
+
+def test_status_board_lines_before_first_check():
+    lines = kc.status_board_lines(None, temps=[], fans=[], uptime="up 1 min")
+    assert lines[0] == ("检查中…", "dim")
+
+
+def test_default_plan_covers_old_status_board():
+    checks = [it["check"] for it in kc.DEFAULT_PLAN]
+    units = {it.get("unit") for it in kc.DEFAULT_PLAN if it["check"] == "service"}
+    assert {"pxe-server", "pxe-http-repo", "pxe-http-boot"} <= units
+    assert "wifi" in checks and "lan" in checks and "tailscale" in checks
+
+
+def test_status_board_skips_cpu_fan_rows_shown_in_temps_block():
+    rows = kc.selftest_run([{"check": "cpu"}, {"check": "fan"}, {"check": "tailscale"}], _ctx())
+    assert rows[0]["check"] == "cpu"
+    texts = [t for t, _ in kc.status_board_lines(rows, temps=[], fans=[], uptime="up")]
+    assert texts[0].startswith("TAILSCALE") and not any(t.startswith(("CPU ", "FAN ")) for t in texts)

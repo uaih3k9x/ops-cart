@@ -1,13 +1,18 @@
 [
-  {"check": "lan",       "label": "LAN2",       "iface": "enp3s0"},
+  {"check": "service",   "label": "PXE SERVER",    "unit": "pxe-server"},
+  {"check": "service",   "label": "PXE HTTP REPO", "unit": "pxe-http-repo"},
+  {"check": "service",   "label": "PXE HTTP BOOT", "unit": "pxe-http-boot"},
+  {"check": "lan",       "label": "LAN2",          "iface": "enp3s0"},
+  {"check": "pxe",       "label": "LAN1 / PXE",    "iface": "eno1"},
+  {"check": "wifi",      "label": "WIFI"},
   {"check": "tailscale"},
-  {"check": "serial",    "label": "CONSOLE",    "dev": "/dev/ttyUSB0"},
+  {"check": "serial",    "label": "CONSOLE",       "dev": "/dev/ttyUSB0"},
   {"check": "ch9329",    "label": "CH9329"},
-  {"check": "pxe",       "label": "LAN1 / PXE", "iface": "eno1"},
+  {"check": "pci",       "label": "SC0710",        "id": "12ab:0710", "count": 2, "driver": "LINUXV4L2SC0710"},
+  {"check": "signal",    "label": "CAPTURE 1",     "match": "卡1"},
+  {"check": "signal",    "label": "CAPTURE 2",     "match": "卡2"},
+  {"check": "video",     "label": "MS2130",        "match": "345f:2109"},
+  {"check": "ping",      "label": "NAS",           "host": "192.168.1.10"},
   {"check": "cpu"},
-  {"check": "fan"},
-  {"check": "pci",       "label": "SC0710",     "id": "12ab:0710", "count": 2, "driver": "LINUXV4L2SC0710"},
-  {"check": "video",     "label": "SC0710 VIDEO", "match": "SC0710", "count": 2},
-  {"check": "video",     "label": "MS2130",     "match": "345f:2109"},
-  {"check": "ping",      "label": "NAS",        "host": "192.168.1.10"}
+  {"check": "fan"}
 ]

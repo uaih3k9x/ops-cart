@@ -138,8 +138,3 @@ def status(scan, addr, routes, iface=IFACE):
     return {"ssid": cur[1], "signal": int(cur[2]) if cur[2].isdigit() else 0, "ip": ip,
             "egress": "dev" in first and first[first.index("dev") + 1] == iface}
 
-
-def status_line(st):
-    if not st["ssid"]:
-        return "    未连接"
-    return f"    {st['ip']:<20} {st['ssid']}  {st['signal']}%  ({'当前出口' if st['egress'] else '备用'})"
