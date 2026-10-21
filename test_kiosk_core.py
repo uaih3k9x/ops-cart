@@ -599,6 +599,12 @@ def test_mpv_does_not_eat_mouse_or_keys():
     assert "--profile=low-latency" in cmd
 
 
+def test_mpv_avoids_gl_output():
+    """2026-10-21: GT740 + nouveau 无合成器, mpv 默认 GL 输出会把碎片画到盖在上面的锁屏上;
+    改用 Xv, 交给 X 服务器画 (正确处理遮挡, 仍有硬件缩放)."""
+    assert "--vo=xv" in kc.mpv_cmd(1, "/dev/video0")
+
+
 # ------------------------------------------------------------ 透传释放组合 (2026-10-21)
 # Ctrl+Alt 按下又松开、中间没按别的键 -> 释放; 中间按过 Del 等 -> 组合被"用掉", 不释放
 
