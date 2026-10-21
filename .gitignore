@@ -6,3 +6,4 @@ ks.cfg
 .DS_Store
 branding/
 BUILD
+.pytest_cache/

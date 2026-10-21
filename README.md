@@ -17,15 +17,33 @@
 
 ## 组成
 
+车上跑的 Python 模块全在仓库根目录,部署时平铺拷进 `/opt/pxe/`(连同 `web/`、`VERSION`、`BUILD`)。
+
 | 文件 | 职责 |
 |---|---|
 | [`pxeserver.py`](pxeserver.py) | PXE 服务端:DHCP(67) + proxyDHCP(4011) + TFTP(69),单文件,Windows/Linux 通用 |
-| [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter,无 WM 直跑):状态板、双网卡配置、UVC 预览、键鼠透传(VMware 式 Ctrl+Alt 释放)、串口会话、KS 编辑、屏保 |
-| [`kiosk_core.py`](kiosk_core.py) | GUI 可测核心层:nmcli 命令生成、服务状态、PXE 配置渲染、Kickstart 编辑引擎 |
-| [`serial_panel.py`](serial_panel.py) | 串口会话面板(人在不在都能操作 console) |
-| [`ks_panel.py`](ks_panel.py) | Kickstart 编辑面板:主机名/root 密码表单化,保存自动轮换备份,破坏性指令前置校验 |
-| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈:键盘 8 字节 / 鼠标 5 字节报告,组合键与长按 |
-| `test_*.py` | **58 个测试**,协议层全部离线可测,不碰硬件也能全绿 |
+| [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter,无 WM 直跑):状态板、二级菜单、采集预览、键鼠透传、锁屏 |
+| [`kiosk_core.py`](kiosk_core.py) | GUI 可测核心层:nmcli 命令、自检计划表与检查函数、PXE 配置、Kickstart 编辑 |
+| [`serial_panel.py`](serial_panel.py) | 串口会话面板 |
+| [`ks_panel.py`](ks_panel.py) | Kickstart 编辑面板:表单化、自动备份、破坏性指令校验 |
+| [`wifi_panel.py`](wifi_panel.py) / [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序 |
+| [`webkiosk.py`](webkiosk.py) / [`web_core.py`](web_core.py) / [`web/`](web/) | 网页版 Kiosk(远程管理口,标准库 http.server) |
+| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 无浏览器自动认证 |
+| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈 |
+| [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract),带坐标,可定位文字 |
+
+其余目录:
+
+| 目录 | 内容 |
+|---|---|
+| [`tests/`](tests/) | 离线单测,不碰硬件也能全绿 |
+| [`deploy/systemd/`](deploy/systemd/) | `kiosk.service`、`cart-boot-success.*`、`campusnet-auth.*` → `/etc/systemd/system/` |
+| [`deploy/sysctl.d/`](deploy/sysctl.d/) | 无线口 rp_filter → `/etc/sysctl.d/` |
+| [`deploy/bin/`](deploy/bin/) | `kiosk-launcher`(装成 `kiosk`)、`kiosk-setpin` → `/usr/local/bin/` |
+| [`scripts/`](scripts/) | `setup-cart.sh`(铺 PXE 引导与仓库)、`stamp-build.sh`(部署前生成 BUILD)、`smoke-kiosk.sh`(Xvfb 冒烟) |
+| [`examples/`](examples/) | `selftest.example.json`、`ks.cfg.example`、`branding/` 换皮样例 |
+| [`plymouth/`](plymouth/) | 开机画面主题 |
+| [`windows/`](windows/) | Windows 版 PXE 部署脚本(`setup.ps1` / `start-pxe.ps1` 等) |
 
 ## 快速开始
 
@@ -46,9 +64,9 @@ python3 pxeserver.py serve --ip 192.168.200.1 \
 推车整机布局:代码部署在 `/opt/pxe/`,systemd 三件套
 (`pxe-server` / `pxe-http-repo` / `pxe-http-boot`)开机自启;
 终端键入 `kiosk` 进入车机界面。
-开机自检的项目在 `/opt/pxe/selftest.json` 里配(照 [`selftest.example.json`](selftest.example.json) 改网卡名、串口、PCI 卡 ID、要 ping 的主机),
-没这个文件就用内置的默认七项;新检查写成 `kiosk_core.check_xxx(ctx, **参数)` 再登记进 `CHECKS`。同一套代码亦可在 Windows 上跑
-(`setup.ps1` / `start-pxe.ps1`),单文件跨平台是设计目标之一。
+开机自检和状态板共用 `/opt/pxe/selftest.json`(照 [`examples/selftest.example.json`](examples/selftest.example.json) 改网卡名、串口、PCI 卡 ID、要 ping 的主机),
+没这个文件就用内置默认计划;新检查写成 `kiosk_core.check_xxx(ctx, **参数)` 再登记进 `CHECKS`。
+同一套 PXE 服务端亦可在 Windows 上跑(见 [`windows/`](windows/)),单文件跨平台是设计目标之一。
 
 ## 协议栈
 

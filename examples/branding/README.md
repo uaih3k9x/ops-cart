@@ -9,7 +9,7 @@ Kiosk 开机自检页（以及以后的 Plymouth 开机动画）从 `/opt/pxe/br
 
 ```bash
 sudo mkdir -p /opt/pxe/branding
-sudo cp branding.example/branding.json /opt/pxe/branding/   # 改成你自己的名字
+sudo cp examples/branding/branding.json /opt/pxe/branding/   # 改成你自己的名字
 sudo cp your-logo.png /opt/pxe/branding/logo.png
 sudo systemctl restart kiosk
 ```
