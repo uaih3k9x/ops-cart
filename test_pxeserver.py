@@ -1,5 +1,6 @@
 """pxeserver 协议层测试: 红绿循环的绿侧. 全部本机回环高位端口, 不碰真接口."""
 
+import errno
 import socket
 import struct
 import threading
@@ -250,3 +251,62 @@ def test_tftp_transfer_no_options(tmp_path):
         if len(pkt) < 4 + 512:
             break
     assert got == payload
+
+
+# ---- 套接字绑定 (2026-10-21 实机暴露: Linux 上绑具体 IP 收不到 255.255.255.255 的 DISCOVER;
+#      开机时网线没插, 绑 192.168.77.1 报 EADDRNOTAVAIL, 线程静默死掉)
+
+class FakeSock:
+    def __init__(self, fail_times=0, errno_=errno.EADDRNOTAVAIL):
+        self.opts, self.binds, self.fail_times, self.errno_ = [], [], fail_times, errno_
+
+    def setsockopt(self, level, opt, val):
+        self.opts.append((level, opt, val))
+
+    def bind(self, addr):
+        self.binds.append(addr)
+        if self.fail_times:
+            self.fail_times -= 1
+            raise OSError(self.errno_, "Cannot assign requested address")
+
+
+SO_BINDTODEVICE = 25
+
+
+def test_dhcp_linux_binds_any_locked_to_iface():
+    from pxeserver import open_dhcp_socket
+    s = FakeSock()
+    open_dhcp_socket(s, "192.168.77.1", 67, iface="eno1", platform="linux")
+    assert s.binds == [("", 67)]                                     # 收得到广播
+    assert (socket.SOL_SOCKET, SO_BINDTODEVICE, b"eno1") in s.opts   # 只在装机口, 绝不漏到 LAN2
+    assert (socket.SOL_SOCKET, socket.SO_BROADCAST, 1) in s.opts
+
+
+def test_dhcp_windows_keeps_ip_bind():
+    from pxeserver import open_dhcp_socket
+    s = FakeSock()
+    open_dhcp_socket(s, "192.168.77.1", 67, iface="eno1", platform="win32")
+    assert s.binds == [("192.168.77.1", 67)]
+    assert not [o for o in s.opts if o[1] == SO_BINDTODEVICE]
+
+
+def test_dhcp_linux_without_iface_never_binds_any():
+    """没给网卡名时宁可收不到广播, 也不能绑 0.0.0.0 变成全网口的野 DHCP."""
+    from pxeserver import open_dhcp_socket
+    s = FakeSock()
+    open_dhcp_socket(s, "192.168.77.1", 67, iface=None, platform="linux")
+    assert s.binds == [("192.168.77.1", 67)]
+
+
+def test_bind_retry_waits_for_address():
+    from pxeserver import bind_retry
+    s, sleeps = FakeSock(fail_times=2), []
+    bind_retry(s, ("192.168.77.1", 69), sleep=sleeps.append, log=FakeLog())
+    assert s.binds == [("192.168.77.1", 69)] * 3 and len(sleeps) == 2
+
+
+def test_bind_retry_reraises_other_errors():
+    from pxeserver import bind_retry
+    s = FakeSock(fail_times=1, errno_=errno.EADDRINUSE)     # 端口被占, 等也没用
+    with pytest.raises(OSError):
+        bind_retry(s, ("192.168.77.1", 69), sleep=lambda _: None, log=FakeLog())
