@@ -1,5 +1,6 @@
 """kiosk_core 测试: 纯函数与配置读写, 不碰真机服务."""
 
+import time
 import json
 
 import pytest
@@ -509,3 +510,121 @@ def test_ch9329_port_prefers_stable_by_id(tmp_path):
 
 def test_ch9329_port_fallback_when_absent(tmp_path):
     assert kc.ch9329_port(str(tmp_path / "none-*"), fallback="/dev/ttyACM0") == "/dev/ttyACM0"
+
+
+# ------------------------------------------------------------ 装机模式 (2026-10-21)
+# 默认只有救援菜单; 推车上输屏幕随机码解锁, 只对选定 MAC 下发装机菜单, 30 分钟或被取走即上锁
+
+MAC = "e0:be:03:41:b5:a2"
+
+
+def test_mac_cfg_name_is_grub_per_mac_file():
+    assert kc.mac_cfg_name(MAC) == "grub.cfg-01-e0-be-03-41-b5-a2"
+    assert kc.mac_cfg_name("E0-BE-03-41-B5-A2") == "grub.cfg-01-e0-be-03-41-b5-a2"
+    with pytest.raises(ValueError):
+        kc.mac_cfg_name("not-a-mac")
+
+
+def test_rescue_menu_never_installs():
+    cfg = kc.grub_cfg_rescue()
+    assert "inst.rescue" in cfg and "inst.ks" not in cfg and "set default=0" in cfg
+
+
+def test_install_menu_has_kickstart():
+    cfg = kc.grub_cfg_install()
+    assert "inst.ks=" in cfg and "inst.repo=" in cfg
+
+
+def test_arm_writes_per_mac_menu_only(tmp_path):
+    state = tmp_path / "pxe-mode.json"
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=state)
+    assert "inst.ks" in (tmp_path / "grub.cfg-01-e0-be-03-41-b5-a2").read_text()
+    assert "inst.ks" not in (tmp_path / "grub.cfg").read_text()        # 别的机器照样只能救援
+    st = kc.pxe_mode_read(path=state, now=1001)
+    assert st == {"mode": "install", "mac": MAC, "since": 1000, "until": 1000 + 1800}
+
+
+def test_disarm_and_expiry(tmp_path):
+    state = tmp_path / "pxe-mode.json"
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=state)
+    assert kc.pxe_mode_read(path=state, now=1000 + 1801)["mode"] == "expired"
+    kc.pxe_disarm(root=tmp_path, path=state)
+    assert not (tmp_path / "grub.cfg-01-e0-be-03-41-b5-a2").exists()
+    assert kc.pxe_mode_read(path=state, now=2000) == {"mode": "rescue"}
+    assert "inst.ks" not in (tmp_path / "grub.cfg").read_text()
+
+
+def test_mode_read_missing_or_garbage_is_rescue(tmp_path):
+    assert kc.pxe_mode_read(path=tmp_path / "nope", now=0) == {"mode": "rescue"}
+    (tmp_path / "bad").write_text("{oops")
+    assert kc.pxe_mode_read(path=tmp_path / "bad", now=0) == {"mode": "rescue"}
+
+
+LOG = """2026-10-21 15:11:01,729 TFTP RRQ /grub.cfg-01-e0-be-03-41-b5-a2 失败: [Errno 2] No such file
+2026-10-21 15:19:22,118 DHCP 客户端 e0:be:03:41:b5:a2 vendor='PXEClient:Arch:00007' arch=7 src=0.0.0.0:68
+2026-10-21 15:19:30,001 DHCP 客户端 aa:bb:cc:dd:ee:ff vendor='PXEClient:Arch:00007' arch=7 src=0.0.0.0:68
+2026-10-21 15:20:00,000 TFTP RRQ /grub.cfg-01-e0-be-03-41-b5-a2 (900 bytes, blksize=1024) from 192.168.77.10
+"""
+
+
+def _ts(s):
+    return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+
+
+def test_consumed_only_by_successful_fetch_after_arm():
+    assert kc.pxe_consumed(LOG, MAC, since=_ts("2026-10-21 15:19:00"))
+    assert not kc.pxe_consumed(LOG, MAC, since=_ts("2026-10-21 15:21:00"))     # 解锁前的旧记录不算
+    assert not kc.pxe_consumed(LOG.splitlines()[0], MAC, since=0)              # 失败的 RRQ 不算
+
+
+def test_recent_clients_latest_first_and_windowed():
+    now = _ts("2026-10-21 15:30:00")
+    assert kc.recent_pxe_clients(LOG, now) == ["aa:bb:cc:dd:ee:ff", MAC]
+    assert kc.recent_pxe_clients(LOG, now + 7200) == []
+
+
+def test_unlock_code():
+    c = kc.new_code()
+    assert len(c) == 6 and c.isdigit()
+    assert kc.code_matches(f" {c} ", c) and not kc.code_matches("000000x", c)
+
+
+# ------------------------------------------------------------ mpv 预览参数
+# 2026-10-21: 有画面时点不进透传 -- mpv 订阅了鼠标事件, 点击被它吃掉, 到不了 Tk 的 Frame
+
+def test_mpv_does_not_eat_mouse_or_keys():
+    cmd = kc.mpv_cmd(4196677, "/dev/video0")
+    assert "--wid=4196677" in cmd and cmd[-1] == "/dev/video0"
+    assert "--input-cursor=no" in cmd and "--input-vo-keyboard=no" in cmd
+    assert "--profile=low-latency" in cmd
+
+
+# ------------------------------------------------------------ 透传释放组合 (2026-10-21)
+# Ctrl+Alt 按下又松开、中间没按别的键 -> 释放; 中间按过 Del 等 -> 组合被"用掉", 不释放
+
+def _feed(seq):
+    r = kc.ReleaseCombo()
+    return [r.key(k, d) for k, d in seq]
+
+
+def test_ctrl_alt_tap_releases_on_keyup():
+    out = _feed([("ctrl", True), ("alt", True), ("alt", False)])
+    assert out == [False, False, True]
+
+
+def test_ctrl_alt_del_goes_through():
+    out = _feed([("ctrl", True), ("alt", True), ("delete", True), ("delete", False),
+                 ("alt", False), ("ctrl", False)])
+    assert not any(out)
+
+
+def test_alt_tab_never_releases():
+    assert not any(_feed([("alt", True), ("tab", True), ("tab", False), ("alt", False)]))
+
+
+def test_combo_rearms_after_all_keys_up():
+    r = kc.ReleaseCombo()
+    for k, d in [("ctrl", True), ("alt", True), ("delete", True), ("delete", False),
+                 ("alt", False), ("ctrl", False)]:
+        r.key(k, d)
+    assert [r.key("ctrl", True), r.key("alt", True), r.key("ctrl", False)] == [False, False, True]

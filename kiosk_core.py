@@ -606,3 +606,165 @@ class PinGate:
             self.fails, self.locked_until = 0, now + self.lock_s
             return "locked"
         return "bad"
+
+
+# ---------------------------------------------------------------- 装机模式
+# 默认: tftp/grub.cfg 只有救援项 (inst.rescue, 不带 ks). 推车屏幕上输随机码解锁时,
+# 只给选定 MAC 写 grub.cfg-01-<mac> (GRUB 先找按 MAC 命名的菜单); 30 分钟或该文件被取走即上锁.
+
+TFTP_ROOT = "/opt/pxe/tftp"
+PXE_MODE = "/opt/pxe/pxe-mode.json"
+PXE_LOG = "/opt/pxe/pxeserver.log"
+ARM_SECONDS = 30 * 60
+_HTTP = "(http,192.168.77.1)"
+_REPO = "http://192.168.77.1:8000"
+
+
+def _menu(entries, timeout):
+    out = [f"set default=0\nset timeout={timeout}\n"]
+    for title, args in entries:
+        for src, label in ((_HTTP, "HTTP fast"), ("", "TFTP slow")):
+            out.append(f"menuentry '{title} ({label})' {{\n"
+                       f"    linux {src}/vmlinuz ip=dhcp {args}\n"
+                       f"    initrd {src}/initrd.img\n}}\n")
+    return "\n".join(out)
+
+
+def grub_cfg_rescue():
+    return ("# 推车 Kiosk 生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
+            _menu([("Rescue shell", f"inst.stage2={_REPO}/rocky inst.rescue inst.sshd inst.text")], 10))
+
+
+def grub_cfg_install():
+    return ("# 推车 Kiosk 生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
+            _menu([("Rocky 9.8 auto install", f"inst.repo={_REPO}/rocky inst.ks={_REPO}/ks.cfg")], 5))
+
+
+def _norm_mac(mac):
+    m = mac.strip().lower().replace("-", ":")
+    if len(m.split(":")) != 6 or not all(len(p) == 2 and all(c in "0123456789abcdef" for c in p)
+                                          for p in m.split(":")):
+        raise ValueError(f"不是 MAC 地址: {mac!r}")
+    return m
+
+
+def mac_cfg_name(mac):
+    return "grub.cfg-01-" + _norm_mac(mac).replace(":", "-")
+
+
+def _write_atomic(path, text):
+    path = str(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def pxe_mode_read(path=PXE_MODE, now=None):
+    """{"mode": "rescue"} / {"mode": "install", mac, since, until} / 过期则 mode="expired"."""
+    now = time.time() if now is None else now
+    try:
+        st = json.load(open(path))
+        mac, since, until = _norm_mac(st["mac"]), st["since"], st["until"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"mode": "rescue"}
+    return {"mode": "install" if now <= until else "expired", "mac": mac, "since": since, "until": until}
+
+
+def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
+    now = time.time() if now is None else now
+    mac = _norm_mac(mac)
+    _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
+    _write_atomic(os.path.join(root, mac_cfg_name(mac)), grub_cfg_install())
+    _write_atomic(path, json.dumps({"mac": mac, "since": now, "until": now + seconds}))
+
+
+def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
+    """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全."""
+    for name in os.listdir(root):
+        if name.startswith("grub.cfg-01-"):
+            os.remove(os.path.join(root, name))
+    _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _log_ts(line):
+    try:
+        return time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def pxe_consumed(log_text, mac, since):
+    """解锁之后, 选定机器成功取走了它的装机菜单 (TFTP RRQ 成功那行)."""
+    needle = f"TFTP RRQ /{mac_cfg_name(mac)} ("
+    for line in log_text.splitlines():
+        ts = _log_ts(line)
+        if ts is not None and ts >= since and needle in line:
+            return True
+    return False
+
+
+def recent_pxe_clients(log_text, now=None, window=3600):
+    """最近来要过地址的机器, 最新在前 (给解锁时选 MAC 用)."""
+    now = time.time() if now is None else now
+    seen = []
+    for line in log_text.splitlines():
+        ts = _log_ts(line)
+        if ts is None or now - ts > window or " DHCP 客户端 " not in line:
+            continue
+        mac = line.split(" DHCP 客户端 ", 1)[1].split()[0]
+        if mac in seen:
+            seen.remove(mac)
+        seen.insert(0, mac)
+    return seen
+
+
+def new_code():
+    import secrets as _se
+    return f"{_se.randbelow(10**6):06d}"
+
+
+def code_matches(typed, code):
+    import hmac as _hm
+    return _hm.compare_digest(typed.strip(), code)
+
+
+# ---------------------------------------------------------------- 预览
+
+def mpv_cmd(wid, dev):
+    """嵌进 Tk Frame 的低延迟预览. 鼠标和键盘都不让 mpv 收: X11 下它不订阅这些事件,
+    点击才会穿透给 Tk 的 Frame (单击进透传)."""
+    return ["mpv", f"--wid={wid}", "--no-osc", "--no-input-default-bindings",
+            "--input-vo-keyboard=no", "--input-cursor=no", "--really-quiet", "--fs=no",
+            # 透传要看着画面操作: 不缓冲, 来一帧显示一帧
+            "--profile=low-latency", "--untimed", "--cache=no",
+            "--demuxer-lavf-o-add=fflags=+nobuffer", dev]
+
+
+# ---------------------------------------------------------------- 透传释放组合
+
+class ReleaseCombo:
+    """VMware 式: Ctrl+Alt 都按下且期间没按别的键, 松开其中一个时才释放透传.
+    这样 Ctrl+Alt+Del 能完整透传过去. key() 收修饰键名 ("ctrl"/"alt"/...) 或普通键名."""
+
+    def __init__(self):
+        self.held, self.armed = set(), False
+
+    def key(self, name, down):
+        if down:
+            self.held.add(name)
+            if name in ("ctrl", "alt"):
+                if {"ctrl", "alt"} <= self.held and self.held <= {"ctrl", "alt"}:
+                    self.armed = True
+            else:
+                self.armed = False          # 组合被用掉 (Ctrl+Alt+Del 之类)
+            return False
+        fire = self.armed and name in ("ctrl", "alt")
+        self.held.discard(name)
+        if fire or not self.held:
+            self.armed = False
+        return fire
