@@ -594,9 +594,15 @@ def test_unlock_code():
 
 def test_mpv_does_not_eat_mouse_or_keys():
     cmd = kc.mpv_cmd(4196677, "/dev/video0")
-    assert "--wid=4196677" in cmd and cmd[-1] == "/dev/video0"
+    assert "--wid=4196677" in cmd
     assert "--input-cursor=no" in cmd and "--input-vo-keyboard=no" in cmd
     assert "--profile=low-latency" in cmd
+
+
+def test_mpv_opens_device_as_v4l2_capture():
+    """2026-10-21: 裸路径 /dev/videoN 被 mpv 当文件 read(); SC0710 厂商驱动的 read() 不出帧 (黑屏),
+    UVC 不支持 read() 才碰巧退回 lavf. 显式 av://v4l2: 走 mmap 采集."""
+    assert kc.mpv_cmd(1, "/dev/video3")[-1] == "av://v4l2:/dev/video3"
 
 
 def test_mpv_avoids_gl_output():
@@ -741,6 +747,32 @@ def test_video_nodes_missing_sysfs(tmp_path):
     assert kc.video_nodes(tmp_path / "nope") == []
 
 
+# 2026-10-21: SC0710 延迟比 MS2130 低不少, 开机默认进有信号的那张卡
+
+def test_parse_input_signal():
+    sc = "Video input : 0 (HDMI k0/TVI/GMSL/SDVOE INPUT(0): {})"
+    assert kc.parse_input_signal(sc.format("ok")) is True
+    assert kc.parse_input_signal(sc.format("no signal, no hsync lock")) is False
+    assert kc.parse_input_signal("Video input : 0 (Camera 1: ok)") is True
+    assert kc.parse_input_signal("VIDIOC_G_INPUT: failed: Inappropriate ioctl for device") is None
+
+
+_NODES = [{"dev": "/dev/video0", "name": "UVC Camera (345f:2109): USB Vid"},
+          {"dev": "/dev/video2", "name": "SC0710:RAW 00.00 0001f715"},
+          {"dev": "/dev/video3", "name": "SC0710:RAW 01.00 0001f715"}]
+
+
+def test_default_video_prefers_sc0710_with_signal():
+    sig = {"/dev/video0": True, "/dev/video2": False, "/dev/video3": True}
+    assert kc.default_video(_NODES, sig.get) == "/dev/video3"
+
+
+def test_default_video_falls_back_to_other_signal_then_first():
+    assert kc.default_video(_NODES, {"/dev/video0": True}.get) == "/dev/video0"
+    assert kc.default_video(_NODES, lambda d: False) == "/dev/video0"
+    assert kc.default_video([], lambda d: True) is None
+
+
 def test_check_video_by_match():
     nodes = [{"dev": "/dev/video0", "friendly": "MS2130 USB", "key": "345f:2109", "name": "UVC Camera"},
              {"dev": "/dev/video2", "friendly": "SC0710 卡1", "key": "0000:02:00.0", "name": "SC0710:RAW"}]
@@ -748,3 +780,26 @@ def test_check_video_by_match():
     assert kc.check_video(ctx, "345f:2109") == ("OK", "video0")
     assert kc.check_video(ctx, "SC0710", count=2) == ("FAIL", "x1 / 2")
     assert kc.check_video(ctx, "dead:beef") == ("FAIL", "NOT FOUND")
+
+
+# ------------------------------------------------------------ 右侧二级菜单 (2026-10-21)
+
+def test_menu_pages_reachable_and_actions_unique():
+    pages = kc.MENU
+    links = {it["page"] for items in pages.values() for it in items if "page" in it}
+    assert links == set(pages) - {"main"}                     # 每个子页都从主页进得去, 没有死链
+    actions = [it["do"] for items in pages.values() for it in items if "do" in it]
+    assert len(actions) == len(set(actions))                  # 同一个动作只放一处
+    assert all(pages.values())
+
+
+def test_menu_keeps_every_existing_action():
+    actions = {it["do"] for items in kc.MENU.values() for it in items if "do" in it}
+    assert actions == {"toggle_preview", "switch_source", "toggle_mouse_mode", "toggle_serial",
+                       "toggle_ks", "toggle_pxe", "toggle_install_mode", "cfg_lan1", "cfg_lan2",
+                       "toggle_wifi", "lock_now", "reboot", "poweroff"}
+
+
+def test_menu_main_keeps_hot_buttons():
+    main = [it.get("do") for it in kc.MENU["main"]]
+    assert "toggle_preview" in main and "toggle_serial" in main and "lock_now" in main

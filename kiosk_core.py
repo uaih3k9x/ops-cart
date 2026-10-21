@@ -408,6 +408,31 @@ def next_video_device(devs, current):
     return devs[(devs.index(current) + 1) % len(devs)] if current in devs else devs[0]
 
 
+def parse_input_signal(text):
+    """v4l2-ctl --get-input 的输出 -> True 有信号 / False 无信号 / None 读不到."""
+    import re as _re
+    m = _re.search(r"Video input\s*:\s*\d+\s*\((.*)\)", text)
+    if not m:
+        return None
+    return not _re.search(r"no signal|no hsync|no lock", m.group(1), _re.I)
+
+
+def video_signal(dev):
+    rc, out = run(["v4l2-ctl", "-d", dev, "--get-input"], timeout=3)
+    return parse_input_signal(out)
+
+
+def default_video(nodes, has_signal=video_signal):
+    """开机默认画面源: 有信号的 SC0710 (延迟低) > 其他有信号的 > 第一个."""
+    devs = [x["dev"] for x in nodes]
+    sc = [x["dev"] for x in nodes if x["name"].startswith("SC0710")]
+    for group in (sc, devs):
+        hit = next((d for d in group if has_signal(d)), None)
+        if hit:
+            return hit
+    return devs[0] if devs else None
+
+
 NOTICE_PATH = "/opt/pxe/notice.txt"
 
 
@@ -803,7 +828,9 @@ def mpv_cmd(wid, dev):
             "--input-vo-keyboard=no", "--input-cursor=no", "--really-quiet", "--fs=no",
             # 透传要看着画面操作: 不缓冲, 来一帧显示一帧
             "--profile=low-latency", "--untimed", "--cache=no",
-            "--demuxer-lavf-o-add=fflags=+nobuffer", dev]
+            "--demuxer-lavf-o-add=fflags=+nobuffer",
+            # 裸路径会被当文件 read(), SC0710 驱动的 read() 不出帧; 显式走 v4l2 mmap 采集
+            f"av://v4l2:{dev}"]
 
 
 # ---------------------------------------------------------------- 透传释放组合
@@ -922,3 +949,38 @@ def video_size(dev):
     """采集设备当前分辨率; 读不到按 1920x1080 (16:9) 算."""
     rc, out = run(["v4l2-ctl", "-d", dev, "--get-fmt-video"], timeout=3)
     return parse_v4l2_size(out) or (1920, 1080)
+
+
+# ---------------------------------------------------------------- 右侧按钮菜单
+# do = Kiosk 方法名; page = 进二级页; attr = 存成 self.<attr> 以便改文字; style = warn / danger
+# 子页由 kiosk 自动加「← 返回」. 常用的 (预览/串口/锁屏) 留在主页一键直达.
+
+MENU = {
+    "main": [
+        {"text": "UVC 预览:  开 / 关", "do": "toggle_preview", "attr": "btn_video"},
+        {"text": "画面设置  ▸", "page": "video"},
+        {"text": "串口会话:  开 / 关", "do": "toggle_serial", "attr": "btn_serial"},
+        {"text": "装机  ▸", "page": "install", "attr": "btn_install_page"},
+        {"text": "网络  ▸", "page": "net"},
+        {"text": "锁屏", "do": "lock_now"},
+        {"text": "电源  ▸", "page": "power"},
+    ],
+    "video": [
+        {"text": "画面源", "do": "switch_source", "attr": "btn_src"},
+        {"text": "鼠标:  绝对 (点哪是哪)", "do": "toggle_mouse_mode", "attr": "btn_mouse"},
+    ],
+    "install": [
+        {"text": "PXE 装机服务:  开 / 关", "do": "toggle_pxe"},
+        {"text": "装机模式:  救援 (安全)", "do": "toggle_install_mode", "attr": "btn_install"},
+        {"text": "Kickstart 编辑", "do": "toggle_ks", "attr": "btn_ks"},
+        {"text": "LAN1 装机口配置", "do": "cfg_lan1"},
+    ],
+    "net": [
+        {"text": "无线网络", "do": "toggle_wifi", "attr": "btn_wifi"},
+        {"text": "LAN2 管理口配置", "do": "cfg_lan2"},
+    ],
+    "power": [
+        {"text": "重启推车", "do": "reboot", "style": "warn"},
+        {"text": "关机", "do": "poweroff", "style": "danger"},
+    ],
+}
