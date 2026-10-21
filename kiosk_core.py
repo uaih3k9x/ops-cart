@@ -798,7 +798,8 @@ def code_matches(typed, code):
 def mpv_cmd(wid, dev):
     """嵌进 Tk Frame 的低延迟预览. 鼠标和键盘都不让 mpv 收: X11 下它不订阅这些事件,
     点击才会穿透给 Tk 的 Frame (单击进透传)."""
-    return ["mpv", f"--wid={wid}", "--no-osc", "--no-input-default-bindings",
+    # --vo=xv: GT740 + nouveau 下 mpv 自己用 GL 画, 会把碎片画到盖在上面的锁屏上 (推车无合成器)
+    return ["mpv", f"--wid={wid}", "--vo=xv", "--no-osc", "--no-input-default-bindings",
             "--input-vo-keyboard=no", "--input-cursor=no", "--really-quiet", "--fs=no",
             # 透传要看着画面操作: 不缓冲, 来一帧显示一帧
             "--profile=low-latency", "--untimed", "--cache=no",
