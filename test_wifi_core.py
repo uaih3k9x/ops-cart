@@ -91,7 +91,6 @@ def test_status_connected_and_is_default_route():
                    addr="wlp4s0           UP             10.253.97.104/20 2001:da8::1/64",
                    routes="default via 10.253.96.1 dev wlp4s0 proto dhcp metric 900")
     assert st == {"ssid": "SCNUNET", "signal": 89, "ip": "10.253.97.104/20", "egress": True}
-    assert wc.status_line(st) == "    10.253.97.104/20     SCNUNET  89%  (当前出口)"
 
 
 def test_status_backup_when_wired_wins():
@@ -99,9 +98,8 @@ def test_status_backup_when_wired_wins():
                    routes="default via 192.168.9.1 dev enp3s0 metric 100\n"
                           "default via 10.0.0.1 dev wlp4s0 metric 900")
     assert st["egress"] is False
-    assert wc.status_line(st).endswith("SCNUNET  70%  (备用)")
 
 
 def test_status_disconnected():
     st = wc.status(scan=r" :SCNUNET:70", addr="wlp4s0 DOWN", routes="")
-    assert st["ssid"] is None and wc.status_line(st) == "    未连接"
+    assert st["ssid"] is None

@@ -13,7 +13,6 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog
 
 import kiosk_core as kc
-import wifi_core as wc
 from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
@@ -40,6 +39,7 @@ class Kiosk(tk.Tk):
         self.video_frame = None
         self.passthrough = False
         self._ssd, self._ssd_ts = None, 0.0
+        self._check_rows, self._check_ts, self._checking = None, 0.0, False
         self._fans_seen = set()
         self._combo = kc.ReleaseCombo()
         self._kb = kc.HidKeyboard()
@@ -157,41 +157,28 @@ class Kiosk(tk.Tk):
 
     # ------------------------------------------------------------ 状态刷新
 
+    CHECK_EVERY = 10        # 自检项 (ping/PCI/nmcli...) 慢一点, 10 s 一轮; 温度风扇照旧 2 s
+
     def refresh(self):
+        """状态板 = 实时自检: 跟开机自检同一张计划表 (selftest.json), 再加温度/风扇."""
+        def checks():
+            try:
+                self._check_rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
+            finally:
+                self._checking = False
+
         def work():
-            svcs = kc.services_status()
-            nics = kc.nics_status()
-            misc = kc.misc_status()
             now = time.time()
             if now - self._ssd_ts > 60:          # smartctl 一分钟读一次就够
                 self._ssd, self._ssd_ts = kc.smart_temp(), now
             temps = kc.temps_status(smart=lambda: self._ssd)
             fans = kc.fans_to_show(kc.fans_status(), self._fans_seen)
-            lines = []
-            for n, (en, ac) in svcs.items():
-                lines.append(f"{'● 正常' if ac else '● 停止':<8} {n}"
-                             + ("  (未自启)" if not en else ""))
-            lines.append("")
-            for nic in nics:
-                lines.append(f"{nic['role']}  {nic['name']}")
-                lines.append(f"    {nic['ip']:<20} {nic['method']}"
-                             f"  {'已插线' if nic['link'] else '未插线'}")
-            wifi = wc.status(kc.run(wc.CMD_STATUS_SCAN)[1], kc.run(["ip", "-4", "-br", "addr", "show", wc.IFACE])[1],
-                             kc.run(["ip", "route"])[1])
-            lines.append(f"无线  {wc.IFACE}")
-            lines.append((wc.status_line(wifi), "t_warn") if wifi["egress"] else wc.status_line(wifi))
-            lines.append("")
-            lines.append(f"tailscale: {misc['tailscale_ip']}")
-            lines.append(f"CH9329 键鼠线: {'已连接' if misc['ch9329'] else '未连接'}")
-            lines.append(misc["uptime"])
-            if temps:
-                lines.append("")
-                for name, c in temps:
-                    lines.append((f"{name:<6}{c:>5.0f}°C", "t_" + kc.temp_level(c)))
-            for name, rpm in fans:
-                lines.append((f"{name:<6}{rpm:>5} RPM", "t_ok" if rpm else "t_hot"))
+            lines = kc.status_board_lines(self._check_rows, temps, fans, kc.misc_status()["uptime"])
             self.after(0, lambda: self._render(lines))
 
+        if not self._checking and time.time() - self._check_ts > self.CHECK_EVERY:
+            self._checking, self._check_ts = True, time.time()
+            threading.Thread(target=checks, daemon=True).start()
         threading.Thread(target=work, daemon=True).start()
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
@@ -200,19 +187,15 @@ class Kiosk(tk.Tk):
         if self.status_text.winfo_ismapped():
             self.status_text.config(state="normal")
             self.status_text.delete("1.0", "end")
-            for ln in lines:
-                if isinstance(ln, tuple):       # (文本, tag)
-                    self.status_text.insert("end", ln[0] + "\n", ln[1])
-                    continue
-                tag = "ok" if ln.startswith("● 正常") else (
-                      "bad" if ln.startswith("● 停止") else None)
-                self.status_text.insert("end", ln + "\n", tag or ())
+            for text, tag in lines:
+                self.status_text.insert("end", text + "\n", tag)
             self.status_text.config(state="disabled")
             self.status_text.tag_config("ok", foreground="#7ee787")
             self.status_text.tag_config("bad", foreground="#ff7b72")
             self.status_text.tag_config("t_ok", foreground="#9aa5b0")
             self.status_text.tag_config("t_warn", foreground="#f0b429")
             self.status_text.tag_config("t_hot", foreground="#ff7b72")
+            self.status_text.tag_config("dim", foreground="#6b7489")
 
     def toggle_serial(self):
         if self.serial_panel:
@@ -553,7 +536,7 @@ class Kiosk(tk.Tk):
         tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg=BOOT_BG, fg="#6b7280").pack()
         tk.Label(top, text=kc.version_string(), font=FONT_MONO, bg=BOOT_BG, fg="#9ca3af").pack(pady=(6, 0))
         box = tk.Frame(w, bg=BOOT_BG)
-        box.place(relx=0.5, rely=0.62, anchor="center")
+        box.place(relx=0.5, rely=0.43, anchor="n")     # 从标题下方往下排: 检查项多了也不盖住标题
         tk.Label(box, text="Step 3/3   System check", font=FONT_BIG, bg=BOOT_BG,
                  fg="#2a2e36", anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
 

@@ -251,11 +251,45 @@ def check_pci(ctx, id, count=1, driver=None):
     return "OK", f"x{len(found)} " + (", ".join(sorted(bound)) if bound else "NO DRIVER")
 
 
+def check_service(ctx, unit, required=False):
+    """在跑 OK; 开了自启却没跑 WARN (标 required 才算 FAIL); 没开自启 --."""
+    enabled, active = ctx["svcs"].get(unit, (False, False))
+    if active:
+        return "OK", "RUNNING"
+    if enabled:
+        return ("FAIL" if required else "WARN"), "NOT RUNNING"
+    return "--", "OFF"
+
+
+def check_wifi(ctx):
+    st = ctx["wifi"]()
+    if not st.get("ssid"):
+        return "--", "NOT CONNECTED"
+    # 默认路由走无线 = 网线断了它在顶班, 能用但该提醒
+    return ("WARN", f"{st['ssid']} {st['signal']}% IN USE") if st["egress"] \
+        else ("OK", f"{st['ssid']} {st['signal']}% STANDBY")
+
+
+def check_signal(ctx, match):
+    """采集卡有没有画面信号. match 对友好名/原名/key 做子串匹配, 取第一个."""
+    hit = next((x for x in ctx["videos"]() if match in x["friendly"] or match in x["name"]
+                or match in x["key"]), None)
+    if not hit:
+        return "FAIL", "NOT FOUND"
+    dev = os.path.basename(hit["dev"])
+    return ("OK", f"SIGNAL {dev}") if ctx["signal"](hit["dev"]) else ("--", f"NO SIGNAL {dev}")
+
+
 CHECKS = {"lan": check_lan, "tailscale": check_tailscale, "serial": check_serial,
           "ch9329": check_ch9329, "pxe": check_pxe, "cpu": check_cpu, "fan": check_fan,
-          "ping": check_ping, "pci": check_pci}
+          "ping": check_ping, "pci": check_pci, "service": check_service, "wifi": check_wifi,
+          "signal": check_signal}
 
-DEFAULT_PLAN = [{"check": "lan", "label": "LAN2", "iface": "enp3s0"},
+DEFAULT_PLAN = [{"check": "service", "label": "PXE SERVER", "unit": "pxe-server"},
+                {"check": "service", "label": "PXE HTTP REPO", "unit": "pxe-http-repo"},
+                {"check": "service", "label": "PXE HTTP BOOT", "unit": "pxe-http-boot"},
+                {"check": "lan", "label": "LAN2", "iface": "enp3s0"},
+                {"check": "wifi", "label": "WIFI"},
                 {"check": "tailscale"},
                 {"check": "serial", "label": "CONSOLE"},
                 {"check": "ch9329", "label": "CH9329"},
@@ -289,7 +323,7 @@ def selftest_run(plan, ctx, checks=CHECKS):
                 state, detail = fn(ctx, **params)
             except Exception:
                 state, detail = "FAIL", "ERROR"
-        rows.append({"label": label, "state": state, "detail": detail})
+        rows.append({"label": label, "state": state, "detail": detail, "check": item.get("check")})
     return rows
 
 
@@ -311,19 +345,43 @@ def selftest_context():
             "temps": temps_status(smart=lambda: None), "fans": fans_status(),
             "exists": os.path.exists, "pci": pci_devices,
             "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0,
-            "videos": video_nodes}
+            "videos": video_nodes, "signal": lambda dev: video_signal(dev), "wifi": wifi_status}
+
+
+def wifi_status():
+    import wifi_core as wc
+    return wc.status(run(wc.CMD_STATUS_SCAN)[1], run(["ip", "-4", "-br", "addr", "show", wc.IFACE])[1],
+                     run(["ip", "route"])[1])
 
 
 def selftest_rows(nics, misc, svcs, temps, fans, serial_ok):
     """旧接口: 默认计划 + 给定快照."""
     ctx = {"nics": nics, "misc": misc, "svcs": svcs, "temps": temps, "fans": fans,
-           "exists": lambda p: serial_ok, "ping": lambda h: False, "pci": lambda v, d: []}
+           "exists": lambda p: serial_ok, "ping": lambda h: False, "pci": lambda v, d: [],
+           "wifi": lambda: {"ssid": None}}
     return selftest_run(DEFAULT_PLAN, ctx)
 
 
 def selftest_line(row, width=24):
     """"LAN2 ............ OK   192.168.9.228\""""
     return f"{row['label'] + ' ':.<{width}} {row['state']:<4} {row['detail']}".rstrip()
+
+
+STATE_TAG = {"OK": "ok", "WARN": "t_warn", "FAIL": "bad"}
+ON_TEMPS_BLOCK = {"cpu", "fan"}      # 状态板下面有温度/风扇明细, 自检行就不重复
+
+
+def status_board_lines(rows, temps, fans, uptime):
+    """状态板 = 自检结果 (rows 为 None 表示第一轮还没跑完) + 温度/风扇 + 开机时长. -> [(文本, tag)]"""
+    lines = [("检查中…", "dim")] if rows is None else \
+        [(selftest_line(r, width=22), STATE_TAG.get(r["state"], "dim")) for r in rows
+         if r.get("check") not in ON_TEMPS_BLOCK]
+    lines += [("", "dim"), (uptime, "dim")]
+    if temps:
+        lines.append(("", "dim"))
+        lines += [(f"{name:<6}{c:>5.0f}°C", "t_" + temp_level(c)) for name, c in temps]
+    lines += [(f"{name:<6}{rpm:>5} RPM", "t_ok" if rpm else "t_hot") for name, rpm in fans]
+    return lines
 
 
 _CTRL_KEYS = {"Control_L", "Control_R"}
