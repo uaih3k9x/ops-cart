@@ -11,10 +11,12 @@ TFTP: 支持 blksize / tsize 协商, octet 模式, 拒绝根目录穿越.
 """
 
 import argparse
+import errno
 import logging
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -81,9 +83,44 @@ def arch_bootfile(opts, uefi_file, bios_file):
     return uefi_file  # 0007/0009: EFI x86-64
 
 
+SO_BINDTODEVICE = 25   # Linux; Python 的 socket 模块不一定导出这个常量
+
+
+def bind_retry(sock, addr, sleep=time.sleep, log=None, every_s=2):
+    """地址还没配上 (开机时网线没插) 就等它出现; 其他错误照常抛."""
+    waited = False
+    while True:
+        try:
+            sock.bind(addr)
+            if waited and log:
+                log.info("%s:%d 绑定成功", *addr)
+            return
+        except OSError as e:
+            if e.errno != errno.EADDRNOTAVAIL:
+                raise
+            if not waited and log:
+                log.warning("%s:%d 暂不可用 (网口没插线?), 每 %ds 重试", addr[0], addr[1], every_s)
+            waited = True
+            sleep(every_s)
+
+
+def open_dhcp_socket(sock, ip, port, iface=None, platform=sys.platform, sleep=time.sleep, log=None):
+    """DISCOVER 是发往 255.255.255.255 的广播. Linux 上绑具体 IP 收不到广播, 要绑 0.0.0.0;
+    但必须同时 SO_BINDTODEVICE 锁死在装机口, 否则就成了管理口上的野 DHCP.
+    没给网卡名时宁可收不到广播也不绑 0.0.0.0. Windows 绑具体 IP 就收得到广播, 保持原样."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    if iface and platform.startswith("linux"):
+        sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
+        sock.bind(("", port))
+    else:
+        bind_retry(sock, (ip, port), sleep=sleep, log=log)
+    return sock
+
+
 class DhcpServer:
-    def __init__(self, ip, pool_start, pool_end, uefi_file, bios_file, log, port=67):
+    def __init__(self, ip, pool_start, pool_end, uefi_file, bios_file, log, port=67, iface=None):
         self.ip = ip
+        self.iface = iface
         prefix, lo = pool_start.rsplit(".", 1)
         hi = int(pool_end.rsplit(".", 1)[1])
         if not pool_end.rsplit(".", 1)[0] == prefix:
@@ -175,7 +212,7 @@ class DhcpServer:
 
     def serve_proxy(self, ready_event=None):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind((self.ip, 4011))
+        bind_retry(s, (self.ip, 4011), log=self.log)
         if ready_event:
             ready_event.set()
         while True:
@@ -189,9 +226,8 @@ class DhcpServer:
                 s.sendto(reply, addr)  # 单播回源
 
     def serve(self, ready_event=None):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.bind((self.ip, self.port))
+        s = open_dhcp_socket(socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+                             self.ip, self.port, self.iface, log=self.log)
         if ready_event:
             ready_event.set()
         while True:
@@ -226,7 +262,7 @@ class TftpServer:
 
     def serve(self, ready_event=None):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind((self.ip, self.port))
+        bind_retry(s, (self.ip, self.port), log=self.log)
         if ready_event:
             ready_event.set()
         while True:
@@ -309,6 +345,7 @@ def main():
     p.add_argument("--uefi-file", default="shimx64.efi")
     p.add_argument("--bios-file", default="pxelinux.0")
     p.add_argument("--log", default=None)
+    p.add_argument("--iface", default=None, help="装机口网卡名 (Linux 必填, 否则收不到 DHCP 广播)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -320,15 +357,17 @@ def main():
     log = logging.getLogger("pxe")
     log.info("PXE 服务启动 ip=%s pool=%s tftp-root=%s", args.ip, args.pool, args.tftp_root)
 
-    dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log)
+    dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log,
+                      iface=args.iface)
+    if sys.platform.startswith("linux") and not args.iface:
+        log.warning("Linux 上没给 --iface: DHCP 只绑 %s, 收不到客户端的广播 DISCOVER", args.ip)
     tftp = TftpServer(args.ip, args.tftp_root, log)
     ev1, ev2, ev3 = threading.Event(), threading.Event(), threading.Event()
     threading.Thread(target=dhcp.serve, args=(ev1,), daemon=True).start()
     threading.Thread(target=tftp.serve, args=(ev2,), daemon=True).start()
     threading.Thread(target=dhcp.serve_proxy, args=(ev3,), daemon=True).start()
-    ev1.wait(5)
-    ev2.wait(5)
-    ev3.wait(5)
+    for ev in (ev1, ev2, ev3):     # 真绑上了才报就绪; 地址没出现就一直等 (bind_retry 里会提示)
+        ev.wait()
     log.info("DHCP UDP/67 + proxyDHCP UDP/4011 + TFTP UDP/69 就绪")
     while True:
         time.sleep(3600)
