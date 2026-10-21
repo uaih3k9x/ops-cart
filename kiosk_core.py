@@ -310,7 +310,8 @@ def selftest_context():
     return {"nics": nics_status(), "misc": misc_status(), "svcs": services_status(),
             "temps": temps_status(smart=lambda: None), "fans": fans_status(),
             "exists": os.path.exists, "pci": pci_devices,
-            "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0}
+            "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0,
+            "videos": video_nodes}
 
 
 def selftest_rows(nics, misc, svcs, temps, fans, serial_ok):
@@ -340,6 +341,65 @@ def video_devices(root="/dev"):
     except OSError:
         return []
     return [os.path.join(root, n) for n in sorted(names, key=lambda n: int(n[5:]))]
+
+
+
+V4L_SYS = "/sys/class/video4linux"
+VIDEO_NAMES = "/opt/pxe/video-names.json"     # 可选改名: {"0000:02:00.0": "X光左屏", "345f:2109": "小采集棒"}
+
+
+def video_nodes(sysdir=V4L_SYS, dev_root="/dev", names=None):
+    """能出画面的采集节点 (index=0; UVC 的元数据节点跳过), 带友好名称.
+    key = PCI 插槽 (SC0710) 或 USB vid:pid (从 UVC 名字里取), 用来改名和自检匹配."""
+    import re as _re
+    if names is None:
+        try:
+            names = json.load(open(VIDEO_NAMES))
+        except (OSError, ValueError):
+            names = {}
+    try:
+        entries = [n for n in os.listdir(sysdir) if n.startswith("video") and n[5:].isdigit()]
+    except OSError:
+        return []
+    nodes = []
+    for n in sorted(entries, key=lambda n: int(n[5:])):
+        d = os.path.join(sysdir, n)
+        if (_read(os.path.join(d, "index")) or "0").strip() != "0":
+            continue
+        name = (_read(os.path.join(d, "name")) or n).strip()
+        parent = os.path.basename(os.path.realpath(os.path.join(d, "device")))
+        usb = _re.search(r"\(([0-9a-f]{4}:[0-9a-f]{4})\)", name)
+        key = usb.group(1) if usb else parent if _re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d", parent) else n
+        nodes.append({"dev": os.path.join(dev_root, n), "name": name, "key": key})
+    sc = sorted(x["key"] for x in nodes if x["name"].startswith("SC0710"))
+    for x in nodes:
+        if x["key"] in names:
+            x["friendly"] = names[x["key"]]
+        elif x["name"].startswith("SC0710"):
+            x["friendly"] = f"SC0710 卡{sc.index(x['key']) + 1}"
+        elif x["key"] == "345f:2109":
+            x["friendly"] = "MS2130 USB"
+        else:
+            x["friendly"] = x["name"][:24]
+    return nodes
+
+
+def video_friendly(dev, nodes=None):
+    nodes = video_nodes() if nodes is None else nodes
+    return next((x["friendly"] for x in nodes if x["dev"] == dev), os.path.basename(dev))
+
+
+def check_video(ctx, match, count=1):
+    """采集节点在不在: match 对 key/原名/友好名做子串匹配 (如 "345f:2109"、"SC0710")."""
+    hit = [x for x in ctx["videos"]() if match in x["key"] or match in x["name"] or match in x["friendly"]]
+    if not hit:
+        return "FAIL", "NOT FOUND"
+    if len(hit) < count:
+        return "FAIL", f"x{len(hit)} / {count}"
+    return "OK", " ".join(os.path.basename(x["dev"]) for x in hit)
+
+
+CHECKS["video"] = check_video       # 定义在 CHECKS 之后, 这里补登记
 
 
 def next_video_device(devs, current):

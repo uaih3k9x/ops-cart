@@ -120,8 +120,8 @@ class Kiosk(tk.Tk):
             return b
 
         self.btn_video = big("UVC 预览:  开 / 关", self.toggle_preview)
-        self.video_dev = (kc.video_devices() or [VIDEO_DEV])[0]
-        self.btn_src = big(f"画面源:  {os.path.basename(self.video_dev)}", self.switch_source)
+        self.video_dev = ([x["dev"] for x in kc.video_nodes()] or [VIDEO_DEV])[0]
+        self.btn_src = big(f"画面源:  {kc.video_friendly(self.video_dev)}", self.switch_source)
         self.btn_mouse = big("鼠标:  绝对 (点哪是哪)", self.toggle_mouse_mode)
         self.btn_serial = big("串口会话:  开 / 关", self.toggle_serial)
         self.btn_ks = big("Kickstart 编辑", self.toggle_ks)
@@ -223,9 +223,9 @@ class Kiosk(tk.Tk):
     # ------------------------------------------------------------ UVC 预览
 
     def switch_source(self):
-        """video0 -> video1 -> ... 轮换; 正在预览就换源重开."""
-        self.video_dev = kc.next_video_device(kc.video_devices(), self.video_dev)
-        self.btn_src.config(text=f"画面源:  {os.path.basename(self.video_dev)}")
+        """在能出画面的采集节点之间轮换 (跳过 UVC 元数据节点); 正在预览就换源重开."""
+        self.video_dev = kc.next_video_device([x["dev"] for x in kc.video_nodes()], self.video_dev)
+        self.btn_src.config(text=f"画面源:  {kc.video_friendly(self.video_dev)}")
         if self.video_frame:
             self._stop_preview()
             self._start_preview()
@@ -293,7 +293,7 @@ class Kiosk(tk.Tk):
 
     def _banner_idle(self):
         mode = "绝对" if self.mouse_abs else "相对"
-        self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 鼠标{mode} · 单击画面进入透传")
+        self.banner.config(text=f"预览 {kc.video_friendly(self.video_dev)} · 鼠标{mode} · 单击画面进入透传")
 
     def _engage_passthrough(self):
         if self.passthrough:

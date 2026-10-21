@@ -6,6 +6,8 @@
   {"check": "pxe",       "label": "LAN1 / PXE", "iface": "eno1"},
   {"check": "cpu"},
   {"check": "fan"},
-  {"check": "pci",       "label": "CAPTURE",    "id": "12ab:0710", "count": 1},
+  {"check": "pci",       "label": "SC0710",     "id": "12ab:0710", "count": 2, "driver": "LINUXV4L2SC0710"},
+  {"check": "video",     "label": "SC0710 VIDEO", "match": "SC0710", "count": 2},
+  {"check": "video",     "label": "MS2130",     "match": "345f:2109"},
   {"check": "ping",      "label": "NAS",        "host": "192.168.1.10"}
 ]
