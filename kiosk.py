@@ -13,9 +13,11 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog
 
 import kiosk_core as kc
+import wifi_core as wc
 from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
+from wifi_panel import WifiPanel
 
 FONT = ("Noto Sans CJK SC", 13)
 FONT_BIG = ("Noto Sans CJK SC", 15)
@@ -111,27 +113,47 @@ class Kiosk(tk.Tk):
 
         btns = tk.Frame(body, bg="#10141c")
         btns.pack(side="right", fill="y")
+        self._build_menu(btns)
+        self.video_dev = kc.default_video(kc.video_nodes()) or VIDEO_DEV
+        self.btn_src.config(text=f"画面源:  {kc.video_friendly(self.video_dev)}")
 
-        def big(text, cmd, bg="#1f2a3d", fg="#e8eaf0"):
-            b = tk.Button(btns, text=text, font=FONT_BIG, command=cmd, bg=bg,
+    def _build_menu(self, btns):
+        """右侧按钮按 kc.MENU 分页: 每页一个 Frame, 全部先建好, 切页只换显示哪一个."""
+        colors = {"warn": ("#4a3320", "#e8eaf0"), "danger": ("#47202a", "#ffb3bd")}
+        self.btns_wrap, self.pages = btns, {}
+
+        def big(parent, text, cmd, bg="#1f2a3d", fg="#e8eaf0"):
+            b = tk.Button(parent, text=text, font=FONT_BIG, command=cmd, bg=bg,
                           fg=fg, activebackground="#3a4560", relief="flat",
-                          cursor="hand2", padx=30, pady=14)
+                          cursor="hand2", padx=30, pady=14, width=18)    # 定宽: 切页时左侧不跟着抖
             b.pack(fill="x", pady=6)
             return b
 
-        self.btn_video = big("UVC 预览:  开 / 关", self.toggle_preview)
-        self.video_dev = ([x["dev"] for x in kc.video_nodes()] or [VIDEO_DEV])[0]
-        self.btn_src = big(f"画面源:  {kc.video_friendly(self.video_dev)}", self.switch_source)
-        self.btn_mouse = big("鼠标:  绝对 (点哪是哪)", self.toggle_mouse_mode)
-        self.btn_serial = big("串口会话:  开 / 关", self.toggle_serial)
-        self.btn_ks = big("Kickstart 编辑", self.toggle_ks)
-        big("PXE 装机服务:  开 / 关", self.toggle_pxe)
-        self.btn_install = big("装机模式:  救援 (安全)", self.toggle_install_mode)
-        big("LAN1 装机口配置", self.cfg_lan1)
-        big("LAN2 管理口配置", self.cfg_lan2)
-        big("锁屏", self.lock_now)
-        big("重启推车", lambda: self.confirm_power(False), bg="#4a3320")
-        big("关机", lambda: self.confirm_power(True), bg="#47202a", fg="#ffb3bd")
+        for name, items in kc.MENU.items():
+            page = tk.Frame(btns, bg="#10141c")
+            self.pages[name] = page
+            if name != "main":
+                big(page, "←  返回", lambda: self.show_page("main"), bg="#2a3347", fg="#8b93a7")
+            for it in items:
+                if "page" in it:
+                    cmd = lambda p=it["page"]: self.show_page(p)
+                else:
+                    cmd = getattr(self, it["do"])
+                b = big(page, it["text"], cmd, *colors.get(it.get("style"), ()))
+                if "attr" in it:
+                    setattr(self, it["attr"], b)
+        self.show_page("main")
+
+    def show_page(self, name):
+        for page in self.pages.values():
+            page.pack_forget()
+        self.pages[name].pack(fill="x")
+
+    def reboot(self):
+        self.confirm_power(False)
+
+    def poweroff(self):
+        self.confirm_power(True)
 
     # ------------------------------------------------------------ 状态刷新
 
@@ -154,6 +176,10 @@ class Kiosk(tk.Tk):
                 lines.append(f"{nic['role']}  {nic['name']}")
                 lines.append(f"    {nic['ip']:<20} {nic['method']}"
                              f"  {'已插线' if nic['link'] else '未插线'}")
+            wifi = wc.status(kc.run(wc.CMD_STATUS_SCAN)[1], kc.run(["ip", "-4", "-br", "addr", "show", wc.IFACE])[1],
+                             kc.run(["ip", "route"])[1])
+            lines.append(f"无线  {wc.IFACE}")
+            lines.append((wc.status_line(wifi), "t_warn") if wifi["egress"] else wc.status_line(wifi))
             lines.append("")
             lines.append(f"tailscale: {misc['tailscale_ip']}")
             lines.append(f"CH9329 键鼠线: {'已连接' if misc['ch9329'] else '未连接'}")
@@ -197,6 +223,7 @@ class Kiosk(tk.Tk):
             self.banner.config(text="")
         else:
             self._stop_preview()
+            self._close_wifi()
             self.status_wrap.pack_forget()
             self.serial_panel = SerialPanel(self.body)
             self.serial_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
@@ -215,10 +242,32 @@ class Kiosk(tk.Tk):
             self._stop_preview()
             if self.serial_panel:
                 self.toggle_serial()
+            self._close_wifi()
             self.status_wrap.pack_forget()
             self.ks_panel = KsPanel(self.body)
             self.ks_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
             self.banner.config(text="Kickstart 编辑 · 保存自动备份, 修改立即对下次装机生效")
+
+    def _close_wifi(self):
+        if getattr(self, "wifi_panel", None):
+            self.wifi_panel.destroy()
+            self.wifi_panel = None
+            self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
+            self.banner.config(text="")
+
+    def toggle_wifi(self):
+        if getattr(self, "wifi_panel", None):
+            self._close_wifi()
+            return
+        self._stop_preview()
+        if self.serial_panel:
+            self.toggle_serial()
+        if getattr(self, "ks_panel", None):
+            self.toggle_ks()
+        self.status_wrap.pack_forget()
+        self.wifi_panel = WifiPanel(self.body)
+        self.wifi_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.banner.config(text="无线网络 · 优先级从上往下自动连, 再点一次按钮返回")
 
     # ------------------------------------------------------------ UVC 预览
 
@@ -240,6 +289,7 @@ class Kiosk(tk.Tk):
         if not os.path.exists(self.video_dev):
             messagebox.showwarning("UVC 预览", f"未检测到采集设备 {self.video_dev}")
             return
+        self._close_wifi()
         self.status_wrap.pack_forget()
         self.video_frame = tk.Frame(self.body, container=True, bg="#000000")
         self.video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
@@ -734,8 +784,12 @@ class Kiosk(tk.Tk):
             left = int(st["until"] - time.time())
             self.btn_install.config(text=f"⚠ 装机已解锁 {st['mac'][-8:]}  {left // 60:02d}:{left % 60:02d}",
                                     bg="#7a1f2b", fg="#ffffff")
+            # 解锁是危险状态, 主页也得看得见
+            self.btn_install_page.config(text=f"⚠ 装机已解锁  {left // 60:02d}:{left % 60:02d}  ▸",
+                                         bg="#7a1f2b", fg="#ffffff")
         else:
             self.btn_install.config(text="装机模式:  救援 (安全)", bg="#1f2a3d", fg="#e8eaf0")
+            self.btn_install_page.config(text="装机  ▸", bg="#1f2a3d", fg="#e8eaf0")
         if reschedule:
             self.after(2000, self._pxe_tick)
 
