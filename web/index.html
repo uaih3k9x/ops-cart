@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ops-cart</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<style>
+  :root { --bg:#12161e; --panel:#1a2130; --btn:#1f2a3d; --fg:#e8eaf0; --dim:#8b95a5;
+          --ok:#7ee787; --warn:#f0b429; --bad:#ff7b72; --acc:#4c8dff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 "Noto Sans CJK SC", system-ui, sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; background:var(--panel); }
+  header b { font-size:16px; }
+  header .ver { color:var(--dim); font-size:12px; }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav button, .btn { background:var(--btn); color:var(--fg); border:0; border-radius:6px;
+                     padding:6px 12px; cursor:pointer; font:inherit; }
+  nav button.on { background:var(--acc); }
+  .btn:hover, nav button:hover { filter:brightness(1.25); }
+  .btn.danger { background:#47202a; color:#ffb3bd; }
+  main { padding:16px; }
+  .page { display:none; } .page.on { display:block; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px; }
+  .card { background:var(--panel); border-radius:8px; padding:12px 14px; }
+  .card h3 { margin:0 0 8px; font-size:13px; color:var(--dim); font-weight:normal; }
+  .row { display:flex; justify-content:space-between; gap:8px; font-family:"Noto Sans Mono CJK SC", monospace; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad, .hot { color:var(--bad); } .dim { color:var(--dim); }
+  .bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:10px; }
+  select, input[type=text], input[type=password], textarea {
+    background:var(--btn); color:var(--fg); border:1px solid #2c3a52; border-radius:6px; padding:5px 8px; font:inherit; }
+  #screen { position:relative; background:#000; border-radius:6px; overflow:hidden; line-height:0; }
+  #screen img { width:100%; height:auto; display:block; cursor:pointer; }
+  #screen.lock img { cursor:none; outline:2px solid var(--acc); }
+  #hint { color:var(--dim); font-size:12px; }
+  #term { height:70vh; background:#000; border-radius:6px; padding:4px; }
+  #login { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; }
+  #login .card { width:min(320px, calc(100vw - 32px)); text-align:center; }
+  #login input { width:100%; font-size:22px; text-align:center; letter-spacing:6px; margin:10px 0; }
+  #msg { min-height:20px; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+
+<div id="login" class="hidden">
+  <div class="card">
+    <h3>ops-cart · 输入 PIN</h3>
+    <input id="pin" type="password" inputmode="numeric" autocomplete="off">
+    <button class="btn" id="go" style="width:100%">进入</button>
+    <div id="msg" class="bad"></div>
+  </div>
+</div>
+
+<header>
+  <b>ops-cart</b><span class="ver" id="ver"></span>
+  <nav>
+    <button data-p="status" class="on">状态</button>
+    <button data-p="kvm">KVM</button>
+    <button data-p="serial">串口</button>
+    <button data-p="settings">设置</button>
+  </nav>
+</header>
+
+<main>
+  <section id="p-status" class="page on">
+    <div class="bar"><button class="btn" id="st-run">跑一次自检</button><span class="dim" id="st-time"></span></div>
+    <div class="grid" id="cards"></div>
+  </section>
+
+  <section id="p-kvm" class="page">
+    <div class="bar">
+      <select id="vdev"></select>
+      <select id="fps"><option>5</option><option>10</option><option selected>15</option><option>25</option></select>
+      <button class="btn" id="v-go">打开画面</button>
+      <button class="btn" data-combo="ControlLeft,AltLeft,Delete">Ctrl+Alt+Del</button>
+      <button class="btn" data-combo="MetaLeft">Win</button>
+      <button class="btn" data-combo="AltLeft,Tab">Alt+Tab</button>
+      <button class="btn" data-combo="AltLeft,F4">Alt+F4</button>
+      <button class="btn" id="fs">全屏</button>
+      <span id="hint">单击画面进入键鼠透传 · Esc 释放</span>
+    </div>
+    <div id="screen"><img id="vimg" alt=""></div>
+    <div class="bar" style="margin-top:10px">
+      <textarea id="paste" rows="2" cols="50" placeholder="粘贴文字, 按“打字”逐字发给目标机器 (US 键盘, 仅 ASCII)"></textarea>
+      <button class="btn" id="type">打字</button>
+    </div>
+  </section>
+
+  <section id="p-serial" class="page">
+    <div class="bar">
+      <select id="sport"></select>
+      <button class="btn" id="s-go">连接</button>
+      <button class="btn" id="s-stop">断开</button>
+      <span class="dim" id="s-state">未连接</span>
+    </div>
+    <div id="term"></div>
+  </section>
+
+  <section id="p-settings" class="page">
+    <div class="grid">
+      <div class="card">
+        <h3>局域网访问</h3>
+        <label><input type="checkbox" id="lan"> 允许实验室局域网直接访问 (仍需 PIN)</label>
+        <div class="dim" id="lan-note" style="margin-top:6px"></div>
+      </div>
+      <div class="card">
+        <h3>会话</h3>
+        <button class="btn danger" id="logout">退出登录</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="vendor/xterm.js"></script>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const api = async (path, body) => {
+  const r = await fetch(path, body === undefined ? {} :
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (r.status === 401) { showLogin(); throw new Error("401"); }
+  return r.json();
+};
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+let me = {};
+
+// ---------------------------------------------------------------- 登录
+function showLogin() { $("#login").classList.remove("hidden"); $("#pin").focus(); }
+async function doLogin() {
+  const r = await api("/api/login", { pin: $("#pin").value });
+  if (r.result === "ok") { $("#login").classList.add("hidden"); $("#pin").value = ""; boot(); }
+  else $("#msg").textContent = r.result === "locked" ? "输错太多次, 稍后再试" : "PIN 不对";
+}
+$("#go").onclick = doLogin;
+$("#pin").onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
+
+// ---------------------------------------------------------------- 导航
+document.querySelectorAll("nav button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.id === "p-" + b.dataset.p));
+  if (b.dataset.p === "serial") setTimeout(() => fit(), 0);
+});
+
+// ---------------------------------------------------------------- 状态
+function card(title, rows) {
+  return `<div class="card"><h3>${esc(title)}</h3>${rows.map(([l, r, cls]) =>
+    `<div class="row"><span>${esc(l)}</span><span class="${cls || ""}">${esc(r)}</span></div>`).join("")}</div>`;
+}
+let selftest = null;
+async function refresh() {
+  const s = await api("/api/status");
+  $("#ver").textContent = s.version;
+  const m = s.misc || {};
+  const cards = [
+    card("服务", s.services.map((x) => [x.name, (x.active ? "● 正常" : "● 停止") + (x.enabled ? "" : " (未自启)"), x.active ? "ok" : "bad"])),
+    card("网卡", s.nics.flatMap((n) => [[`${n.role} ${n.name}`, n.link ? "已插线" : "未插线", n.link ? "ok" : "dim"], ["", `${n.ip} ${n.method}`, "dim"]])),
+    card("连接", [["tailscale", m.tailscale_ip || "-"], ["CH9329 键鼠线", m.ch9329 ? "已连接" : "未连接", m.ch9329 ? "ok" : "bad"], ["", m.uptime || "", "dim"]]),
+    card("温度 / 风扇", s.temps.map((t) => [t.name, `${t.c.toFixed(0)}°C`, t.level]).concat(
+      s.fans.map((f) => [f.name, `${f.rpm} RPM`, f.rpm ? "ok" : "hot"]))),
+  ];
+  if (selftest) cards.push(card("自检", selftest.map((r) => [r.label, `${r.state} ${r.detail}`,
+    { OK: "ok", WARN: "warn", FAIL: "bad" }[r.state]])));
+  if (Object.keys(s.errors).length) cards.push(card("采集出错", Object.entries(s.errors).map(([k, v]) => [k, v, "bad"])));
+  $("#cards").innerHTML = cards.join("");
+  $("#st-time").textContent = new Date(s.time * 1000).toLocaleTimeString();
+}
+$("#st-run").onclick = async () => {
+  $("#st-run").disabled = true;
+  try { selftest = (await api("/api/selftest")).rows; await refresh(); } finally { $("#st-run").disabled = false; }
+};
+
+// ---------------------------------------------------------------- KVM: 画面
+async function loadVideos() {
+  const { devices } = await api("/api/videos");
+  $("#vdev").innerHTML = devices.map((d) => `<option>${esc(d)}</option>`).join("") || "<option value=''>没有采集设备</option>";
+}
+$("#v-go").onclick = () => {
+  const d = $("#vdev").value;
+  if (!d) return;
+  $("#vimg").src = `/api/video?dev=${encodeURIComponent(d)}&fps=${$("#fps").value}&t=${Date.now()}`;
+};
+$("#fs").onclick = async () => {
+  await $("#screen").requestFullscreen();
+  if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+};
+
+// ---------------------------------------------------------------- KVM: 键鼠
+// 事件攒一小批串行 POST, 保证顺序; 鼠标位移在批内累加
+const q = []; let mouse = { dx: 0, dy: 0, w: 0, b: 0, dirty: false }; let sending = false;
+async function pump() {
+  if (sending) return;
+  sending = true;
+  try {
+    while (q.length || mouse.dirty) {
+      if (mouse.dirty) { q.push({ t: "m", dx: mouse.dx, dy: mouse.dy, w: mouse.w, b: mouse.b });
+                         mouse.dx = mouse.dy = mouse.w = 0; mouse.dirty = false; }
+      const batch = q.splice(0, q.length);
+      const r = await fetch("/api/hid", { method: "POST", headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify({ events: batch }) });
+      if (!r.ok) { $("#hint").textContent = "CH9329 未连接或发送失败"; q.length = 0; break; }
+    }
+  } finally { sending = false; }
+}
+const push = (ev) => { q.push(ev); pump(); };
+const locked = () => document.pointerLockElement === $("#vimg");
+
+$("#vimg").onclick = () => { if (!locked()) $("#vimg").requestPointerLock(); };
+document.addEventListener("pointerlockchange", () => {
+  $("#screen").classList.toggle("lock", locked());
+  $("#hint").textContent = locked() ? "🔒 透传中 · Esc 释放" : "单击画面进入键鼠透传 · Esc 释放";
+  if (!locked()) push({ t: "release" });
+});
+document.addEventListener("mousemove", (e) => {
+  if (!locked()) return;
+  mouse.dx += e.movementX; mouse.dy += e.movementY; mouse.dirty = true; pump();
+});
+const btn = (e) => { if (!locked()) return; e.preventDefault(); mouse.b = e.buttons & 7; mouse.dirty = true; pump(); };
+document.addEventListener("mousedown", btn);
+document.addEventListener("mouseup", btn);
+document.addEventListener("contextmenu", (e) => { if (locked()) e.preventDefault(); });
+document.addEventListener("wheel", (e) => {
+  if (!locked()) return;
+  e.preventDefault(); mouse.w += e.deltaY > 0 ? -1 : 1; mouse.dirty = true; pump();
+}, { passive: false });
+const key = (down) => (e) => {
+  if (!locked()) return;
+  e.preventDefault();
+  push({ t: "k", code: e.code, down });
+};
+document.addEventListener("keydown", key(true));
+document.addEventListener("keyup", key(false));
+window.addEventListener("blur", () => push({ t: "release" }));   // 切走窗口别让目标机器以为键还按着
+
+document.querySelectorAll("[data-combo]").forEach((b) => b.onclick = () => {
+  const codes = b.dataset.combo.split(",");
+  codes.forEach((c) => q.push({ t: "k", code: c, down: true }));
+  codes.reverse().forEach((c) => q.push({ t: "k", code: c, down: false }));
+  pump();
+});
+$("#type").onclick = async () => {
+  const text = $("#paste").value;
+  if (text) await api("/api/type", { text });
+};
+
+// ---------------------------------------------------------------- 串口
+const term = new Terminal({ fontFamily: '"Noto Sans Mono CJK SC", monospace', fontSize: 14,
+                            theme: { background: "#000000" }, convertEol: false });
+term.open($("#term"));
+function fit() {   // 不带 fit 插件, 按字符格子粗算
+  const el = $("#term"), cw = 8.4, ch = 17;
+  term.resize(Math.max(40, Math.floor((el.clientWidth - 8) / cw)), Math.max(10, Math.floor((el.clientHeight - 8) / ch)));
+}
+window.addEventListener("resize", fit);
+let es = null;
+const b64 = (s) => { let bin = ""; new TextEncoder().encode(s).forEach((x) => bin += String.fromCharCode(x)); return btoa(bin); };
+term.onData((d) => { if (es) api("/api/serial/send", { data: b64(d) }).catch(() => {}); });
+async function loadPorts() {
+  const { ports } = await api("/api/serial/ports");
+  $("#sport").innerHTML = ports.map((p) => `<option>${esc(p)}</option>`).join("") || "<option value=''>没有在跑的串口服务</option>";
+}
+$("#s-go").onclick = () => {
+  const name = $("#sport").value;
+  if (!name) return;
+  if (es) es.close();
+  es = new EventSource(`/api/serial/stream?name=${encodeURIComponent(name)}`);
+  es.onopen = () => { $("#s-state").textContent = `已连接 ${name}`; $("#s-state").className = "ok"; term.focus(); };
+  es.onmessage = (e) => term.write(Uint8Array.from(atob(e.data), (c) => c.charCodeAt(0)));
+  es.onerror = () => { $("#s-state").textContent = "已断开"; $("#s-state").className = "bad"; es.close(); es = null; };
+};
+$("#s-stop").onclick = () => { if (es) { es.close(); es = null; } $("#s-state").textContent = "未连接"; $("#s-state").className = "dim"; };
+
+// ---------------------------------------------------------------- 设置
+$("#lan").onchange = async () => {
+  try { me.lan_open = (await api("/api/lan", { open: $("#lan").checked })).lan_open; }
+  finally { $("#lan").checked = !!me.lan_open; }
+};
+$("#logout").onclick = async () => { await api("/api/logout", {}); location.reload(); };
+
+// ---------------------------------------------------------------- 启动
+let timer = null;
+async function boot() {
+  me = await (await fetch("/api/whoami")).json();
+  if (!me.authed) return showLogin();
+  $("#lan").checked = me.lan_open;
+  $("#lan").disabled = me.kind !== "trusted";
+  $("#lan-note").textContent = me.kind === "trusted" ? "关闭后局域网立即无法访问, tailnet 不受影响。未设 PIN 时局域网始终拒绝。"
+                                                     : "你正通过局域网访问, 只能从 tailnet 或推车本机切换。";
+  await Promise.all([refresh(), loadVideos(), loadPorts()]);
+  clearInterval(timer);
+  timer = setInterval(() => refresh().catch(() => {}), 3000);
+}
+boot();
+</script>
+</body>
+</html>
