@@ -694,3 +694,51 @@ def test_parse_v4l2_size():
     out = "Format Video Capture:\n\tWidth/Height      : 1920/1080\n\tPixel Format      : 'MJPG'\n"
     assert kc.parse_v4l2_size(out) == (1920, 1080)
     assert kc.parse_v4l2_size("garbage") is None
+
+
+# ------------------------------------------------------------ 采集设备友好名称 + 自检 (2026-10-21)
+
+def _fake_v4l(tmp_path):
+    """照推车实测造一份 /sys/class/video4linux: MS2130 占 video0(画面)+video1(元数据), 两张 SC0710."""
+    sysv, devs = tmp_path / "v4l", tmp_path / "devices"
+    for node, name, index, dev in (
+            ("video0", "UVC Camera (345f:2109): USB Vid", 0, "usb1/1-4/1-4.4/1-4.4:1.0"),
+            ("video1", "UVC Camera (345f:2109): USB Vid", 1, "usb1/1-4/1-4.4/1-4.4:1.0"),
+            ("video3", "SC0710:RAW 01.00 0001f715", 0, "pci0000:00/0000:00:1d.0/0000:04:00.0"),
+            ("video2", "SC0710:RAW 00.00 0001f715", 0, "pci0000:00/0000:00:06.0/0000:02:00.0")):
+        d = sysv / node
+        d.mkdir(parents=True)
+        (d / "name").write_text(name + "\n")
+        (d / "index").write_text(f"{index}\n")
+        (devs / dev).mkdir(parents=True, exist_ok=True)
+        (d / "device").symlink_to(devs / dev)
+    return sysv
+
+
+def test_video_nodes_friendly_and_capture_only(tmp_path):
+    nodes = kc.video_nodes(_fake_v4l(tmp_path), dev_root="/dev")
+    assert [(n["dev"], n["friendly"]) for n in nodes] == [
+        ("/dev/video0", "MS2130 USB"),
+        ("/dev/video2", "SC0710 卡1"),          # 按 PCI 插槽排: 02:00.0 是卡1
+        ("/dev/video3", "SC0710 卡2"),
+    ]                                           # video1 是元数据节点, 不出画面, 跳过
+    assert nodes[1]["key"] == "0000:02:00.0" and nodes[0]["key"] == "345f:2109"
+
+
+def test_video_nodes_name_overrides(tmp_path):
+    names = {"0000:04:00.0": "X光右屏"}
+    nodes = kc.video_nodes(_fake_v4l(tmp_path), dev_root="/dev", names=names)
+    assert [n["friendly"] for n in nodes] == ["MS2130 USB", "SC0710 卡1", "X光右屏"]
+
+
+def test_video_nodes_missing_sysfs(tmp_path):
+    assert kc.video_nodes(tmp_path / "nope") == []
+
+
+def test_check_video_by_match():
+    nodes = [{"dev": "/dev/video0", "friendly": "MS2130 USB", "key": "345f:2109", "name": "UVC Camera"},
+             {"dev": "/dev/video2", "friendly": "SC0710 卡1", "key": "0000:02:00.0", "name": "SC0710:RAW"}]
+    ctx = {"videos": lambda: nodes}
+    assert kc.check_video(ctx, "345f:2109") == ("OK", "video0")
+    assert kc.check_video(ctx, "SC0710", count=2) == ("FAIL", "x1 / 2")
+    assert kc.check_video(ctx, "dead:beef") == ("FAIL", "NOT FOUND")
