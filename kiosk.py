@@ -22,7 +22,6 @@ FONT_BIG = ("Noto Sans CJK SC", 15)
 FONT_MONO = ("Noto Sans Mono CJK SC", 13)
 BOOT_BG = "#ffffff"     # 开机自检页白底, 接 Plymouth 的白底
 VIDEO_DEV = "/dev/video0"
-SCREENSAVER_IMG = "/opt/pxe/nailong.png"
 IDLE_SECONDS = 180
 
 # Tk keysym -> ch9329 键名
@@ -59,6 +58,7 @@ class Kiosk(tk.Tk):
         self._ssd, self._ssd_ts = None, 0.0
         self._fans_seen = set()
         self._mods = set()
+        self._combo = kc.ReleaseCombo()
         self._mouse_acc = [0, 0, 0]      # dx, dy, wheel
         self._mouse_btn = 0
         self._last_pos = None
@@ -68,18 +68,22 @@ class Kiosk(tk.Tk):
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read())
         self._lock_win = None
-        self._screensaver_win = None
         self._boot_win = None
+        self._code = None
+        try:
+            kc.pxe_disarm()             # 开机即复位: PXE 默认只给救援菜单
+        except OSError:
+            pass
         self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
         self.after(50, self._boot_selftest)
         self._last_input = time.time()
-        self._img = None
         for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
             self.bind_all(seq, self._note_input, add="+")
         # 透传的键盘走全局: Tk 把按键投给有焦点的窗口, 不是嵌着 mpv 的那个 Frame
         self.bind_all("<KeyPress>", lambda e: self.passthrough and self._on_key(e, True), add="+")
         self.bind_all("<KeyRelease>", lambda e: self.passthrough and self._on_key(e, False), add="+")
-        self.after(5000, self._screensaver_tick)
+        self.after(5000, self._idle_tick)
+        self.after(2000, self._pxe_tick)
         self.after(100, self.refresh)
 
     def _fill_screen(self):
@@ -136,6 +140,7 @@ class Kiosk(tk.Tk):
         self.btn_serial = big("串口会话:  开 / 关", self.toggle_serial)
         self.btn_ks = big("Kickstart 编辑", self.toggle_ks)
         big("PXE 装机服务:  开 / 关", self.toggle_pxe)
+        self.btn_install = big("装机模式:  救援 (安全)", self.toggle_install_mode)
         big("LAN1 装机口配置", self.cfg_lan1)
         big("LAN2 管理口配置", self.cfg_lan2)
         big("锁屏", self.lock_now)
@@ -256,11 +261,7 @@ class Kiosk(tk.Tk):
         self.update_idletasks()
         wid = self.video_frame.winfo_id()
         self.mpv = subprocess.Popen(
-            ["mpv", f"--wid={wid}", "--no-osc", "--no-input-default-bindings",
-             "--input-vo-keyboard=no", "--really-quiet", "--fs=no",
-             # 透传要看着画面操作: 不缓冲, 来一帧显示一帧
-             "--profile=low-latency", "--untimed", "--cache=no",
-             "--demuxer-lavf-o-add=fflags=+nobuffer", self.video_dev],
+            kc.mpv_cmd(wid, self.video_dev),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
 
@@ -310,8 +311,11 @@ class Kiosk(tk.Tk):
             messagebox.showwarning("键鼠透传", f"CH9329 未连接 ({kc.ch9329_port()})")
             return
         self.passthrough = True
+        self._combo = kc.ReleaseCombo()
+        self._mute_tk_keys()
         self._mods.clear()
         self._last_pos = None
+        self._mouse_acc, self._mouse_btn = [0, 0, 0], 0
         self.video_frame.grab_set_global()
         self.video_frame.config(cursor="none")
         for seq in ("<Motion>", "<Button-1>", "<Button-2>", "<Button-3>",
@@ -319,22 +323,31 @@ class Kiosk(tk.Tk):
                     "<MouseWheel>"):
             self.video_frame.bind(seq, self._on_passthrough_event)
         self.focus_force()
-        self.banner.config(text="🔒 透传中 · Ctrl+Alt 释放")
+        self.banner.config(text="🔒 透传中 · 按一下 Ctrl+Alt 再松开 = 释放")
         self.after(16, self._flush_mouse)
 
     def _release_passthrough(self):
         if not self.passthrough:
             return
         self.passthrough = False
+        self._restore_tk_keys()
         try:
             self.video_frame.grab_release()
             self.video_frame.config(cursor="arrow")
         except tk.TclError:
             pass
         self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
-        self._ch_send("send_mouse", 0, 0, 0, 0)   # 松开所有键
+        self._mouse_acc, self._mouse_btn, self._mods = [0, 0, 0], 0, set()
+        self._ch_send("send_mouse", 0, 0, 0, 0)   # 松开所有鼠标键
+        self._ch_send("send_keys", [], press_ms=0)   # 松开所有键盘键
 
     def _on_passthrough_event(self, ev):
+        # 透传时这些事件绑定会一直留在 Frame 上: 释放后左键单击 = 重新进透传, 其余忽略
+        # (否则第二次点不进去, 且释放期间的移动会攒成一大步甩给目标机)
+        if not self.passthrough:
+            if ev.type == "4" and str(ev.num) == "1":
+                self._engage_passthrough()
+            return
         if ev.type == "6":            # Motion
             pos = (ev.x_root, ev.y_root)
             if self._last_pos:
@@ -352,18 +365,17 @@ class Kiosk(tk.Tk):
 
     def _on_key(self, ev, down):
         mod = MODIFIER_KEYS.get(ev.keysym)
+        name = mod or ev.keysym
+        if self._combo.key(name, down):      # Ctrl+Alt 按下又松开、中间没按别的 -> 释放
+            self._release_passthrough()
+            return
         if mod:
             if down:
                 self._mods.add(mod)
             else:
                 self._mods.discard(mod)
-            # Ctrl+Alt 同按 -> 释放透传(看 X 的修饰位, 不全靠自己记的按下集合)
-            if down and ({"ctrl", "alt"} <= self._mods or kc.is_release_combo(ev.keysym, ev.state)):
-                self._release_passthrough()
             return
         if not down:
-            self.ch and self.ch._send_raw(
-                self.ch.build_frame(0x02, b"\x00" * 8)) if hasattr(self.ch, "build_frame") else None
             return
         key = None
         if len(ev.char) == 1 and ev.char in KEYS:
@@ -375,6 +387,20 @@ class Kiosk(tk.Tk):
                 self._ch_send("send_keys", list(self._mods) + [key], press_ms=20)
             except ValueError:      # 组合里有 CH9329 不认的键
                 pass
+
+    # Tk 在 all 标签上默认绑了 Tab/Shift-Tab(切焦点)、Alt+键(跳菜单)、F10(菜单),
+    # 比我们的 <KeyPress> 更具体, 会把这些键截走 -> 透传期间临时撤掉, 释放时原样装回
+    _TK_STEALS = ("<<NextWindow>>", "<<PrevWindow>>", "<Alt-KeyPress>", "<Key-F10>")
+
+    def _mute_tk_keys(self):
+        self._tk_saved = {seq: self.tk.call("bind", "all", seq) for seq in self._TK_STEALS}
+        for seq in self._TK_STEALS:
+            self.tk.call("bind", "all", seq, "")
+
+    def _restore_tk_keys(self):
+        for seq, script in getattr(self, "_tk_saved", {}).items():
+            self.tk.call("bind", "all", seq, script)
+        self._tk_saved = {}
 
     def _flush_mouse(self):
         if not self.passthrough:
@@ -583,47 +609,123 @@ class Kiosk(tk.Tk):
             messagebox.showerror("PIN", "PIN 不对" if r == "bad" else "错误次数过多，稍后再试")
         return r == "ok"
 
-    # ------------------------------------------------------------ 屏保 (奶龙)
+    # ------------------------------------------------------------ 闲置自动锁屏
 
     def _note_input(self, _event=None):
         self._last_input = time.time()
-        if self._screensaver_win:
-            self._hide_screensaver()
 
-    def _screensaver_tick(self):
-        signage = self._lock_win is not None and kc.notice_read() != ""   # 当引导牌时不放屏保
-        if not signage and kc.screensaver_due(self._last_input, time.time(),
-                              IDLE_SECONDS, showing=bool(self._screensaver_win)):
-            self._show_screensaver()
-        self.after(5000, self._screensaver_tick)
+    def _idle_tick(self):
+        """闲置 IDLE_SECONDS 直接进锁屏 (时钟 + 公告 + PIN), 不再放屏保盖住公告."""
+        if self.gate.required and kc.screensaver_due(self._last_input, time.time(), IDLE_SECONDS,
+                                                     showing=self._lock_win is not None):
+            self.lock()
+        self.after(5000, self._idle_tick)
 
-    def _show_screensaver(self):
-        import os
-        if not os.path.exists(SCREENSAVER_IMG):
+    # ------------------------------------------------------------ 装机模式
+
+    def toggle_install_mode(self):
+        st = kc.pxe_mode_read()
+        if st["mode"] == "install":
+            if messagebox.askyesno("装机模式", f"提前上锁? (当前只对 {st['mac']} 开放装机)"):
+                kc.pxe_disarm()
+                self._pxe_tick(reschedule=False)
             return
-        try:
-            if self._img is None:
-                self._img = tk.PhotoImage(file=SCREENSAVER_IMG)
-        except tk.TclError:
-            return
-        w = tk.Toplevel(self)
+        self._arm_dialog()
+
+    def _arm_dialog(self):
+        """解锁: 选一台机器 + 照抄屏幕上的随机码. 码只显示在推车屏幕上, 远程开不了."""
+        self._code = kc.new_code()
+        w = tk.Toplevel(self, bg="#161b26", highlightthickness=3, highlightbackground="#7a1f2b")
         w.overrideredirect(True)
-        w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
-        w.configure(bg="#000000")
-        tk.Label(w, image=self._img, bg="#000000").place(relx=0.5, rely=0.5, anchor="center")
+        W, H = 780, 760
+        w.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
         w.attributes("-topmost", True)
-        w.bind("<Any-KeyPress>", self._note_input, add="+")
-        w.bind("<Any-Motion>", self._note_input, add="+")
-        w.bind("<Button>", self._note_input, add="+")
-        self._screensaver_win = w
+        tk.Label(w, text="解锁装机模式", font=FONT_BIG, bg="#161b26", fg="#e8eaf0").pack(pady=(18, 4))
+        tk.Label(w, text="选定的机器下次 PXE 会自动安装 Rocky 并清空整块硬盘 (clearpart --all)。\n"
+                         "只对这一台开放, 30 分钟或它取走装机菜单后自动上锁。",
+                 font=FONT, bg="#161b26", fg="#ff7b72", justify="center").pack(pady=(0, 10))
+        tk.Label(w, text="最近来要过地址的机器 (或在下面手填 MAC):", font=FONT, bg="#161b26",
+                 fg="#8b93a7").pack(anchor="w", padx=24)
+        lb = tk.Listbox(w, font=FONT_MONO, height=5, bg="#1f2a3d", fg="#e8eaf0", relief="flat",
+                        selectbackground="#3a4560", exportselection=False)
+        for mac in kc.recent_pxe_clients(self._pxe_log_tail()):
+            lb.insert("end", mac)
+        if lb.size():
+            lb.selection_set(0)
+        lb.pack(fill="x", padx=24)
+        mac_var = tk.StringVar()
+        tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg="#1f2a3d", fg="#e8eaf0",
+                 insertbackground="#e8eaf0", relief="flat").pack(fill="x", padx=24, pady=(6, 12), ipady=4)
+        tk.Label(w, text="照抄验证码:", font=FONT, bg="#161b26", fg="#8b93a7").pack()
+        tk.Label(w, text=" ".join(self._code), font=("Noto Sans Mono CJK SC", 40, "bold"),
+                 bg="#161b26", fg="#f0b429").pack()
+        code_var = tk.StringVar()
+        e = tk.Entry(w, textvariable=code_var, font=("Noto Sans Mono CJK SC", 22), width=10,
+                     justify="center", bg="#1f2a3d", fg="#e8eaf0", insertbackground="#e8eaf0", relief="flat")
+        e.pack(pady=8, ipady=6)
+        msg = tk.Label(w, text="", font=FONT, bg="#161b26", fg="#ff7b72")
+        msg.pack()
 
-    def _hide_screensaver(self):
-        if self._screensaver_win:
-            self._screensaver_win.destroy()
-            self._screensaver_win = None
-            if self.gate.required:      # 屏保醒来即锁屏
-                self.lock()
-        self._last_input = time.time()
+        def ok(_e=None):
+            sel = lb.curselection()
+            mac = mac_var.get().strip() or (lb.get(sel[0]) if sel else "")
+            if not kc.code_matches(code_var.get(), self._code or ""):
+                self._code = kc.new_code()          # 输错就换码, 不给试
+                msg.config(text="验证码不对, 已换新码")
+                w.destroy()
+                self._arm_dialog()
+                return
+            try:
+                kc.pxe_arm(mac)
+            except ValueError as ex:
+                msg.config(text=str(ex))
+                return
+            self._code = None
+            w.destroy()
+            self._pxe_tick(reschedule=False)
+
+        def cancel():
+            self._code = None
+            w.destroy()
+
+        row = tk.Frame(w, bg="#161b26")
+        row.pack(pady=10)
+        tk.Button(row, text="解锁", font=FONT_BIG, command=ok, bg="#47202a", fg="#ffb3bd",
+                  relief="flat", padx=24).pack(side="left", padx=8)
+        tk.Button(row, text="取消", font=FONT_BIG, command=cancel, bg="#2a3347", fg="#e8eaf0",
+                  relief="flat", padx=24).pack(side="left", padx=8)
+        e.bind("<Return>", ok)
+        w.after(100, lambda: (w.focus_force(), e.focus_set()))
+
+    @staticmethod
+    def _pxe_log_tail(n=256 * 1024):
+        try:
+            with open(kc.PXE_LOG, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - n))
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def _pxe_tick(self, reschedule=True):
+        """到期 / 选定机器取走了装机菜单 -> 自动上锁; 按钮显示当前状态."""
+        st = kc.pxe_mode_read()
+        if st["mode"] == "install" and kc.pxe_consumed(self._pxe_log_tail(), st["mac"], st["since"]):
+            kc.pxe_disarm()
+            self.banner.config(text=f"{st['mac']} 已取走装机菜单, 装机模式已自动上锁")
+            st = {"mode": "rescue"}
+        elif st["mode"] == "expired":
+            kc.pxe_disarm()
+            self.banner.config(text="装机模式 30 分钟到期, 已自动上锁")
+            st = {"mode": "rescue"}
+        if st["mode"] == "install":
+            left = int(st["until"] - time.time())
+            self.btn_install.config(text=f"⚠ 装机已解锁 {st['mac'][-8:]}  {left // 60:02d}:{left % 60:02d}",
+                                    bg="#7a1f2b", fg="#ffffff")
+        else:
+            self.btn_install.config(text="装机模式:  救援 (安全)", bg="#1f2a3d", fg="#e8eaf0")
+        if reschedule:
+            self.after(2000, self._pxe_tick)
 
     def quit_kiosk(self):
         if not self._confirm_pin("退出到终端"):
