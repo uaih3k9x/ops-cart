@@ -768,3 +768,96 @@ class ReleaseCombo:
         if fire or not self.held:
             self.armed = False
         return fire
+
+
+# ---------------------------------------------------------------- 透传键盘: 物理键码 -> HID
+
+# Linux evdev 键码 -> USB HID usage (修饰键给位); X 键码 = evdev + 8
+_EVDEV_HID = {
+    1: 0x29, 14: 0x2A, 15: 0x2B, 28: 0x28, 57: 0x2C, 58: 0x39,
+    12: 0x2D, 13: 0x2E, 26: 0x2F, 27: 0x30, 43: 0x31, 39: 0x33, 40: 0x34, 41: 0x35,
+    51: 0x36, 52: 0x37, 53: 0x38, 86: 0x64, 127: 0x65,
+    99: 0x46, 70: 0x47, 119: 0x48, 110: 0x49, 102: 0x4A, 104: 0x4B, 111: 0x4C,
+    107: 0x4D, 109: 0x4E, 106: 0x4F, 105: 0x50, 108: 0x51, 103: 0x52,
+    69: 0x53, 98: 0x54, 55: 0x55, 74: 0x56, 78: 0x57, 96: 0x58, 83: 0x63,
+    79: 0x59, 80: 0x5A, 81: 0x5B, 75: 0x5C, 76: 0x5D, 77: 0x5E, 71: 0x5F, 72: 0x60, 73: 0x61, 82: 0x62,
+    87: 0x44, 88: 0x45,
+}
+_EVDEV_HID.update({2 + i: 0x1E + i for i in range(10)})                 # 1..0
+_EVDEV_HID.update({59 + i: 0x3A + i for i in range(10)})                # F1..F10
+for _ev, _c in zip((30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+                    22, 47, 17, 45, 21, 44), "abcdefghijklmnopqrstuvwxyz"):
+    _EVDEV_HID[_ev] = 0x04 + ord(_c) - ord("a")
+_EVDEV_MOD = {29: 0x01, 42: 0x02, 56: 0x04, 125: 0x08, 97: 0x10, 54: 0x20, 100: 0x40, 126: 0x80}
+
+X_KEYCODE_HID = {ev + 8: ("key", u) for ev, u in _EVDEV_HID.items()}
+X_KEYCODE_HID.update({ev + 8: ("mod", b) for ev, b in _EVDEV_MOD.items()})
+_MOD_NAMES = {0x01: "ctrl", 0x10: "ctrl", 0x02: "shift", 0x20: "shift",
+              0x04: "alt", 0x40: "alt", 0x08: "gui", 0x80: "gui"}
+
+
+def mod_name(xkeycode):
+    kind, val = X_KEYCODE_HID.get(xkeycode, (None, None))
+    return _MOD_NAMES[val] if kind == "mod" else None
+
+
+class HidKeyboard:
+    """按住/松开同步成 8 字节报告 (Alt 按着连按 Tab、长按都行); 状态没变返回 None."""
+
+    def __init__(self):
+        self.mods, self.keys = 0, []
+
+    def _report(self):
+        return bytes([self.mods, 0] + self.keys + [0] * (6 - len(self.keys)))
+
+    def press(self, xkeycode):
+        kind, val = X_KEYCODE_HID.get(xkeycode, (None, None))
+        if kind == "mod":
+            if self.mods & val:
+                return None
+            self.mods |= val
+        elif kind == "key":
+            if val in self.keys or len(self.keys) >= 6:
+                return None
+            self.keys.append(val)
+        else:
+            return None
+        return self._report()
+
+    def release(self, xkeycode):
+        kind, val = X_KEYCODE_HID.get(xkeycode, (None, None))
+        if kind == "mod" and self.mods & val:
+            self.mods &= ~val
+        elif kind == "key" and val in self.keys:
+            self.keys.remove(val)
+        else:
+            return None
+        return self._report()
+
+    def release_all(self):
+        self.mods, self.keys = 0, []
+        return self._report()
+
+
+# ---------------------------------------------------------------- 绝对鼠标
+
+def abs_point(x, y, fw, fh, vw, vh):
+    """预览框里的点 -> CH9329 绝对坐标 (0~4095). mpv 等比缩放居中, 点在黑边上返回 None."""
+    scale = min(fw / vw, fh / vh)
+    dw, dh = vw * scale, vh * scale
+    rx, ry = x - (fw - dw) / 2, y - (fh - dh) / 2
+    if not (0 <= rx <= dw - 1 and 0 <= ry <= dh - 1):
+        return None
+    return round(rx * 4095 / (dw - 1)), round(ry * 4095 / (dh - 1))
+
+
+def parse_v4l2_size(text):
+    import re as _re
+    m = _re.search(r"Width/Height\s*:\s*(\d+)/(\d+)", text)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def video_size(dev):
+    """采集设备当前分辨率; 读不到按 1920x1080 (16:9) 算."""
+    rc, out = run(["v4l2-ctl", "-d", dev, "--get-fmt-video"], timeout=3)
+    return parse_v4l2_size(out) or (1920, 1080)

@@ -23,6 +23,7 @@ import time
 HEADER = b"\x57\xab"
 CMD_GET_INFO = 0x01
 CMD_SEND_DATA = 0x02      # 普通键盘数据, 8 字节
+CMD_SEND_MS_ABS = 0x04    # 绝对鼠标, 7 字节: 0x02, 按键, xL, xH, yL, yH, 滚轮 (0~4095)
 CMD_SEND_MS_REL = 0x05    # 相对鼠标, 5 字节: 0x01, 按键, dx, dy, 滚轮
 
 # HID modifier 位
@@ -132,6 +133,10 @@ class Ch9329:
         up = self._send_raw(build_frame(CMD_SEND_DATA, b"\x00" * 8))
         return down, up
 
+    def send_report(self, report):
+        """直接发一份 8 字节键盘报告 (按住/松开同步用)."""
+        return self._send_raw(build_frame(CMD_SEND_DATA, report))
+
     def send_mouse(self, buttons=0, dx=0, dy=0, wheel=0):
         """发一帧鼠标位移 (相对位移, int8 两补码). buttons: 左1 右2 中4."""
         def i8(v):
@@ -139,6 +144,13 @@ class Ch9329:
             return v & 0xFF
         report = bytes([0x01, buttons & 0x07, i8(dx), i8(dy), i8(wheel)])
         return self._send_raw(build_frame(CMD_SEND_MS_REL, report))
+
+    def send_mouse_abs(self, buttons=0, x=0, y=0, wheel=0):
+        """绝对鼠标: x/y 0~4095 对应目标屏幕左上到右下. BIOS 里多半不认, 那里用相对鼠标."""
+        x, y = (max(0, min(4095, int(v))) for v in (x, y))
+        w = max(-127, min(127, int(wheel))) & 0xFF
+        report = bytes([0x02, buttons & 0x07, x & 0xFF, x >> 8, y & 0xFF, y >> 8, w])
+        return self._send_raw(build_frame(CMD_SEND_MS_ABS, report))
 
     def type_text(self, text, press_ms=30):
         """逐字符打字 (US 键盘布局)."""

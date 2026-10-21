@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog
 
 import kiosk_core as kc
-from ch9329 import Ch9329, KEYS
+from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 
@@ -23,24 +23,6 @@ FONT_MONO = ("Noto Sans Mono CJK SC", 13)
 BOOT_BG = "#ffffff"     # 开机自检页白底, 接 Plymouth 的白底
 VIDEO_DEV = "/dev/video0"
 IDLE_SECONDS = 180
-
-# Tk keysym -> ch9329 键名
-KEYSYM_SPECIAL = {
-    "Return": "enter", "KP_Enter": "enter", "Escape": "esc",
-    "BackSpace": "backspace", "Tab": "tab", "space": "space",
-    "Delete": "delete", "Insert": "insert", "Home": "home", "End": "end",
-    "Prior": "pgup", "Next": "pgdn", "Left": "left", "Right": "right",
-    "Up": "up", "Down": "down",
-    "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4", "F5": "f5", "F6": "f6",
-    "F7": "f7", "F8": "f8", "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
-    "KP_1": "1", "KP_2": "2", "KP_3": "3", "KP_4": "4", "KP_5": "5",
-    "KP_6": "6", "KP_7": "7", "KP_8": "8", "KP_9": "9", "KP_0": "0",
-    "KP_Add": "+", "KP_Subtract": "-", "KP_Multiply": "*", "KP_Divide": "/",
-    "KP_Decimal": ".", "KP_Delete": "delete",
-}
-MODIFIER_KEYS = {"Control_L": "ctrl", "Control_R": "ctrl", "Shift_L": "shift",
-                 "Shift_R": "shift", "Alt_L": "alt", "Alt_R": "alt", "Meta_L": "alt", "Meta_R": "alt",
-                 "Super_L": "gui", "Super_R": "gui"}
 
 
 class Kiosk(tk.Tk):
@@ -57,8 +39,11 @@ class Kiosk(tk.Tk):
         self.passthrough = False
         self._ssd, self._ssd_ts = None, 0.0
         self._fans_seen = set()
-        self._mods = set()
         self._combo = kc.ReleaseCombo()
+        self._kb = kc.HidKeyboard()
+        self.mouse_abs = True               # 默认绝对鼠标; BIOS 里切相对
+        self._video_wh = (1920, 1080)
+        self._last_abs, self._abs_pos, self._sent_abs = None, None, None
         self._mouse_acc = [0, 0, 0]      # dx, dy, wheel
         self._mouse_btn = 0
         self._last_pos = None
@@ -137,6 +122,7 @@ class Kiosk(tk.Tk):
         self.btn_video = big("UVC 预览:  开 / 关", self.toggle_preview)
         self.video_dev = (kc.video_devices() or [VIDEO_DEV])[0]
         self.btn_src = big(f"画面源:  {os.path.basename(self.video_dev)}", self.switch_source)
+        self.btn_mouse = big("鼠标:  绝对 (点哪是哪)", self.toggle_mouse_mode)
         self.btn_serial = big("串口会话:  开 / 关", self.toggle_serial)
         self.btn_ks = big("Kickstart 编辑", self.toggle_ks)
         big("PXE 装机服务:  开 / 关", self.toggle_pxe)
@@ -260,10 +246,11 @@ class Kiosk(tk.Tk):
         self.video_frame.bind("<Button-1>", lambda e: self._engage_passthrough())
         self.update_idletasks()
         wid = self.video_frame.winfo_id()
+        self._video_wh = kc.video_size(self.video_dev)     # 绝对鼠标按真实画面比例扣黑边
         self.mpv = subprocess.Popen(
             kc.mpv_cmd(wid, self.video_dev),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
+        self._banner_idle()
 
     def _stop_preview(self):
         self._release_passthrough()
@@ -304,6 +291,10 @@ class Kiosk(tk.Tk):
             self.ch, self._ch_dev = None, None
             self.banner.config(text="CH9329 断开 · 重新单击画面重连")
 
+    def _banner_idle(self):
+        mode = "绝对" if self.mouse_abs else "相对"
+        self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 鼠标{mode} · 单击画面进入透传")
+
     def _engage_passthrough(self):
         if self.passthrough:
             return
@@ -312,18 +303,22 @@ class Kiosk(tk.Tk):
             return
         self.passthrough = True
         self._combo = kc.ReleaseCombo()
+        self._kb = kc.HidKeyboard()
         self._mute_tk_keys()
-        self._mods.clear()
-        self._last_pos = None
+        self._last_pos, self._abs_pos, self._last_abs = None, None, None
         self._mouse_acc, self._mouse_btn = [0, 0, 0], 0
-        self.video_frame.grab_set_global()
-        self.video_frame.config(cursor="none")
+        if self.mouse_abs:                  # 绝对: 不锁鼠标不藏光标, 指哪打哪
+            self.video_frame.config(cursor="tcross")
+        else:                               # 相对 (BIOS 用): 锁住鼠标, 藏本地光标
+            self.video_frame.grab_set_global()
+            self.video_frame.config(cursor="none")
         for seq in ("<Motion>", "<Button-1>", "<Button-2>", "<Button-3>",
                     "<ButtonRelease-1>", "<ButtonRelease-2>", "<ButtonRelease-3>",
                     "<MouseWheel>"):
             self.video_frame.bind(seq, self._on_passthrough_event)
         self.focus_force()
-        self.banner.config(text="🔒 透传中 · 按一下 Ctrl+Alt 再松开 = 释放")
+        mode = "绝对" if self.mouse_abs else "相对"
+        self.banner.config(text=f"🔒 透传中 · 鼠标{mode} · 按一下 Ctrl+Alt 再松开 = 释放")
         self.after(16, self._flush_mouse)
 
     def _release_passthrough(self):
@@ -336,10 +331,20 @@ class Kiosk(tk.Tk):
             self.video_frame.config(cursor="arrow")
         except tk.TclError:
             pass
-        self.banner.config(text=f"预览 {os.path.basename(self.video_dev)} · 单击画面进入键鼠透传 (Ctrl+Alt 释放)")
-        self._mouse_acc, self._mouse_btn, self._mods = [0, 0, 0], 0, set()
-        self._ch_send("send_mouse", 0, 0, 0, 0)   # 松开所有鼠标键
-        self._ch_send("send_keys", [], press_ms=0)   # 松开所有键盘键
+        self._banner_idle()
+        self._mouse_acc, self._mouse_btn = [0, 0, 0], 0
+        if self.mouse_abs and self._last_abs:
+            self._ch_send("send_mouse_abs", 0, *self._last_abs, 0)   # 松开鼠标键, 光标留原地
+        else:
+            self._ch_send("send_mouse", 0, 0, 0, 0)
+        self._ch_send("send_report", self._kb.release_all())         # 松开所有键盘键
+
+    def toggle_mouse_mode(self):
+        self._release_passthrough()
+        self.mouse_abs = not self.mouse_abs
+        self.btn_mouse.config(text="鼠标:  绝对 (点哪是哪)" if self.mouse_abs else "鼠标:  相对 (BIOS 用)")
+        if self.video_frame:
+            self._banner_idle()
 
     def _on_passthrough_event(self, ev):
         # 透传时这些事件绑定会一直留在 Frame 上: 释放后左键单击 = 重新进透传, 其余忽略
@@ -349,44 +354,48 @@ class Kiosk(tk.Tk):
                 self._engage_passthrough()
             return
         if ev.type == "6":            # Motion
-            pos = (ev.x_root, ev.y_root)
-            if self._last_pos:
-                self._mouse_acc[0] += pos[0] - self._last_pos[0]
-                self._mouse_acc[1] += pos[1] - self._last_pos[1]
-            self._last_pos = pos
+            if self.mouse_abs:
+                self._abs_pos = (ev.x, ev.y)
+            else:
+                pos = (ev.x_root, ev.y_root)
+                if self._last_pos:
+                    self._mouse_acc[0] += pos[0] - self._last_pos[0]
+                    self._mouse_acc[1] += pos[1] - self._last_pos[1]
+                self._last_pos = pos
         elif ev.type in ("4", "5"):   # ButtonPress / Release
-            bit = {"1": 0x01, "2": 0x04, "3": 0x02}[ev.num]   # 左/中/右
+            bit = {"1": 0x01, "2": 0x04, "3": 0x02}[str(ev.num)]   # 左/中/右
             if ev.type == "4":
                 self._mouse_btn |= bit
             else:
                 self._mouse_btn &= ~bit & 0xFF
+            if self.mouse_abs:
+                self._abs_pos = (ev.x, ev.y)
+                self._send_abs(force=True)          # 点击立刻发, 不等下一帧
         elif ev.type == "38":         # MouseWheel
             self._mouse_acc[2] += max(-1, min(1, ev.delta // 120))
 
+    def _send_abs(self, force=False):
+        wheel = self._mouse_acc[2]
+        if self._abs_pos:
+            fw, fh = self.video_frame.winfo_width(), self.video_frame.winfo_height()
+            pt = kc.abs_point(*self._abs_pos, fw, fh, *self._video_wh)
+            if pt:
+                self._last_abs = pt
+            self._abs_pos = None
+        if self._last_abs and (force or wheel or self._last_abs != self._sent_abs):
+            self._ch_send("send_mouse_abs", self._mouse_btn, *self._last_abs, wheel)
+            self._sent_abs = self._last_abs
+            self._mouse_acc[2] = 0
+
     def _on_key(self, ev, down):
-        mod = MODIFIER_KEYS.get(ev.keysym)
-        name = mod or ev.keysym
+        """物理键码同步按住/松开 (X 键码 = evdev + 8), 不看 keysym, 不受 Shift/输入法影响."""
+        name = kc.mod_name(ev.keycode) or f"k{ev.keycode}"
         if self._combo.key(name, down):      # Ctrl+Alt 按下又松开、中间没按别的 -> 释放
             self._release_passthrough()
             return
-        if mod:
-            if down:
-                self._mods.add(mod)
-            else:
-                self._mods.discard(mod)
-            return
-        if not down:
-            return
-        key = None
-        if len(ev.char) == 1 and ev.char in KEYS:
-            key = ev.char
-        elif ev.keysym in KEYSYM_SPECIAL:
-            key = KEYSYM_SPECIAL[ev.keysym]
-        if key:
-            try:
-                self._ch_send("send_keys", list(self._mods) + [key], press_ms=20)
-            except ValueError:      # 组合里有 CH9329 不认的键
-                pass
+        rep = self._kb.press(ev.keycode) if down else self._kb.release(ev.keycode)
+        if rep is not None:
+            self._ch_send("send_report", rep)
 
     # Tk 在 all 标签上默认绑了 Tab/Shift-Tab(切焦点)、Alt+键(跳菜单)、F10(菜单),
     # 比我们的 <KeyPress> 更具体, 会把这些键截走 -> 透传期间临时撤掉, 释放时原样装回
@@ -405,10 +414,13 @@ class Kiosk(tk.Tk):
     def _flush_mouse(self):
         if not self.passthrough:
             return
-        dx, dy, wheel = self._mouse_acc
-        if dx or dy or wheel or self._mouse_btn:
-            self._ch_send("send_mouse", self._mouse_btn, dx, dy, wheel)
-            self._mouse_acc = [0, 0, 0]
+        if self.mouse_abs:
+            self._send_abs()
+        else:
+            dx, dy, wheel = self._mouse_acc
+            if dx or dy or wheel or self._mouse_btn:
+                self._ch_send("send_mouse", self._mouse_btn, dx, dy, wheel)
+                self._mouse_acc = [0, 0, 0]
         self.after(16, self._flush_mouse)
 
     # ------------------------------------------------------------ 原有动作
