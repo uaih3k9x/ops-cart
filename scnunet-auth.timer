@@ -1,0 +1,9 @@
+[Unit]
+Description=Every 2 min: re-login SCNUNET portal if kicked out
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=120
+
+[Install]
+WantedBy=timers.target
