@@ -7,7 +7,7 @@ StartLimitBurst=3
 
 [Service]
 WorkingDirectory=/opt/pxe
-ExecStart=/usr/bin/xinit /usr/bin/python3 /opt/pxe/kiosk.py -- /usr/bin/X :0 vt7 -br -nolisten tcp
+ExecStart=/usr/bin/xinit /usr/bin/python3 /opt/pxe/kiosk.py -- /usr/bin/X :0 vt7 -br -nolisten tcp -s 0 -dpms
 ExecStopPost=/usr/bin/chvt 1
 Restart=on-failure
 RestartSec=5
