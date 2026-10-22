@@ -1,0 +1,11 @@
+[Unit]
+Description=PXE HTTP repo+ks (:8000)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/pxe/httpserve.py 8000 --directory /opt/pxe/http --bind 192.168.200.1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
