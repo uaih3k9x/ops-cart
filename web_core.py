@@ -13,6 +13,7 @@ import os
 import secrets
 import time
 
+import atomicfile
 import kiosk_core as kc
 
 WEB_CONF = "/opt/pxe/web.conf"
@@ -63,10 +64,7 @@ def web_conf_set(path=WEB_CONF, **kv):
     except (OSError, ValueError):
         cfg = {}
     cfg.update(kv)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(cfg, f)
-    os.replace(tmp, path)
+    atomicfile.write_json(path, cfg)
 
 
 # ------------------------------------------------------------ 会话

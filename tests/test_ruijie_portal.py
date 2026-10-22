@@ -61,3 +61,81 @@ def test_parse_login_result():
     assert rp.parse_result('{"result":"success","message":"","userIndex":"x"}') == (True, "")
     assert rp.parse_result('{"result":"fail","message":"密码错误"}') == (False, "密码错误")
     assert rp.parse_result("<html>") == (False, "<html>")
+
+
+# ------------------------------------------------------------ 只在 SCNUNET 上跑 / 结果可见 (2026-10-22)
+
+def test_parse_iw_ssid():
+    text = "Connected to 94:14:57:86:ae:38 (on wlp4s0)\n\tSSID: SCNUNET\n\tfreq: 5300.0\n"
+    assert rp.parse_iw_ssid(text) == "SCNUNET"
+    assert rp.parse_iw_ssid("Not connected.\n") is None
+
+
+def test_on_target_case_insensitive():
+    assert rp.on_target("SCNUNET", {"ssid": "SCNUNET"})
+    assert rp.on_target("scnunet", {})                       # 老配置没写 ssid, 默认 SCNUNET
+    assert not rp.on_target("AutobitsCoLtd_5G", {})          # 别的网的锐捷页不能交 SCNUNET 的密码
+    assert not rp.on_target(None, {})
+
+
+def test_record_marks_ok_and_fail():
+    ok = rp.record("online", "", now=100)
+    assert ok == {"time": 100, "state": "online", "ok": True, "message": ""}
+    assert rp.record("skip", "连的是 X", now=1)["ok"] is True
+    assert rp.record("login ok", "", now=1)["ok"] is True
+    for bad in ("login fail", "error", "down", "portal?"):
+        assert rp.record(bad, "x", now=1)["ok"] is False
+
+
+def test_changed_only_on_state_or_message():
+    a = rp.record("online", "", now=1)
+    assert rp.changed(None, a)
+    assert not rp.changed(a, rp.record("online", "", now=999))   # 时间变了不算, 不刷日志
+    assert rp.changed(a, rp.record("login fail", "密码错误", now=2))
+    f = rp.record("login fail", "密码错误", now=2)
+    assert rp.changed(f, rp.record("login fail", "账号欠费", now=3))
+
+
+def test_conf_update_keeps_other_keys_and_validates():
+    old = {"iface": "wlp4s0", "user": "a", "password": "b"}
+    new = rp.conf_update(old, " 2025xxxx ", "p w")
+    assert new == {"iface": "wlp4s0", "ssid": "SCNUNET", "user": "2025xxxx", "password": "p w"}
+    assert old["user"] == "a"                                   # 不改原对象
+    assert rp.conf_update(None, "u", "p")["iface"] == "wlp4s0"   # 没有配置也能新建
+    for u, p in (("", "p"), ("u", "")):
+        try:
+            rp.conf_update(old, u, p)
+            assert False
+        except ValueError:
+            pass
+
+
+def test_attempt_wraps_exceptions(monkeypatch):
+    def boom(conf):
+        raise ValueError("pageInfo 不是 JSON")
+    monkeypatch.setattr(rp, "run_once", boom)
+    r = rp.attempt({"iface": "wlp4s0"}, "SCNUNET", now=5)
+    assert r["state"] == "error" and "pageInfo" in r["message"] and r["ok"] is False
+
+
+def test_attempt_skips_other_networks(monkeypatch):
+    monkeypatch.setattr(rp, "run_once", lambda conf: (_ for _ in ()).throw(AssertionError("不该跑")))
+    r = rp.attempt({"iface": "wlp4s0"}, "AutobitsCoLtd_5G", now=5)
+    assert r["state"] == "skip" and "AutobitsCoLtd_5G" in r["message"] and r["ok"]
+
+
+def test_attempt_splits_login_fail_message(monkeypatch):
+    monkeypatch.setattr(rp, "run_once", lambda conf: "login fail: 密码错误")
+    r = rp.attempt({"iface": "wlp4s0"}, "SCNUNET", now=5)
+    assert (r["state"], r["message"], r["ok"]) == ("login fail", "密码错误", False)
+
+
+def test_conf_save_is_root_only_and_roundtrips(tmp_path):
+    import os, stat
+    p = tmp_path / "ops-cart" / "scnunet.json"
+    rp.conf_save({"iface": "wlp4s0", "ssid": "SCNUNET", "user": "u", "password": "密码"}, path=str(p))
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600            # 有密码, 只给 root 读
+    assert rp._read_json(str(p))["password"] == "密码"
+    p.chmod(0o644)
+    rp.conf_save({"user": "x", "password": "y"}, path=str(p))    # 覆盖时也收紧权限
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600

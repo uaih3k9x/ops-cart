@@ -1,0 +1,9 @@
+[Unit]
+Description=Every 3 min: make Wi-Fi priority actually take effect
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=180
+
+[Install]
+WantedBy=timers.target

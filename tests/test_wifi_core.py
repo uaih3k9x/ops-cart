@@ -103,3 +103,63 @@ def test_status_backup_when_wired_wins():
 def test_status_disconnected():
     st = wc.status(scan=r" :SCNUNET:70", addr="wlp4s0 DOWN", routes="")
     assert st["ssid"] is None
+
+
+# ------------------------------------------------------------ 优先级主动生效 (2026-10-22)
+# NM 只在断线重连时按优先级挑; 已经连着低优先级的, 高优先级的出现了也不换 -> 我们来换
+
+def _saved(ssid, prio, active=False, auto=True):
+    return {"name": ssid, "uuid": f"u-{ssid}", "priority": prio, "active": active, "autoconnect": auto, "ssid": ssid}
+
+
+def _scan(*pairs):
+    return [{"ssid": s, "signal": sig, "security": "WPA2", "in_use": False} for s, sig in pairs]
+
+
+SAVED_P = [_saved("Autobits5G", 20), _saved("Autobits", 10), _saved("scnunet", 0, active=True)]
+
+
+def test_pick_switch_prefers_highest_visible():
+    got = wc.pick_switch(SAVED_P, _scan(("Autobits5G", 67), ("Autobits", 84), ("scnunet", 29)), now=0)
+    assert got["ssid"] == "Autobits5G"
+
+
+def test_pick_switch_needs_enough_signal():
+    got = wc.pick_switch(SAVED_P, _scan(("Autobits5G", 25), ("Autobits", 84)), now=0)
+    assert got["ssid"] == "Autobits"                            # 5G 太弱, 退而求其次
+
+
+def test_pick_switch_none_when_already_best_or_nothing_better():
+    best = [_saved("Autobits5G", 20, active=True), _saved("scnunet", 0)]
+    assert wc.pick_switch(best, _scan(("Autobits5G", 60), ("scnunet", 80)), now=0) is None
+    assert wc.pick_switch(SAVED_P, _scan(("scnunet", 29)), now=0) is None
+
+
+def test_pick_switch_leaves_disconnected_to_nm():
+    idle = [_saved("Autobits5G", 20), _saved("scnunet", 0)]
+    assert wc.pick_switch(idle, _scan(("Autobits5G", 90)), now=0) is None   # 没连着 = NM 自己会按优先级连
+
+
+def test_pick_switch_respects_cooldown_and_autoconnect_off():
+    cool = {"Autobits5G": 1000}                                 # 冷却到 t=1000
+    got = wc.pick_switch(SAVED_P, _scan(("Autobits5G", 90), ("Autobits", 90)), now=500, cooldown=cool)
+    assert got["ssid"] == "Autobits"
+    assert wc.pick_switch(SAVED_P, _scan(("Autobits5G", 90)), now=1001, cooldown=cool)["ssid"] == "Autobits5G"
+    off = [_saved("Home", 30, auto=False), _saved("scnunet", 0, active=True)]
+    assert wc.pick_switch(off, _scan(("Home", 90)), now=0) is None        # 用户关了自动连的不碰
+
+
+def test_check_wifi_shows_auth_failure():
+    import kiosk_core as kc
+    st = {"ssid": "SCNUNET", "signal": 70, "ip": "10.0.0.2", "egress": False,
+          "auth": {"state": "login fail", "ok": False, "message": "密码错误"}}
+    level, text = kc.check_wifi({"wifi": lambda: st})
+    assert level == "WARN" and "AUTH" in text and "密码错误" in text
+    st["auth"] = {"state": "online", "ok": True, "message": ""}
+    assert kc.check_wifi({"wifi": lambda: st})[0] == "OK"
+
+
+def test_cmd_scan_rescan_modes():
+    assert wc.cmd_scan(rescan=True)[-1] == "yes"
+    assert wc.cmd_scan(rescan=False)[-1] == "no"
+    assert wc.cmd_scan(rescan="auto")[-1] == "auto"

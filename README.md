@@ -39,18 +39,21 @@
 | [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、nmcli 命令、PXE 配置、菜单定义 |
 | [`serial_panel.py`](serial_panel.py) | 串口会话面板 |
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
-| [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序 |
+| [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序;面板底部改校园网认证账号、立即认证、看最近结果 |
+| [`wifi_prefer.py`](wifi_prefer.py) | 定时让优先级真正生效:看得见更高优先级的已保存网络就切过去,失败冷却 30 分钟 |
 | [`netprof_panel.py`](netprof_panel.py) · [`netprof_core.py`](netprof_core.py) | 网口配置文件:LAN1/LAN2 切换、一键回退、静态地址模板;发地址只在 LAN1,启用前探测对面有没有 DHCP |
+| [`wol_panel.py`](wol_panel.py) · [`wol_core.py`](wol_core.py) | 网络唤醒:常用目标清单 + 临时输 MAC,从选定网口广播魔术包 |
+| [`atomicfile.py`](atomicfile.py) | 防断电写文件:临时文件 → fsync → 改名,配置要么旧要么新 |
 | [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
 | [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版 Kiosk(标准库 http.server + xterm.js) |
-| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录 |
+| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着 SCNUNET 时跑;结果写 `/run/ops-cart/scnunet-status.json` 给面板和状态板 |
 | [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈,也可当命令行工具用 |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract) |
 
 | 目录 | 内容 |
 |---|---|
 | [`tests/`](tests/) | 离线单测,不接任何硬件也能全绿 |
-| [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
+| [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库,`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟 |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例 |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
@@ -80,11 +83,13 @@ python3 cart_ocr.py shot.png --find "Boot Menu"
 scripts/stamp-build.sh                         # 生成 BUILD(提交数 + 哈希)
 scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web cart:/opt/pxe/
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo cp deploy/sysctl.d/* /etc/sysctl.d/ && sudo sysctl --system
+sudo mkdir -p /etc/systemd/journald.conf.d && sudo cp deploy/journald.conf.d/* /etc/systemd/journald.conf.d/ && sudo systemctl restart systemd-journald
 sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/ && sudo cp deploy/tmpfiles.d/ops-cart.conf /etc/tmpfiles.d/
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
 sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk
 sudo cp deploy/bin/kiosk-setpin /usr/local/bin/ && sudo kiosk-setpin
-sudo systemctl enable --now kiosk.service cart-boot-success.timer
+sudo systemctl enable --now kiosk.service cart-boot-success.timer scnunet-auth.timer wifi-prefer.timer
 ```
 
 开机自检和状态板共用一张计划表 `/opt/pxe/selftest.json`
@@ -122,3 +127,9 @@ datasheet 不写"校验含帧头"—— 真机的应答帧会。
 ## License
 
 MIT
+
+## 断电与挪车
+
+推车常被直接拔电挪走,做了几层兜底:盘是带掉电保护的企业级 SSD;脏页 5 秒内落盘;配置一律原子写;
+系统日志落盘(`journalctl -b -1` 看上一次断电前);BIOS 设了来电自动开机;GRUB 在上次没正常启动时自动出菜单。
+**但能关就关**:挪车前短按一下电源键,十来秒正常关机,不用进菜单。

@@ -28,8 +28,9 @@ def split_terse(line):
 
 
 def cmd_scan(iface=IFACE, rescan=True):
+    """rescan: True 立刻扫 / False 用缓存 / "auto" 缓存旧了才扫."""
     return ["nmcli", "-t", "-f", "IN-USE,BSSID,SSID,SIGNAL,SECURITY", "dev", "wifi", "list",
-            "ifname", iface, "--rescan", "yes" if rescan else "no"]
+            "ifname", iface, "--rescan", {True: "yes", False: "no"}.get(rescan, rescan)]
 
 
 def parse_scan(text):
@@ -138,3 +139,25 @@ def status(scan, addr, routes, iface=IFACE):
     return {"ssid": cur[1], "signal": int(cur[2]) if cur[2].isdigit() else 0, "ip": ip,
             "egress": "dev" in first and first[first.index("dev") + 1] == iface}
 
+
+
+# ---------------------------------------------------------------- 优先级主动生效
+# NM 只在断线重连时按优先级挑; 已经连着低优先级的, 高优先级的出现了也不换. 定时看一眼, 该换就换.
+
+MIN_SIGNAL = 40
+COOLDOWN_S = 1800
+
+
+def pick_switch(saved, scan, now, cooldown=None, min_signal=MIN_SIGNAL):
+    """saved = parse_saved + 每项补 ssid; scan = parse_scan; cooldown = {ssid: 冷却到的时间}.
+    当前连着的不是"看得见、信号够、允许自动连"里优先级最高的 -> 返回该切去的那个, 否则 None.
+    没连着就不管 (NM 自己会按优先级连)."""
+    cur = next((s for s in saved if s["active"]), None)
+    if not cur:
+        return None
+    seen = {n["ssid"]: n["signal"] for n in scan}
+    cooldown = cooldown or {}
+    better = [s for s in saved
+              if s["autoconnect"] and s["priority"] > cur["priority"]
+              and seen.get(s["ssid"], 0) >= min_signal and cooldown.get(s["ssid"], 0) <= now]
+    return max(better, key=lambda s: s["priority"]) if better else None

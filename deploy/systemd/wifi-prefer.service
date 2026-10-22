@@ -1,0 +1,7 @@
+[Unit]
+Description=Switch Wi-Fi to a higher-priority saved network when one is in range
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/pxe/wifi_prefer.py
