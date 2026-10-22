@@ -5,4 +5,4 @@ if systemctl cat kiosk.service >/dev/null 2>&1; then
     exec systemctl restart kiosk.service
 fi
 cd /opt/pxe
-exec xinit /usr/bin/python3 /opt/pxe/kiosk.py -- /usr/bin/X :0 vt7 -br -nolisten tcp
+exec xinit /usr/bin/python3 /opt/pxe/kiosk.py -- /usr/bin/X :0 vt7 -br -nolisten tcp -s 0 -dpms
