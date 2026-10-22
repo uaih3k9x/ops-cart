@@ -367,7 +367,7 @@ class Kiosk(tk.Tk):
             self.video_frame.config(cursor="none")
         for seq in ("<Motion>", "<Button-1>", "<Button-2>", "<Button-3>",
                     "<ButtonRelease-1>", "<ButtonRelease-2>", "<ButtonRelease-3>",
-                    "<MouseWheel>"):
+                    "<Button-4>", "<Button-5>", "<MouseWheel>"):    # X11 滚轮 = 4/5 号键
             self.video_frame.bind(seq, self._on_passthrough_event)
         self.focus_force()
         mode = "绝对" if self.mouse_abs else "相对"
@@ -415,8 +415,12 @@ class Kiosk(tk.Tk):
                     self._mouse_acc[0] += pos[0] - self._last_pos[0]
                     self._mouse_acc[1] += pos[1] - self._last_pos[1]
                 self._last_pos = pos
-        elif ev.type in ("4", "5"):   # ButtonPress / Release
-            bit = {"1": 0x01, "2": 0x04, "3": 0x02}[str(ev.num)]   # 左/中/右
+        elif step := kc.wheel_step(ev.type, ev.num, getattr(ev, "delta", 0)):
+            self._mouse_acc[2] += step
+            if self.mouse_abs:
+                self._send_abs(force=True)          # 滚一格立刻发, 不等下一帧
+        elif ev.type in ("4", "5") and kc.mouse_bit(ev.num):   # ButtonPress / Release
+            bit = kc.mouse_bit(ev.num)
             if ev.type == "4":
                 self._mouse_btn |= bit
             else:
@@ -424,8 +428,6 @@ class Kiosk(tk.Tk):
             if self.mouse_abs:
                 self._abs_pos = (ev.x, ev.y)
                 self._send_abs(force=True)          # 点击立刻发, 不等下一帧
-        elif ev.type == "38":         # MouseWheel
-            self._mouse_acc[2] += max(-1, min(1, ev.delta // 120))
 
     def _send_abs(self, force=False):
         wheel = self._mouse_acc[2]
