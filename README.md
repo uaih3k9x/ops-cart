@@ -34,11 +34,14 @@
 | 文件 | 职责 |
 |---|---|
 | [`pxeserver.py`](pxeserver.py) | PXE 服务端,单文件,Linux / Windows 通用 |
+| [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);LAN1 没插线就等地址出现,不退出 |
 | [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter) |
 | [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、nmcli 命令、PXE 配置、菜单定义 |
 | [`serial_panel.py`](serial_panel.py) | 串口会话面板 |
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
 | [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序 |
+| [`netprof_panel.py`](netprof_panel.py) · [`netprof_core.py`](netprof_core.py) | 网口配置文件:LAN1/LAN2 切换、一键回退、静态地址模板;发地址只在 LAN1,启用前探测对面有没有 DHCP |
+| [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
 | [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版 Kiosk(标准库 http.server + xterm.js) |
 | [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录 |
 | [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈,也可当命令行工具用 |
@@ -47,7 +50,7 @@
 | 目录 | 内容 |
 |---|---|
 | [`tests/`](tests/) | 离线单测,不接任何硬件也能全绿 |
-| [`deploy/`](deploy/) | systemd 单元、sysctl 配置、`kiosk` / `kiosk-setpin` 命令 |
+| [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库,`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟 |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例 |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
@@ -77,6 +80,8 @@ python3 cart_ocr.py shot.png --find "Boot Menu"
 scripts/stamp-build.sh                         # 生成 BUILD(提交数 + 哈希)
 scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web cart:/opt/pxe/
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/ && sudo cp deploy/tmpfiles.d/ops-cart.conf /etc/tmpfiles.d/
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
 sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk
 sudo cp deploy/bin/kiosk-setpin /usr/local/bin/ && sudo kiosk-setpin
 sudo systemctl enable --now kiosk.service cart-boot-success.timer
