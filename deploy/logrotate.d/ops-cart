@@ -1,0 +1,13 @@
+# 推车机器日志轮转 (人读的 /opt/pxe/CART-LOG.md 不在这里, 它只收一行摘要)
+# 写日志的进程都开着文件不关, 用 copytruncate 免得重启服务
+/var/log/ops-cart/*.log /opt/pxe/pxeserver.log {
+    weekly
+    maxsize 10M
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
