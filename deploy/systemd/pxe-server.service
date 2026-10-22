@@ -1,0 +1,11 @@
+[Unit]
+Description=PXE server (DHCP+proxyDHCP+TFTP) on Lan1 install port
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/pxe/pxeserver.py serve --ip 192.168.77.1 --pool 192.168.77.10,192.168.77.20 --tftp-root /opt/pxe/tftp --log /opt/pxe/pxeserver.log --iface eno1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

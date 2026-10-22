@@ -1,0 +1,11 @@
+[Unit]
+Description=PXE HTTP for grub kernel loading (:80)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/pxe/httpserve.py 80 --directory /opt/pxe/tftp --bind 192.168.77.1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
