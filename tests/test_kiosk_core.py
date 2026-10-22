@@ -895,3 +895,30 @@ def test_kp_enter_acts_as_return_in_every_entry():
         widget = w
     fn(Ev())
     assert w.generated == ["<Return>"]
+
+
+# ------------------------------------------------------------ 滚轮 (2026-10-22)
+# 推车 Tk 8.6 + X11: 滚轮是 4/5 号键, 不发 <MouseWheel>; Windows/macOS 才发 MouseWheel(delta)
+
+def test_wheel_step_x11_buttons():
+    assert kc.wheel_step("4", 4, 0) == 1        # ButtonPress-4 = 上滚 = HID 正
+    assert kc.wheel_step("4", 5, 0) == -1
+    assert kc.wheel_step("5", 4, 0) == 0        # 松开不算, 否则一格滚两下
+
+
+def test_wheel_step_mousewheel_delta():
+    assert kc.wheel_step("38", "??", 120) == 1
+    assert kc.wheel_step("38", "??", -120) == -1
+    assert kc.wheel_step("38", "??", 360) == 3      # 快速滚动别吞格
+    assert kc.wheel_step("38", "??", -40) == -1     # 小 delta 正负对称, 不能一边是 0 一边是 -1
+    assert kc.wheel_step("38", "??", 40) == 1
+
+
+def test_wheel_step_ignores_other_buttons():
+    assert kc.wheel_step("4", 1, 0) == 0
+    assert kc.wheel_step("6", "??", 0) == 0
+
+
+def test_mouse_bit_only_for_real_buttons():
+    assert kc.mouse_bit(1) == 0x01 and kc.mouse_bit(3) == 0x02 and kc.mouse_bit(2) == 0x04
+    assert kc.mouse_bit(4) is None and kc.mouse_bit(5) is None

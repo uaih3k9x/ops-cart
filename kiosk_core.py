@@ -992,6 +992,25 @@ class HidKeyboard:
 
 # ---------------------------------------------------------------- 绝对鼠标
 
+_MOUSE_BITS = {1: 0x01, 2: 0x04, 3: 0x02}   # Tk 左/中/右 -> HID 位
+
+
+def mouse_bit(num):
+    """Tk 鼠标键号 -> HID 按键位; 4/5 是滚轮不是键, 返回 None."""
+    return _MOUSE_BITS.get(int(num)) if str(num).isdigit() else None
+
+
+def wheel_step(ev_type, num, delta):
+    """一个 Tk 事件折算成几格滚轮 (正 = 上滚). X11 上滚轮是 ButtonPress-4/5,
+    Windows/macOS 是 MouseWheel(delta, 一格 120); 按幅度向外取整, 正负对称."""
+    if ev_type == "4":
+        return {"4": 1, "5": -1}.get(str(num), 0)
+    if ev_type == "38" and delta:
+        n = max(1, round(abs(delta) / 120))
+        return n if delta > 0 else -n
+    return 0
+
+
 def abs_point(x, y, fw, fh, vw, vh):
     """预览框里的点 -> CH9329 绝对坐标 (0~4095). mpv 等比缩放居中, 点在黑边上返回 None."""
     scale = min(fw / vw, fh / vh)
