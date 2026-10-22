@@ -797,7 +797,7 @@ def test_menu_keeps_every_existing_action():
     actions = {it["do"] for items in kc.MENU.values() for it in items if "do" in it}
     assert actions == {"toggle_preview", "switch_source", "toggle_mouse_mode", "toggle_serial",
                        "toggle_ks", "toggle_pxe", "toggle_install_mode", "cfg_lan1", "cfg_lan2",
-                       "toggle_wifi", "lock_now", "reboot", "poweroff"}
+                       "toggle_wifi", "toggle_netprof", "lock_now", "reboot", "poweroff"}
 
 
 def test_menu_main_keeps_hot_buttons():
@@ -866,3 +866,32 @@ def test_status_board_skips_cpu_fan_rows_shown_in_temps_block():
     assert rows[0]["check"] == "cpu"
     texts = [t for t, _ in kc.status_board_lines(rows, temps=[], fans=[], uptime="up")]
     assert texts[0].startswith("TAILSCALE") and not any(t.startswith(("CPU ", "FAN ")) for t in texts)
+
+
+class _FakeRoot:
+    def __init__(self):
+        self.binds = {}
+
+    def bind_class(self, cls, seq, fn):
+        self.binds[(cls, seq)] = fn
+
+
+class _FakeWidget:
+    def __init__(self):
+        self.generated = []
+
+    def event_generate(self, seq):
+        self.generated.append(seq)
+
+
+def test_kp_enter_acts_as_return_in_every_entry():
+    """小键盘回车 (KP_Enter) 在所有输入框里等同主键盘回车, 弹窗(simpledialog)也算."""
+    root = _FakeRoot()
+    kc.kp_enter_as_return(root)
+    fn = root.binds[("Entry", "<KP_Enter>")]
+    w = _FakeWidget()
+
+    class Ev:
+        widget = w
+    fn(Ev())
+    assert w.generated == ["<Return>"]
