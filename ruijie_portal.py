@@ -2,8 +2,11 @@
 """锐捷 ePortal 无线网页认证, 给没有浏览器的推车用. 由 systemd timer 定时跑一次:
 探测 -> 被 302 到 portal 就登录 -> 已在线什么都不做.
 
-配置 (root 0600): {"iface": "wlp4s0", "user": "...", "password": "..."}
+配置 (root 0600): {"iface": "wlp4s0", "ssid": "CAMPUSNET", "user": "...", "password": "..."}
 用法: ruijie_portal.py [配置路径]     网络操作全走 curl --interface, 不碰默认路由.
+
+只在无线连着 ssid 时才跑: 别的网也可能是锐捷认证, 不能把 CAMPUSNET 的密码交给它.
+每次结果写 STATUS (Kiosk 面板/状态板读), 状态变了才记 events.log; 没登上就以 1 退出.
 """
 
 import json
@@ -15,6 +18,9 @@ import sys
 import urllib.parse
 
 CONF = "/etc/ops-cart/campusnet.json"
+STATUS = "/run/ops-cart/campusnet-status.json"
+DEFAULT_SSID = "CAMPUSNET"
+OK_STATES = ("online", "login ok", "skip")
 PROBE = "http://www.msftconnecttest.com/connecttest.txt"
 PROBE_OK = "Microsoft Connect Test"
 DEFAULT_MAC = "111111111"                    # 页面 JS: 地址栏取不到 mac 时用这个
@@ -172,9 +178,88 @@ def run_once(conf):
     return "login ok" if ok else f"login fail: {msg}"
 
 
+# ---------------------------------------------------------------- 守门 / 结果
+
+def parse_iw_ssid(text):
+    """`iw dev <if> link` -> 当前 SSID, 没连返回 None."""
+    for line in text.splitlines():
+        k, _, v = line.strip().partition(": ")
+        if k == "SSID":
+            return v
+    return None
+
+
+def current_ssid(iface):
+    return parse_iw_ssid(subprocess.run(["iw", "dev", iface, "link"], capture_output=True, text=True).stdout)
+
+
+def on_target(ssid, conf):
+    return bool(ssid) and ssid.lower() == conf.get("ssid", DEFAULT_SSID).lower()
+
+
+def record(state, message, now):
+    return {"time": now, "state": state, "ok": state in OK_STATES, "message": message}
+
+
+def changed(prev, cur):
+    return prev is None or (prev.get("state"), prev.get("message")) != (cur["state"], cur["message"])
+
+
+def conf_update(conf, user, password):
+    """Kiosk 面板改账号密码: 保留别的键, 补齐 iface/ssid."""
+    user = user.strip()
+    if not user or not password:
+        raise ValueError("账号和密码都不能为空")
+    new = {"iface": "wlp4s0", "ssid": DEFAULT_SSID}
+    new.update(conf or {})
+    new.update(user=user, password=password)
+    return new
+
+
+def conf_save(conf, path=CONF):
+    """写配置, 永远 0600 (里面有密码); 原子写, 写一半断电也不坏."""
+    import atomicfile
+    atomicfile.write_json(path, conf, mode=0o600)
+
+
+def attempt(conf, ssid, now):
+    """跑一次 (不在目标网上就跳过), 异常也收成一条结果, 不让 systemd 只看到一段 traceback."""
+    if not on_target(ssid, conf):
+        return record("skip", f"连的是 {ssid or '(没连无线)'}, 不是 {conf.get('ssid', DEFAULT_SSID)}", now)
+    try:
+        res = run_once(conf)
+    except Exception as ex:          # noqa: BLE001  portal 页面千奇百怪, 统一报出来
+        return record("error", f"{type(ex).__name__}: {ex}", now)
+    state, _, msg = res.partition(": ")
+    return record(state, msg, now)
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def main():
+    import time
     conf = json.load(open(sys.argv[1] if len(sys.argv) > 1 else CONF))
-    print(run_once(conf))
+    cur = attempt(conf, current_ssid(conf["iface"]), int(time.time()))
+    prev = _read_json(STATUS)
+    try:
+        import atomicfile
+        atomicfile.write_json(STATUS, cur)
+    except OSError:
+        pass
+    if changed(prev, cur):
+        try:
+            import cartlog
+            cartlog.event("campusnet", f"{cur['state']} {cur['message']}".strip())
+        except ImportError:
+            pass
+    print(f"{cur['state']} {cur['message']}".strip())
+    sys.exit(0 if cur["ok"] else 1)
 
 
 if __name__ == "__main__":

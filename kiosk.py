@@ -18,6 +18,7 @@ from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
 from netprof_panel import NetProfPanel
+from wol_panel import WolPanel
 
 FONT = ("Noto Sans CJK SC", 13)
 FONT_BIG = ("Noto Sans CJK SC", 15)
@@ -234,8 +235,8 @@ class Kiosk(tk.Tk):
             self.banner.config(text="Kickstart 编辑 · 保存自动备份, 修改立即对下次装机生效")
 
     def _close_net_panels(self):
-        """无线 / 网口配置文件两个网络面板, 开着哪个关哪个."""
-        for attr in ("wifi_panel", "netprof_panel"):
+        """无线 / 网口配置文件 / 网络唤醒几个网络面板, 开着哪个关哪个."""
+        for attr in ("wifi_panel", "netprof_panel", "wol_panel"):
             if getattr(self, attr, None):
                 getattr(self, attr).destroy()
                 setattr(self, attr, None)
@@ -271,6 +272,21 @@ class Kiosk(tk.Tk):
         self.netprof_panel = NetProfPanel(self.body)
         self.netprof_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.banner.config(text="网口配置文件 · 切换 / 回退 / 新建, 再点一次按钮返回")
+
+    def toggle_wol(self):
+        if getattr(self, "wol_panel", None):
+            self._close_net_panels()
+            return
+        self._close_net_panels()
+        self._stop_preview()
+        if self.serial_panel:
+            self.toggle_serial()
+        if getattr(self, "ks_panel", None):
+            self.toggle_ks()
+        self.status_wrap.pack_forget()
+        self.wol_panel = WolPanel(self.body)
+        self.wol_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.banner.config(text="网络唤醒 · 双击清单里的机器直接唤醒, 再点一次按钮返回")
 
     # ------------------------------------------------------------ UVC 预览
 

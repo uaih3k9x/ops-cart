@@ -797,7 +797,7 @@ def test_menu_keeps_every_existing_action():
     actions = {it["do"] for items in kc.MENU.values() for it in items if "do" in it}
     assert actions == {"toggle_preview", "switch_source", "toggle_mouse_mode", "toggle_serial",
                        "toggle_ks", "toggle_pxe", "toggle_install_mode", "cfg_lan1", "cfg_lan2",
-                       "toggle_wifi", "toggle_netprof", "lock_now", "reboot", "poweroff"}
+                       "toggle_wifi", "toggle_netprof", "toggle_wol", "lock_now", "reboot", "poweroff"}
 
 
 def test_menu_main_keeps_hot_buttons():

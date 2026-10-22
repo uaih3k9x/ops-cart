@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Kiosk 无线管理面板: 扫描/连接/输密码(可显示)/已保存网络按优先级排序/忘记.
+"""Kiosk 无线管理面板: 扫描/连接/输密码(可显示)/已保存网络按优先级排序/忘记;
+底部是校园网 (CAMPUSNET) 认证: 改账号密码、立即认证、看最近一次结果.
 
 nmcli 调用放后台线程, 结果用 after() 回到 Tk 线程. 规则见 wifi_core.
 """
 
 import subprocess
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 
+import ruijie_portal as rp
 import wifi_core as wc
 
 FONT = ("Noto Sans CJK SC", 13)
@@ -95,6 +98,61 @@ class WifiPanel(tk.Frame):
 
         self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg="#f0b429", anchor="w")
         self.msg.pack(fill="x", padx=16, pady=(2, 10))
+        self._build_auth()
+
+    def _build_auth(self):
+        box = tk.LabelFrame(self, text=" 校园网认证 (只在连着 CAMPUSNET 时自动跑, 每 2 分钟) ", font=FONT,
+                            bg=BG, fg="#8b93a7", bd=1, relief="groove")
+        box.pack(fill="x", padx=16, pady=(0, 10))
+        row = tk.Frame(box, bg=BG)
+        row.pack(fill="x", pady=4)
+        conf = rp._read_json(rp.CONF) or {}
+        self.auth_user = tk.StringVar(value=conf.get("user", ""))
+        self.auth_pw = tk.StringVar(value=conf.get("password", ""))
+        tk.Label(row, text="账号:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
+        tk.Entry(row, textvariable=self.auth_user, width=16, font=FONT_MONO, bg="#10141c", fg=FG,
+                 insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
+        tk.Label(row, text="密码:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(10, 0))
+        self.auth_pw_entry = tk.Entry(row, textvariable=self.auth_pw, width=20, show="•", font=FONT_MONO,
+                                      bg="#10141c", fg=FG, insertbackground=FG, relief="flat")
+        self.auth_pw_entry.pack(side="left", padx=6, ipady=3)
+        self.auth_pw_entry.bind("<Return>", lambda _e: self.auth_save())
+        self.auth_show = tk.BooleanVar(value=False)
+        tk.Checkbutton(row, text="显示", variable=self.auth_show, font=FONT, bg=BG, fg="#c8cede",
+                       selectcolor=BOX, activebackground=BG, activeforeground=FG,
+                       command=lambda: self.auth_pw_entry.config(show="" if self.auth_show.get() else "•")
+                       ).pack(side="left", padx=4)
+        self._btn(row, "保存", self.auth_save)
+        self._btn(row, "立即认证", self.auth_now, bg="#26577c")
+        self.auth_lbl = tk.Label(box, text="", font=FONT, bg=BG, fg="#8b93a7", anchor="w")
+        self.auth_lbl.pack(fill="x", padx=6, pady=(0, 6))
+        self._auth_render()
+
+    def _auth_render(self):
+        st = rp._read_json(rp.STATUS)
+        if not st:
+            self.auth_lbl.config(text="最近一次: 还没跑过", fg="#8b93a7")
+            return
+        when = time.strftime("%H:%M:%S", time.localtime(st.get("time", 0)))
+        text = {"online": "已在线", "login ok": "登录成功", "skip": "跳过", "login fail": "登录失败",
+                "error": "出错", "down": "连不上网", "portal?": "认证页没认出来"}.get(st["state"], st["state"])
+        self.auth_lbl.config(text=f"最近一次 {when}: {text} {st.get('message', '')}".rstrip(),
+                             fg="#7ee787" if st.get("ok") else "#ff7b72")
+
+    def auth_save(self):
+        try:
+            conf = rp.conf_update(rp._read_json(rp.CONF), self.auth_user.get(), self.auth_pw.get())
+            rp.conf_save(conf)
+        except (ValueError, OSError) as ex:
+            return self._say(f"保存失败: {ex}", ok=False)
+        self._say("认证账号已保存, 下次自动认证用新的; 要马上试点「立即认证」")
+
+    def auth_now(self):
+        def done(res):
+            self._auth_render()
+            ok = not isinstance(res, Exception) and res[0] == 0
+            self._say("认证完成" if ok else "认证没成功, 原因见下面一行", ok)
+        self._bg(lambda: _run(["systemctl", "start", "campusnet-auth.service"], timeout=60), done, "认证中…")
 
     def _toggle_show(self):
         self.pw_entry.config(show="" if self.show_var.get() else "•")

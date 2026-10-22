@@ -11,6 +11,8 @@ import os
 import subprocess
 import time
 
+import atomicfile
+
 PXE_CONF = "/opt/pxe/pxe.conf"
 LAN1_CON = "Lan1-pxe"   # eno1, 装机口
 LAN2_CON = "enp3s0"     # 管理口
@@ -270,6 +272,9 @@ def check_wifi(ctx):
     st = ctx["wifi"]()
     if not st.get("ssid"):
         return "--", "NOT CONNECTED"
+    auth = st.get("auth") or {}
+    if auth and not auth.get("ok") and auth.get("state") != "skip":
+        return "WARN", f"{st['ssid']} AUTH {auth.get('state', '?').upper()} {auth.get('message', '')}".strip()
     # 默认路由走无线 = 网线断了它在顶班, 能用但该提醒
     return ("WARN", f"{st['ssid']} {st['signal']}% IN USE") if st["egress"] \
         else ("OK", f"{st['ssid']} {st['signal']}% STANDBY")
@@ -354,9 +359,12 @@ def selftest_context():
 
 
 def wifi_status():
+    import ruijie_portal as rp
     import wifi_core as wc
-    return wc.status(run(wc.CMD_STATUS_SCAN)[1], run(["ip", "-4", "-br", "addr", "show", wc.IFACE])[1],
-                     run(["ip", "route"])[1])
+    st = wc.status(run(wc.CMD_STATUS_SCAN)[1], run(["ip", "-4", "-br", "addr", "show", wc.IFACE])[1],
+                   run(["ip", "route"])[1])
+    st["auth"] = rp._read_json(rp.STATUS)       # 校园网认证最近一次结果 (campusnet-auth 写)
+    return st
 
 
 def selftest_rows(nics, misc, svcs, temps, fans, serial_ok):
@@ -528,8 +536,7 @@ def pxe_conf_read():
 
 
 def pxe_conf_write(cfg):
-    with open(PXE_CONF, "w") as f:
-        json.dump(cfg, f, indent=2)
+    atomicfile.write_json(PXE_CONF, cfg, indent=2)
 
 
 # ---------------------------------------------------------------- 命令生成 (纯函数)
@@ -567,8 +574,7 @@ def apply_pxe_conf(cfg, unit_path="/etc/systemd/system/pxe-server.service"):
             "After=network.target\n\n[Service]\n"
             f"ExecStart={render_pxe_service(cfg)}\n"
             "Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n")
-    with open(unit_path, "w") as f:
-        f.write(unit)
+    atomicfile.write_text(unit_path, unit)
     rc, _ = run(["systemctl", "daemon-reload"])
     rc2, out = run(["systemctl", "restart", "pxe-server"])
     return rc == 0 and rc2 == 0, out or ("ok" if rc2 == 0 else "restart 失败")
@@ -614,8 +620,7 @@ def ks_write(text, path=KS_PATH):
         backups = sorted(glob.glob(path + ".bak-*"))
         for old in backups[:-KS_BACKUPS]:
             os.unlink(old)
-    with open(path, "w") as f:
-        f.write(text)
+    atomicfile.write_text(path, text)
 
 
 def ks_set_rootpw(text, hashed):
@@ -723,10 +728,7 @@ def pin_set(pin, path=None):
     except (OSError, ValueError):
         cfg = {}
     cfg["pin"] = pin_hash(pin)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(cfg, f)
-    os.chmod(path, 0o600)
+    atomicfile.write_json(path, cfg, mode=0o600)
 
 
 class PinGate:
@@ -801,11 +803,7 @@ def mac_cfg_name(mac):
 
 
 def _write_atomic(path, text):
-    path = str(path)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    atomicfile.write_text(path, text)
 
 
 def pxe_mode_read(path=PXE_MODE, now=None):
@@ -1060,6 +1058,7 @@ MENU = {
     "net": [
         {"text": "无线网络", "do": "toggle_wifi", "attr": "btn_wifi"},
         {"text": "网口配置文件", "do": "toggle_netprof"},
+        {"text": "网络唤醒 (WOL)", "do": "toggle_wol"},
         {"text": "LAN2 管理口配置", "do": "cfg_lan2"},
     ],
     "power": [
