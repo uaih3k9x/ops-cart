@@ -54,7 +54,12 @@ def nics_status():
     return result
 
 
-CH9329_BY_ID = "/dev/serial/by-id/usb-1a86_*-if00"   # CH343 串口; 重插后 ttyACMn 会变, by-id 不变
+def kp_enter_as_return(root):
+    """小键盘回车在所有输入框里等同主键盘回车 (各处只绑了 <Return>, simpledialog 也是)."""
+    root.bind_class("Entry", "<KP_Enter>", lambda e: e.widget.event_generate("<Return>"))
+
+
+CH9329_BY_ID ="/dev/serial/by-id/usb-1a86_*-if00"   # CH343 串口; 重插后 ttyACMn 会变, by-id 不变
 
 
 def ch9329_port(pattern=CH9329_BY_ID, fallback="/dev/ttyACM0"):
@@ -1035,6 +1040,7 @@ MENU = {
     ],
     "net": [
         {"text": "无线网络", "do": "toggle_wifi", "attr": "btn_wifi"},
+        {"text": "网口配置文件", "do": "toggle_netprof"},
         {"text": "LAN2 管理口配置", "do": "cfg_lan2"},
     ],
     "power": [

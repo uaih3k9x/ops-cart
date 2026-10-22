@@ -17,6 +17,7 @@ from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
+from netprof_panel import NetProfPanel
 
 FONT = ("Noto Sans CJK SC", 13)
 FONT_BIG = ("Noto Sans CJK SC", 15)
@@ -52,6 +53,7 @@ class Kiosk(tk.Tk):
         self.ch, self._ch_dev = None, None
         self._ensure_ch()
 
+        kc.kp_enter_as_return(self)
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read())
         self._lock_win = None
@@ -206,7 +208,7 @@ class Kiosk(tk.Tk):
             self.banner.config(text="")
         else:
             self._stop_preview()
-            self._close_wifi()
+            self._close_net_panels()
             self.status_wrap.pack_forget()
             self.serial_panel = SerialPanel(self.body)
             self.serial_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
@@ -225,23 +227,26 @@ class Kiosk(tk.Tk):
             self._stop_preview()
             if self.serial_panel:
                 self.toggle_serial()
-            self._close_wifi()
+            self._close_net_panels()
             self.status_wrap.pack_forget()
             self.ks_panel = KsPanel(self.body)
             self.ks_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
             self.banner.config(text="Kickstart 编辑 · 保存自动备份, 修改立即对下次装机生效")
 
-    def _close_wifi(self):
-        if getattr(self, "wifi_panel", None):
-            self.wifi_panel.destroy()
-            self.wifi_panel = None
-            self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
-            self.banner.config(text="")
+    def _close_net_panels(self):
+        """无线 / 网口配置文件两个网络面板, 开着哪个关哪个."""
+        for attr in ("wifi_panel", "netprof_panel"):
+            if getattr(self, attr, None):
+                getattr(self, attr).destroy()
+                setattr(self, attr, None)
+                self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
+                self.banner.config(text="")
 
     def toggle_wifi(self):
         if getattr(self, "wifi_panel", None):
-            self._close_wifi()
+            self._close_net_panels()
             return
+        self._close_net_panels()
         self._stop_preview()
         if self.serial_panel:
             self.toggle_serial()
@@ -251,6 +256,21 @@ class Kiosk(tk.Tk):
         self.wifi_panel = WifiPanel(self.body)
         self.wifi_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.banner.config(text="无线网络 · 优先级从上往下自动连, 再点一次按钮返回")
+
+    def toggle_netprof(self):
+        if getattr(self, "netprof_panel", None):
+            self._close_net_panels()
+            return
+        self._close_net_panels()
+        self._stop_preview()
+        if self.serial_panel:
+            self.toggle_serial()
+        if getattr(self, "ks_panel", None):
+            self.toggle_ks()
+        self.status_wrap.pack_forget()
+        self.netprof_panel = NetProfPanel(self.body)
+        self.netprof_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.banner.config(text="网口配置文件 · 切换 / 回退 / 新建, 再点一次按钮返回")
 
     # ------------------------------------------------------------ UVC 预览
 
@@ -272,7 +292,7 @@ class Kiosk(tk.Tk):
         if not os.path.exists(self.video_dev):
             messagebox.showwarning("UVC 预览", f"未检测到采集设备 {self.video_dev}")
             return
-        self._close_wifi()
+        self._close_net_panels()
         self.status_wrap.pack_forget()
         self.video_frame = tk.Frame(self.body, container=True, bg="#000000")
         self.video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
