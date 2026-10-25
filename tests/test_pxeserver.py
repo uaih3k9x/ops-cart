@@ -898,3 +898,11 @@ def test_tmpfiles_log_dir_readable_by_wheel_and_run_dir_exists():
     for d in ("/var/log/ops-cart", "/var/log/ops-cart/reports"):
         assert rows[d][2:5] == ["0750", "root", "wheel"], rows[d]
     assert rows["/run/ops-cart"][0] == "d"                  # pxe-guard.json / pin-gate.json 放这
+
+
+def test_guard_state_sticks_at_foreign(tmp_path):
+    g = guard_for(tmp_path, Box())
+    g.tick()
+    g.foreign("198.51.100.1", "被动监听")
+    g._set("serving", "")                          # 模拟另一线程晚到的 tick
+    assert g.state == "foreign" and not g.may_reply()

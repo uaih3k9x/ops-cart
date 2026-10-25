@@ -237,6 +237,8 @@ class PxeGuard:
             self.foreign(others[0].get("server"), "主动探测")
 
     def _set(self, state, detail):
+        if self.tripped and state != "foreign":     # 别的线程刚判了 foreign, 不许被 tick 改回去
+            return
         if (state, detail) == (self.state, self.detail):
             return
         self.state, self.detail = state, detail
