@@ -795,7 +795,7 @@ def test_menu_pages_reachable_and_actions_unique():
 
 def test_menu_keeps_every_existing_action():
     actions = {it["do"] for items in kc.MENU.values() for it in items if "do" in it}
-    assert actions == {"toggle_preview", "switch_source", "toggle_mouse_mode", "toggle_serial",
+    assert actions == {"toggle_preview", "switch_source", "toggle_mouse_mode", "cycle_kvm", "toggle_serial",
                        "toggle_ks", "toggle_pxe", "toggle_install_mode", "cfg_lan1", "cfg_lan2",
                        "toggle_wifi", "toggle_netprof", "toggle_wol", "lock_now", "reboot", "poweroff"}
 
@@ -922,3 +922,48 @@ def test_wheel_step_ignores_other_buttons():
 def test_mouse_bit_only_for_real_buttons():
     assert kc.mouse_bit(1) == 0x01 and kc.mouse_bit(3) == 0x02 and kc.mouse_bit(2) == 0x04
     assert kc.mouse_bit(4) is None and kc.mouse_bit(5) is None
+
+
+def test_video_key_of_dev():
+    nodes = [{"dev": "/dev/video0", "key": "0000:05:00.0"}, {"dev": "/dev/video2", "key": "345f:2109"}]
+    assert kc.video_key("/dev/video2", nodes) == "345f:2109"
+    assert kc.video_key("/dev/video9", nodes) is None
+
+
+def test_video_nodes_usb_key_from_sysfs_when_name_has_no_ids(tmp_path):
+    """2K USB Camera 的名字里没有 vid:pid -> 从 USB 设备目录读, 不能退回 video4 这种会变的编号."""
+    sysv = _fake_v4l(tmp_path)
+    usb = tmp_path / "devices" / "usb1" / "1-2" / "1-2.1"
+    (usb / "1-2.1:1.0").mkdir(parents=True)
+    (usb / "idVendor").write_text("2bdf\n")
+    (usb / "idProduct").write_text("0294\n")
+    d = sysv / "video4"
+    d.mkdir()
+    (d / "name").write_text("2K USB Camera: 2K USB Camera\n")
+    (d / "index").write_text("0\n")
+    (d / "device").symlink_to(usb / "1-2.1:1.0")
+    cam = next(n for n in kc.video_nodes(sysv) if n["dev"] == "/dev/video4")
+    assert cam["key"] == "2bdf:0294"
+
+
+ROUTE_WIRED = "default via 192.168.99.1 dev enp3s0 proto dhcp src 192.168.99.228 metric 100\n" \
+              "default via 192.168.166.1 dev wlp4s0 proto dhcp metric 600\n"
+ROUTE_WIFI = "default via 192.168.166.1 dev wlp4s0 proto dhcp src 192.168.166.20 metric 600\n"
+
+
+def test_default_route_dev_takes_first_default():
+    assert kc.default_route_dev(ROUTE_WIRED) == "enp3s0"
+    assert kc.default_route_dev("10.0.0.0/8 via 1.1.1.1 dev eno1\n") is None
+    assert kc.default_route_dev("") is None
+
+
+def test_net_state_three_levels():
+    assert kc.net_state(ROUTE_WIRED, internet=True) == ("on", "有线")
+    assert kc.net_state(ROUTE_WIFI, internet=True) == ("on", "Wi-Fi")
+    assert kc.net_state(ROUTE_WIFI, internet=False) == ("warn", "Wi-Fi 无外网")   # 连上了但出不去: 没认证/上游断
+    assert kc.net_state("", internet=False) == ("off", "未连接")
+    assert kc.net_state("default dev tailscale0\n", internet=True) == ("on", "tailscale0")
+
+
+def test_net_icon_paths(tmp_path):
+    assert kc.net_icon("warn", d=str(tmp_path)) == str(tmp_path / "net-warn.png")

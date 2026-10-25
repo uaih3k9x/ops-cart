@@ -77,6 +77,41 @@ def misc_status():
     return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up or "-"}
 
 
+# ---------------------------------------------------------------- 顶栏网络标
+
+NET_PROBE_HOST = "223.5.5.5"        # 阿里 DNS: 校园网/5G 哪条出口都通, ping 得通就算有外网
+ICON_DIR = "/opt/pxe/icons"
+
+
+def default_route_dev(route_text):
+    """`ip route show default` 里第一条默认路由走哪个口(内核按 metric 排好了); 没有 -> None."""
+    for line in route_text.splitlines():
+        p = line.split()
+        if p and p[0] == "default" and "dev" in p[:-1]:
+            return p[p.index("dev") + 1]
+    return None
+
+
+def net_state(route_text, internet):
+    """-> (状态, 说明). off=没默认路由; warn=连上了但出不去(校园网没认证/上游断); on=通外网."""
+    dev = default_route_dev(route_text)
+    if not dev:
+        return "off", "未连接"
+    via = "有线" if dev.startswith(("en", "eth")) else "Wi-Fi" if dev.startswith("wl") else dev
+    return ("on", via) if internet else ("warn", f"{via} 无外网")
+
+
+def net_probe():
+    route = run(["ip", "route", "show", "default"])[1]
+    up = bool(default_route_dev(route)) and \
+        run(["ping", "-c", "1", "-W", "1", NET_PROBE_HOST], timeout=3)[0] == 0
+    return net_state(route, up)
+
+
+def net_icon(state, d=ICON_DIR):
+    return f"{d}/net-{state}.png"
+
+
 HWMON = "/sys/class/hwmon"
 # hwmon 驱动名 -> (显示名, 取哪个 label; None = 第一个 temp)
 TEMP_SOURCES = (("coretemp", "CPU", "Package id 0"),
@@ -440,7 +475,14 @@ def video_nodes(sysdir=V4L_SYS, dev_root="/dev", names=None):
         name = (_read(os.path.join(d, "name")) or n).strip()
         parent = os.path.basename(os.path.realpath(os.path.join(d, "device")))
         usb = _re.search(r"\(([0-9a-f]{4}:[0-9a-f]{4})\)", name)
-        key = usb.group(1) if usb else parent if _re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d", parent) else n
+        if usb:
+            key = usb.group(1)
+        elif _re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d", parent):
+            key = parent
+        else:                           # USB 设备名里没带 vid:pid: 去接口的上一级读, 别用会变的 videoN
+            up = os.path.dirname(os.path.realpath(os.path.join(d, "device")))
+            ids = [(_read(os.path.join(up, f)) or "").strip() for f in ("idVendor", "idProduct")]
+            key = ":".join(ids) if all(ids) else n
         nodes.append({"dev": os.path.join(dev_root, n), "name": name, "key": key})
     sc = sorted(x["key"] for x in nodes if x["name"].startswith("SC0710"))
     for x in nodes:
@@ -453,6 +495,12 @@ def video_nodes(sysdir=V4L_SYS, dev_root="/dev", names=None):
         else:
             x["friendly"] = x["name"][:24]
     return nodes
+
+
+def video_key(dev, nodes=None):
+    """画面源设备 -> 绑定用的 key (同 video_nodes); 找不到 None."""
+    nodes = video_nodes() if nodes is None else nodes
+    return next((x["key"] for x in nodes if x["dev"] == dev), None)
 
 
 def video_friendly(dev, nodes=None):
@@ -890,6 +938,8 @@ def mpv_cmd(wid, dev):
             # 透传要看着画面操作: 不缓冲, 来一帧显示一帧
             "--profile=low-latency", "--untimed", "--cache=no",
             "--demuxer-lavf-o-add=fflags=+nobuffer",
+            # 远程截图口: cart_snap.py 经它存当前帧 (锁屏盖住也拿得到)
+            "--input-ipc-server=/run/ops-cart/mpv.sock",
             # 裸路径会被当文件 read(), SC0710 驱动的 read() 不出帧; 显式走 v4l2 mmap 采集
             f"av://v4l2:{dev}"]
 
@@ -1048,6 +1098,7 @@ MENU = {
     "video": [
         {"text": "画面源", "do": "switch_source", "attr": "btn_src"},
         {"text": "鼠标:  绝对 (点哪是哪)", "do": "toggle_mouse_mode", "attr": "btn_mouse"},
+        {"text": "键鼠绑定:  不绑定", "do": "cycle_kvm", "attr": "btn_kvm"},
     ],
     "install": [
         {"text": "PXE 装机服务:  开 / 关", "do": "toggle_pxe"},

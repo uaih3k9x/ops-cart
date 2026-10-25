@@ -12,7 +12,9 @@ import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
+import cartlog
 import kiosk_core as kc
+import kvm_core as kvm
 from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
@@ -52,7 +54,7 @@ class Kiosk(tk.Tk):
         self._mouse_btn = 0
         self._last_pos = None
         self.ch, self._ch_dev = None, None
-        self._ensure_ch()
+        self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
 
         kc.kp_enter_as_return(self)
         self._build()
@@ -90,6 +92,17 @@ class Kiosk(tk.Tk):
                  bg="#10141c", fg="#e8eaf0").pack(side="left")
         self.banner = tk.Label(top, text="", font=FONT_BIG, bg="#10141c", fg="#ffb86c")
         self.banner.pack(side="left", padx=20)
+        # 网络标: 最右边常驻, 点一下开无线面板; 图标缺了就只显示文字
+        self._net_imgs = {}
+        for state in ("on", "warn", "off"):
+            try:
+                self._net_imgs[state] = tk.PhotoImage(file=kc.net_icon(state))
+            except tk.TclError:
+                pass
+        self.net_label = tk.Label(top, text="检查中", font=FONT, bg="#10141c", fg="#6b7489",
+                                  compound="left", padx=6, cursor="hand2")
+        self.net_label.pack(side="right", padx=(12, 0))
+        self.net_label.bind("<Button-1>", lambda _e: self.toggle_wifi())
         self.clock = tk.Label(top, font=FONT, bg="#10141c", fg="#8b93a7")
         self.clock.pack(side="right")
         tk.Label(top, text=kc.version_string(), font=FONT, bg="#10141c",
@@ -119,6 +132,7 @@ class Kiosk(tk.Tk):
         self._build_menu(btns)
         self.video_dev = kc.default_video(kc.video_nodes()) or VIDEO_DEV
         self.btn_src.config(text=f"画面源:  {kc.video_friendly(self.video_dev)}")
+        self._show_kvm()
 
     def _build_menu(self, btns):
         """右侧按钮按 kc.MENU 分页: 每页一个 Frame, 全部先建好, 切页只换显示哪一个."""
@@ -166,6 +180,8 @@ class Kiosk(tk.Tk):
         """状态板 = 实时自检: 跟开机自检同一张计划表 (selftest.json), 再加温度/风扇."""
         def checks():
             try:
+                net = kc.net_probe()
+                self.after(0, lambda: self._render_net(*net))
                 self._check_rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
             finally:
                 self._checking = False
@@ -185,6 +201,12 @@ class Kiosk(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
+
+    NET_COLORS = {"on": "#7ee787", "warn": "#f0b429", "off": "#ff7b72"}
+
+    def _render_net(self, state, text):
+        self.net_label.config(image=self._net_imgs.get(state, ""), text=text,
+                              fg=self.NET_COLORS[state])
 
     def _render(self, lines):
         if self.status_text.winfo_ismapped():
@@ -292,8 +314,10 @@ class Kiosk(tk.Tk):
 
     def switch_source(self):
         """在能出画面的采集节点之间轮换 (跳过 UVC 元数据节点); 正在预览就换源重开."""
+        self._release_passthrough()        # 别带着上一路的透传切过去
         self.video_dev = kc.next_video_device([x["dev"] for x in kc.video_nodes()], self.video_dev)
         self.btn_src.config(text=f"画面源:  {kc.video_friendly(self.video_dev)}")
+        self._show_kvm()
         if self.video_frame:
             self._stop_preview()
             self._start_preview()
@@ -316,6 +340,7 @@ class Kiosk(tk.Tk):
         self.update_idletasks()
         wid = self.video_frame.winfo_id()
         self._video_wh = kc.video_size(self.video_dev)     # 绝对鼠标按真实画面比例扣黑边
+        os.makedirs("/run/ops-cart", exist_ok=True)        # mpv 的 IPC socket 放这 (cart_snap.py 用)
         self.mpv = subprocess.Popen(
             kc.mpv_cmd(wid, self.video_dev),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -334,21 +359,58 @@ class Kiosk(tk.Tk):
 
     # ------------------------------------------------------------ 键鼠透传
 
-    def _ensure_ch(self):
-        """CH9329 串口按 by-id 找; 重插后 ttyACMn 变了就重连. 返回能不能用."""
-        dev = os.path.realpath(kc.ch9329_port())
-        if self.ch and dev == self._ch_dev:
-            return True
+    def _kvm_state(self):
+        """当前画面源绑的键鼠 -> (串口路径, 序列号, ok/unbound/offline)."""
+        return kvm.resolve(self.kvm, kc.video_key(self.video_dev), kvm.ports())
+
+    def _close_ch(self):
         if self.ch:
             try:
                 self.ch.close()
             except OSError:
                 pass
+        self.ch, self._ch_dev = None, None
+
+    def _ensure_ch(self):
+        """连当前画面源绑定的那块 CH9329 (按 CH343 序列号, 重插后 ttyACMn 变了也认得).
+        没绑 / 不在线就不连 —— 绝不退回随便一块. 返回 ok/unbound/offline/error."""
+        path, _serial, state = self._kvm_state()
+        if state != "ok":
+            self._close_ch()
+            return state
+        dev = os.path.realpath(path)
+        if self.ch and dev == self._ch_dev:
+            return "ok"
+        self._close_ch()
         try:
             self.ch, self._ch_dev = Ch9329(dev, log=lambda *a: None), dev
         except OSError:
-            self.ch, self._ch_dev = None, None
-        return self.ch is not None
+            return "error"
+        return "ok"
+
+    def _show_kvm(self):
+        _path, serial, state = self._kvm_state()
+        text = kvm.label(self.kvm, serial) + {"offline": " (不在线)"}.get(state, "")
+        self.btn_kvm.config(text=f"键鼠绑定:  {text}")
+
+    def cycle_kvm(self):
+        """给当前画面源换绑: 不绑定 -> 在线的第一块 -> 第二块 -> ... (按序列号排)."""
+        key = kc.video_key(self.video_dev)
+        if not key:
+            return messagebox.showwarning("键鼠绑定", "当前没有画面源")
+        self._release_passthrough()
+        new = kvm.next_choice(sorted(kvm.ports()), self.kvm["bind"].get(key))
+        self.kvm = kvm.bind(self.kvm, key, new)
+        try:
+            kvm.save(self.kvm)
+        except OSError as ex:
+            return messagebox.showerror("键鼠绑定", f"保存失败: {ex}")
+        src = kc.video_friendly(self.video_dev)
+        cartlog.event("kvm", f"{src} ({key}) → {kvm.label(self.kvm, new)} {new or ''}".strip())
+        self._show_kvm()
+        others = kvm.shared_with(self.kvm, new, key) if new else []
+        note = f" · 注意: 这块也绑在 {len(others)} 个别的画面源上" if others else ""
+        self.banner.config(text=f"{src} 的键鼠: {kvm.label(self.kvm, new)}{note}")
 
     def _ch_send(self, fn, *args, **kw):
         """发送失败(线被拔)就丢掉句柄, 下次进透传再重连; 不让异常打断 Tk 的定时循环."""
@@ -361,14 +423,24 @@ class Kiosk(tk.Tk):
             self.banner.config(text="CH9329 断开 · 重新单击画面重连")
 
     def _banner_idle(self):
+        _path, serial, state = self._kvm_state()
+        src = kc.video_friendly(self.video_dev)
+        if state != "ok":
+            why = "绑定的键鼠不在线" if state == "offline" else "没绑定键鼠"
+            self.banner.config(text=f"预览 {src} · {why}, 只看不操作 · 画面设置 ▸ 键鼠绑定")
+            return
         mode = "绝对" if self.mouse_abs else "相对"
-        self.banner.config(text=f"预览 {kc.video_friendly(self.video_dev)} · 鼠标{mode} · 单击画面进入透传")
+        self.banner.config(text=f"预览 {src} · 键鼠 {kvm.label(self.kvm, serial)} · 鼠标{mode} · 单击画面进入透传")
 
     def _engage_passthrough(self):
         if self.passthrough:
             return
-        if not self._ensure_ch():
-            messagebox.showwarning("键鼠透传", f"CH9329 未连接 ({kc.ch9329_port()})")
+        state = self._ensure_ch()
+        if state in ("unbound", "offline"):
+            self._banner_idle()                     # 只看不操作: 横幅说明原因, 不弹窗打断
+            return
+        if state != "ok":
+            messagebox.showwarning("键鼠透传", "绑定的 CH9329 打不开 (被占用或刚拔掉?)")
             return
         self.passthrough = True
         self._combo = kc.ReleaseCombo()

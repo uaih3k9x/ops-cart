@@ -47,12 +47,14 @@
 | [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
 | [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版 Kiosk(标准库 http.server + xterm.js) |
 | [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着 CAMPUSNET 时跑;结果写 `/run/ops-cart/campusnet-status.json` 给面板和状态板 |
+| [`kvm_core.py`](kvm_core.py) | 画面源 ↔ 键鼠绑定:CH9329 按 CH343 序列号认身份;没绑或不在线 = 只看不操作,绝不退回随便一块 |
 | [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈,也可当命令行工具用 |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract) |
 
 | 目录 | 内容 |
 |---|---|
 | [`tests/`](tests/) | 离线单测,不接任何硬件也能全绿 |
+| [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库,`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟 |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例 |
@@ -81,7 +83,7 @@ python3 cart_ocr.py shot.png --find "Boot Menu"
 
 ```bash
 scripts/stamp-build.sh                         # 生成 BUILD(提交数 + 哈希)
-scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web cart:/opt/pxe/
+scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web icons cart:/opt/pxe/
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo cp deploy/sysctl.d/* /etc/sysctl.d/ && sudo sysctl --system
 sudo mkdir -p /etc/systemd/journald.conf.d && sudo cp deploy/journald.conf.d/* /etc/systemd/journald.conf.d/ && sudo systemctl restart systemd-journald
