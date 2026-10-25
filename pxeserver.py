@@ -57,7 +57,7 @@ def parse_dhcp(msg):
     """返回 (xid, client_mac, option dict). 非 DHCP 报文返回 None."""
     if len(msg) < 240 or msg[236:240] != MAGIC:
         return None
-    xid = msg[0:4]
+    xid = msg[4:8]
     mac = msg[28:34]
     opts = {}
     i = 240
@@ -119,6 +119,10 @@ def open_dhcp_socket(sock, ip, port, iface=None, platform=sys.platform, sleep=ti
 
 
 class DhcpServer:
+    LEASE_S = 3600          # ACK 给的租期; 到期不续就回收
+    OFFER_HOLD_S = 60       # 只 DISCOVER 不 REQUEST 的机器, 地址先替它留这么久
+    DECLINE_HOLD_S = 600    # 客户端 DECLINE (ARP 发现有人占着) 的地址隔离这么久
+
     def __init__(self, ip, pool_start, pool_end, uefi_file, bios_file, log, port=67, iface=None,
                  prefix=24):
         self.ip = ip
@@ -134,69 +138,103 @@ class DhcpServer:
         self.port = port
         self.uefi_file, self.bios_file = uefi_file, bios_file
         self.log = log
-        self.leases = {}   # mac -> ip
-        self.assigned = set()
+        self.leases = {}        # mac(bytes) -> [ip, 到期时间]
+        self.declined = {}      # ip -> 隔离到什么时候
+        self._lock = threading.Lock()
 
-    def offer_ip(self, mac):
-        if mac in self.leases:
-            return self.leases[mac]
+    # ---- 租约表
+
+    def _holder(self, ip, now):
+        """ip 现在被谁占着 (租约没过期); 没人占返回 None."""
+        for mac, (lip, until) in self.leases.items():
+            if lip == ip and until > now:
+                return mac
+        return None
+
+    def _usable(self, ip, mac, now):
+        return self.declined.get(ip, 0) <= now and self._holder(ip, now) in (None, mac)
+
+    def offer_ip(self, mac, now=None):
+        now = time.time() if now is None else now
+        lease = self.leases.get(mac)
+        if lease and self._usable(lease[0], mac, now):
+            lease[1] = max(lease[1], now + self.OFFER_HOLD_S)
+            return lease[0]
         for ip in self.pool:
-            if ip not in self.assigned:
-                self.leases[mac] = ip
-                self.assigned.add(ip)
+            if self._usable(ip, mac, now):
+                for other in [m for m, (lip, _) in self.leases.items() if lip == ip and m != mac]:
+                    del self.leases[other]          # 过期的旧租约, 回收
+                self.leases[mac] = [ip, now + self.OFFER_HOLD_S]
                 return ip
         return None             # 池子用完: 宁可不回, 也不把同一个地址发给两台机器
 
-    def handle(self, msg, addr):
+    def _reply(self, msg, kind, ip, opts):
+        bootfile = arch_bootfile(opts, self.uefi_file, self.bios_file)
+        return build_dhcp_reply(msg, 2, ip, self.ip, [
+            encode_opt(53, kind),
+            encode_opt(60, "PXEClient"),
+            encode_opt(54, (self.ip,)),
+            encode_opt(51, struct.pack("!I", self.LEASE_S)),
+            encode_opt(1, (self.netmask,)),
+            encode_opt(3, (self.ip,)),
+            encode_opt(66, self.ip),
+            encode_opt(67, bootfile),
+        ], bootfile)
+
+    def handle(self, msg, addr, now=None):
         parsed = parse_dhcp(msg)
-        if not parsed:
+        if not parsed or msg[0] != 1:       # 只管 BOOTREQUEST
             return None
+        now = time.time() if now is None else now
+        with self._lock:
+            return self._handle(msg, addr, parsed, now)
+
+    def _handle(self, msg, addr, parsed, now):
         xid, mac, opts = parsed
         mac_hex = mac.hex(":", 1)
         msg_type = opts.get(53, b"")[0:1]
         vendor = opts.get(60, b"").decode("ascii", "replace")
-        if vendor and msg_type == b"\x01":
+        server_id = opts.get(54)
+        ours = server_id == socket.inet_aton(self.ip)
+        ciaddr = socket.inet_ntoa(msg[12:16])
+        req_ip = socket.inet_ntoa(opts[50]) if len(opts.get(50, b"")) == 4 else \
+            (ciaddr if ciaddr != "0.0.0.0" else None)
+        lease = self.leases.get(mac)
+        if vendor and msg_type == b"\x01" and addr:
             self.log.info("DHCP 客户端 %s vendor=%r arch=%s src=%s:%d", mac_hex,
                           vendor, opts.get(93, b"").hex(), addr[0], addr[1])
         if msg_type == b"\x01":  # DISCOVER
-            ip = self.offer_ip(mac)
+            ip = self.offer_ip(mac, now)
             if ip is None:
                 self.log.warning("DHCP DISCOVER %s: 地址池已用完, 不回 OFFER", mac_hex)
                 return None
-            bootfile = arch_bootfile(opts, self.uefi_file, self.bios_file)
-            self.log.info("DHCP DISCOVER %s -> OFFER %s bootfile=%s", mac_hex, ip, bootfile)
-            return build_dhcp_reply(msg, 2, ip, self.ip, [
-                encode_opt(53, b"\x02"),
-                encode_opt(60, "PXEClient"),
-                encode_opt(54, (self.ip,)),
-                encode_opt(51, struct.pack("!I", 3600)),
-                encode_opt(1, (self.netmask,)),
-                encode_opt(3, (self.ip,)),
-                encode_opt(66, self.ip),
-                encode_opt(67, bootfile),
-            ], bootfile)
+            self.log.info("DHCP DISCOVER %s -> OFFER %s bootfile=%s", mac_hex, ip,
+                          arch_bootfile(opts, self.uefi_file, self.bios_file))
+            return self._reply(msg, b"\x02", ip, opts)
         if msg_type == b"\x03":  # REQUEST
-            server_id = opts.get(54)
-            if server_id and server_id != socket.inet_aton(self.ip):
+            if server_id and not ours:
                 return None     # 客户端选了别的 DHCP 服务器: 不 ACK 也不 NAK
-            req_ip = opts.get(50)
-            ip = socket.inet_ntoa(req_ip) if req_ip else self.leases.get(mac)
-            if ip not in self.pool:
-                self.log.info("DHCP REQUEST %s 拒绝 %s", mac_hex, ip)
+            mine = lease is not None and (req_ip is None or req_ip == lease[0]) and \
+                self._usable(lease[0], mac, now)
+            if not mine:
+                if not ours:    # INIT-REBOOT / 续租, 但不是我们的租约: 不是我们的事, 不吭声
+                    return None
+                self.log.info("DHCP REQUEST %s 拒绝 %s", mac_hex, req_ip)
                 return build_dhcp_reply(msg, 2, "0.0.0.0", self.ip, [
-                    encode_opt(53, b"\x06")])  # NAK
-            self.log.info("DHCP REQUEST %s -> ACK %s", mac_hex, ip)
-            bootfile = arch_bootfile(opts, self.uefi_file, self.bios_file)
-            return build_dhcp_reply(msg, 2, ip, self.ip, [
-                encode_opt(53, b"\x05"),
-                encode_opt(60, "PXEClient"),
-                encode_opt(54, (self.ip,)),
-                encode_opt(51, struct.pack("!I", 3600)),
-                encode_opt(1, (self.netmask,)),
-                encode_opt(3, (self.ip,)),
-                encode_opt(66, self.ip),
-                encode_opt(67, bootfile),
-            ], bootfile)
+                    encode_opt(53, b"\x06"), encode_opt(54, (self.ip,))])  # NAK
+            lease[1] = now + self.LEASE_S
+            self.log.info("DHCP REQUEST %s -> ACK %s", mac_hex, lease[0])
+            return self._reply(msg, b"\x05", lease[0], opts)
+        if msg_type in (b"\x04", b"\x07") and (ours or not server_id):  # DECLINE / RELEASE
+            ip = req_ip if msg_type == b"\x04" else ciaddr
+            if lease and lease[0] == ip:
+                del self.leases[mac]
+                if msg_type == b"\x04":
+                    self.declined[ip] = now + self.DECLINE_HOLD_S
+                    self.log.warning("DHCP DECLINE %s %s: 地址有冲突, 隔离 %ds", mac_hex, ip,
+                                     self.DECLINE_HOLD_S)
+                else:
+                    self.log.info("DHCP RELEASE %s %s", mac_hex, ip)
         return None
 
     def handle_proxy(self, msg, addr):

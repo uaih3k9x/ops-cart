@@ -20,7 +20,7 @@ def make_discover(mac=b"\xaa\xbb\xcc\xdd\xee\x01", arch=7, with_arch=True):
     msg[0] = 1  # BOOTREQUEST
     msg[1] = 1  # ethernet
     msg[2] = 6  # hlen
-    msg[0:4] = b"\x99\x88\x77\x66"  # xid
+    msg[4:8] = b"\x99\x88\x77\x66"  # xid
     msg[28:34] = mac
     msg[236:240] = b"\x63\x82\x53\x63"
     opts = encode_opt(53, b"\x01")
@@ -159,12 +159,12 @@ def test_request_acks_offered_ip():
     assert socket.inet_ntoa(reply[16:20]) == "192.0.2.10"
 
 
-def test_request_outside_pool_naks():
+def test_request_outside_pool_naks_when_we_are_selected():
     d = dhcp_for_test()
-    req = bytes(bytearray(make_discover())[:240] +
-                encode_opt(53, b"\x03") + encode_opt(50, ("10.99.99.99",)) + b"\xff")
+    req = bytes(bytearray(make_discover())[:240] + encode_opt(53, b"\x03") +
+                encode_opt(50, ("198.51.100.99",)) + encode_opt(54, ("192.0.2.1",)) + b"\xff")
     reply = d.handle(req, None)
-    assert parse_dhcp(reply)[2][53] == b"\x06"  # NAK
+    assert parse_dhcp(reply)[2][53] == b"\x06"  # NAK: 客户端选的是我们, 地址又不对
 
 
 def test_build_reply_preserves_xid_and_chaddr():
@@ -356,3 +356,104 @@ def test_pool_must_sit_inside_subnet():
 def test_pool_must_not_contain_server_ip():
     with pytest.raises(ValueError):
         DhcpServer("192.0.2.1", "192.0.2.1", "192.0.2.5", "shim.efi", "pxelinux.0", FakeLog())
+
+
+# ---- A1: 租约 / 静默 / RELEASE / DECLINE
+
+M1, M2 = b"\x02\x00\x00\x00\x00\x01", b"\x02\x00\x00\x00\x00\x02"
+
+
+def _msg(mac, mtype, ip=None, server_id=None, ciaddr=None):
+    head = bytearray(make_discover(mac=mac))[:240]
+    if ciaddr:
+        head[12:16] = socket.inet_aton(ciaddr)
+    opts = encode_opt(53, mtype)
+    if ip:
+        opts += encode_opt(50, (ip,))
+    if server_id:
+        opts += encode_opt(54, (server_id,))
+    return bytes(head + opts + b"\xff")
+
+
+def _yiaddr(reply):
+    return socket.inet_ntoa(reply[16:20])
+
+
+def test_request_without_server_id_for_unknown_lease_is_silent():
+    """INIT-REBOOT: 客户端拿着别处的旧地址来问, 不是我们的租约就不吭声 (不发 NAK 抢戏)."""
+    d = dhcp_for_test()
+    assert d.handle(_msg(M1, b"\x03", "198.51.100.99"), None, now=0) is None
+    assert d.handle(_msg(M1, b"\x03", "192.0.2.10"), None, now=0) is None     # 池里但没租给它
+
+
+def test_request_without_server_id_renews_own_lease():
+    d = dhcp_for_test()
+    d.handle(make_discover(mac=M1), None, now=0)
+    assert d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=1)[242] == 5
+    r = d.handle(_msg(M1, b"\x03", ciaddr="192.0.2.10"), None, now=1000)     # RENEWING: 只填 ciaddr
+    assert parse_dhcp(r)[2][53] == b"\x05" and _yiaddr(r) == "192.0.2.10"
+
+
+def test_request_for_ip_leased_to_someone_else_naks():
+    d = dhcp_for_test()
+    d.handle(make_discover(mac=M1), None, now=0)
+    d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=0)
+    d.handle(make_discover(mac=M2), None, now=0)
+    r = d.handle(_msg(M2, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=0)
+    assert parse_dhcp(r)[2][53] == b"\x06"
+
+
+def test_twelve_macs_eleven_addresses_last_gets_no_offer():
+    d = DhcpServer("192.0.2.1", "192.0.2.10", "192.0.2.20", "shim.efi", "pxelinux.0", FakeLog())
+    replies = [d.handle(make_discover(mac=bytes([2, 0, 0, 0, 1, i])), None, now=0) for i in range(12)]
+    assert all(replies[:11]) and replies[11] is None
+    assert len({_yiaddr(r) for r in replies[:11]}) == 11
+
+
+def test_expired_lease_is_reclaimed():
+    d = DhcpServer("192.0.2.1", "192.0.2.10", "192.0.2.10", "shim.efi", "pxelinux.0", FakeLog())
+    d.handle(make_discover(mac=M1), None, now=0)
+    d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=0)
+    assert d.handle(make_discover(mac=M2), None, now=3599) is None           # 还在租期内
+    r = d.handle(make_discover(mac=M2), None, now=3601)                       # 3600 秒到期回收
+    assert _yiaddr(r) == "192.0.2.10"
+
+
+def test_unrequested_offer_is_held_briefly_only():
+    d = DhcpServer("192.0.2.1", "192.0.2.10", "192.0.2.10", "shim.efi", "pxelinux.0", FakeLog())
+    d.handle(make_discover(mac=M1), None, now=0)                              # 只 DISCOVER 不 REQUEST
+    assert d.handle(make_discover(mac=M2), None, now=10) is None
+    assert d.handle(make_discover(mac=M2), None, now=d.OFFER_HOLD_S + 1) is not None
+
+
+def test_ack_lease_time_is_3600():
+    d = dhcp_for_test()
+    d.handle(make_discover(mac=M1), None, now=0)
+    r = d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=0)
+    assert struct.unpack("!I", parse_dhcp(r)[2][51])[0] == 3600
+
+
+def test_release_frees_address():
+    d = DhcpServer("192.0.2.1", "192.0.2.10", "192.0.2.10", "shim.efi", "pxelinux.0", FakeLog())
+    d.handle(make_discover(mac=M1), None, now=0)
+    d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=0)
+    assert d.handle(_msg(M1, b"\x07", server_id="192.0.2.1", ciaddr="192.0.2.10"), None, now=5) is None
+    assert _yiaddr(d.handle(make_discover(mac=M2), None, now=6)) == "192.0.2.10"
+
+
+def test_release_of_someone_elses_address_ignored():
+    d = DhcpServer("192.0.2.1", "192.0.2.10", "192.0.2.10", "shim.efi", "pxelinux.0", FakeLog())
+    d.handle(make_discover(mac=M1), None, now=0)
+    d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=0)
+    d.handle(_msg(M2, b"\x07", server_id="192.0.2.1", ciaddr="192.0.2.10"), None, now=5)
+    assert d.handle(make_discover(mac=M2), None, now=6) is None
+
+
+def test_decline_quarantines_address():
+    d = DhcpServer("192.0.2.1", "192.0.2.10", "192.0.2.11", "shim.efi", "pxelinux.0", FakeLog())
+    d.handle(make_discover(mac=M1), None, now=0)
+    d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=0)
+    assert d.handle(_msg(M1, b"\x04", "192.0.2.10", "192.0.2.1"), None, now=1) is None   # ARP 撞了
+    assert _yiaddr(d.handle(make_discover(mac=M1), None, now=2)) == "192.0.2.11"     # 换一个
+    assert d.handle(make_discover(mac=M2), None, now=3) is None                       # .10 隔离中
+    assert _yiaddr(d.handle(make_discover(mac=M2), None, now=d.DECLINE_HOLD_S + 2)) == "192.0.2.10"
