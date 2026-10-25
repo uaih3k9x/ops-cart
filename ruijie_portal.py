@@ -7,6 +7,9 @@
 
 只在无线连着配置里的 ssid 时才跑: 别的网也可能是锐捷认证, 不能把密码交给它. 配置没写 ssid 就一律跳过.
 每次结果写 STATUS (Kiosk 面板/状态板读), 状态变了才记 events.log; 没登上就以 1 退出.
+
+portal 主机白名单 (TOFU): 配置里的 portal_hosts 为空时, 第一次登录成功就记住 eportal 的主机;
+以后被 302 到不在名单里的主机, 一个请求体都不发 (结果记 untrusted). 换了认证服务器就手动改配置.
 """
 
 import json
@@ -157,7 +160,21 @@ def find_eportal(iface, location):
     return None
 
 
+def portal_host(base):
+    """eportal 地址 -> 主机[:端口], 小写."""
+    return urllib.parse.urlsplit(base).netloc.lower()
+
+
+def host_trust(conf, host):
+    """ok = 在白名单; tofu = 名单还空着 (第一次, 登录成功后记住); stranger = 不认识, 不发凭据."""
+    hosts = conf.get("portal_hosts") or []
+    if not hosts:
+        return "tofu"
+    return "ok" if host in hosts else "stranger"
+
+
 def run_once(conf):
+    """跑一次认证. 第一次登录成功时把 portal 主机写进 conf["portal_hosts"] (调用方负责落盘)."""
     iface = conf["iface"]
     code, loc, body = curl(iface, PROBE)
     state = classify(code, loc, body)
@@ -167,6 +184,10 @@ def run_once(conf):
     if not hit:
         return "portal?"
     base, query = hit
+    host = portal_host(base)
+    trust = host_trust(conf, host)
+    if trust == "stranger":
+        return f"untrusted: {host}"
     _c, _l, info = curl(iface, base + "InterFace.do?method=pageInfo", data="queryString=" + ec(ec(query)))
     info = json.loads(info)
     pw = conf["password"]
@@ -174,6 +195,8 @@ def run_once(conf):
         pw = encrypt_password(pw, info["publicKeyExponent"], info["publicKeyModulus"], mac_from_query(query))
     _c, _l, res = curl(iface, base + "InterFace.do?method=login", data=login_body(conf["user"], pw, query))
     ok, msg = parse_result(res)
+    if ok and trust == "tofu":
+        conf["portal_hosts"] = [host]
     return "login ok" if ok else f"login fail: {msg}"
 
 
@@ -238,6 +261,14 @@ def attempt(conf, ssid, now):
     return record(state, msg, now)
 
 
+def persist_hosts(conf, before, path=CONF):
+    """run_once 记住了新的 portal 主机就写回配置. -> 是否写了."""
+    if (conf.get("portal_hosts") or None) == (before or None):
+        return False
+    conf_save(conf, path)
+    return True
+
+
 def _read_json(path):
     try:
         with open(path) as f:
@@ -248,8 +279,16 @@ def _read_json(path):
 
 def main():
     import time
-    conf = json.load(open(sys.argv[1] if len(sys.argv) > 1 else CONF))
+    path = sys.argv[1] if len(sys.argv) > 1 else CONF
+    with open(path) as f:
+        conf = json.load(f)
+    before = list(conf.get("portal_hosts") or []) or None
     cur = attempt(conf, current_ssid(conf["iface"]), int(time.time()))
+    try:
+        if persist_hosts(conf, before, path):
+            cur["message"] = (cur["message"] + f" (已记住认证页 {conf['portal_hosts'][0]})").strip()
+    except OSError:
+        pass
     prev = _read_json(STATUS)
     try:
         import atomicfile
