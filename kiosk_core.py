@@ -6,12 +6,16 @@
 - 装机网段: 部署配置 /etc/ops-cart/pxe.env (pxe-* 单元和 grub 菜单共用同一份)
 """
 
+import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 
 import atomicfile
+import cartlog
+import pxeserver
 
 LAN1_CON = "Lan1-pxe"   # eno1, 装机口
 LAN2_CON = "enp3s0"     # 管理口
@@ -803,41 +807,17 @@ PXE_LOG = "/opt/pxe/pxeserver.log"
 ARM_SECONDS = 30 * 60
 
 
-def _repo(env_path):
-    return f"http://{pxe_env_read(env_path)['PXE_IP']}:8000"
-
-
-def _menu(entries, timeout, env_path):
-    http = f"(http,{pxe_env_read(env_path)['PXE_IP']})"
-    out = [f"set default=0\nset timeout={timeout}\n"]
-    for title, args in entries:
-        for src, label in ((http, "HTTP fast"), ("", "TFTP slow")):
-            out.append(f"menuentry '{title} ({label})' {{\n"
-                       f"    linux {src}/vmlinuz ip=dhcp {args}\n"
-                       f"    initrd {src}/initrd.img\n}}\n")
-    return "\n".join(out)
-
-
 def grub_cfg_rescue(env_path=None):
-    repo = _repo(env_path or PXE_ENV)
-    return ("# 推车 Kiosk 生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
-            _menu([("Rescue shell", f"inst.stage2={repo}/rocky inst.rescue inst.sshd inst.text")], 10,
-                  env_path or PXE_ENV))
+    return ("# 推车生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
+            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
 def grub_cfg_install(env_path=None):
-    repo = _repo(env_path or PXE_ENV)
-    return ("# 推车 Kiosk 生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
-            _menu([("Rocky 9.8 auto install", f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg")], 5,
-                  env_path or PXE_ENV))
+    return ("# 推车生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
+            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True))
 
 
-def _norm_mac(mac):
-    m = mac.strip().lower().replace("-", ":")
-    if len(m.split(":")) != 6 or not all(len(p) == 2 and all(c in "0123456789abcdef" for c in p)
-                                          for p in m.split(":")):
-        raise ValueError(f"不是 MAC 地址: {mac!r}")
-    return m
+_norm_mac = pxeserver.norm_mac
 
 
 def mac_cfg_name(mac):
@@ -848,15 +828,13 @@ def _write_atomic(path, text):
     atomicfile.write_text(path, text)
 
 
+def _pxe_event(msg):
+    cartlog.event("pxe", msg)
+
+
 def pxe_mode_read(path=PXE_MODE, now=None):
     """{"mode": "rescue"} / {"mode": "install", mac, since, until} / 过期则 mode="expired"."""
-    now = time.time() if now is None else now
-    try:
-        st = json.load(open(path))
-        mac, since, until = _norm_mac(st["mac"]), st["since"], st["until"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return {"mode": "rescue"}
-    return {"mode": "install" if now <= until else "expired", "mac": mac, "since": since, "until": until}
+    return pxeserver.pxe_mode(path, now)
 
 
 def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
@@ -865,6 +843,7 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
     _write_atomic(os.path.join(root, mac_cfg_name(mac)), grub_cfg_install())
     _write_atomic(path, json.dumps({"mac": mac, "since": now, "until": now + seconds}))
+    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟")
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
@@ -872,27 +851,28 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
     只要带 inst.ks= 也一并删掉. grub.cfg.bak-* 这类手工备份 GRUB 不会去取, 不动."""
     root = str(root)
+    removed = []
     for d, _dirs, files in os.walk(root):
         for name in files:
             full = os.path.join(d, name)
             fetched = name == "grub.cfg" or name.startswith("grub.cfg-")
             if not fetched or full == os.path.join(root, "grub.cfg"):
                 continue
-            if name.startswith("grub.cfg-01-") and d == root:
-                os.remove(full)
-                continue
-            try:
-                with open(full, errors="replace") as f:
-                    armed = "inst.ks=" in f.read()
-            except OSError:
-                continue
-            if armed:
-                os.remove(full)
+            if not (name.startswith("grub.cfg-01-") and d == root):
+                try:
+                    with open(full, errors="replace") as f:
+                        if "inst.ks=" not in f.read():
+                            continue
+                except OSError:
+                    continue
+            os.remove(full)
+            removed.append(os.path.relpath(full, root))
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
     try:
         os.remove(path)
     except FileNotFoundError:
         pass
+    _pxe_event("装机模式上锁, 只剩救援菜单" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else ""))
 
 
 def _log_ts(line):
@@ -1126,3 +1106,25 @@ MENU = {
         {"text": "关机", "do": "poweroff", "style": "danger"},
     ],
 }
+
+
+# ---------------------------------------------------------------- 命令行 (部署脚本用)
+
+def main(argv=None):
+    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留救援菜单 (setup-cart.sh 调).
+    菜单只从这里 (pxeserver.grub_menu) 生成, 部署脚本不再自己写 grub.cfg."""
+    ap = argparse.ArgumentParser(prog="kiosk_core.py")
+    ap.add_argument("--write-rescue", action="store_true", help="写救援菜单并删掉所有自动装机菜单")
+    ap.add_argument("--root", default=TFTP_ROOT)
+    ap.add_argument("--state", default=PXE_MODE)
+    a = ap.parse_args(sys.argv[1:] if argv is None else argv)
+    if not a.write_rescue:
+        ap.print_usage(sys.stderr)
+        return 2
+    pxe_disarm(root=a.root, path=a.state)
+    print(f"救援菜单已写入 {os.path.join(a.root, 'grub.cfg')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

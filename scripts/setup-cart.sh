@@ -13,7 +13,7 @@ echo "==> 校验 ISO"
 actual=$(sha256sum "$ISO" | awk '{print $1}')
 [ "$actual" = "$EXPECT_SHA256" ] || { echo "SHA256 不符: $actual"; exit 1; }
 
-mkdir -p "$TFTP/EFI/BOOT" "$HTTP"
+mkdir -p "$TFTP" "$HTTP"
 
 echo "==> 挂载 ISO"
 MNT=$(mktemp -d)
@@ -26,9 +26,10 @@ install -m 644 "$MNT/EFI/BOOT/grubx64.efi"        "$TFTP/grubx64.efi"
 install -m 644 "$MNT/images/pxeboot/vmlinuz"      "$TFTP/vmlinuz"
 install -m 644 "$MNT/images/pxeboot/initrd.img"   "$TFTP/initrd.img"
 
-echo "==> grub.cfg: 只写救援菜单 (装机菜单由推车上解锁时按 MAC 单独下发)"
+echo "==> grub.cfg: 只留救援菜单 (本脚本不写菜单; 装机菜单由推车上解锁时按 MAC 单独下发)"
 [ -f /etc/ops-cart/pxe.env ] || { echo "缺 /etc/ops-cart/pxe.env (照 deploy/pxe.env.example 写)"; exit 1; }
-python3 -c 'import sys; sys.path.insert(0, "/opt/pxe"); import kiosk_core as kc; kc.pxe_disarm()'
+python3 /opt/pxe/kiosk_core.py --write-rescue --root "$TFTP"
+# 老部署留下的 EFI/BOOT 菜单: 带 inst.ks 的上一步已删, 不带的也不要, 菜单只认 tftp 根这一份
 rm -f "$TFTP/EFI/BOOT/grub.cfg"
 
 echo "==> 铺 HTTP 仓库 (约 2.5GB)"

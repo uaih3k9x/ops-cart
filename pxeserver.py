@@ -12,6 +12,7 @@ TFTP: 支持 blksize / tsize 协商, octet 模式, 拒绝根目录穿越.
 
 import argparse
 import errno
+import io
 import ipaddress
 import json
 import logging
@@ -510,6 +511,68 @@ class DhcpServer:
             sock.sendto(result, (self.broadcast, port))
 
 
+# ---------------------------------------------------------------- 装机菜单与装机模式
+# 默认只有救援菜单; 推车上解锁时 kiosk_core 只给选定 MAC 写 grub.cfg-01-<mac>, 状态在 pxe-mode.json.
+# 菜单模板只在这里一份 (kiosk_core 也用它); TFTP/HTTP 发菜单和 ks 之前再看一遍 pxe-mode.json 兜底,
+# 车机界面不在时也不会误装.
+
+PXE_MODE = "/opt/pxe/pxe-mode.json"
+
+
+def grub_menu(ip, install=False):
+    """GRUB 菜单: 救援 (默认, 不装系统) / 自动装机. 每项都给 HTTP (快) 和 TFTP (慢) 两条路.
+    装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此只发给解锁的那台."""
+    repo = f"http://{ip}:8000"
+    if install:
+        title, args, timeout = ("Rocky 9.8 auto install",
+                                f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg inst.ks.sendmac", 5)
+    else:
+        title, args, timeout = ("Rescue shell", f"inst.stage2={repo}/rocky inst.rescue inst.sshd inst.text", 10)
+    out = [f"set default=0\nset timeout={timeout}\n"]
+    for src, label in ((f"(http,{ip})", "HTTP fast"), ("", "TFTP slow")):
+        out.append(f"menuentry '{title} ({label})' {{\n"
+                   f"    linux {src}/vmlinuz ip=dhcp {args}\n"
+                   f"    initrd {src}/initrd.img\n}}\n")
+    return "\n".join(out)
+
+
+def norm_mac(mac):
+    m = mac.strip().lower().replace("-", ":")
+    if len(m.split(":")) != 6 or not all(len(p) == 2 and all(c in "0123456789abcdef" for c in p)
+                                          for p in m.split(":")):
+        raise ValueError(f"不是 MAC 地址: {mac!r}")
+    return m
+
+
+def pxe_mode(path=PXE_MODE, now=None):
+    """{"mode": "rescue"} / {"mode": "install", mac, since, until} / 过期则 mode="expired".
+    文件没有、坏了、字段不对一律当救援."""
+    now = time.time() if now is None else now
+    try:
+        with open(path) as f:
+            st = json.load(f)
+        mac, since, until = norm_mac(st["mac"]), st["since"], st["until"]
+        armed = now <= until
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {"mode": "rescue"}
+    return {"mode": "install" if armed else "expired", "mac": mac, "since": since, "until": until}
+
+
+def menu_mac(name):
+    """grub.cfg-01-<mac> -> mac; 别的名字 None."""
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    if not base.startswith("grub.cfg-01-"):
+        return None
+    try:
+        return norm_mac(base[len("grub.cfg-01-"):])
+    except ValueError:
+        return None
+
+
+def install_allowed(mac, mode):
+    return bool(mac) and mode.get("mode") == "install" and mode.get("mac") == mac
+
+
 # ---------------------------------------------------------------- TFTP
 
 TFTP_MIN_BLKSIZE, TFTP_MAX_BLKSIZE = 8, 65464     # RFC 2348
@@ -585,12 +648,15 @@ def tftp_safe_name(root, name):
 
 
 class TftpServer:
+    MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的不当菜单看
+
     def __init__(self, ip, root, log, blksize=1428, timeout=2.0, retries=5, port=69,
-                 sock_factory=None):
+                 sock_factory=None, pxe_mode_path=PXE_MODE, now=time.time, event=cart_event):
         self.ip, self.root, self.log = ip, os.path.abspath(root), log
         self.blksize, self.timeout, self.retries = blksize, timeout, retries
         self.port = port
         self.sock_factory = sock_factory or (lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+        self.pxe_mode_path, self.now, self.event = pxe_mode_path, now, event
 
     def serve(self, ready_event=None, sock=None):
         if sock is None:
@@ -608,10 +674,24 @@ class TftpServer:
             sock.sendto(tftp_error(4, "Only RRQ supported"), addr)
 
     def open_file(self, name, client):
-        """-> (文件对象, 大小, 日志前缀). 找不到/越界抛 OSError."""
+        """-> (文件对象, 大小, 日志前缀). 找不到/越界抛 OSError.
+        GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 的, 只有已解锁、没过期、文件名就是那台 MAC 时才照发,
+        否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走)."""
         path = tftp_safe_name(self.root, name)
         f = open(path, "rb")
-        return f, os.fstat(f.fileno()).st_size, f"TFTP RRQ {name}"
+        size = os.fstat(f.fileno()).st_size
+        base = os.path.basename(path)
+        if not base.startswith("grub.cfg") or base.startswith("grub.cfg.") or size > self.MENU_MAX:
+            return f, size, f"TFTP RRQ {name}"
+        with f:
+            data = f.read()
+        if b"inst.ks=" in data:
+            mac = menu_mac(base)
+            if not install_allowed(mac, pxe_mode(self.pxe_mode_path, self.now())):
+                data = grub_menu(self.ip).encode()
+                return io.BytesIO(data), len(data), f"TFTP RRQ {name} 未解锁, 回救援菜单"
+            self.event(f"装机菜单被取走 mac={mac} from {client[0]}")
+        return io.BytesIO(data), len(data), f"TFTP RRQ {name}"
 
     def _rrq(self, msg, addr):
         client = (addr[0], addr[1])
@@ -661,7 +741,7 @@ class TftpServer:
 
 # ---------------------------------------------------------------- main
 
-def main():
+def parse_args(argv):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("serve")
@@ -674,8 +754,12 @@ def main():
     p.add_argument("--log", default=None)
     p.add_argument("--iface", default=None, help="装机口网卡名 (Linux 必填, 否则收不到 DHCP 广播)")
     p.add_argument("--guard-state", default=GUARD_STATE, help="守卫状态文件 (JSON)")
-    args = ap.parse_args()
+    p.add_argument("--pxe-mode", default=PXE_MODE, help="装机模式状态文件 (kiosk 解锁时写)")
+    return ap.parse_args(argv)
 
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(message)s",
@@ -701,7 +785,7 @@ def main():
     guard.tick()                    # 先探测: 装机口接在别人的网段上就一个包都不发
     if guard.tripped:
         sys.exit(EXIT_FOREIGN_DHCP)
-    tftp = TftpServer(args.ip, args.tftp_root, log)
+    tftp = TftpServer(args.ip, args.tftp_root, log, pxe_mode_path=args.pxe_mode)
     ev1, ev2, ev3 = threading.Event(), threading.Event(), threading.Event()
     threads = [threading.Thread(target=dhcp.serve, args=(ev1,), name="dhcp", daemon=True),
                threading.Thread(target=tftp.serve, args=(ev2,), name="tftp", daemon=True),

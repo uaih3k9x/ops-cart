@@ -8,6 +8,12 @@ import pytest
 import kiosk_core as kc
 
 
+@pytest.fixture(autouse=True)
+def _no_real_cartlog(monkeypatch):
+    """装机事件默认写 /var/log/ops-cart; 测试里不碰真目录."""
+    monkeypatch.setattr(kc, "_pxe_event", lambda msg: None)
+
+
 # ------------------------------------------------------------ 装机网段: 只来自部署配置 /etc/ops-cart/pxe.env
 
 def test_pxe_env_missing_gives_example_defaults(tmp_path):
@@ -971,13 +977,6 @@ def test_disarm_scrubs_install_menus_anywhere_in_tree(tmp_path):
     assert (tmp_path / "grub.cfg.bak-20261021").exists()
 
 
-def test_tracked_grub_templates_default_to_rescue():
-    import pathlib
-    here = pathlib.Path(__file__).resolve().parent.parent
-    for p in [here / "windows" / "grub.cfg", here / "scripts" / "setup-cart.sh"]:
-        assert "inst.ks" not in p.read_text(), p
-
-
 # ------------------------------------------------------------ PinGate 退避 + 线程安全 (1.06.00)
 
 def test_pin_gate_backoff_grows_and_caps():
@@ -1033,3 +1032,36 @@ def test_status_fields_dash_when_commands_missing(monkeypatch):
         assert n["ip"] == "-" and n["method"] == "-" and n["link"] is False
     m = kc.misc_status()
     assert m["tailscale_ip"] == "-" and m["uptime"] == "-"
+
+
+# ------------------------------------------------------------ A3: --write-rescue 入口, 菜单只从一处生成
+
+def test_write_rescue_cli_scrubs_tree(tmp_path):
+    (tmp_path / "EFI" / "BOOT").mkdir(parents=True)
+    (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text("set default=0\nlinux /vmlinuz inst.ks=x\n")
+    (tmp_path / "grub.cfg-01-02-00-00-00-00-01").write_text("inst.ks=x\n")
+    assert kc.main(["--write-rescue", "--root", str(tmp_path),
+                    "--state", str(tmp_path / "pxe-mode.json")]) == 0
+    cfgs = [p for p in tmp_path.rglob("grub.cfg*")]
+    assert [p.name for p in cfgs] == ["grub.cfg"]
+    assert "inst.rescue" in cfgs[0].read_text()
+
+
+def test_main_without_command_fails():
+    assert kc.main([]) != 0
+
+
+def test_menus_come_from_pxeserver_template(tmp_path):
+    import pxeserver
+    p = tmp_path / "pxe.env"
+    p.write_text("PXE_IP=198.51.100.1\n")
+    assert pxeserver.grub_menu("198.51.100.1") in kc.grub_cfg_rescue(env_path=p)
+    assert pxeserver.grub_menu("198.51.100.1", install=True) in kc.grub_cfg_install(env_path=p)
+
+
+def test_arm_and_disarm_log_pxe_events(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(kc, "_pxe_event", events.append)
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
+    assert len(events) == 2 and MAC in events[0] and "上锁" in events[1]

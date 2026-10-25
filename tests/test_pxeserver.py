@@ -782,3 +782,110 @@ def test_pxe_unit_prevents_restart_on_foreign_dhcp():
     line = next(l for l in u.splitlines() if l.startswith("RestartPreventExitStatus="))
     assert "3" in line.split("=", 1)[1].split()
     assert "--iface eno1" in u
+
+
+# ---- A4: 服务端兜底, 发装机菜单前看 pxe-mode.json
+
+from pxeserver import grub_menu, pxe_mode  # noqa: E402
+
+ARMED_MAC = "02:00:00:00:00:01"
+ARMED_CFG = "grub.cfg-01-02-00-00-00-00-01"
+
+
+def _tree(tmp_path, armed_until=None, mac=ARMED_MAC):
+    root = tmp_path / "tftp"
+    (root / "EFI" / "BOOT").mkdir(parents=True)
+    install = grub_menu("192.0.2.1", install=True)
+    (root / ARMED_CFG).write_text(install)
+    (root / "grub.cfg-01-02-00-00-00-00-02").write_text(install)       # 没解锁的那台
+    (root / "EFI" / "BOOT" / "grub.cfg").write_text(install)           # 老部署留下的自动装机菜单
+    (root / "grub.cfg").write_text(grub_menu("192.0.2.1"))
+    mode = tmp_path / "pxe-mode.json"
+    if armed_until is not None:
+        mode.write_text(json.dumps({"mac": mac, "since": 0, "until": armed_until}))
+    return root, mode
+
+
+def _fetch(root, mode, name, now=100):
+    sock = AckingSock()
+    srv = TftpServer("192.0.2.1", str(root), FakeLog(), sock_factory=lambda: sock,
+                     pxe_mode_path=str(mode), now=lambda: now, event=lambda m: None)
+    srv._rrq(b"\x00\x01" + name.encode() + b"\x00octet\x00", sock.client)
+    return b"".join(p[4:] for p in sock.sent if p[:2] == b"\x00\x03").decode()
+
+
+def test_tftp_serves_install_menu_to_armed_mac(tmp_path):
+    root, mode = _tree(tmp_path, armed_until=1000)
+    assert "inst.ks=" in _fetch(root, mode, "/" + ARMED_CFG)
+
+
+@pytest.mark.parametrize("name", ["/grub.cfg-01-02-00-00-00-00-02", "EFI/BOOT/grub.cfg"])
+def test_tftp_rescue_for_other_mac_or_shared_menu(tmp_path, name):
+    root, mode = _tree(tmp_path, armed_until=1000)
+    got = _fetch(root, mode, name)
+    assert "inst.ks" not in got and "inst.rescue" in got
+
+
+def test_tftp_rescue_when_expired(tmp_path):
+    root, mode = _tree(tmp_path, armed_until=50)
+    assert "inst.ks" not in _fetch(root, mode, "/" + ARMED_CFG, now=51)
+
+
+def test_tftp_rescue_when_not_armed(tmp_path):
+    root, mode = _tree(tmp_path)                                         # 没有 pxe-mode.json
+    assert "inst.ks" not in _fetch(root, mode, "/" + ARMED_CFG)
+
+
+def test_tftp_plain_files_untouched_by_gate(tmp_path):
+    root, mode = _tree(tmp_path)
+    (root / "vmlinuz").write_bytes(b"kernel inst.ks= not a menu")
+    assert _fetch(root, mode, "vmlinuz") == "kernel inst.ks= not a menu"
+
+
+def test_tftp_consumed_log_line_only_for_real_install_menu(tmp_path):
+    """车机靠 'TFTP RRQ /<菜单> (' 这行判断菜单被取走, 回救援时不能写成同样的行."""
+    root, mode = _tree(tmp_path, armed_until=1000)
+    lines = []
+
+    class L(FakeLog):
+        def info(self, fmt, *a, **k):
+            lines.append(fmt % a)
+    for name, armed in (("/" + ARMED_CFG, True), ("/grub.cfg-01-02-00-00-00-00-02", False)):
+        sock = AckingSock()
+        TftpServer("192.0.2.1", str(root), L(), sock_factory=lambda: sock, pxe_mode_path=str(mode),
+                   now=lambda: 100, event=lambda m: None)._rrq(
+            b"\x00\x01" + name.encode() + b"\x00octet\x00", sock.client)
+        hit = [l for l in lines if l.startswith(f"TFTP RRQ {name} (")]
+        assert bool(hit) == armed, lines
+
+
+def test_tftp_install_menu_fetch_is_logged_to_cartlog(tmp_path):
+    root, mode = _tree(tmp_path, armed_until=1000)
+    events, sock = [], AckingSock()
+    TftpServer("192.0.2.1", str(root), FakeLog(), sock_factory=lambda: sock, pxe_mode_path=str(mode),
+               now=lambda: 100, event=events.append)._rrq(
+        b"\x00\x01/" + ARMED_CFG.encode() + b"\x00octet\x00", sock.client)
+    assert events and ARMED_MAC in events[0]
+
+
+def test_pxe_mode_reader():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = f"{d}/m.json"
+        assert pxe_mode(p, now=0) == {"mode": "rescue"}
+        with open(p, "w") as f:
+            json.dump({"mac": "02-00-00-00-00-01", "since": 1, "until": 10}, f)
+        assert pxe_mode(p, now=5)["mac"] == ARMED_MAC and pxe_mode(p, now=5)["mode"] == "install"
+        assert pxe_mode(p, now=11)["mode"] == "expired"
+
+
+def test_grub_menu_rescue_and_install():
+    r, i = grub_menu("198.51.100.1"), grub_menu("198.51.100.1", install=True)
+    assert "inst.ks" not in r and "inst.rescue" in r and "198.51.100.1" in r
+    assert "inst.ks=http://198.51.100.1:8000/ks.cfg" in i and "inst.ks.sendmac" in i
+
+
+def test_parse_args_defaults_point_at_cart_state_files():
+    from pxeserver import GUARD_STATE, PXE_MODE, parse_args
+    a = parse_args(["serve", "--ip", "192.0.2.1", "--pool", "192.0.2.10,192.0.2.20", "--tftp-root", "/x"])
+    assert (a.prefix, a.pxe_mode, a.guard_state, a.iface) == (24, PXE_MODE, GUARD_STATE, None)
