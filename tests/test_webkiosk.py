@@ -804,3 +804,27 @@ def test_serial_stream_needs_cid(served):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     c.request("GET", "/api/serial/stream?name=ttyUSB0", headers={"Cookie": login(app)})
     assert c.getresponse().status == 400
+
+
+def _page():
+    import pathlib
+    return (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
+
+
+def test_web_page_no_symbol_icons():
+    assert "●" not in _page()
+
+
+def test_web_page_serial_wake_button_and_connection_id():
+    html = _page()
+    assert 'id="s-wake"' in html and "cid=" in html and "cid: serialCid" in html
+
+
+def test_web_page_mouse_defaults_to_absolute():
+    html = _page()
+    assert '<option value="abs" selected>' in html and 't: "a"' in html
+    assert "object-fit: contain" in html.replace("object-fit:contain", "object-fit: contain")
+
+
+def test_web_page_reports_type_result():
+    assert "r.skipped" in _page()
