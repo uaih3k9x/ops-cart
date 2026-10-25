@@ -10,8 +10,8 @@ import kiosk_core as kc
 
 @pytest.fixture(autouse=True)
 def _no_real_cartlog(monkeypatch):
-    """装机事件默认写 /var/log/ops-cart; 测试里不碰真目录."""
-    monkeypatch.setattr(kc, "_pxe_event", lambda msg: None)
+    """装机/PIN 事件默认写 /var/log/ops-cart; 测试里不碰真目录."""
+    monkeypatch.setattr(kc.cartlog, "event", lambda *a, **k: True)
 
 
 # ------------------------------------------------------------ 装机网段: 只来自部署配置 /etc/ops-cart/pxe.env
@@ -995,11 +995,68 @@ def test_pin_gate_backoff_grows_and_caps():
     assert g.locked_until - t == 60                       # 输对一次就回到起步
 
 
-def test_pin_gate_default_keeps_fixed_lock():
-    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1, lock_s=60)
+def test_pin_gate_none_cap_keeps_fixed_lock():
+    """max_lock_s=None 显式要求固定冷却 (网页口 tailnet 用)."""
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1, lock_s=60, max_lock_s=None)
     g.attempt("0000", now=0)
     g.attempt("0000", now=60)
     assert g.locked_until == 120
+
+
+def test_pin_gate_default_backoff_grows_to_cap():
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1, lock_s=60, event=lambda m: None)
+    t, spans = 0, []
+    for _ in range(6):
+        g.attempt("0000", now=t)
+        spans.append(g.locked_until - t)
+        t = g.locked_until
+    assert spans == [60, 120, 240, 480, 900, 900] and kc.PIN_MAX_LOCK_S == 900
+
+
+def test_pin_gate_persists_failures_across_restart(tmp_path):
+    state = tmp_path / "run" / "pin-gate.json"
+    h = kc.pin_hash("2468")
+    g = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    g.attempt("0000", now=0)
+    g.attempt("0000", now=1)
+    g2 = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    assert g2.attempt("0000", now=2) == "locked"          # kiosk 重启不清零
+    g3 = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    assert g3.attempt("2468", now=30) == "locked"         # 冷却也跟着留下
+    assert g3.attempt("2468", now=63) == "ok"
+    g4 = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    assert (g4.fails, g4.lockouts) == (0, 0)
+
+
+def test_pin_gate_bad_state_file_starts_clean(tmp_path):
+    state = tmp_path / "pin-gate.json"
+    state.write_text("{oops")
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=2, state_path=str(state), event=lambda m: None)
+    assert g.attempt("0000", now=0) == "bad"
+
+
+def test_pin_gate_unwritable_state_does_not_break(tmp_path):
+    (tmp_path / "f").write_text("x")
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=2, state_path=str(tmp_path / "f" / "s.json"),
+                   event=lambda m: None)
+    assert g.attempt("0000", now=0) == "bad" and g.attempt("2468", now=1) == "ok"
+
+
+def test_pin_gate_logs_cooldown_event():
+    events = []
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=2, lock_s=60, event=events.append)
+    g.attempt("0000", now=0)
+    assert events == []
+    assert g.attempt("0000", now=1) == "locked"
+    assert len(events) == 1 and "60" in events[0]
+
+
+def test_pin_gate_default_event_goes_to_cartlog_pin(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kc.cartlog, "event", lambda kind, msg, **k: calls.append(kind))
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1)
+    g.attempt("0000", now=0)
+    assert calls == ["pin"]
 
 
 def test_pin_gate_concurrent_bad_attempts_counted_once_each():

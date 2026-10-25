@@ -763,21 +763,54 @@ def pin_set(pin, path=None):
     atomicfile.write_json(path, cfg, mode=0o600)
 
 
+PIN_MAX_LOCK_S = 15 * 60                # 车机输错冷却封顶
+PIN_STATE = "/run/ops-cart/pin-gate.json"   # 失败计数落在这 (重启 kiosk 不清零, 重启推车清零)
+_DEFAULT = object()
+
+
 class PinGate:
     """PIN 校验 + 连续输错冷却. attempt() 返回 'ok' / 'bad' / 'locked'.
-    max_lock_s 给了就指数退避: 每连续冷却一次时长翻倍, 封顶 max_lock_s; 输对一次回到起步.
-    网页口多线程同时试, 内部加锁, 计数不会被并发冲掉."""
+    冷却指数退避: lock_s 起步, 每连续冷却一次翻倍, 封顶 max_lock_s (默认 PIN_MAX_LOCK_S;
+    显式传 None 表示固定 lock_s 不翻倍); 输对一次回到起步.
+    state_path 给了就把失败计数、冷却到期时间持久化 (kiosk 用 PIN_STATE), 读写失败都不影响校验.
+    进入冷却时记 cartlog [pin]. 网页口多线程同时试, 内部加锁, 计数不会被并发冲掉."""
 
-    def __init__(self, stored, max_fails=5, lock_s=60, max_lock_s=None):
+    def __init__(self, stored, max_fails=5, lock_s=60, max_lock_s=_DEFAULT, state_path=None,
+                 event=None):
         import threading as _th
         self.stored, self.max_fails, self.lock_s = stored, max_fails, lock_s
-        self.max_lock_s = max_lock_s or lock_s
+        if max_lock_s is _DEFAULT:
+            max_lock_s = PIN_MAX_LOCK_S
+        self.max_lock_s = max(max_lock_s or lock_s, lock_s)
+        self.state_path = state_path
+        self.event = event or (lambda msg: cartlog.event("pin", msg))
         self.fails, self.locked_until, self.lockouts = 0, 0.0, 0
         self._lock = _th.Lock()
+        self._load()
 
     @property
     def required(self):
         return bool(self.stored)
+
+    def _load(self):
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path) as f:
+                st = json.load(f)
+            self.fails, self.locked_until, self.lockouts = \
+                int(st["fails"]), float(st["locked_until"]), int(st["lockouts"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _save(self):
+        if not self.state_path:
+            return
+        try:
+            atomicfile.write_json(self.state_path, {"fails": self.fails, "locked_until": self.locked_until,
+                                                    "lockouts": self.lockouts}, mode=0o600)
+        except OSError:
+            pass
 
     def attempt(self, pin, now=None):
         now = time.time() if now is None else now
@@ -787,13 +820,21 @@ class PinGate:
             if now < self.locked_until:
                 return "locked"
             if pin_verify(pin, self.stored):
-                self.fails, self.lockouts = 0, 0
+                if self.fails or self.lockouts:
+                    self.fails, self.lockouts = 0, 0
+                    self._save()
                 return "ok"
             self.fails += 1
             if self.fails >= self.max_fails:
                 span = min(self.lock_s * 2 ** self.lockouts, self.max_lock_s)
                 self.fails, self.locked_until, self.lockouts = 0, now + span, self.lockouts + 1
+                self._save()
+                try:
+                    self.event(f"PIN 连续输错 {self.max_fails} 次, 冷却 {span:.0f} 秒 (第 {self.lockouts} 次)")
+                except Exception:   # noqa: BLE001  记日志不能拖垮校验
+                    pass
                 return "locked"
+            self._save()
             return "bad"
 
 
