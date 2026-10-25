@@ -54,8 +54,12 @@ class _NewSyntax(ast.NodeVisitor):
 
 
 def _hits(src):
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:                                   # 真 3.9 上 match 直接就是语法错误
+        return ["语法错误"]
     v = _NewSyntax("from __future__ import annotations" in src)
-    v.visit(ast.parse(src))
+    v.visit(tree)
     return [why for _n, why in v.hits]
 
 
