@@ -127,7 +127,7 @@ def scan_repo(root, files, deny_words=()):
 
 def main(argv=None):
     root = (argv or sys.argv[1:] or ["."])[0]
-    files = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True,
+    files = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=root, capture_output=True, text=True,
                            check=True).stdout.split()
     found = scan_repo(root, files, load_local(os.path.join(root, ".public-safe.local")))
     for f, n, k, s in found:
