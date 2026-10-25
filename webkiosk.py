@@ -34,6 +34,7 @@ BODY_MAX = 64 * 1024        # 请求体上限; 粘贴打字也够用
 TYPE_MAX = 4096             # /api/type 一次最多几个字符 (115200 波特下约 10 秒)
 STREAM_RECHECK_S = 2.0      # 长连接多久复查一次来源和会话
 LAN_MAX_LOCK_S = 3600       # 局域网输错冷却: 60 秒起翻倍, 封顶 1 小时
+GATES_MAX = 1024            # 按来源 IP 记的输错闸门上限
 
 
 def _json(status, obj, extra=None):
@@ -94,15 +95,22 @@ class App:
             self._close_streams(self.sessions.revoke_all())
         return state, stored
 
-    def gate_for(self, kind):
-        """输错冷却按来源分开: 局域网怎么试都锁不到 tailnet 这边; 局域网冷却指数退避."""
+    def gate_for(self, ip):
+        """输错冷却按来源 IP 分开: 一台机器试错锁不到别人, 更锁不到 tailnet; 局域网冷却指数退避."""
         _state, stored = self.pin()
+        kind = wc.client_kind(ip)
         with self._state_lock:
-            g = self._gates.get(kind)
+            g = self._gates.get(ip)
             if g is None:
-                g = self._gates[kind] = kc.PinGate(
+                if len(self._gates) >= GATES_MAX:       # 防内存涨: 满了从头记
+                    self._gates = {}
+                g = self._gates[ip] = kc.PinGate(
                     stored, lock_s=60, max_lock_s=LAN_MAX_LOCK_S if kind == "lan" else None)
         return g
+
+    def request_reason(self, method, headers):
+        hosts = list(wc.web_conf_read(self.conf_path).get("hosts") or []) + [socket.gethostname()]
+        return wc.request_reason(method, headers, hosts)
 
     def deny_nets(self, conf=None):
         """装机口网段 (pxe.env) + web.conf 里额外写的; 这些来源一律不给管理口."""
@@ -131,7 +139,11 @@ class App:
     def stream_register(self, tok, closer):
         with self._state_lock:
             self._streams.setdefault(tok, set()).add(closer)
-        return lambda: self._streams.get(tok, set()).discard(closer)
+
+        def unregister():
+            with self._state_lock:
+                self._streams.get(tok, set()).discard(closer)
+        return unregister
 
     def _close_streams(self, toks):
         for tok in toks:
@@ -146,7 +158,7 @@ class App:
     # -------------------------------------------------------- 路由
 
     def handle(self, method, path, ip, headers, body, local_ip=None):
-        reason = self.source_reason(ip, local_ip)
+        reason = self.source_reason(ip, local_ip) or self.request_reason(method, headers)
         if reason:
             return _text(403, reason)
         path = path.split("?", 1)[0]
@@ -197,11 +209,10 @@ class App:
         state, stored = self.pin()
         if state == "unreadable":           # 读不到不等于没设: 谁都不放
             return _json(200, {"result": "unavailable"})
-        kind = wc.client_kind(ip)
-        result = self.gate_for(kind).attempt(pin)
+        result = self.gate_for(ip).attempt(pin)
         if result != "ok":
             return _json(200, {"result": result})
-        tok = self.sessions.issue(kind, pin_tag=stored)
+        tok = self.sessions.issue(wc.client_kind(ip), pin_tag=stored)
         return _json(200, {"result": "ok"},
                      {"Set-Cookie": f"{wc.COOKIE}={tok}; Path=/; HttpOnly; SameSite=Strict"})
 
@@ -425,8 +436,8 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         app, ip, local = self.app, self.client_address[0], self._local_ip()
         try:
-            reason = app.source_reason(ip, local)
-            if reason:                       # 拒绝的来源: 请求体一个字节都不读
+            reason = app.source_reason(ip, local) or app.request_reason(method, self.headers)
+            if reason:                       # 拒绝的来源 / 跨站: 请求体一个字节都不读
                 self.close_connection = True
                 return self._send(*_text(403, reason))
             body, err = self._body()
@@ -454,7 +465,7 @@ class Handler(BaseHTTPRequestHandler):
     def _stream(self, path, q):
         app, ip, local = self.app, self.client_address[0], self._local_ip()
         self.close_connection = True
-        reason = app.source_reason(ip, local)
+        reason = app.source_reason(ip, local) or app.request_reason("GET", self.headers)
         if reason:
             return self._send(*_text(403, reason))
         tok = wc.cookie_token(self.headers.get("Cookie"))

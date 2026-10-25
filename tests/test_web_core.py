@@ -307,3 +307,32 @@ def test_relay_ends_on_eof():
     out = []
     wc.relay(lambda: next(chunks), out.append, lambda: True, clock=lambda: 0, every=2)
     assert out == [b"a"]
+
+
+# ============================================================ C 线: 请求来源头、会话锁
+
+def test_request_reason_host_and_origin():
+    ok = {"Host": "192.0.2.1:8088"}
+    assert wc.request_reason("GET", ok) is None
+    assert wc.request_reason("GET", {"Host": "x.example"}) is not None
+    assert wc.request_reason("GET", {"Host": "x.example"}, hosts=["X.example"]) is None
+    assert wc.request_reason("POST", dict(ok, Origin="http://192.0.2.1:8088")) is None
+    assert wc.request_reason("POST", dict(ok, Origin="https://192.0.2.1:8088")) is None
+    assert wc.request_reason("POST", dict(ok, Origin="http://192.0.2.1")) is not None
+    assert wc.request_reason("POST", ok) is not None
+    assert wc.request_reason("POST", dict(ok, **{"Sec-Fetch-Site": "same-origin"})) is None
+    assert wc.request_reason("POST", dict(ok, **{"Sec-Fetch-Site": "same-site"})) is not None
+
+
+def test_host_name_parsing():
+    assert wc.host_name("[2001:db8::1]:80") == "2001:db8::1"
+    assert wc.host_name("Example.ORG:8088") == "example.org"
+    assert wc.host_name("192.0.2.1") == "192.0.2.1"
+
+
+def test_sessions_kind_and_prefix_are_safe():
+    s = wc.Sessions()
+    tok = s.issue("lan", now=0)
+    assert s.kind(tok) == "lan" and s.kind("nope") is None
+    tag = wc.session_tag(tok)
+    assert len(tag) == 8 and tag not in tok and wc.session_tag(None) == "-"

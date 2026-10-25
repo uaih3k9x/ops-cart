@@ -2,12 +2,15 @@
 """web_core: 网页版 Kiosk 的可测核心层. HTTP 之外的逻辑都在这.
 
 - 来源过滤: tailnet / 本机永远放行; 局域网看开关, 且推车必须设了 PIN; 装机口 (LAN1) 永远拒绝
-- 配置: /opt/pxe/web.conf ({"lan_open": bool, "port": int, "deny_nets": [...]})
+- 请求头: Host 必须是 IP 字面量 / localhost / 本机名 / web.conf 的 hosts (挡 DNS rebinding);
+  POST 还要同源 (Origin 或 Sec-Fetch-Site: same-origin, 挡跨站提交)
+- 配置: /opt/pxe/web.conf ({"lan_open": bool, "port": int, "deny_nets": [...], "hosts": [...]})
 - 会话: 内存里的随机令牌, 闲置超时 + 绝对上限, 绑定签发时的 PIN, 走 HttpOnly cookie
 - 请求校验: 键鼠事件先校验成干净的列表, 再碰 CH9329
 - 状态 JSON: 复用 kiosk_core 的采集函数, 单项出错不拖垮整份
 """
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -15,6 +18,7 @@ import os
 import secrets
 import threading
 import time
+from urllib.parse import urlsplit
 
 import atomicfile
 import ch9329
@@ -80,6 +84,45 @@ def source_reason(ip, lan_open, pin_set, deny_nets=(), local_ip=None):
 
 def client_allowed(ip, lan_open, pin_set, deny_nets=()):
     return source_reason(ip, lan_open, pin_set, deny_nets) is None
+
+
+def host_name(host):
+    """Host 头 -> 小写主机名 (去端口, IPv6 去方括号)."""
+    host = (host or "").strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    if host.count(":") == 1:
+        return host.split(":", 1)[0]
+    return host
+
+
+def _host_ok(name, hosts):
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True                     # 直接敲 IP: 攻击者的域名没法变成这个
+    except ValueError:
+        pass
+    return name == "localhost" or name in {str(h).lower() for h in hosts or ()}
+
+
+def request_reason(method, headers, hosts=()):
+    """Host 白名单 + POST 同源; 放行返回 None, 否则返回拒绝原因. 只看请求头, 不碰请求体."""
+    host = headers.get("Host") or ""
+    if not _host_ok(host_name(host), hosts):
+        return "主机名不在白名单 (web.conf 的 hosts)"
+    if method != "POST":
+        return None
+    origin = headers.get("Origin")
+    if origin:
+        u = urlsplit(origin)
+        if u.scheme in ("http", "https") and u.netloc.lower() == host.strip().lower():
+            return None
+        return "跨站请求被拒绝"
+    if headers.get("Sec-Fetch-Site") == "same-origin":
+        return None
+    return "缺少同源标记 (Origin)"
 
 
 def pin_state(path):
@@ -153,8 +196,9 @@ class Sessions:
             return True
 
     def kind(self, tok):
-        rec = self._s.get(tok)
-        return rec["kind"] if rec else None
+        with self._lock:
+            rec = self._s.get(tok)
+            return rec["kind"] if rec else None
 
     def revoke(self, tok):
         with self._lock:
@@ -172,6 +216,11 @@ class Sessions:
             gone = list(self._s)
             self._s.clear()
         return gone
+
+
+def session_tag(tok):
+    """日志里认会话用: 令牌哈希的前 8 位, 拿它反推不出令牌."""
+    return hashlib.sha256(tok.encode()).hexdigest()[:8] if tok else "-"
 
 
 def cookie_token(header):

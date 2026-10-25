@@ -35,8 +35,22 @@ def make_app(tmp_path, pin="2468", lan_open=False, bound=True):
     return app
 
 
+HOST = "192.0.2.10:8088"               # 浏览器地址栏里的推车地址 (IP 字面量, 白名单默认放行)
+ORIGIN = "http://" + HOST
+
+
+def hdrs_for(method, cookie=None, **extra):
+    h = {"Host": HOST}
+    if method == "POST":
+        h["Origin"] = ORIGIN
+    if cookie:
+        h["Cookie"] = cookie
+    h.update(extra)
+    return h
+
+
 def call(app, method, path, ip=TAIL, body=None, cookie=None):
-    headers = {"Cookie": cookie} if cookie else {}
+    headers = hdrs_for(method, cookie)
     raw = json.dumps(body).encode() if body is not None else b""
     status, hdrs, out = app.handle(method, path, ip, headers, raw)
     try:
@@ -122,7 +136,7 @@ def test_logout_revokes(tmp_path):
 
 def test_bad_json_body_is_400(tmp_path):
     app = make_app(tmp_path)
-    status, _, _ = app.handle("POST", "/api/login", TAIL, {}, b"{nope")
+    status, _, _ = app.handle("POST", "/api/login", TAIL, hdrs_for("POST"), b"{nope")
     assert status == 400
 
 
@@ -297,7 +311,7 @@ def test_streams_closed_on_logout_lan_off_and_pin_change(tmp_path):
     ck2 = login(app)
     app.stream_register(ck2.split("=", 1)[1], lambda: closed.append("pin"))
     kc.pin_set("1357", app.pin_path)
-    app.gate_for("trusted")                               # 任何一次鉴权都会发现 PIN 变了
+    app.gate_for(TAIL)                                    # 任何一次鉴权都会发现 PIN 变了
     assert closed[-1] == "pin"
 
 
@@ -322,7 +336,8 @@ def test_lan_lockout_does_not_lock_out_tailnet(tmp_path):
 
 def test_lan_gate_backs_off(tmp_path):
     app = make_app(tmp_path)
-    assert app.gate_for("lan").max_lock_s > app.gate_for("lan").lock_s
+    assert app.gate_for(LAN).max_lock_s > app.gate_for(LAN).lock_s
+    assert app.gate_for(TAIL).max_lock_s == app.gate_for(TAIL).lock_s
 
 
 def test_unreadable_pin_refuses_everyone(tmp_path):
@@ -360,7 +375,7 @@ def test_malformed_hid_is_400_without_opening_ch(tmp_path, body):
     app.ch_open = lambda path: opened.append(path)
     ck = login(app)
     raw = json.dumps(body).replace("1e+400", "1e400").encode()
-    status, _, _ = app.handle("POST", "/api/hid", TAIL, {"Cookie": ck}, raw)
+    status, _, _ = app.handle("POST", "/api/hid", TAIL, hdrs_for("POST", ck), raw)
     assert status == 400 and opened == []
 
 
@@ -523,7 +538,8 @@ def test_http11_keepalive(served):
 
 def test_body_too_large_is_413(served):
     _app, port = served
-    _, r, _ = _req(port, "POST", "/api/login", body=b"x" * (webkiosk.BODY_MAX + 1))
+    _, r, _ = _req(port, "POST", "/api/login", body=b"x" * (webkiosk.BODY_MAX + 1),
+                   headers={"Origin": f"http://127.0.0.1:{port}"})
     assert r.status == 413
 
 
@@ -536,6 +552,8 @@ def test_bad_header_or_query_is_400(served, path, hdrs):
     c.putrequest(method, path)
     for k, v in hdrs.items():
         c.putheader(k, v)
+    if method == "POST":
+        c.putheader("Origin", f"http://127.0.0.1:{port}")
     if method == "GET":
         c.putheader("Cookie", login(app))
     c.endheaders()
@@ -556,3 +574,58 @@ def test_refused_source_body_never_read(served):
     app.handle = lambda *a, **k: seen.append(a) or (200, {}, b"")
     _, r, _ = _req(port, "POST", "/api/login", body=b'{"pin":"1"}')
     assert r.status == 403 and seen == []
+
+
+# ============================================================ C 线: Host / Origin、按 IP 计数
+
+@pytest.mark.parametrize("host", ["evil.example", "evil.example:8088", "", None])
+def test_host_not_in_whitelist_is_403(tmp_path, host):
+    app = make_app(tmp_path)
+    h = {} if host is None else {"Host": host}
+    status, _, body = app.handle("GET", "/api/whoami", TAIL, h, b"")
+    assert status == 403
+
+
+@pytest.mark.parametrize("host", ["192.0.2.10:8088", "127.0.0.1", "[2001:db8::1]:8088", "localhost:8088",
+                                  "cart.example:8088", "CART.example"])
+def test_host_ip_literal_or_configured_is_ok(tmp_path, host):
+    app = make_app(tmp_path)
+    wc.web_conf_set(app.conf_path, hosts=["cart.example"])
+    assert app.handle("GET", "/api/whoami", TAIL, {"Host": host}, b"")[0] == 200
+
+
+@pytest.mark.parametrize("extra", [{"Origin": "http://evil.example"}, {"Origin": "null"},
+                                   {"Origin": "http://192.0.2.10:9999"},
+                                   {"Origin": None, "Sec-Fetch-Site": "cross-site"},
+                                   {"Origin": None}])
+def test_post_must_be_same_origin(tmp_path, extra):
+    app = make_app(tmp_path)
+    h = hdrs_for("POST", **{k: v for k, v in extra.items() if v is not None})
+    if extra.get("Origin", "") is None:
+        h.pop("Origin")
+    status, _, _ = app.handle("POST", "/api/login", TAIL, h, json.dumps({"pin": "2468"}).encode())
+    assert status == 403
+
+
+def test_post_same_origin_via_fetch_metadata(tmp_path):
+    app = make_app(tmp_path)
+    h = {"Host": HOST, "Sec-Fetch-Site": "same-origin"}
+    status, _, data = app.handle("POST", "/api/login", TAIL, h, json.dumps({"pin": "2468"}).encode())
+    assert status == 200 and json.loads(data)["result"] == "ok"
+
+
+def test_cross_origin_post_body_never_read(served):
+    app, port = served
+    seen = []
+    app.handle = lambda *a, **k: seen.append(a) or (200, {}, b"")
+    _, r, _ = _req(port, "POST", "/api/login", body=b'{"pin":"1"}', headers={"Origin": "http://evil.example"})
+    assert r.status == 403 and seen == []
+
+
+def test_lockout_is_per_source_ip(tmp_path):
+    app = make_app(tmp_path, lan_open=True)
+    for _ in range(5):
+        r = call(app, "POST", "/api/login", LAN, {"pin": "0000"})[2]["result"]
+    assert r == "locked"
+    assert call(app, "POST", "/api/login", "198.51.100.8", {"pin": "2468"})[2]["result"] == "ok"
+    assert app.gate_for(LAN) is not app.gate_for("198.51.100.8")
