@@ -129,3 +129,134 @@ def test_abs_mouse_frame_and_clamp():
     f = dev.sent[0]
     assert f[3] == 0x04 and f[4] == 7
     assert f[5:12] == bytes([0x02, 0x01, 0x00, 0x08, 0xFF, 0x0F, 0xFD])   # y 夹到 4095, 滚轮 -3 原样
+
+
+# ============================================================ 加固: 独占 / 拔线 / ACK / 键名表
+
+import os
+
+import termios
+
+
+def _pty():
+    master, slave = os.openpty()
+    return master, slave, os.ttyname(slave)
+
+
+def test_gone_is_oserror_subclass():
+    assert issubclass(ch9329.Ch9329Gone, OSError)
+    assert issubclass(ch9329.Ch9329Busy, OSError)
+
+
+def test_second_open_of_same_port_is_busy():
+    master, slave, path = _pty()
+    try:
+        a = ch9329.Ch9329(path, log=lambda *x: None)
+        with pytest.raises(ch9329.Ch9329Busy):
+            ch9329.Ch9329(path, log=lambda *x: None)
+        a.close()
+        ch9329.Ch9329(path, log=lambda *x: None).close()     # 关掉之后又能开
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_send_after_unplug_raises_gone():
+    master, slave, path = _pty()
+    dev = ch9329.Ch9329(path, log=lambda *x: None)
+    os.close(master)                                         # 拔线
+    os.close(slave)
+    with pytest.raises(ch9329.Ch9329Gone):
+        for _ in range(3):                                   # 有的系统第一次 write 还能进缓冲
+            dev.send_report(bytes(8))
+    dev.close()
+
+
+def test_accepts_open_fd_and_writes_frame():
+    master, slave, path = _pty()
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        dev = ch9329.Ch9329(fd=fd, log=lambda *x: None, ack_timeout=0.01)
+        dev.send_report(bytes(8))
+        assert os.read(master, 64) == ch9329.build_frame(ch9329.CMD_SEND_DATA, bytes(8))
+        dev.close()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_flush_only_drops_input(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ch9329.termios, "tcflush", lambda fd, q: calls.append(q))
+    dev = ch9329.Ch9329.__new__(ch9329.Ch9329)
+    dev.fd, dev.ack_timeout = -1, 0
+    monkeypatch.setattr(ch9329.os, "write", lambda fd, b: len(b))
+    monkeypatch.setattr(ch9329.select, "select", lambda r, w, x, t: ([], [], []))
+    dev._send_raw(b"x")
+    assert calls == [termios.TCIFLUSH]
+
+
+def test_termios_error_becomes_gone(monkeypatch):
+    def boom(*a):
+        raise termios.error(5, "Input/output error")
+    monkeypatch.setattr(ch9329.termios, "tcflush", boom)
+    dev = ch9329.Ch9329.__new__(ch9329.Ch9329)
+    dev.fd, dev.ack_timeout = -1, 0
+    with pytest.raises(ch9329.Ch9329Gone):
+        dev._send_raw(b"x")
+
+
+def test_unknown_baud_is_value_error_and_lookup_is_lazy():
+    assert ch9329.baud_const(115200) == termios.B115200
+    assert ch9329.baud_const(12345) is None
+
+
+def test_ack_timeout_is_short():
+    assert ch9329.ACK_TIMEOUT <= 0.1
+
+
+def test_parse_ack():
+    ok = ch9329.build_frame(0x82, b"\x00")                  # SEND_DATA 正常应答
+    assert ch9329.parse_ack(ok) == {"cmd": 0x02, "ok": True, "data": b"\x00"}
+    err = bytes.fromhex("57 ab 00 c1 01 e4 a8")             # 实机: 0xC0 位 = 出错应答
+    assert ch9329.parse_ack(err) == {"cmd": 0x01, "ok": False, "data": b"\xe4"}
+    assert ch9329.parse_ack(b"\x00\x00" + ok) == ch9329.parse_ack(ok)   # 前面有垃圾也找得到
+    assert ch9329.parse_ack(ok[:-1] + b"\x00") is None      # 校验不对
+    assert ch9329.parse_ack(ok[:4]) is None                 # 不完整
+    assert ch9329.parse_ack(b"") is None
+
+
+@pytest.mark.parametrize("name", ["win", "super", "gui"])
+def test_win_is_gui_modifier(name):
+    report, unknown = ch9329.key_report([name, "r"])
+    assert unknown == [] and report[0] == 0x08 and report[2] == 0x15
+
+
+def test_key_aliases_and_extra_keys():
+    assert ch9329.KEYS["del"] == ch9329.KEYS["delete"]
+    assert ch9329.KEYS["printscreen"][0] == 0x46
+    assert ch9329.KEYS["scrolllock"][0] == 0x47
+    assert ch9329.KEYS["pause"][0] == 0x48
+    assert ch9329.KEYS["numlock"][0] == 0x53
+    assert ch9329.KEYS["f13"][0] == 0x68 and ch9329.KEYS["f24"][0] == 0x73
+    assert ch9329.KEYS["menu"][0] == 0x65
+
+
+def test_type_text_rejects_whole_string_before_sending():
+    class FakeDev:
+        sent = []
+
+        def send_keys(self, keys, press_ms=30):
+            self.sent.append(keys)
+    dev = FakeDev()
+    with pytest.raises(ValueError) as e:
+        ch9329.Ch9329.type_text(dev, "ab中cé")
+    assert dev.sent == [] and "中" in str(e.value) and "é" in str(e.value)
+    assert ch9329.untypable("ab\n\tc") == []
+
+
+def test_mouse_chunks_shared_here():
+    assert ch9329.mouse_chunks(300, -5, 3) == [(127, -5, 1), (127, 0, 0), (46, 0, 0)]
+    assert ch9329.mouse_chunks(0, 0, 0) == [(0, 0, 0)]
+    big = ch9329.mouse_chunks(10 ** 9, 0, 0)
+    assert len(big) == ch9329.MOUSE_MAX // 127 + 1

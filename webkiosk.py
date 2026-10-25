@@ -17,7 +17,6 @@ import os
 import socket
 import subprocess
 import sys
-import termios
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -51,7 +50,7 @@ def _real_ch_open(path):
     """按绑定解析出的 by-id 路径打开 CH9329; 打不开返回 None."""
     try:
         return ch9329.Ch9329(os.path.realpath(path), log=lambda *a: None)
-    except (OSError, termios.error):
+    except OSError:                     # 含被占用 (Ch9329Busy) 和打不开
         return None
 
 
@@ -254,7 +253,7 @@ class App:
                 return _json(503, {"error": "CH9329 打不开"})
             try:
                 fn(self._ch)
-            except (OSError, termios.error, ValueError) as e:
+            except (OSError, ValueError) as e:
                 self._drop_ch()
                 self.kbd.release_all()
                 return _json(503, {"error": f"CH9329 发送失败: {e}"})

@@ -17,6 +17,7 @@ import threading
 import time
 
 import atomicfile
+import ch9329
 import kiosk_core as kc
 
 WEB_CONF = "/opt/pxe/web.conf"
@@ -275,26 +276,15 @@ class KeyboardState:
         return self.report()
 
 
-# ------------------------------------------------------------ 鼠标 (相对位移, 跟 Tk 版同一条路)
+# ------------------------------------------------------------ 鼠标
 
-MOUSE_MAX = 4096            # 一次位移上限 (像素): 再大也只是甩到屏幕边, 不值得在 115200 波特上发几十万帧
+# 相对位移拆帧和车机共用 ch9329 里的一份
+MOUSE_MAX = ch9329.MOUSE_MAX
+mouse_chunks = ch9329.mouse_chunks
 
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
-
-
-def mouse_chunks(dx, dy, wheel):
-    """大位移拆成多帧 int8 (先夹到 ±MOUSE_MAX); 滚轮夹到 ±1."""
-    dx, dy = _clamp(int(dx), -MOUSE_MAX, MOUSE_MAX), _clamp(int(dy), -MOUSE_MAX, MOUSE_MAX)
-    wheel = _clamp(int(wheel), -1, 1)
-    out = []
-    while True:
-        sx, sy = max(-127, min(127, dx)), max(-127, min(127, dy))
-        out.append((sx, sy, wheel))
-        dx, dy, wheel = dx - sx, dy - sy, 0
-        if not (dx or dy):
-            return out
 
 
 def mouse_buttons(b):
