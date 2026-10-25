@@ -307,3 +307,62 @@ def test_relay_ends_on_eof():
     out = []
     wc.relay(lambda: next(chunks), out.append, lambda: True, clock=lambda: 0, every=2)
     assert out == [b"a"]
+
+
+# ============================================================ C 线: 请求来源头、会话锁
+
+def test_request_reason_host_and_origin():
+    ok = {"Host": "192.0.2.1:8088"}
+    assert wc.request_reason("GET", ok) is None
+    assert wc.request_reason("GET", {"Host": "x.example"}) is not None
+    assert wc.request_reason("GET", {"Host": "x.example"}, hosts=["X.example"]) is None
+    assert wc.request_reason("POST", dict(ok, Origin="http://192.0.2.1:8088")) is None
+    assert wc.request_reason("POST", dict(ok, Origin="https://192.0.2.1:8088")) is None
+    assert wc.request_reason("POST", dict(ok, Origin="http://192.0.2.1")) is not None
+    assert wc.request_reason("POST", ok) is not None
+    assert wc.request_reason("POST", dict(ok, **{"Sec-Fetch-Site": "same-origin"})) is None
+    assert wc.request_reason("POST", dict(ok, **{"Sec-Fetch-Site": "same-site"})) is not None
+
+
+def test_host_name_parsing():
+    assert wc.host_name("[2001:db8::1]:80") == "2001:db8::1"
+    assert wc.host_name("Example.ORG:8088") == "example.org"
+    assert wc.host_name("192.0.2.1") == "192.0.2.1"
+
+
+def test_sessions_kind_and_prefix_are_safe():
+    s = wc.Sessions()
+    tok = s.issue("lan", now=0)
+    assert s.kind(tok) == "lan" and s.kind("nope") is None
+    tag = wc.session_tag(tok)
+    assert len(tag) == 8 and tag not in tok and wc.session_tag(None) == "-"
+
+
+def test_abs_coords_full_box_and_letterbox():
+    assert wc.abs_coords(0, 0, 100, 50) == (0, 0, True)
+    assert wc.abs_coords(100, 50, 100, 50) == (4095, 4095, True)
+    assert wc.abs_coords(50, 25, 100, 50) == (2048, 2048, True)
+    # 方形画面放进 2:1 的框: 左右各 25 像素黑边
+    assert wc.abs_coords(25, 0, 100, 50, 640, 640) == (0, 0, True)
+    assert wc.abs_coords(75, 50, 100, 50, 640, 640) == (4095, 4095, True)
+    assert wc.abs_coords(10, 25, 100, 50, 640, 640) == (0, 2048, False)    # 黑边上: 夹到边, 标出来
+    assert wc.abs_coords(5, 5, 0, 0) == (0, 0, False)
+
+
+def test_parse_hid_events_abs():
+    out = wc.parse_hid_events({"events": [{"t": "a", "x": 50, "y": 25, "vw": 100, "vh": 50, "b": 9, "w": 3}]})
+    assert out == [{"t": "a", "x": 2048, "y": 2048, "inside": True, "b": 1, "w": 1}]
+    with pytest.raises(ValueError):
+        wc.parse_hid_events({"events": [{"t": "a", "x": "1", "y": 0, "vw": 1, "vh": 1}]})
+
+
+def test_web_conf_set_falls_back_to_in_place_write(tmp_path, monkeypatch):
+    """专用用户只能写 web.conf 这一个文件 (目录只读, 改名换不了): 退回原地写."""
+    p = tmp_path / "web.conf"
+    p.write_text('{"lan_open": false, "port": 8088}')
+
+    def ro(*a, **k):
+        raise PermissionError(13, "read-only dir")
+    monkeypatch.setattr(wc.atomicfile, "write_json", ro)
+    wc.web_conf_set(p, lan_open=True)
+    assert wc.web_conf_read(p)["lan_open"] is True and wc.web_conf_read(p)["port"] == 8088

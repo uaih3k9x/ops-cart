@@ -2,21 +2,27 @@
 """web_core: 网页版 Kiosk 的可测核心层. HTTP 之外的逻辑都在这.
 
 - 来源过滤: tailnet / 本机永远放行; 局域网看开关, 且推车必须设了 PIN; 装机口 (LAN1) 永远拒绝
-- 配置: /opt/pxe/web.conf ({"lan_open": bool, "port": int, "deny_nets": [...]})
+- 请求头: Host 必须是 IP 字面量 / localhost / 本机名 / web.conf 的 hosts (挡 DNS rebinding);
+  POST 还要同源 (Origin 或 Sec-Fetch-Site: same-origin, 挡跨站提交)
+- 配置: /opt/pxe/web.conf ({"lan_open": bool, "port": int, "deny_nets": [...], "hosts": [...]})
 - 会话: 内存里的随机令牌, 闲置超时 + 绝对上限, 绑定签发时的 PIN, 走 HttpOnly cookie
 - 请求校验: 键鼠事件先校验成干净的列表, 再碰 CH9329
 - 状态 JSON: 复用 kiosk_core 的采集函数, 单项出错不拖垮整份
 """
 
+import hashlib
 import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
+from urllib.parse import urlsplit
 
 import atomicfile
+import ch9329
 import kiosk_core as kc
 
 WEB_CONF = "/opt/pxe/web.conf"
@@ -81,6 +87,45 @@ def client_allowed(ip, lan_open, pin_set, deny_nets=()):
     return source_reason(ip, lan_open, pin_set, deny_nets) is None
 
 
+def host_name(host):
+    """Host 头 -> 小写主机名 (去端口, IPv6 去方括号)."""
+    host = (host or "").strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    if host.count(":") == 1:
+        return host.split(":", 1)[0]
+    return host
+
+
+def _host_ok(name, hosts):
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True                     # 直接敲 IP: 攻击者的域名没法变成这个
+    except ValueError:
+        pass
+    return name == "localhost" or name in {str(h).lower() for h in hosts or ()}
+
+
+def request_reason(method, headers, hosts=()):
+    """Host 白名单 + POST 同源; 放行返回 None, 否则返回拒绝原因. 只看请求头, 不碰请求体."""
+    host = headers.get("Host") or ""
+    if not _host_ok(host_name(host), hosts):
+        return "主机名不在白名单 (web.conf 的 hosts)"
+    if method != "POST":
+        return None
+    origin = headers.get("Origin")
+    if origin:
+        u = urlsplit(origin)
+        if u.scheme in ("http", "https") and u.netloc.lower() == host.strip().lower():
+            return None
+        return "跨站请求被拒绝"
+    if headers.get("Sec-Fetch-Site") == "same-origin":
+        return None
+    return "缺少同源标记 (Origin)"
+
+
 def pin_state(path):
     """('set', 哈希) / ('unset', None) / ('unreadable', None). 读不到不能当成没设 (没设 = 不上锁)."""
     try:
@@ -106,12 +151,21 @@ def web_conf_read(path=WEB_CONF):
 
 
 def web_conf_set(path=WEB_CONF, **kv):
+    """先试原子写 (写临时文件再改名); 专用用户跑时目录只读、只有这个文件可写, 退回原地写.
+    原地写断电写坏了也不怕: 读不出来就按默认 (局域网关) 处理."""
     try:
         cfg = json.load(open(path))
     except (OSError, ValueError):
         cfg = {}
     cfg.update(kv)
-    atomicfile.write_json(path, cfg)
+    try:
+        atomicfile.write_json(path, cfg)
+    except OSError:
+        with open(path, "r+", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, ensure_ascii=False))
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
 
 
 # ------------------------------------------------------------ 会话
@@ -152,8 +206,9 @@ class Sessions:
             return True
 
     def kind(self, tok):
-        rec = self._s.get(tok)
-        return rec["kind"] if rec else None
+        with self._lock:
+            rec = self._s.get(tok)
+            return rec["kind"] if rec else None
 
     def revoke(self, tok):
         with self._lock:
@@ -171,6 +226,11 @@ class Sessions:
             gone = list(self._s)
             self._s.clear()
         return gone
+
+
+def session_tag(tok):
+    """日志里认会话用: 令牌哈希的前 8 位, 拿它反推不出令牌."""
+    return hashlib.sha256(tok.encode()).hexdigest()[:8] if tok else "-"
 
 
 def cookie_token(header):
@@ -275,26 +335,31 @@ class KeyboardState:
         return self.report()
 
 
-# ------------------------------------------------------------ 鼠标 (相对位移, 跟 Tk 版同一条路)
+# ------------------------------------------------------------ 鼠标
 
-MOUSE_MAX = 4096            # 一次位移上限 (像素): 再大也只是甩到屏幕边, 不值得在 115200 波特上发几十万帧
+# 相对位移拆帧和车机共用 ch9329 里的一份
+MOUSE_MAX = ch9329.MOUSE_MAX
+mouse_chunks = ch9329.mouse_chunks
 
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def mouse_chunks(dx, dy, wheel):
-    """大位移拆成多帧 int8 (先夹到 ±MOUSE_MAX); 滚轮夹到 ±1."""
-    dx, dy = _clamp(int(dx), -MOUSE_MAX, MOUSE_MAX), _clamp(int(dy), -MOUSE_MAX, MOUSE_MAX)
-    wheel = _clamp(int(wheel), -1, 1)
-    out = []
-    while True:
-        sx, sy = max(-127, min(127, dx)), max(-127, min(127, dy))
-        out.append((sx, sy, wheel))
-        dx, dy, wheel = dx - sx, dy - sy, 0
-        if not (dx or dy):
-            return out
+def abs_coords(x, y, vw, vh, nw=0, nh=0):
+    """浏览器里画面上的点 -> CH9329 绝对坐标 (0~4095) 和"是不是落在画面上".
+    vw/vh = 元素大小; nw/nh = 画面原始大小 (object-fit: contain 时两边留黑边), 不知道就当铺满.
+    落在黑边上: 坐标夹到画面边上, inside=False (按下不该发, 松开照发)."""
+    if vw <= 0 or vh <= 0:
+        return 0, 0, False
+    cw, ch, ox, oy = vw, vh, 0.0, 0.0
+    if nw > 0 and nh > 0:
+        k = min(vw / nw, vh / nh)
+        cw, ch = nw * k, nh * k
+        ox, oy = (vw - cw) / 2, (vh - ch) / 2
+    fx, fy = (x - ox) / cw, (y - oy) / ch
+    inside = 0 <= fx <= 1 and 0 <= fy <= 1
+    return (int(round(_clamp(fx, 0.0, 1.0) * 4095)), int(round(_clamp(fy, 0.0, 1.0) * 4095)), inside)
 
 
 def mouse_buttons(b):
@@ -336,6 +401,12 @@ def parse_hid_events(req):
                         "dy": _clamp(_num(ev.get("dy", 0)), -MOUSE_MAX, MOUSE_MAX),
                         "b": mouse_buttons(_num(ev.get("b", 0))),
                         "w": _clamp(_num(ev.get("w", 0)), -1, 1)})
+        elif t == "a":                      # 绝对坐标: 元素内的点 + 元素/画面尺寸
+            dims = [_clamp(_num(ev.get(k, 0)), 0, 65535) for k in ("vw", "vh", "nw", "nh")]
+            ax, ay, inside = abs_coords(_num(ev.get("x")), _num(ev.get("y")), *dims)
+            out.append({"t": "a", "x": ax, "y": ay, "inside": inside,
+                        "b": mouse_buttons(_num(ev.get("b", 0))),
+                        "w": _clamp(_num(ev.get("w", 0)), -1, 1)})
         elif t == "release":
             out.append({"t": "release"})
         else:
@@ -365,7 +436,6 @@ def relay(read, write, still_ok, clock=time.monotonic, every=2.0):
 # ------------------------------------------------------------ 视频
 
 def video_device(name, root="/dev"):
-    import re
     if not re.fullmatch(r"video\d+", name or ""):
         return None
     path = f"{root}/{name}"
@@ -381,6 +451,28 @@ def video_cmd(dev, fps=15, quality=6):
 
 
 # ------------------------------------------------------------ 串口 (conbroker)
+
+SERIAL_CID = re.compile(r"[A-Za-z0-9_-]{1,32}")
+HISTORY_MAX = 16 * 1024
+
+
+def valid_cid(cid):
+    """串口连接序号: 浏览器每个标签页自己生成的短 id."""
+    return isinstance(cid, str) and SERIAL_CID.fullmatch(cid) is not None
+
+
+def serial_history(ddir, name, max_bytes=HISTORY_MAX):
+    """conbroker 日志末尾 max_bytes 字节 (接入时回放, 进来就看得到当前提示符). 读不到返回 b''."""
+    if os.path.basename(name) != name or name.startswith("."):
+        return b""
+    try:
+        with open(os.path.join(ddir, "logs", f"{name}.log"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read()
+    except OSError:
+        return b""
+
 
 def serial_ports(ddir):
     """在跑的 conbroker 服务: run/<name>.json 里有本地端口."""

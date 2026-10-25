@@ -24,7 +24,7 @@ def make_app(tmp_path, pin="2468", lan_open=False, bound=True):
                             "fans": [], "version": "Ver test"}[k]) for k in wc.STATUS_KEYS}
     app = webkiosk.App(conf_path=conf, pin_path=pin_path, status_src=src,
                        selftest=lambda: [{"label": "LAN2", "state": "OK", "detail": "x"}],
-                       static_dir=tmp_path, pxe_env=env)
+                       static_dir=tmp_path, pxe_env=env, audit_log=str(tmp_path / "audit.log"))
     # 画面源 / 键鼠绑定: 一块采集卡 video0 绑在一块在线的 CH9329 上; video1 是没绑的摄像头
     app.video_nodes = lambda: [{"dev": "/dev/video0", "name": "SC0710 PCI", "key": "0000:02:00.0",
                                 "friendly": "SC0710 卡1"},
@@ -35,8 +35,22 @@ def make_app(tmp_path, pin="2468", lan_open=False, bound=True):
     return app
 
 
+HOST = "192.0.2.10:8088"               # 浏览器地址栏里的推车地址 (IP 字面量, 白名单默认放行)
+ORIGIN = "http://" + HOST
+
+
+def hdrs_for(method, cookie=None, **extra):
+    h = {"Host": HOST}
+    if method == "POST":
+        h["Origin"] = ORIGIN
+    if cookie:
+        h["Cookie"] = cookie
+    h.update(extra)
+    return h
+
+
 def call(app, method, path, ip=TAIL, body=None, cookie=None):
-    headers = {"Cookie": cookie} if cookie else {}
+    headers = hdrs_for(method, cookie)
     raw = json.dumps(body).encode() if body is not None else b""
     status, hdrs, out = app.handle(method, path, ip, headers, raw)
     try:
@@ -122,7 +136,7 @@ def test_logout_revokes(tmp_path):
 
 def test_bad_json_body_is_400(tmp_path):
     app = make_app(tmp_path)
-    status, _, _ = app.handle("POST", "/api/login", TAIL, {}, b"{nope")
+    status, _, _ = app.handle("POST", "/api/login", TAIL, hdrs_for("POST"), b"{nope")
     assert status == 400
 
 
@@ -149,13 +163,16 @@ def test_index_served_and_unknown_404(tmp_path):
 
 class FakeCh:
     def __init__(self):
-        self.frames, self.mice = [], []
+        self.frames, self.mice, self.abs = [], [], []
 
     def send_report(self, report):
         self.frames.append(report)
 
     def send_mouse(self, buttons, dx, dy, wheel):
         self.mice.append((buttons, dx, dy, wheel))
+
+    def send_mouse_abs(self, buttons, x, y, wheel):
+        self.abs.append((buttons, x, y, wheel))
 
 
 def test_hid_events_reach_ch9329(tmp_path):
@@ -209,10 +226,11 @@ def test_type_text(tmp_path):
     fake = FakeCh()
     app.ch_open = lambda path: fake
     ck = login(app)
-    status, _, _ = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "aB"}, ck)
-    assert status == 200
+    status, _, data = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "aB"}, ck)
+    assert status == 200 and data["sent"] == 2 and data["skipped"] == 0
     assert fake.frames == [bytes([0, 0, 0x04, 0, 0, 0, 0, 0]), bytes(8),
-                           bytes([2, 0, 0x05, 0, 0, 0, 0, 0]), bytes(8)]
+                           bytes([2, 0, 0x05, 0, 0, 0, 0, 0]), bytes(8),
+                           bytes(8)]                            # 结束时真发一次全部松开
 
 
 # ------------------------------------------------------------ 视频 / 串口 列表
@@ -237,7 +255,7 @@ def test_serial_list(tmp_path):
 def test_serial_send_without_stream_is_409(tmp_path):
     app = make_app(tmp_path)
     ck = login(app)
-    assert call(app, "POST", "/api/serial/send", TAIL, {"data": "aGk="}, ck)[0] == 409
+    assert call(app, "POST", "/api/serial/send", TAIL, {"cid": "c1", "data": "aGk="}, ck)[0] == 409
 
 
 def test_serial_send_goes_to_session_socket(tmp_path):
@@ -249,9 +267,10 @@ def test_serial_send_goes_to_session_socket(tmp_path):
         def sendall(self, b):
             sent.append(b)
 
-    app.serial_socks[ck.split("=", 1)[1]] = Sock()
-    status, _, _ = call(app, "POST", "/api/serial/send", TAIL, {"data": "aGkN"}, ck)
+    app.serial_socks[(ck.split("=", 1)[1], "c1")] = Sock()
+    status, _, _ = call(app, "POST", "/api/serial/send", TAIL, {"cid": "c1", "data": "aGkN"}, ck)
     assert status == 200 and sent == [b"hi\r"]
+    assert call(app, "POST", "/api/serial/send", TAIL, {"cid": "c2", "data": "aGkN"}, ck)[0] == 409
 
 
 # ============================================================ 1.06.00 复审修复
@@ -297,7 +316,7 @@ def test_streams_closed_on_logout_lan_off_and_pin_change(tmp_path):
     ck2 = login(app)
     app.stream_register(ck2.split("=", 1)[1], lambda: closed.append("pin"))
     kc.pin_set("1357", app.pin_path)
-    app.gate_for("trusted")                               # 任何一次鉴权都会发现 PIN 变了
+    app.gate_for(TAIL)                                    # 任何一次鉴权都会发现 PIN 变了
     assert closed[-1] == "pin"
 
 
@@ -322,7 +341,8 @@ def test_lan_lockout_does_not_lock_out_tailnet(tmp_path):
 
 def test_lan_gate_backs_off(tmp_path):
     app = make_app(tmp_path)
-    assert app.gate_for("lan").max_lock_s > app.gate_for("lan").lock_s
+    assert app.gate_for(LAN).max_lock_s > app.gate_for(LAN).lock_s
+    assert app.gate_for(TAIL).max_lock_s == app.gate_for(TAIL).lock_s
 
 
 def test_unreadable_pin_refuses_everyone(tmp_path):
@@ -360,7 +380,7 @@ def test_malformed_hid_is_400_without_opening_ch(tmp_path, body):
     app.ch_open = lambda path: opened.append(path)
     ck = login(app)
     raw = json.dumps(body).replace("1e+400", "1e400").encode()
-    status, _, _ = app.handle("POST", "/api/hid", TAIL, {"Cookie": ck}, raw)
+    status, _, _ = app.handle("POST", "/api/hid", TAIL, hdrs_for("POST", ck), raw)
     assert status == 400 and opened == []
 
 
@@ -378,7 +398,9 @@ def test_huge_mouse_move_sends_bounded_frames(tmp_path):
 def test_non_object_or_wrong_type_bodies_are_400(tmp_path, path, body):
     app = make_app(tmp_path)
     ck = login(app)
-    app.serial_socks[ck.split("=", 1)[1]] = object()
+    app.serial_socks[(ck.split("=", 1)[1], "c1")] = object()
+    if isinstance(body, dict) and path == "/api/serial/send":
+        body = dict(body, cid="c1")
     assert call(app, "POST", path, TAIL, body, ck)[0] == 400
 
 
@@ -464,8 +486,9 @@ def test_serial_send_is_serialized_per_session(tmp_path):
             time.sleep(0.01)
             inside[0] -= 1
 
-    app.serial_socks[ck.split("=", 1)[1]] = SlowSock()
-    ts = [threading.Thread(target=call, args=(app, "POST", "/api/serial/send", TAIL, {"data": "YQ=="}, ck))
+    app.serial_socks[(ck.split("=", 1)[1], "c1")] = SlowSock()
+    ts = [threading.Thread(target=call, args=(app, "POST", "/api/serial/send", TAIL,
+                                               {"cid": "c1", "data": "YQ=="}, ck))
           for _ in range(8)]
     for t in ts:
         t.start()
@@ -523,7 +546,8 @@ def test_http11_keepalive(served):
 
 def test_body_too_large_is_413(served):
     _app, port = served
-    _, r, _ = _req(port, "POST", "/api/login", body=b"x" * (webkiosk.BODY_MAX + 1))
+    _, r, _ = _req(port, "POST", "/api/login", body=b"x" * (webkiosk.BODY_MAX + 1),
+                   headers={"Origin": f"http://127.0.0.1:{port}"})
     assert r.status == 413
 
 
@@ -536,6 +560,8 @@ def test_bad_header_or_query_is_400(served, path, hdrs):
     c.putrequest(method, path)
     for k, v in hdrs.items():
         c.putheader(k, v)
+    if method == "POST":
+        c.putheader("Origin", f"http://127.0.0.1:{port}")
     if method == "GET":
         c.putheader("Cookie", login(app))
     c.endheaders()
@@ -556,3 +582,286 @@ def test_refused_source_body_never_read(served):
     app.handle = lambda *a, **k: seen.append(a) or (200, {}, b"")
     _, r, _ = _req(port, "POST", "/api/login", body=b'{"pin":"1"}')
     assert r.status == 403 and seen == []
+
+
+# ============================================================ C 线: Host / Origin、按 IP 计数
+
+@pytest.mark.parametrize("host", ["evil.example", "evil.example:8088", "", None])
+def test_host_not_in_whitelist_is_403(tmp_path, host):
+    app = make_app(tmp_path)
+    h = {} if host is None else {"Host": host}
+    status, _, body = app.handle("GET", "/api/whoami", TAIL, h, b"")
+    assert status == 403
+
+
+@pytest.mark.parametrize("host", ["192.0.2.10:8088", "127.0.0.1", "[2001:db8::1]:8088", "localhost:8088",
+                                  "cart.example:8088", "CART.example"])
+def test_host_ip_literal_or_configured_is_ok(tmp_path, host):
+    app = make_app(tmp_path)
+    wc.web_conf_set(app.conf_path, hosts=["cart.example"])
+    assert app.handle("GET", "/api/whoami", TAIL, {"Host": host}, b"")[0] == 200
+
+
+@pytest.mark.parametrize("extra", [{"Origin": "http://evil.example"}, {"Origin": "null"},
+                                   {"Origin": "http://192.0.2.10:9999"},
+                                   {"Origin": None, "Sec-Fetch-Site": "cross-site"},
+                                   {"Origin": None}])
+def test_post_must_be_same_origin(tmp_path, extra):
+    app = make_app(tmp_path)
+    h = hdrs_for("POST", **{k: v for k, v in extra.items() if v is not None})
+    if extra.get("Origin", "") is None:
+        h.pop("Origin")
+    status, _, _ = app.handle("POST", "/api/login", TAIL, h, json.dumps({"pin": "2468"}).encode())
+    assert status == 403
+
+
+def test_post_same_origin_via_fetch_metadata(tmp_path):
+    app = make_app(tmp_path)
+    h = {"Host": HOST, "Sec-Fetch-Site": "same-origin"}
+    status, _, data = app.handle("POST", "/api/login", TAIL, h, json.dumps({"pin": "2468"}).encode())
+    assert status == 200 and json.loads(data)["result"] == "ok"
+
+
+def test_cross_origin_post_body_never_read(served):
+    app, port = served
+    seen = []
+    app.handle = lambda *a, **k: seen.append(a) or (200, {}, b"")
+    _, r, _ = _req(port, "POST", "/api/login", body=b'{"pin":"1"}', headers={"Origin": "http://evil.example"})
+    assert r.status == 403 and seen == []
+
+
+def test_lockout_is_per_source_ip(tmp_path):
+    app = make_app(tmp_path, lan_open=True)
+    for _ in range(5):
+        r = call(app, "POST", "/api/login", LAN, {"pin": "0000"})[2]["result"]
+    assert r == "locked"
+    assert call(app, "POST", "/api/login", "198.51.100.8", {"pin": "2468"})[2]["result"] == "ok"
+    assert app.gate_for(LAN) is not app.gate_for("198.51.100.8")
+
+
+# ------------------------------------------------------------ 打字: 限长 / 分块 / 跳过统计
+
+def test_type_reports_skipped_and_still_types_the_rest(tmp_path):
+    app = make_app(tmp_path)
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    status, _, data = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "a中b\r\n"}, ck)
+    assert status == 200
+    assert (data["sent"], data["skipped"], data["unknown"]) == (3, 1, ["中"])
+    assert fake.frames[-3] == bytes([0, 0, 0x28, 0, 0, 0, 0, 0])      # \r\n 只算一次回车
+    assert fake.frames[-1] == bytes(8)
+
+
+def test_type_is_sent_in_chunks_releasing_lock_between(tmp_path):
+    app = make_app(tmp_path)
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    held = []
+    real = app._with_ch
+
+    def spy(path, fn):
+        held.append(app._ch_lock.locked())
+        return real(path, fn)
+    app._with_ch = spy
+    n = webkiosk.TYPE_CHUNK * 3 + 1
+    status, _, data = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "a" * n}, ck)
+    assert status == 200 and data["sent"] == n
+    assert len(held) == 4 + 1 and not any(held)            # 4 块 + 结束松开, 进来时锁都是空的
+
+
+def test_type_unbound_is_409(tmp_path):
+    app = make_app(tmp_path)
+    ck = login(app)
+    assert call(app, "POST", "/api/type", TAIL, {"src": "video2", "text": "a"}, ck)[0] == 409
+
+
+# ------------------------------------------------------------ 绝对坐标鼠标
+
+def test_abs_mouse_goes_to_ch9329(tmp_path):
+    app = make_app(tmp_path)
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    ev = [{"t": "a", "x": 50, "y": 25, "vw": 100, "vh": 50, "b": 1, "w": 0},
+          {"t": "a", "x": 0, "y": 49, "vw": 100, "vh": 50, "nw": 100, "nh": 100, "b": 1, "w": 0},   # 黑边上按下: 不发
+          {"t": "a", "x": 0, "y": 50, "vw": 100, "vh": 50, "nw": 100, "nh": 100, "b": 0, "w": 0}]   # 黑边上松开: 照发
+    status, _, _ = call(app, "POST", "/api/hid", TAIL, {"src": "video0", "events": ev}, ck)
+    assert status == 200
+    assert fake.abs == [(1, 2048, 2048, 0), (0, 0, 4095, 0)]
+
+
+# ------------------------------------------------------------ 审计日志
+
+def test_audit_log_events_without_secrets(tmp_path):
+    app = make_app(tmp_path, lan_open=True)
+    logged = []
+    app.audit = lambda kind, msg: logged.append((kind, msg))
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    call(app, "POST", "/api/login", LAN, {"pin": "1111"})
+    ck = login(app)
+    call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "secret-text"}, ck)
+    call(app, "POST", "/api/lan", TAIL, {"open": False}, ck)
+    call(app, "POST", "/api/logout", TAIL, {}, ck)
+    text = "\n".join(m for _, m in logged)
+    assert all(k == "web" for k, _ in logged)
+    rows = [dict(f.split("=", 1) for f in m.split()) for _, m in logged]
+    for want in ({"act": "login", "result": "bad"}, {"act": "login", "result": "ok"},
+                 {"act": "type", "n": "11"}, {"act": "lan", "open": "false"}, {"act": "logout"}):
+        assert any(want.items() <= r.items() for r in rows), want
+    assert f"src={LAN}" in text and f"sid={wc.session_tag(ck.split('=', 1)[1])}" in text
+    for secret in ("1111", "2468", "secret-text", ck.split("=", 1)[1]):
+        assert secret not in text
+
+
+# ------------------------------------------------------------ 串口: 按连接 id、不自动回车、回放历史
+
+def _broker(tmp_path, name="ttyUSB0", log=b""):
+    (tmp_path / "run").mkdir(exist_ok=True)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    import socket as _s
+    srv = _s.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    (tmp_path / "run" / f"{name}.json").write_text(json.dumps({"port": srv.getsockname()[1]}))
+    (tmp_path / "logs" / f"{name}.log").write_bytes(log)
+    return srv
+
+
+def test_open_serial_per_connection_id_and_no_auto_enter(tmp_path):
+    app = make_app(tmp_path)
+    app.serial_dir = lambda: str(tmp_path)
+    srv = _broker(tmp_path)
+    try:
+        a = app.open_serial("tok", "ttyUSB0", "c1")
+        b = app.open_serial("tok", "ttyUSB0", "c2")             # 第二个标签页不挤掉第一个
+        peer_a, _ = srv.accept()
+        peer_b, _ = srv.accept()
+        assert set(app.serial_socks) == {("tok", "c1"), ("tok", "c2")}
+        peer_a.settimeout(0.3)
+        assert peer_a.recv(64) == b"HELLO human\n"            # 只打招呼, 不替人按回车
+        import socket as _s
+        with pytest.raises(_s.timeout):
+            peer_a.recv(64)
+        app.serial_close("tok", "c1", a)
+        assert set(app.serial_socks) == {("tok", "c2")}
+        for x in (b, peer_a, peer_b):
+            x.close()
+    finally:
+        srv.close()
+
+
+def test_serial_history_tail(tmp_path):
+    srv = _broker(tmp_path, log=b"x" * 100 + b"\r\nprompt> ")
+    srv.close()
+    assert wc.serial_history(str(tmp_path), "ttyUSB0", max_bytes=10) == b"\r\nprompt> "
+    assert wc.serial_history(str(tmp_path), "nope") == b""
+    assert wc.serial_history(str(tmp_path), "../run/ttyUSB0") == b""
+
+
+@pytest.mark.parametrize("cid", [None, "", "a b", "x" * 40, 7])
+def test_serial_send_needs_valid_cid(tmp_path, cid):
+    app = make_app(tmp_path)
+    ck = login(app)
+    body = {"data": "YQ=="} if cid is None else {"cid": cid, "data": "YQ=="}
+    assert call(app, "POST", "/api/serial/send", TAIL, body, ck)[0] == 400
+
+
+def test_serial_stream_replays_history_and_sends_no_enter(served, tmp_path):
+    app, port = served
+    srv = _broker(tmp_path, log=b"old\r\nSwitch> ")
+    app.serial_dir = lambda: str(tmp_path)
+    logged = []
+    app.audit = lambda kind, msg: logged.append(msg)
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/api/serial/stream?name=ttyUSB0&cid=t1", headers={"Cookie": login(app)})
+        r = c.getresponse()
+        assert r.status == 200 and "event-stream" in r.getheader("Content-Type")
+        first = r.fp.readline()
+        import base64
+        assert base64.b64decode(first.split(b"data: ", 1)[1].strip()) == b"old\r\nSwitch> "
+        peer, _ = srv.accept()
+        peer.settimeout(0.5)
+        assert peer.recv(64) == b"HELLO human\n"
+        c.close()
+        peer.close()
+        for _ in range(50):                               # 断开后 relay 下一轮读到 EOF 才收尾
+            if any("serial-close" in m for m in logged):
+                break
+            time.sleep(0.1)
+        assert any("act=serial-open" in m for m in logged)
+        assert any("act=serial-close" in m and "tx=0" in m for m in logged)
+        assert app.serial_socks == {}
+    finally:
+        srv.close()
+
+
+def test_serial_stream_needs_cid(served):
+    app, port = served
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", "/api/serial/stream?name=ttyUSB0", headers={"Cookie": login(app)})
+    assert c.getresponse().status == 400
+
+
+def _page():
+    import pathlib
+    return (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
+
+
+def test_web_page_no_symbol_icons():
+    assert "●" not in _page()
+
+
+def test_web_page_serial_wake_button_and_connection_id():
+    html = _page()
+    assert 'id="s-wake"' in html and "cid=" in html and "cid: serialCid" in html
+
+
+def test_web_page_mouse_defaults_to_absolute():
+    html = _page()
+    assert '<option value="abs" selected>' in html and 't: "a"' in html
+    assert "object-fit: contain" in html.replace("object-fit:contain", "object-fit: contain")
+
+
+def test_web_page_reports_type_result():
+    assert "r.skipped" in _page()
+
+
+# ------------------------------------------------------------ 部署单元: 专用用户 + 加固
+
+def test_webkiosk_unit_runs_as_dedicated_user():
+    import pathlib
+    u = (pathlib.Path(webkiosk.__file__).parent / "deploy" / "systemd" / "webkiosk.service").read_text()
+    body = [l.strip() for l in u.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    assert "User=ops-web" in body and "Group=ops-web" in body
+    assert "SupplementaryGroups=dialout video" in body
+    # 读 root 0600 的 PIN 和 conbroker 状态只给读权限的能力, 别的都不给
+    assert "AmbientCapabilities=CAP_DAC_READ_SEARCH" in body
+    assert "CapabilityBoundingSet=CAP_DAC_READ_SEARCH" in body
+    assert "ReadWritePaths=/opt/pxe/web.conf" in body               # 只开放要写的那一个文件
+    assert "LogsDirectory=ops-cart-web" in body
+    assert "Environment=OPS_CART_WEB_LOG=/var/log/ops-cart-web/audit.log" in body
+    for k in ("NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateTmp=yes", "ProtectHome=read-only",
+              "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"):
+        assert k in body, k
+
+
+def test_audit_log_path_from_env(monkeypatch):
+    monkeypatch.delenv("OPS_CART_WEB_LOG", raising=False)
+    import cartlog
+    assert webkiosk.audit_path() == cartlog.EVENTS
+    monkeypatch.setenv("OPS_CART_WEB_LOG", "/var/log/ops-cart-web/audit.log")
+    assert webkiosk.audit_path() == "/var/log/ops-cart-web/audit.log"
+
+
+def test_audit_written_to_file_or_stderr(tmp_path, capsys):
+    app = make_app(tmp_path)
+    call(app, "POST", "/api/login", TAIL, {"pin": "0000"})
+    assert "act=login" in (tmp_path / "audit.log").read_text()
+    (tmp_path / "file").write_text("")
+    app.audit_log = str(tmp_path / "file" / "audit.log")          # 写不进去: 退到 stderr (journald)
+    call(app, "POST", "/api/login", TAIL, {"pin": "0000"})
+    assert "act=login" in capsys.readouterr().err

@@ -27,6 +27,18 @@ def _one_line(msg):
     return " ".join(str(msg).split())
 
 
+def fields(**kv):
+    """结构化事件的正文: 'k=v k=v'; 带空白的值加引号, None 不写, 布尔写成 true/false.
+    调用方自己决定写什么 —— PIN、令牌、打字内容这类不该进日志的, 别传进来."""
+    out = []
+    for k, v in kv.items():
+        if v is None:
+            continue
+        v = ("true" if v else "false") if isinstance(v, bool) else _one_line(v).replace('"', "'")
+        out.append(f'{k}="{v}"' if (" " in v or not v) else f"{k}={v}")
+    return " ".join(out)
+
+
 def event(kind, msg, path=EVENTS, now=None):
     """'2026-10-22 14:03:00 [kind] msg'"""
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now if now is not None else time.time()))

@@ -6,15 +6,20 @@
   python3 cart_ocr.py shot.png --lang eng+chi_sim
 
 依赖: tesseract(+ chi_sim 语言包) 和 ImageMagick convert. 预处理 = 放大 + 灰度,
-BIOS 的小点阵字放大 3 倍后识别明显变好.
+BIOS 的小点阵字放大后识别明显变好; 放大倍数按图宽自适应 (放大到 3000 像素上下, 1~4 倍).
+退出码: 0 正常; 1 --find 没找到; 2 出错 (工具缺失 / 超时 / 识别失败).
 """
 
 import argparse
 import re
+import struct
 import subprocess
 import sys
 
-SCALE = 3
+SCALE = 3                   # 读不出图宽时的放大倍数
+TARGET_W = 3072             # 放大后的目标宽度
+CONVERT_TIMEOUT = 30
+TESSERACT_TIMEOUT = 90
 GAP = 3          # 同一行里词间空隙 > 3 倍字高就切成两栏(BIOS 左菜单 / 中间取值 / 右说明)
 
 
@@ -59,11 +64,31 @@ def find_text(lines, needle):
     return next((l for l in lines if n in _norm(l["text"])), None)
 
 
-def ocr_image(path, lang="eng", scale=SCALE, psm=6):
+def image_width(path):
+    """PNG 头里的宽度 (cart_snap 出的都是 PNG); 别的格式返回 None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+    except OSError:
+        return None
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">I", head[16:20])[0]
+
+
+def auto_scale(width):
+    """小图多放大, 大图少放大: 1024 宽的 BIOS 截图放 3 倍, 1080p 放 2 倍, 4K 不放."""
+    if not width:
+        return SCALE
+    return max(1, min(4, int(round(TARGET_W / width))))
+
+
+def ocr_image(path, lang="eng", scale=None, psm=6):
+    scale = scale or auto_scale(image_width(path))
     pre = subprocess.run(["convert", path, "-resize", f"{scale * 100}%", "-colorspace", "Gray", "png:-"],
-                         capture_output=True, check=True).stdout
+                         capture_output=True, check=True, timeout=CONVERT_TIMEOUT).stdout
     tsv = subprocess.run(["tesseract", "stdin", "stdout", "-l", lang, "--psm", str(psm), "tsv"],
-                         input=pre, capture_output=True, check=True).stdout.decode()
+                         input=pre, capture_output=True, check=True, timeout=TESSERACT_TIMEOUT).stdout.decode()
     return parse_tsv(tsv, scale=scale)
 
 
@@ -73,7 +98,18 @@ def main(argv=None):
     ap.add_argument("--lang", default="eng")
     ap.add_argument("--find", help="只找这行, 打印坐标; 找不到退出码 1")
     args = ap.parse_args(argv)
-    lines = ocr_image(args.image, lang=args.lang)
+    try:
+        lines = ocr_image(args.image, lang=args.lang)
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode(errors="replace").strip()
+        print(f"OCR 失败: {e.cmd[0]} 退出码 {e.returncode} {err}".strip(), file=sys.stderr)
+        return 2
+    except subprocess.TimeoutExpired as e:
+        print(f"OCR 失败: {e.cmd[0]} 超时 ({e.timeout} 秒)", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"OCR 失败: {e} (装了 tesseract 和 ImageMagick 吗?)", file=sys.stderr)
+        return 2
     if args.find:
         hit = find_text(lines, args.find)
         if not hit:

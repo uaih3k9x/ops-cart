@@ -34,3 +34,8 @@ def test_summary_escapes_pipes(tmp_path):
     p = tmp_path / "CART-LOG.md"
     cartlog.summary("a|b", path=str(p), now=NOW)
     assert "a\\|b" in p.read_text()
+
+
+def test_fields_formats_key_values_on_one_line():
+    line = cartlog.fields(act="login", src="192.0.2.1", ok=True, note="a b\nc", n=3, none=None)
+    assert line == 'act=login src=192.0.2.1 ok=true note="a b c" n=3'

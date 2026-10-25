@@ -68,3 +68,52 @@ def test_parse_tsv_splits_columns_on_big_gap():
     ])
     texts = [l["text"] for l in co.parse_tsv(tsv)]
     assert texts == ["> Device Manager", "the language"]
+
+
+# ============================================================ C 线: 超时 / 退出码 / 自适应放大
+
+import struct
+import subprocess
+
+
+def _png_header(w, h):
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", w, h) + b"\x08\x02\x00\x00\x00"
+
+
+def test_image_width_reads_png_header(tmp_path):
+    p = tmp_path / "a.png"
+    p.write_bytes(_png_header(1024, 768))
+    assert co.image_width(str(p)) == 1024
+    (tmp_path / "b.jpg").write_bytes(b"\xff\xd8junk")
+    assert co.image_width(str(tmp_path / "b.jpg")) is None
+
+
+@pytest.mark.parametrize("width,scale", [(640, 4), (800, 4), (1024, 3), (1280, 2), (1920, 2),
+                                         (3840, 1), (None, co.SCALE)])
+def test_auto_scale(width, scale):
+    assert co.auto_scale(width) == scale
+
+
+def test_subprocesses_have_timeouts(monkeypatch, tmp_path):
+    seen = []
+
+    class R:
+        stdout = b"level\n"
+    monkeypatch.setattr(co.subprocess, "run", lambda cmd, **kw: seen.append(kw.get("timeout")) or R())
+    co.ocr_image(str(tmp_path / "x.png"), scale=2)
+    assert len(seen) == 2 and all(t and t > 0 for t in seen)
+
+
+def test_main_exit_codes(monkeypatch, tmp_path, capsys):
+    img = str(tmp_path / "x.png")
+    monkeypatch.setattr(co, "ocr_image", lambda *a, **k: [])
+    assert co.main([img, "--find", "Boot"]) == 1                 # 没找到 = 1
+
+    def boom(*a, **k):
+        raise subprocess.CalledProcessError(1, ["tesseract"], stderr=b"bad lang")
+    monkeypatch.setattr(co, "ocr_image", boom)
+    assert co.main([img]) == 2                                   # 出错 = 2
+    for exc in (subprocess.TimeoutExpired(["convert"], 30), FileNotFoundError("convert")):
+        monkeypatch.setattr(co, "ocr_image", lambda *a, e=exc, **k: (_ for _ in ()).throw(e))
+        assert co.main([img]) == 2
+    assert "OCR 失败" in capsys.readouterr().err
