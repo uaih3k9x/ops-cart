@@ -336,3 +336,21 @@ def test_sessions_kind_and_prefix_are_safe():
     assert s.kind(tok) == "lan" and s.kind("nope") is None
     tag = wc.session_tag(tok)
     assert len(tag) == 8 and tag not in tok and wc.session_tag(None) == "-"
+
+
+def test_abs_coords_full_box_and_letterbox():
+    assert wc.abs_coords(0, 0, 100, 50) == (0, 0, True)
+    assert wc.abs_coords(100, 50, 100, 50) == (4095, 4095, True)
+    assert wc.abs_coords(50, 25, 100, 50) == (2048, 2048, True)
+    # 方形画面放进 2:1 的框: 左右各 25 像素黑边
+    assert wc.abs_coords(25, 0, 100, 50, 640, 640) == (0, 0, True)
+    assert wc.abs_coords(75, 50, 100, 50, 640, 640) == (4095, 4095, True)
+    assert wc.abs_coords(10, 25, 100, 50, 640, 640) == (0, 2048, False)    # 黑边上: 夹到边, 标出来
+    assert wc.abs_coords(5, 5, 0, 0) == (0, 0, False)
+
+
+def test_parse_hid_events_abs():
+    out = wc.parse_hid_events({"events": [{"t": "a", "x": 50, "y": 25, "vw": 100, "vh": 50, "b": 9, "w": 3}]})
+    assert out == [{"t": "a", "x": 2048, "y": 2048, "inside": True, "b": 1, "w": 1}]
+    with pytest.raises(ValueError):
+        wc.parse_hid_events({"events": [{"t": "a", "x": "1", "y": 0, "vw": 1, "vh": 1}]})

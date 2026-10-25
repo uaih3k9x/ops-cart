@@ -15,6 +15,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -336,6 +337,22 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def abs_coords(x, y, vw, vh, nw=0, nh=0):
+    """浏览器里画面上的点 -> CH9329 绝对坐标 (0~4095) 和"是不是落在画面上".
+    vw/vh = 元素大小; nw/nh = 画面原始大小 (object-fit: contain 时两边留黑边), 不知道就当铺满.
+    落在黑边上: 坐标夹到画面边上, inside=False (按下不该发, 松开照发)."""
+    if vw <= 0 or vh <= 0:
+        return 0, 0, False
+    cw, ch, ox, oy = vw, vh, 0.0, 0.0
+    if nw > 0 and nh > 0:
+        k = min(vw / nw, vh / nh)
+        cw, ch = nw * k, nh * k
+        ox, oy = (vw - cw) / 2, (vh - ch) / 2
+    fx, fy = (x - ox) / cw, (y - oy) / ch
+    inside = 0 <= fx <= 1 and 0 <= fy <= 1
+    return (int(round(_clamp(fx, 0.0, 1.0) * 4095)), int(round(_clamp(fy, 0.0, 1.0) * 4095)), inside)
+
+
 def mouse_buttons(b):
     return int(b) & 0x07
 
@@ -375,6 +392,12 @@ def parse_hid_events(req):
                         "dy": _clamp(_num(ev.get("dy", 0)), -MOUSE_MAX, MOUSE_MAX),
                         "b": mouse_buttons(_num(ev.get("b", 0))),
                         "w": _clamp(_num(ev.get("w", 0)), -1, 1)})
+        elif t == "a":                      # 绝对坐标: 元素内的点 + 元素/画面尺寸
+            dims = [_clamp(_num(ev.get(k, 0)), 0, 65535) for k in ("vw", "vh", "nw", "nh")]
+            ax, ay, inside = abs_coords(_num(ev.get("x")), _num(ev.get("y")), *dims)
+            out.append({"t": "a", "x": ax, "y": ay, "inside": inside,
+                        "b": mouse_buttons(_num(ev.get("b", 0))),
+                        "w": _clamp(_num(ev.get("w", 0)), -1, 1)})
         elif t == "release":
             out.append({"t": "release"})
         else:
@@ -404,7 +427,6 @@ def relay(read, write, still_ok, clock=time.monotonic, every=2.0):
 # ------------------------------------------------------------ 视频
 
 def video_device(name, root="/dev"):
-    import re
     if not re.fullmatch(r"video\d+", name or ""):
         return None
     path = f"{root}/{name}"
@@ -420,6 +442,28 @@ def video_cmd(dev, fps=15, quality=6):
 
 
 # ------------------------------------------------------------ 串口 (conbroker)
+
+SERIAL_CID = re.compile(r"[A-Za-z0-9_-]{1,32}")
+HISTORY_MAX = 16 * 1024
+
+
+def valid_cid(cid):
+    """串口连接序号: 浏览器每个标签页自己生成的短 id."""
+    return isinstance(cid, str) and SERIAL_CID.fullmatch(cid) is not None
+
+
+def serial_history(ddir, name, max_bytes=HISTORY_MAX):
+    """conbroker 日志末尾 max_bytes 字节 (接入时回放, 进来就看得到当前提示符). 读不到返回 b''."""
+    if os.path.basename(name) != name or name.startswith("."):
+        return b""
+    try:
+        with open(os.path.join(ddir, "logs", f"{name}.log"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read()
+    except OSError:
+        return b""
+
 
 def serial_ports(ddir):
     """在跑的 conbroker 服务: run/<name>.json 里有本地端口."""

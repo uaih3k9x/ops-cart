@@ -163,13 +163,16 @@ def test_index_served_and_unknown_404(tmp_path):
 
 class FakeCh:
     def __init__(self):
-        self.frames, self.mice = [], []
+        self.frames, self.mice, self.abs = [], [], []
 
     def send_report(self, report):
         self.frames.append(report)
 
     def send_mouse(self, buttons, dx, dy, wheel):
         self.mice.append((buttons, dx, dy, wheel))
+
+    def send_mouse_abs(self, buttons, x, y, wheel):
+        self.abs.append((buttons, x, y, wheel))
 
 
 def test_hid_events_reach_ch9329(tmp_path):
@@ -223,10 +226,11 @@ def test_type_text(tmp_path):
     fake = FakeCh()
     app.ch_open = lambda path: fake
     ck = login(app)
-    status, _, _ = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "aB"}, ck)
-    assert status == 200
+    status, _, data = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "aB"}, ck)
+    assert status == 200 and data["sent"] == 2 and data["skipped"] == 0
     assert fake.frames == [bytes([0, 0, 0x04, 0, 0, 0, 0, 0]), bytes(8),
-                           bytes([2, 0, 0x05, 0, 0, 0, 0, 0]), bytes(8)]
+                           bytes([2, 0, 0x05, 0, 0, 0, 0, 0]), bytes(8),
+                           bytes(8)]                            # 结束时真发一次全部松开
 
 
 # ------------------------------------------------------------ 视频 / 串口 列表
@@ -251,7 +255,7 @@ def test_serial_list(tmp_path):
 def test_serial_send_without_stream_is_409(tmp_path):
     app = make_app(tmp_path)
     ck = login(app)
-    assert call(app, "POST", "/api/serial/send", TAIL, {"data": "aGk="}, ck)[0] == 409
+    assert call(app, "POST", "/api/serial/send", TAIL, {"cid": "c1", "data": "aGk="}, ck)[0] == 409
 
 
 def test_serial_send_goes_to_session_socket(tmp_path):
@@ -263,9 +267,10 @@ def test_serial_send_goes_to_session_socket(tmp_path):
         def sendall(self, b):
             sent.append(b)
 
-    app.serial_socks[ck.split("=", 1)[1]] = Sock()
-    status, _, _ = call(app, "POST", "/api/serial/send", TAIL, {"data": "aGkN"}, ck)
+    app.serial_socks[(ck.split("=", 1)[1], "c1")] = Sock()
+    status, _, _ = call(app, "POST", "/api/serial/send", TAIL, {"cid": "c1", "data": "aGkN"}, ck)
     assert status == 200 and sent == [b"hi\r"]
+    assert call(app, "POST", "/api/serial/send", TAIL, {"cid": "c2", "data": "aGkN"}, ck)[0] == 409
 
 
 # ============================================================ 1.06.00 复审修复
@@ -393,7 +398,9 @@ def test_huge_mouse_move_sends_bounded_frames(tmp_path):
 def test_non_object_or_wrong_type_bodies_are_400(tmp_path, path, body):
     app = make_app(tmp_path)
     ck = login(app)
-    app.serial_socks[ck.split("=", 1)[1]] = object()
+    app.serial_socks[(ck.split("=", 1)[1], "c1")] = object()
+    if isinstance(body, dict) and path == "/api/serial/send":
+        body = dict(body, cid="c1")
     assert call(app, "POST", path, TAIL, body, ck)[0] == 400
 
 
@@ -479,8 +486,9 @@ def test_serial_send_is_serialized_per_session(tmp_path):
             time.sleep(0.01)
             inside[0] -= 1
 
-    app.serial_socks[ck.split("=", 1)[1]] = SlowSock()
-    ts = [threading.Thread(target=call, args=(app, "POST", "/api/serial/send", TAIL, {"data": "YQ=="}, ck))
+    app.serial_socks[(ck.split("=", 1)[1], "c1")] = SlowSock()
+    ts = [threading.Thread(target=call, args=(app, "POST", "/api/serial/send", TAIL,
+                                               {"cid": "c1", "data": "YQ=="}, ck))
           for _ in range(8)]
     for t in ts:
         t.start()
@@ -629,3 +637,170 @@ def test_lockout_is_per_source_ip(tmp_path):
     assert r == "locked"
     assert call(app, "POST", "/api/login", "198.51.100.8", {"pin": "2468"})[2]["result"] == "ok"
     assert app.gate_for(LAN) is not app.gate_for("198.51.100.8")
+
+
+# ------------------------------------------------------------ 打字: 限长 / 分块 / 跳过统计
+
+def test_type_reports_skipped_and_still_types_the_rest(tmp_path):
+    app = make_app(tmp_path)
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    status, _, data = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "a中b\r\n"}, ck)
+    assert status == 200
+    assert (data["sent"], data["skipped"], data["unknown"]) == (3, 1, ["中"])
+    assert fake.frames[-3] == bytes([0, 0, 0x28, 0, 0, 0, 0, 0])      # \r\n 只算一次回车
+    assert fake.frames[-1] == bytes(8)
+
+
+def test_type_is_sent_in_chunks_releasing_lock_between(tmp_path):
+    app = make_app(tmp_path)
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    held = []
+    real = app._with_ch
+
+    def spy(path, fn):
+        held.append(app._ch_lock.locked())
+        return real(path, fn)
+    app._with_ch = spy
+    n = webkiosk.TYPE_CHUNK * 3 + 1
+    status, _, data = call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "a" * n}, ck)
+    assert status == 200 and data["sent"] == n
+    assert len(held) == 4 + 1 and not any(held)            # 4 块 + 结束松开, 进来时锁都是空的
+
+
+def test_type_unbound_is_409(tmp_path):
+    app = make_app(tmp_path)
+    ck = login(app)
+    assert call(app, "POST", "/api/type", TAIL, {"src": "video2", "text": "a"}, ck)[0] == 409
+
+
+# ------------------------------------------------------------ 绝对坐标鼠标
+
+def test_abs_mouse_goes_to_ch9329(tmp_path):
+    app = make_app(tmp_path)
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    ev = [{"t": "a", "x": 50, "y": 25, "vw": 100, "vh": 50, "b": 1, "w": 0},
+          {"t": "a", "x": 0, "y": 49, "vw": 100, "vh": 50, "nw": 100, "nh": 100, "b": 1, "w": 0},   # 黑边上按下: 不发
+          {"t": "a", "x": 0, "y": 50, "vw": 100, "vh": 50, "nw": 100, "nh": 100, "b": 0, "w": 0}]   # 黑边上松开: 照发
+    status, _, _ = call(app, "POST", "/api/hid", TAIL, {"src": "video0", "events": ev}, ck)
+    assert status == 200
+    assert fake.abs == [(1, 2048, 2048, 0), (0, 0, 4095, 0)]
+
+
+# ------------------------------------------------------------ 审计日志
+
+def test_audit_log_events_without_secrets(tmp_path):
+    app = make_app(tmp_path, lan_open=True)
+    logged = []
+    app.audit = lambda kind, msg: logged.append((kind, msg))
+    fake = FakeCh()
+    app.ch_open = lambda path: fake
+    call(app, "POST", "/api/login", LAN, {"pin": "1111"})
+    ck = login(app)
+    call(app, "POST", "/api/type", TAIL, {"src": "video0", "text": "secret-text"}, ck)
+    call(app, "POST", "/api/lan", TAIL, {"open": False}, ck)
+    call(app, "POST", "/api/logout", TAIL, {}, ck)
+    text = "\n".join(m for _, m in logged)
+    assert all(k == "web" for k, _ in logged)
+    rows = [dict(f.split("=", 1) for f in m.split()) for _, m in logged]
+    for want in ({"act": "login", "result": "bad"}, {"act": "login", "result": "ok"},
+                 {"act": "type", "n": "11"}, {"act": "lan", "open": "false"}, {"act": "logout"}):
+        assert any(want.items() <= r.items() for r in rows), want
+    assert f"src={LAN}" in text and f"sid={wc.session_tag(ck.split('=', 1)[1])}" in text
+    for secret in ("1111", "2468", "secret-text", ck.split("=", 1)[1]):
+        assert secret not in text
+
+
+# ------------------------------------------------------------ 串口: 按连接 id、不自动回车、回放历史
+
+def _broker(tmp_path, name="ttyUSB0", log=b""):
+    (tmp_path / "run").mkdir(exist_ok=True)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    import socket as _s
+    srv = _s.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    (tmp_path / "run" / f"{name}.json").write_text(json.dumps({"port": srv.getsockname()[1]}))
+    (tmp_path / "logs" / f"{name}.log").write_bytes(log)
+    return srv
+
+
+def test_open_serial_per_connection_id_and_no_auto_enter(tmp_path):
+    app = make_app(tmp_path)
+    app.serial_dir = lambda: str(tmp_path)
+    srv = _broker(tmp_path)
+    try:
+        a = app.open_serial("tok", "ttyUSB0", "c1")
+        b = app.open_serial("tok", "ttyUSB0", "c2")             # 第二个标签页不挤掉第一个
+        peer_a, _ = srv.accept()
+        peer_b, _ = srv.accept()
+        assert set(app.serial_socks) == {("tok", "c1"), ("tok", "c2")}
+        peer_a.settimeout(0.3)
+        assert peer_a.recv(64) == b"HELLO human\n"            # 只打招呼, 不替人按回车
+        import socket as _s
+        with pytest.raises(_s.timeout):
+            peer_a.recv(64)
+        app.serial_close("tok", "c1", a)
+        assert set(app.serial_socks) == {("tok", "c2")}
+        for x in (b, peer_a, peer_b):
+            x.close()
+    finally:
+        srv.close()
+
+
+def test_serial_history_tail(tmp_path):
+    srv = _broker(tmp_path, log=b"x" * 100 + b"\r\nprompt> ")
+    srv.close()
+    assert wc.serial_history(str(tmp_path), "ttyUSB0", max_bytes=10) == b"\r\nprompt> "
+    assert wc.serial_history(str(tmp_path), "nope") == b""
+    assert wc.serial_history(str(tmp_path), "../run/ttyUSB0") == b""
+
+
+@pytest.mark.parametrize("cid", [None, "", "a b", "x" * 40, 7])
+def test_serial_send_needs_valid_cid(tmp_path, cid):
+    app = make_app(tmp_path)
+    ck = login(app)
+    body = {"data": "YQ=="} if cid is None else {"cid": cid, "data": "YQ=="}
+    assert call(app, "POST", "/api/serial/send", TAIL, body, ck)[0] == 400
+
+
+def test_serial_stream_replays_history_and_sends_no_enter(served, tmp_path):
+    app, port = served
+    srv = _broker(tmp_path, log=b"old\r\nSwitch> ")
+    app.serial_dir = lambda: str(tmp_path)
+    logged = []
+    app.audit = lambda kind, msg: logged.append(msg)
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/api/serial/stream?name=ttyUSB0&cid=t1", headers={"Cookie": login(app)})
+        r = c.getresponse()
+        assert r.status == 200 and "event-stream" in r.getheader("Content-Type")
+        first = r.fp.readline()
+        import base64
+        assert base64.b64decode(first.split(b"data: ", 1)[1].strip()) == b"old\r\nSwitch> "
+        peer, _ = srv.accept()
+        peer.settimeout(0.5)
+        assert peer.recv(64) == b"HELLO human\n"
+        c.close()
+        peer.close()
+        for _ in range(50):                               # 断开后 relay 下一轮读到 EOF 才收尾
+            if any("serial-close" in m for m in logged):
+                break
+            time.sleep(0.1)
+        assert any("act=serial-open" in m for m in logged)
+        assert any("act=serial-close" in m and "tx=0" in m for m in logged)
+        assert app.serial_socks == {}
+    finally:
+        srv.close()
+
+
+def test_serial_stream_needs_cid(served):
+    app, port = served
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", "/api/serial/stream?name=ttyUSB0", headers={"Cookie": login(app)})
+    assert c.getresponse().status == 400

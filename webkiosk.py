@@ -8,6 +8,8 @@
 - 装机口 (LAN1) 网段来的连接一律拒绝, 开了局域网开关也一样
 - 会话绑定签发时的 PIN; PIN 一改, 退出登录 / 关局域网开关, 对应的会话和长连接一起断
 - 键鼠只发给当前画面源绑定的那块 CH9329 (kvm_core), 没绑就只能看
+- Host 白名单 + POST 同源, 都在读请求体之前查
+- 审计: 登录 / 退出 / 开关 / 打字 (只记长度) / 画面和串口的开关 (只记字节数) 写 cartlog, PIN 不进日志
 """
 
 import argparse
@@ -20,6 +22,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import cartlog
 import ch9329
 import kiosk_core as kc
 import kvm_core as kvm
@@ -32,6 +35,7 @@ _TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=
 
 BODY_MAX = 64 * 1024        # 请求体上限; 粘贴打字也够用
 TYPE_MAX = 4096             # /api/type 一次最多几个字符 (115200 波特下约 10 秒)
+TYPE_CHUNK = 32             # 打字分块发, 块间放开键鼠锁, 别的键鼠请求插得进来
 STREAM_RECHECK_S = 2.0      # 长连接多久复查一次来源和会话
 LAN_MAX_LOCK_S = 3600       # 局域网输错冷却: 60 秒起翻倍, 封顶 1 小时
 GATES_MAX = 1024            # 按来源 IP 记的输错闸门上限
@@ -68,6 +72,7 @@ class App:
         self.selftest = selftest or (lambda: kc.selftest_run(kc.selftest_plan_read(),
                                                              kc.selftest_context()))
         self.sessions = wc.Sessions()
+        self.audit = lambda kind, msg: cartlog.event(kind, msg)
         self._state_lock = threading.Lock()
         self._pin_tag, self._gates = None, {}
         # 键鼠
@@ -78,8 +83,9 @@ class App:
         self.popen = subprocess.Popen
         self._videos, self._video_lock = {}, threading.Lock()
         self.serial_dir = _real_serial_dir
-        self.serial_socks = {}          # 会话令牌 -> conbroker socket
-        self._send_locks = {}           # 会话令牌 -> 发送锁 (同一会话的按键按顺序进串口)
+        self.serial_socks = {}          # (会话令牌, 连接序号) -> conbroker socket; 每个标签页各一条
+        self._send_locks = {}           # 同上 -> 发送锁 (同一条连接的按键按顺序进串口)
+        self._serial_tx = {}            # 同上 -> 发出去的字节数 (审计用)
         self._streams = {}              # 会话令牌 -> {关闭函数}
 
     # -------------------------------------------------------- 鉴权
@@ -134,6 +140,14 @@ class App:
     def stream_ok(self, ip, tok, local_ip=None):
         return self.source_reason(ip, local_ip) is None and self._session_ok(tok)
 
+    def log(self, act, ip, tok=None, **kv):
+        """审计一行; 日志坏了不影响服务."""
+        try:
+            self.audit("web", cartlog.fields(act=act, src=ip, kind=wc.client_kind(ip),
+                                             sid=wc.session_tag(tok), **kv))
+        except Exception:
+            pass
+
     # -------------------------------------------------------- 长连接登记
 
     def stream_register(self, tok, closer):
@@ -183,6 +197,7 @@ class App:
         if (method, path) == ("POST", "/api/logout"):
             self.sessions.revoke(tok)
             self._close_streams([tok])
+            self.log("logout", ip, tok)
             return _json(200, {"ok": True})
         if (method, path) == ("GET", "/api/status"):
             return _json(200, wc.status_payload(self.status_src))
@@ -191,15 +206,15 @@ class App:
         if (method, path) == ("POST", "/api/hid"):
             return self._hid(req)
         if (method, path) == ("POST", "/api/type"):
-            return self._type(req)
+            return self._type(req, ip, tok)
         if (method, path) == ("GET", "/api/videos"):
             return _json(200, {"devices": self._video_list()})
         if (method, path) == ("GET", "/api/serial/ports"):
             return _json(200, {"ports": [p["name"] for p in wc.serial_ports(self.serial_dir())]})
         if (method, path) == ("POST", "/api/serial/send"):
-            return self._serial_send(tok, req.get("data"))
+            return self._serial_send(tok, req.get("cid"), req.get("data"))
         if (method, path) == ("POST", "/api/lan"):
-            return self._lan(ip, req.get("open"))
+            return self._lan(ip, tok, req.get("open"))
         return _json(404, {"error": "no such api"})
 
     def _login(self, req, ip):
@@ -208,20 +223,24 @@ class App:
             return _json(400, {"error": "pin 必须是字符串"})
         state, stored = self.pin()
         if state == "unreadable":           # 读不到不等于没设: 谁都不放
+            self.log("login", ip, result="unavailable")
             return _json(200, {"result": "unavailable"})
         result = self.gate_for(ip).attempt(pin)
         if result != "ok":
+            self.log("login", ip, result=result)
             return _json(200, {"result": result})
         tok = self.sessions.issue(wc.client_kind(ip), pin_tag=stored)
+        self.log("login", ip, tok, result="ok")
         return _json(200, {"result": "ok"},
                      {"Set-Cookie": f"{wc.COOKIE}={tok}; Path=/; HttpOnly; SameSite=Strict"})
 
-    def _lan(self, ip, want):
+    def _lan(self, ip, tok, want):
         if wc.client_kind(ip) != "trusted":      # 局域网这头不许自己改开关
             return _json(403, {"error": "只能从 tailnet 或本机切换"})
         if not isinstance(want, bool):
             return _json(400, {"error": "open 必须是 true / false"})
         wc.web_conf_set(self.conf_path, lan_open=want)
+        self.log("lan", ip, tok, open=want)
         if not want:                             # 关掉 = 局域网的会话和长连接立刻作废
             self._close_streams(self.sessions.revoke_kind("lan"))
         return _json(200, {"lan_open": bool(wc.web_conf_read(self.conf_path).get("lan_open"))})
@@ -253,7 +272,8 @@ class App:
             pass
 
     def _with_ch(self, path, fn):
-        """拿绑定的 CH9329 发一串报告; 换了画面源就换口; 线被拔就丢句柄, 下次请求重开."""
+        """拿绑定的 CH9329 发一串报告 -> None (成功) 或错误响应.
+        换了画面源就换口; 线被拔就丢句柄, 下次请求重开."""
         with self._ch_lock:
             if self._ch is not None and self._ch_path != path:
                 self._drop_ch()
@@ -261,14 +281,14 @@ class App:
             if self._ch is None:
                 self._ch, self._ch_path = self.ch_open(path), path
             if self._ch is None:
-                return _json(503, {"error": "CH9329 打不开"})
+                return _json(503, {"error": "CH9329 打不开 (没插好或被车机占着)"})
             try:
                 fn(self._ch)
             except (OSError, ValueError) as e:
                 self._drop_ch()
                 self.kbd.release_all()
                 return _json(503, {"error": f"CH9329 发送失败: {e}"})
-            return _json(200, {"ok": True})
+            return None
 
     def _hid(self, req):
         try:
@@ -288,13 +308,17 @@ class App:
                 elif ev["t"] == "m":
                     for dx, dy, w in wc.mouse_chunks(ev["dx"], ev["dy"], ev["w"]):
                         ch.send_mouse(ev["b"], dx, dy, w)
+                elif ev["t"] == "a":
+                    if ev["b"] and not ev["inside"]:   # 黑边上按下 / 拖着: 不发, 免得点到画面边上的东西
+                        continue
+                    ch.send_mouse_abs(ev["b"], ev["x"], ev["y"], ev["w"])
                 else:                          # 浏览器失焦 / 退出透传: 全部抬起
                     ch.send_report(self.kbd.release_all())
                     ch.send_mouse(0, 0, 0, 0)
-        return self._with_ch(path, send)
+        return self._with_ch(path, send) or _json(200, {"ok": True})
 
-    def _type(self, req):
-        """粘贴即打字 (US 布局); 打不出的字符跳过."""
+    def _type(self, req, ip=None, tok=None):
+        """粘贴即打字 (US 布局). 打不出的字符跳过并如实报数; 分块发, 最后真发一次全部松开."""
         text = req.get("text", "")
         if not isinstance(text, str):
             return _json(400, {"error": "text 必须是字符串"})
@@ -303,16 +327,27 @@ class App:
         path, why = self._kvm_port(req.get("src"))
         if path is None:
             return _json(409, {"error": why})
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        unknown = ch9329.untypable(text)
+        keys = [c for c in text if c not in unknown]
+        self.log("type", ip, tok, n=len(text), skipped=len(text) - len(keys))
 
-        def run(ch):
-            for c in text:
-                rep, unknown = ch9329.key_report(["enter"] if c == "\n" else [c])
-                if unknown:
-                    continue
-                ch.send_report(rep)
-                ch.send_report(bytes(8))
-            self.kbd.release_all()
-        return self._with_ch(path, run)
+        def run(chunk):
+            def send(ch):
+                for c in chunk:
+                    rep, _ = ch9329.key_report(["enter"] if c == "\n" else [c])
+                    ch.send_report(rep)
+                    ch.send_report(bytes(8))
+            return send
+        for i in range(0, len(keys), TYPE_CHUNK):
+            err = self._with_ch(path, run(keys[i:i + TYPE_CHUNK]))
+            if err:
+                return err
+        err = self._with_ch(path, lambda ch: ch.send_report(self.kbd.release_all()))
+        if err:
+            return err
+        return _json(200, {"ok": True, "sent": len(keys), "skipped": len(text) - len(keys),
+                           "unknown": unknown[:32]})
 
     # -------------------------------------------------------- 画面
 
@@ -353,35 +388,58 @@ class App:
 
     # -------------------------------------------------------- 串口
 
-    def open_serial(self, tok, name):
+    def open_serial(self, tok, name, cid):
+        """接到 conbroker 的 human 通道. 只打招呼, 不替人按回车 (唤醒由页面上的按钮来).
+        同一标签页重连顶掉自己的旧连接, 别的标签页不受影响."""
         port = next((p["port"] for p in wc.serial_ports(self.serial_dir()) if p["name"] == name), None)
         if port is None:
             return None
         s = socket.create_connection(("127.0.0.1", port), timeout=3)
         s.sendall(b"HELLO human\n")
-        old = self.serial_socks.pop(tok, None)
+        with self._state_lock:
+            old = self.serial_socks.pop((tok, cid), None)
+            self.serial_socks[(tok, cid)] = s
+            self._serial_tx[(tok, cid)] = 0
         if old:
             old.close()
-        self.serial_socks[tok] = s
         return s
 
-    def _serial_send(self, tok, data):
+    def serial_history(self, name):
+        return wc.serial_history(self.serial_dir(), name)
+
+    def serial_close(self, tok, cid, s):
+        """-> 这条连接发出去的字节数."""
+        with self._state_lock:
+            if self.serial_socks.get((tok, cid)) is s:
+                del self.serial_socks[(tok, cid)]
+                self._send_locks.pop((tok, cid), None)
+            sent = self._serial_tx.pop((tok, cid), 0)
+        s.close()
+        return sent
+
+    def _serial_send(self, tok, cid, data):
+        if not wc.valid_cid(cid):
+            return _json(400, {"error": "cid 不对"})
         if not isinstance(data, str):
             return _json(400, {"error": "data 必须是 base64 字符串"})
         try:
             raw = base64.b64decode(data, validate=True)
         except ValueError:
             return _json(400, {"error": "data 不是合法的 base64"})
-        sock = self.serial_socks.get(tok)
+        key = (tok, cid)
+        with self._state_lock:
+            sock = self.serial_socks.get(key)
+            lock = self._send_locks.setdefault(key, threading.Lock()) if sock else None
         if sock is None:
             return _json(409, {"error": "串口没连上"})
-        with self._state_lock:
-            lock = self._send_locks.setdefault(tok, threading.Lock())
         with lock:
             try:
                 sock.sendall(raw)
             except OSError as e:
                 return _json(409, {"error": str(e)})
+        with self._state_lock:
+            if key in self._serial_tx:
+                self._serial_tx[key] += len(raw)
         return _json(200, {"ok": True})
 
     # -------------------------------------------------------- 静态文件
@@ -477,8 +535,10 @@ class Handler(BaseHTTPRequestHandler):
                 fps = max(1, min(30, int(q.get("fps") or 15)))
             except ValueError:
                 return self._send(*_text(400, "bad fps"))
-            return self._video(tok, q.get("dev", ""), fps, still_ok)
-        return self._serial(tok, q.get("name", ""), still_ok)
+            return self._video(ip, tok, q.get("dev", ""), fps, still_ok)
+        if not wc.valid_cid(q.get("cid")):
+            return self._send(*_text(400, "bad cid"))
+        return self._serial(ip, tok, q.get("name", ""), q["cid"], still_ok)
 
     def _stream_head(self, ctype):
         self.send_response(200)
@@ -487,11 +547,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
-    def _video(self, tok, dev, fps, still_ok):
+    def _video(self, ip, tok, dev, fps, still_ok):
         app = self.app
         proc = app.open_video(dev, fps=fps)
         if proc is None:
             return self._send(*_text(404, "no such video device"))
+        app.log("video-open", ip, tok, dev=dev, fps=fps)
         unregister = app.stream_register(tok, proc.kill)
         try:
             self._stream_head("multipart/x-mixed-replace; boundary=ffmpeg")
@@ -504,11 +565,12 @@ class Handler(BaseHTTPRequestHandler):
             proc.kill()
             proc.wait()
             app.video_done(dev, proc)
+            app.log("video-close", ip, tok, dev=dev)
 
-    def _serial(self, tok, name, still_ok):
+    def _serial(self, ip, tok, name, cid, still_ok):
         app = self.app
         try:
-            s = app.open_serial(tok, name)
+            s = app.open_serial(tok, name, cid)
         except OSError as e:
             return self._send(*_text(502, f"conbroker: {e}"))
         if s is None:
@@ -521,7 +583,10 @@ class Handler(BaseHTTPRequestHandler):
             except socket.timeout:
                 return None
 
+        rx = [0]
+
         def write(data):
+            rx[0] += len(data)
             self.wfile.write(b"data: " + base64.b64encode(data) + b"\n\n")
             self.wfile.flush()
 
@@ -531,17 +596,20 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         unregister = app.stream_register(tok, closer)
+        app.log("serial-open", ip, tok, name=name, cid=cid)
         try:
             self._stream_head("text/event-stream")
-            s.sendall(b"\r")
+            history = app.serial_history(name)
+            if history:                          # 回放最近的输出: 进来就看得到停在哪个提示符上
+                self.wfile.write(b"data: " + base64.b64encode(history) + b"\n\n")
+                self.wfile.flush()
             wc.relay(read, write, still_ok, every=STREAM_RECHECK_S)
         except OSError:
             pass
         finally:
             unregister()
-            if app.serial_socks.get(tok) is s:
-                del app.serial_socks[tok]
-            s.close()
+            sent = app.serial_close(tok, cid, s)
+            app.log("serial-close", ip, tok, name=name, cid=cid, rx=rx[0], tx=sent)
 
     def log_message(self, fmt, *args):
         pass
