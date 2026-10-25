@@ -6,12 +6,16 @@
 - 装机网段: 部署配置 /etc/ops-cart/pxe.env (pxe-* 单元和 grub 菜单共用同一份)
 """
 
+import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 
 import atomicfile
+import cartlog
+import pxeserver
 
 LAN1_CON = "Lan1-pxe"   # eno1, 装机口
 LAN2_CON = "enp3s0"     # 管理口
@@ -52,27 +56,46 @@ def run(cmd, timeout=5):
 
 # ---------------------------------------------------------------- 状态
 
-def services_status(names=("pxe-server", "pxe-http-repo", "pxe-http-boot")):
-    """{服务名: (enabled, active)}"""
+def parse_systemctl_show(text, names):
+    """`systemctl show -p Id,ActiveState,UnitFileState a b c` 的输出 -> {名字: (enabled, active)}.
+    每个单元一段, 段间空行; 段内属性顺序不定. 先按 Id 认, 认不出再按段的顺序. 缺的给 (False, False)."""
+    blocks = []
+    for chunk in text.split("\n\n"):
+        kv = dict(line.split("=", 1) for line in chunk.splitlines() if "=" in line)
+        if kv:
+            blocks.append(kv)
+    by_id = {b.get("Id", ""): b for b in blocks}
     out = {}
-    for n in names:
-        _, en = run(["systemctl", "is-enabled", n])
-        _, ac = run(["systemctl", "is-active", n])
-        out[n] = (en.strip() == "enabled", ac.strip() == "active")
+    for i, n in enumerate(names):
+        b = by_id.get(n) or by_id.get(n + ".service")
+        if b is None and len(blocks) == len(names) and not blocks[i].get("Id"):
+            b = blocks[i]
+        b = b or {}
+        out[n] = (b.get("UnitFileState") == "enabled", b.get("ActiveState") == "active")
     return out
 
 
-def nics_status():
-    """[{name, con, ip, method, link}] 只看两个业务口."""
+def services_status(names=("pxe-server", "pxe-http-repo", "pxe-http-boot")):
+    """{服务名: (enabled, active)}; 一次 systemctl show 查全部."""
+    names = list(names)
+    _, out = run(["systemctl", "show", "-p", "Id,ActiveState,UnitFileState"] + names)
+    return parse_systemctl_show(out, names)
+
+
+SYS_NET = "/sys/class/net"
+
+
+def nics_status(sysfs=SYS_NET):
+    """[{name, con, ip, method, link}] 只看两个业务口. carrier 直接读 sysfs, 读不到 = 没插线."""
     result = []
     for con, name, role in ((LAN1_CON, "eno1", "PXE 装机口"),
                             (LAN2_CON, "enp3s0", "管理口")):
         _, ip = run(["ip", "-4", "-br", "addr", "show", name])
         ip = ip.split()[-1] if ip else "-"
         _, method = run(["nmcli", "-g", "ipv4.method", "con", "show", con])
-        _, link = run(["cat", f"/sys/class/net/{name}/carrier"])
+        link = _read(f"{sysfs}/{name}/carrier") == "1"
         result.append({"name": name, "con": con, "role": role, "ip": ip,
-                       "method": method or "-", "link": link.strip() == "1"})
+                       "method": method or "-", "link": link})
     return result
 
 
@@ -90,11 +113,28 @@ def ch9329_port(pattern=CH9329_BY_ID, fallback="/dev/ttyACM0"):
     return hits[0] if hits else fallback
 
 
+PROC_UPTIME = "/proc/uptime"
+
+
+def uptime_text(seconds):
+    """秒 -> 和 `uptime -p` 一样的说法: "up 1 day, 2 hours, 5 minutes"."""
+    m = int(seconds) // 60
+    d, h, m = m // 1440, m // 60 % 24, m % 60
+
+    def unit(n, word):
+        return f"{n} {word}" + ("" if n == 1 else "s")
+    parts = ([unit(d, "day")] if d else []) + ([unit(h, "hour")] if d or h else []) + [unit(m, "minute")]
+    return "up " + ", ".join(parts)
+
+
 def misc_status():
     _, ts_ip = run(["tailscale", "ip", "-4"])
     ch = os.path.exists(ch9329_port())
-    _, up = run(["uptime", "-p"])
-    return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up or "-"}
+    try:
+        up = uptime_text(float((_read(PROC_UPTIME) or "").split()[0]))
+    except (ValueError, IndexError):
+        up = "-"
+    return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up}
 
 
 # ---------------------------------------------------------------- 顶栏网络标
@@ -374,19 +414,35 @@ def selftest_plan_read(path=SELFTEST_PLAN):
         return DEFAULT_PLAN
 
 
+def _selftest_fail(detail, label="SELFTEST", check="selftest"):
+    return {"label": label, "state": "FAIL", "detail": detail, "check": check}
+
+
 def selftest_run(plan, ctx, checks=CHECKS):
-    """按计划逐项跑; 单项抛异常只把那一行标 FAIL, 不拖垮整页."""
+    """按计划逐项跑; 单项抛异常只把那一行标 FAIL, 不拖垮整页. 永不抛异常.
+    ctx 可以是快照, 也可以是采集函数 (采集出错 -> 一行 SELFTEST / FAIL)."""
+    if callable(ctx):
+        try:
+            ctx = ctx()
+        except Exception:       # noqa: BLE001
+            return [_selftest_fail("CONTEXT ERROR")]
+    if not isinstance(plan, list):
+        return [_selftest_fail("BAD PLAN")]
     rows = []
     for item in plan:
-        params = {k: v for k, v in item.items() if k not in ("check", "label")}
-        label = item.get("label", item.get("check", "?").upper())
-        fn = checks.get(item.get("check"))
+        try:
+            params = {k: v for k, v in item.items() if k not in ("check", "label")}
+            label = str(item.get("label", str(item.get("check", "?")).upper()))
+            fn = checks.get(item.get("check"))
+        except Exception:       # noqa: BLE001  计划里混进了不是对象的东西
+            rows.append(_selftest_fail("BAD ITEM", check=None))
+            continue
         if fn is None:
             state, detail = "FAIL", "UNKNOWN CHECK"
         else:
             try:
                 state, detail = fn(ctx, **params)
-            except Exception:
+            except Exception:   # noqa: BLE001
                 state, detail = "FAIL", "ERROR"
         rows.append({"label": label, "state": state, "detail": detail, "check": item.get("check")})
     return rows
@@ -404,10 +460,18 @@ def pci_devices(vid, did, root="/sys/bus/pci/devices"):
     return out
 
 
+def _safe(fn, default):
+    try:
+        return fn()
+    except Exception:           # noqa: BLE001  一样采不到不拖垮整个自检
+        return default
+
+
 def selftest_context():
-    """真机快照. SMART 要 sudo 且慢, 自检不读."""
-    return {"nics": nics_status(), "misc": misc_status(), "svcs": services_status(),
-            "temps": temps_status(smart=lambda: None), "fans": fans_status(),
+    """真机快照. SMART 要 sudo 且慢, 自检不读. 每一样都兜住, 本函数不抛."""
+    return {"nics": _safe(nics_status, []), "misc": _safe(misc_status, {}),
+            "svcs": _safe(services_status, {}),
+            "temps": _safe(lambda: temps_status(smart=lambda: None), []), "fans": _safe(fans_status, []),
             "exists": os.path.exists, "pci": pci_devices,
             "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0,
             "videos": video_nodes, "signal": lambda dev: video_signal(dev), "wifi": wifi_status}
@@ -759,21 +823,54 @@ def pin_set(pin, path=None):
     atomicfile.write_json(path, cfg, mode=0o600)
 
 
+PIN_MAX_LOCK_S = 15 * 60                # 车机输错冷却封顶
+PIN_STATE = "/run/ops-cart/pin-gate.json"   # 失败计数落在这 (重启 kiosk 不清零, 重启推车清零)
+_DEFAULT = object()
+
+
 class PinGate:
     """PIN 校验 + 连续输错冷却. attempt() 返回 'ok' / 'bad' / 'locked'.
-    max_lock_s 给了就指数退避: 每连续冷却一次时长翻倍, 封顶 max_lock_s; 输对一次回到起步.
-    网页口多线程同时试, 内部加锁, 计数不会被并发冲掉."""
+    冷却指数退避: lock_s 起步, 每连续冷却一次翻倍, 封顶 max_lock_s (默认 PIN_MAX_LOCK_S;
+    显式传 None 表示固定 lock_s 不翻倍); 输对一次回到起步.
+    state_path 给了就把失败计数、冷却到期时间持久化 (kiosk 用 PIN_STATE), 读写失败都不影响校验.
+    进入冷却时记 cartlog [pin]. 网页口多线程同时试, 内部加锁, 计数不会被并发冲掉."""
 
-    def __init__(self, stored, max_fails=5, lock_s=60, max_lock_s=None):
+    def __init__(self, stored, max_fails=5, lock_s=60, max_lock_s=_DEFAULT, state_path=None,
+                 event=None):
         import threading as _th
         self.stored, self.max_fails, self.lock_s = stored, max_fails, lock_s
-        self.max_lock_s = max_lock_s or lock_s
+        if max_lock_s is _DEFAULT:
+            max_lock_s = PIN_MAX_LOCK_S
+        self.max_lock_s = max(max_lock_s or lock_s, lock_s)
+        self.state_path = state_path
+        self.event = event or (lambda msg: cartlog.event("pin", msg))
         self.fails, self.locked_until, self.lockouts = 0, 0.0, 0
         self._lock = _th.Lock()
+        self._load()
 
     @property
     def required(self):
         return bool(self.stored)
+
+    def _load(self):
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path) as f:
+                st = json.load(f)
+            self.fails, self.locked_until, self.lockouts = \
+                int(st["fails"]), float(st["locked_until"]), int(st["lockouts"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _save(self):
+        if not self.state_path:
+            return
+        try:
+            atomicfile.write_json(self.state_path, {"fails": self.fails, "locked_until": self.locked_until,
+                                                    "lockouts": self.lockouts}, mode=0o600)
+        except OSError:
+            pass
 
     def attempt(self, pin, now=None):
         now = time.time() if now is None else now
@@ -783,13 +880,21 @@ class PinGate:
             if now < self.locked_until:
                 return "locked"
             if pin_verify(pin, self.stored):
-                self.fails, self.lockouts = 0, 0
+                if self.fails or self.lockouts:
+                    self.fails, self.lockouts = 0, 0
+                    self._save()
                 return "ok"
             self.fails += 1
             if self.fails >= self.max_fails:
                 span = min(self.lock_s * 2 ** self.lockouts, self.max_lock_s)
                 self.fails, self.locked_until, self.lockouts = 0, now + span, self.lockouts + 1
+                self._save()
+                try:
+                    self.event(f"PIN 连续输错 {self.max_fails} 次, 冷却 {span:.0f} 秒 (第 {self.lockouts} 次)")
+                except Exception:   # noqa: BLE001  记日志不能拖垮校验
+                    pass
                 return "locked"
+            self._save()
             return "bad"
 
 
@@ -803,41 +908,17 @@ PXE_LOG = "/opt/pxe/pxeserver.log"
 ARM_SECONDS = 30 * 60
 
 
-def _repo(env_path):
-    return f"http://{pxe_env_read(env_path)['PXE_IP']}:8000"
-
-
-def _menu(entries, timeout, env_path):
-    http = f"(http,{pxe_env_read(env_path)['PXE_IP']})"
-    out = [f"set default=0\nset timeout={timeout}\n"]
-    for title, args in entries:
-        for src, label in ((http, "HTTP fast"), ("", "TFTP slow")):
-            out.append(f"menuentry '{title} ({label})' {{\n"
-                       f"    linux {src}/vmlinuz ip=dhcp {args}\n"
-                       f"    initrd {src}/initrd.img\n}}\n")
-    return "\n".join(out)
-
-
 def grub_cfg_rescue(env_path=None):
-    repo = _repo(env_path or PXE_ENV)
-    return ("# 推车 Kiosk 生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
-            _menu([("Rescue shell", f"inst.stage2={repo}/rocky inst.rescue inst.sshd inst.text")], 10,
-                  env_path or PXE_ENV))
+    return ("# 推车生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
+            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
 def grub_cfg_install(env_path=None):
-    repo = _repo(env_path or PXE_ENV)
-    return ("# 推车 Kiosk 生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
-            _menu([("Rocky 9.8 auto install", f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg")], 5,
-                  env_path or PXE_ENV))
+    return ("# 推车生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
+            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True))
 
 
-def _norm_mac(mac):
-    m = mac.strip().lower().replace("-", ":")
-    if len(m.split(":")) != 6 or not all(len(p) == 2 and all(c in "0123456789abcdef" for c in p)
-                                          for p in m.split(":")):
-        raise ValueError(f"不是 MAC 地址: {mac!r}")
-    return m
+_norm_mac = pxeserver.norm_mac
 
 
 def mac_cfg_name(mac):
@@ -848,15 +929,13 @@ def _write_atomic(path, text):
     atomicfile.write_text(path, text)
 
 
+def _pxe_event(msg):
+    cartlog.event("pxe", msg)
+
+
 def pxe_mode_read(path=PXE_MODE, now=None):
     """{"mode": "rescue"} / {"mode": "install", mac, since, until} / 过期则 mode="expired"."""
-    now = time.time() if now is None else now
-    try:
-        st = json.load(open(path))
-        mac, since, until = _norm_mac(st["mac"]), st["since"], st["until"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return {"mode": "rescue"}
-    return {"mode": "install" if now <= until else "expired", "mac": mac, "since": since, "until": until}
+    return pxeserver.pxe_mode(path, now)
 
 
 def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
@@ -865,6 +944,7 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
     _write_atomic(os.path.join(root, mac_cfg_name(mac)), grub_cfg_install())
     _write_atomic(path, json.dumps({"mac": mac, "since": now, "until": now + seconds}))
+    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟")
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
@@ -872,27 +952,28 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
     只要带 inst.ks= 也一并删掉. grub.cfg.bak-* 这类手工备份 GRUB 不会去取, 不动."""
     root = str(root)
+    removed = []
     for d, _dirs, files in os.walk(root):
         for name in files:
             full = os.path.join(d, name)
             fetched = name == "grub.cfg" or name.startswith("grub.cfg-")
             if not fetched or full == os.path.join(root, "grub.cfg"):
                 continue
-            if name.startswith("grub.cfg-01-") and d == root:
-                os.remove(full)
-                continue
-            try:
-                with open(full, errors="replace") as f:
-                    armed = "inst.ks=" in f.read()
-            except OSError:
-                continue
-            if armed:
-                os.remove(full)
+            if not (name.startswith("grub.cfg-01-") and d == root):
+                try:
+                    with open(full, errors="replace") as f:
+                        if "inst.ks=" not in f.read():
+                            continue
+                except OSError:
+                    continue
+            os.remove(full)
+            removed.append(os.path.relpath(full, root))
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
     try:
         os.remove(path)
     except FileNotFoundError:
         pass
+    _pxe_event("装机模式上锁, 只剩救援菜单" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else ""))
 
 
 def _log_ts(line):
@@ -1126,3 +1207,25 @@ MENU = {
         {"text": "关机", "do": "poweroff", "style": "danger"},
     ],
 }
+
+
+# ---------------------------------------------------------------- 命令行 (部署脚本用)
+
+def main(argv=None):
+    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留救援菜单 (setup-cart.sh 调).
+    菜单只从这里 (pxeserver.grub_menu) 生成, 部署脚本不再自己写 grub.cfg."""
+    ap = argparse.ArgumentParser(prog="kiosk_core.py")
+    ap.add_argument("--write-rescue", action="store_true", help="写救援菜单并删掉所有自动装机菜单")
+    ap.add_argument("--root", default=TFTP_ROOT)
+    ap.add_argument("--state", default=PXE_MODE)
+    a = ap.parse_args(sys.argv[1:] if argv is None else argv)
+    if not a.write_rescue:
+        ap.print_usage(sys.stderr)
+        return 2
+    pxe_disarm(root=a.root, path=a.state)
+    print(f"救援菜单已写入 {os.path.join(a.root, 'grub.cfg')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

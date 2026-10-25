@@ -8,6 +8,12 @@ import pytest
 import kiosk_core as kc
 
 
+@pytest.fixture(autouse=True)
+def _no_real_cartlog(monkeypatch):
+    """装机/PIN 事件默认写 /var/log/ops-cart; 测试里不碰真目录."""
+    monkeypatch.setattr(kc.cartlog, "event", lambda *a, **k: True)
+
+
 # ------------------------------------------------------------ 装机网段: 只来自部署配置 /etc/ops-cart/pxe.env
 
 def test_pxe_env_missing_gives_example_defaults(tmp_path):
@@ -61,24 +67,81 @@ def test_nmcli_set_dhcp_clears_static():
     assert m[m.index("ipv4.gateway") + 1] == ""
 
 
-def test_services_status_shape(monkeypatch):
-    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (0, "enabled" if cmd[1] == "is-enabled" else "active"))
-    st = kc.services_status(("pxe-server",))
-    assert st["pxe-server"] == (True, True)
+SHOW = """Id=pxe-server.service
+ActiveState=active
+UnitFileState=enabled
+
+UnitFileState=disabled
+ActiveState=inactive
+Id=pxe-http-repo.service
+
+Id=pxe-http-boot.service
+ActiveState=failed
+UnitFileState=enabled
+"""
 
 
-def test_nics_status_marks_no_carrier(monkeypatch):
+def test_services_status_one_systemctl_call(monkeypatch):
+    calls = []
+
     def fake_run(cmd, timeout=5):
+        calls.append(cmd)
+        return 0, SHOW
+    monkeypatch.setattr(kc, "run", fake_run)
+    st = kc.services_status()
+    assert st == {"pxe-server": (True, True), "pxe-http-repo": (False, False),
+                  "pxe-http-boot": (True, False)}
+    assert len(calls) == 1 and calls[0][:2] == ["systemctl", "show"]
+    assert "-p" in calls[0] and calls[0][-3:] == ["pxe-server", "pxe-http-repo", "pxe-http-boot"]
+
+
+def test_parse_systemctl_show_matches_by_id_and_tolerates_junk():
+    st = kc.parse_systemctl_show(SHOW, ["pxe-http-boot", "pxe-server", "nope"])
+    assert st == {"pxe-http-boot": (True, False), "pxe-server": (True, True), "nope": (False, False)}
+    assert kc.parse_systemctl_show("", ["a"]) == {"a": (False, False)}
+    assert kc.parse_systemctl_show("garbage\n\n=x", ["a"]) == {"a": (False, False)}
+
+
+def test_services_status_systemctl_failure(monkeypatch):
+    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (127, ""))
+    assert kc.services_status(("pxe-server",)) == {"pxe-server": (False, False)}
+
+
+def test_nics_status_reads_carrier_from_sysfs(monkeypatch, tmp_path):
+    (tmp_path / "eno1").mkdir()
+    (tmp_path / "eno1" / "carrier").write_text("1\n")       # enp3s0 没有文件 = 读不到 = 没插线
+
+    def fake_run(cmd, timeout=5):
+        assert cmd[0] != "cat"
         if cmd[:2] == ["ip", "-4"]:
             return 0, "eno1            UP      203.0.113.1/24"
         if cmd[0] == "nmcli":
             return 0, "manual"
-        return 1, ""   # carrier 文件读不到 = 没插线
+        return 1, ""
     monkeypatch.setattr(kc, "run", fake_run)
-    nics = kc.nics_status()
+    nics = kc.nics_status(sysfs=str(tmp_path))
     assert nics[0]["ip"] == "203.0.113.1/24"
-    assert nics[0]["link"] is False
+    assert nics[0]["link"] is True and nics[1]["link"] is False
     assert nics[0]["method"] == "manual"
+
+
+@pytest.mark.parametrize("secs,text", [
+    (30, "up 0 minutes"), (61, "up 1 minute"), (3600 * 2 + 60 * 5, "up 2 hours, 5 minutes"),
+    (86400 + 3600, "up 1 day, 1 hour, 0 minutes"), (86400 * 3, "up 3 days, 0 hours, 0 minutes"),
+])
+def test_uptime_text(secs, text):
+    assert kc.uptime_text(secs) == text
+
+
+def test_misc_status_uptime_from_proc(monkeypatch, tmp_path):
+    p = tmp_path / "uptime"
+    p.write_text("7265.13 14000.00\n")
+    monkeypatch.setattr(kc, "PROC_UPTIME", str(p))
+    calls = []
+    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (calls.append(cmd) or (0, "192.0.2.10")))
+    m = kc.misc_status()
+    assert m["uptime"] == "up 2 hours, 1 minute"
+    assert all(c[0] != "uptime" for c in calls)
 
 
 def test_screensaver_due_basic():
@@ -971,13 +1034,6 @@ def test_disarm_scrubs_install_menus_anywhere_in_tree(tmp_path):
     assert (tmp_path / "grub.cfg.bak-20261021").exists()
 
 
-def test_tracked_grub_templates_default_to_rescue():
-    import pathlib
-    here = pathlib.Path(__file__).resolve().parent.parent
-    for p in [here / "windows" / "grub.cfg", here / "scripts" / "setup-cart.sh"]:
-        assert "inst.ks" not in p.read_text(), p
-
-
 # ------------------------------------------------------------ PinGate 退避 + 线程安全 (1.06.00)
 
 def test_pin_gate_backoff_grows_and_caps():
@@ -996,11 +1052,68 @@ def test_pin_gate_backoff_grows_and_caps():
     assert g.locked_until - t == 60                       # 输对一次就回到起步
 
 
-def test_pin_gate_default_keeps_fixed_lock():
-    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1, lock_s=60)
+def test_pin_gate_none_cap_keeps_fixed_lock():
+    """max_lock_s=None 显式要求固定冷却 (网页口 tailnet 用)."""
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1, lock_s=60, max_lock_s=None)
     g.attempt("0000", now=0)
     g.attempt("0000", now=60)
     assert g.locked_until == 120
+
+
+def test_pin_gate_default_backoff_grows_to_cap():
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1, lock_s=60, event=lambda m: None)
+    t, spans = 0, []
+    for _ in range(6):
+        g.attempt("0000", now=t)
+        spans.append(g.locked_until - t)
+        t = g.locked_until
+    assert spans == [60, 120, 240, 480, 900, 900] and kc.PIN_MAX_LOCK_S == 900
+
+
+def test_pin_gate_persists_failures_across_restart(tmp_path):
+    state = tmp_path / "run" / "pin-gate.json"
+    h = kc.pin_hash("2468")
+    g = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    g.attempt("0000", now=0)
+    g.attempt("0000", now=1)
+    g2 = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    assert g2.attempt("0000", now=2) == "locked"          # kiosk 重启不清零
+    g3 = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    assert g3.attempt("2468", now=30) == "locked"         # 冷却也跟着留下
+    assert g3.attempt("2468", now=63) == "ok"
+    g4 = kc.PinGate(h, max_fails=3, lock_s=60, state_path=str(state), event=lambda m: None)
+    assert (g4.fails, g4.lockouts) == (0, 0)
+
+
+def test_pin_gate_bad_state_file_starts_clean(tmp_path):
+    state = tmp_path / "pin-gate.json"
+    state.write_text("{oops")
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=2, state_path=str(state), event=lambda m: None)
+    assert g.attempt("0000", now=0) == "bad"
+
+
+def test_pin_gate_unwritable_state_does_not_break(tmp_path):
+    (tmp_path / "f").write_text("x")
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=2, state_path=str(tmp_path / "f" / "s.json"),
+                   event=lambda m: None)
+    assert g.attempt("0000", now=0) == "bad" and g.attempt("2468", now=1) == "ok"
+
+
+def test_pin_gate_logs_cooldown_event():
+    events = []
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=2, lock_s=60, event=events.append)
+    g.attempt("0000", now=0)
+    assert events == []
+    assert g.attempt("0000", now=1) == "locked"
+    assert len(events) == 1 and "60" in events[0]
+
+
+def test_pin_gate_default_event_goes_to_cartlog_pin(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kc.cartlog, "event", lambda kind, msg, **k: calls.append(kind))
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1)
+    g.attempt("0000", now=0)
+    assert calls == ["pin"]
 
 
 def test_pin_gate_concurrent_bad_attempts_counted_once_each():
@@ -1027,9 +1140,75 @@ def test_run_timeout_gives_empty_stdout():
     assert rc != 0 and out == ""
 
 
-def test_status_fields_dash_when_commands_missing(monkeypatch):
+def test_status_fields_dash_when_commands_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(kc.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("x")))
-    for n in kc.nics_status():
+    monkeypatch.setattr(kc, "PROC_UPTIME", str(tmp_path / "none"))
+    for n in kc.nics_status(sysfs=str(tmp_path)):
         assert n["ip"] == "-" and n["method"] == "-" and n["link"] is False
     m = kc.misc_status()
     assert m["tailscale_ip"] == "-" and m["uptime"] == "-"
+
+
+# ------------------------------------------------------------ A3: --write-rescue 入口, 菜单只从一处生成
+
+def test_write_rescue_cli_scrubs_tree(tmp_path):
+    (tmp_path / "EFI" / "BOOT").mkdir(parents=True)
+    (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text("set default=0\nlinux /vmlinuz inst.ks=x\n")
+    (tmp_path / "grub.cfg-01-02-00-00-00-00-01").write_text("inst.ks=x\n")
+    assert kc.main(["--write-rescue", "--root", str(tmp_path),
+                    "--state", str(tmp_path / "pxe-mode.json")]) == 0
+    cfgs = [p for p in tmp_path.rglob("grub.cfg*")]
+    assert [p.name for p in cfgs] == ["grub.cfg"]
+    assert "inst.rescue" in cfgs[0].read_text()
+
+
+def test_main_without_command_fails():
+    assert kc.main([]) != 0
+
+
+def test_menus_come_from_pxeserver_template(tmp_path):
+    import pxeserver
+    p = tmp_path / "pxe.env"
+    p.write_text("PXE_IP=198.51.100.1\n")
+    assert pxeserver.grub_menu("198.51.100.1") in kc.grub_cfg_rescue(env_path=p)
+    assert pxeserver.grub_menu("198.51.100.1", install=True) in kc.grub_cfg_install(env_path=p)
+
+
+def test_arm_and_disarm_log_pxe_events(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(kc, "_pxe_event", events.append)
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
+    assert len(events) == 2 and MAC in events[0] and "上锁" in events[1]
+
+
+# ------------------------------------------------------------ A9: 自检连上下文采集也兜住
+
+def test_selftest_run_context_factory_crash_gives_fail_row():
+    def ctx():
+        raise RuntimeError("nmcli hung")
+    rows = kc.selftest_run([{"check": "cpu"}], ctx)
+    assert rows == [{"label": "SELFTEST", "state": "FAIL", "detail": "CONTEXT ERROR", "check": "selftest"}]
+
+
+def test_selftest_run_accepts_context_factory():
+    rows = kc.selftest_run([{"check": "cpu"}], _ctx)
+    assert rows[0]["label"] == "CPU" and rows[0]["state"] in ("OK", "WARN", "FAIL", "--")
+
+
+@pytest.mark.parametrize("plan", [None, 42, "cpu", [None, 3, "x"], [{"check": "cpu", "label": 5}]])
+def test_selftest_run_never_raises_on_bad_plan(plan):
+    rows = kc.selftest_run(plan, _ctx())
+    assert rows and all(set(r) == {"label", "state", "detail", "check"} for r in rows)
+
+
+def test_selftest_context_survives_collector_crash(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("x")
+    for name in ("nics_status", "misc_status", "services_status", "temps_status", "fans_status"):
+        monkeypatch.setattr(kc, name, boom)
+    ctx = kc.selftest_context()
+    assert ctx["nics"] == [] and ctx["misc"] == {} and ctx["svcs"] == {}
+    assert ctx["temps"] == [] and ctx["fans"] == []
+    rows = kc.selftest_run(kc.DEFAULT_PLAN, ctx)
+    assert len(rows) == len(kc.DEFAULT_PLAN)

@@ -9,6 +9,8 @@ EnvironmentFile=/etc/ops-cart/pxe.env
 ExecStart=/usr/bin/python3 /opt/pxe/pxeserver.py serve --ip ${PXE_IP} --prefix ${PXE_PREFIX} --pool ${PXE_POOL} --tftp-root /opt/pxe/tftp --log /opt/pxe/pxeserver.log --iface eno1
 Restart=on-failure
 RestartSec=3
+# 3 = 装机口上发现别人的 DHCP (状态见 /run/ops-cart/pxe-guard.json), 4 / 2 = 参数不对: 重启也没用, 别反复拉起
+RestartPreventExitStatus=2 3 4
 
 [Install]
 WantedBy=multi-user.target
