@@ -2,10 +2,10 @@
 """锐捷 ePortal 无线网页认证, 给没有浏览器的推车用. 由 systemd timer 定时跑一次:
 探测 -> 被 302 到 portal 就登录 -> 已在线什么都不做.
 
-配置 (root 0600): {"iface": "wlp4s0", "ssid": "CAMPUSNET", "user": "...", "password": "..."}
+配置 (root 0600): {"iface": "wlp4s0", "ssid": "<要认证的无线>", "user": "...", "password": "..."}
 用法: ruijie_portal.py [配置路径]     网络操作全走 curl --interface, 不碰默认路由.
 
-只在无线连着 ssid 时才跑: 别的网也可能是锐捷认证, 不能把 CAMPUSNET 的密码交给它.
+只在无线连着配置里的 ssid 时才跑: 别的网也可能是锐捷认证, 不能把密码交给它. 配置没写 ssid 就一律跳过.
 每次结果写 STATUS (Kiosk 面板/状态板读), 状态变了才记 events.log; 没登上就以 1 退出.
 """
 
@@ -17,9 +17,8 @@ import subprocess
 import sys
 import urllib.parse
 
-CONF = "/etc/ops-cart/campusnet.json"
-STATUS = "/run/ops-cart/campusnet-status.json"
-DEFAULT_SSID = "CAMPUSNET"
+CONF = "/etc/ops-cart/campus-auth.json"
+STATUS = "/run/ops-cart/campus-auth-status.json"
 OK_STATES = ("online", "login ok", "skip")
 PROBE = "http://www.msftconnecttest.com/connecttest.txt"
 PROBE_OK = "Microsoft Connect Test"
@@ -194,7 +193,8 @@ def current_ssid(iface):
 
 
 def on_target(ssid, conf):
-    return bool(ssid) and ssid.lower() == conf.get("ssid", DEFAULT_SSID).lower()
+    want = conf.get("ssid") or ""
+    return bool(ssid) and bool(want) and ssid.lower() == want.lower()
 
 
 def record(state, message, now):
@@ -205,13 +205,17 @@ def changed(prev, cur):
     return prev is None or (prev.get("state"), prev.get("message")) != (cur["state"], cur["message"])
 
 
-def conf_update(conf, user, password):
-    """Kiosk 面板改账号密码: 保留别的键, 补齐 iface/ssid."""
+def conf_update(conf, user, password, ssid=None):
+    """Kiosk 面板改账号密码: 保留别的键, 补齐 iface; 配置里没有 ssid 时用 ssid (当前连着的无线)."""
     user = user.strip()
     if not user or not password:
         raise ValueError("账号和密码都不能为空")
-    new = {"iface": "wlp4s0", "ssid": DEFAULT_SSID}
+    new = {"iface": "wlp4s0"}
     new.update(conf or {})
+    if not new.get("ssid"):
+        if not ssid:
+            raise ValueError("不知道这是哪个无线的账号: 先连上要认证的无线再保存")
+        new["ssid"] = ssid
     new.update(user=user, password=password)
     return new
 
@@ -225,7 +229,7 @@ def conf_save(conf, path=CONF):
 def attempt(conf, ssid, now):
     """跑一次 (不在目标网上就跳过), 异常也收成一条结果, 不让 systemd 只看到一段 traceback."""
     if not on_target(ssid, conf):
-        return record("skip", f"连的是 {ssid or '(没连无线)'}, 不是 {conf.get('ssid', DEFAULT_SSID)}", now)
+        return record("skip", f"连的是 {ssid or '(没连无线)'}, 不是 {conf.get('ssid') or '(配置没写 ssid)'}", now)
     try:
         res = run_once(conf)
     except Exception as ex:          # noqa: BLE001  portal 页面千奇百怪, 统一报出来
@@ -255,7 +259,7 @@ def main():
     if changed(prev, cur):
         try:
             import cartlog
-            cartlog.event("campusnet", f"{cur['state']} {cur['message']}".strip())
+            cartlog.event("campus-auth", f"{cur['state']} {cur['message']}".strip())
         except ImportError:
             pass
     print(f"{cur['state']} {cur['message']}".strip())

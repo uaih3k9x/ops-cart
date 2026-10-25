@@ -20,14 +20,14 @@ class FlakySock:
 
 
 def test_parse_args():
-    a = httpserve.parse_args(["8000", "--directory", "/opt/pxe/http", "--bind", "192.168.200.1"])
-    assert (a.port, a.directory, a.bind) == (8000, "/opt/pxe/http", "192.168.200.1")
+    a = httpserve.parse_args(["8000", "--directory", "/opt/pxe/http", "--bind", "192.0.2.1"])
+    assert (a.port, a.directory, a.bind) == (8000, "/opt/pxe/http", "192.0.2.1")
 
 
 def test_server_waits_for_address_instead_of_exiting(tmp_path):
     sleeps = []
     sock = FlakySock(3)
-    srv = httpserve.make_server("192.168.200.1", 0, str(tmp_path), sleep=sleeps.append,
+    srv = httpserve.make_server("192.0.2.1", 0, str(tmp_path), sleep=sleeps.append,
                                 sock_factory=lambda: sock, activate=False)
     assert sock.calls == 4 and sleeps == [2, 2, 2]
     assert srv.socket is sock

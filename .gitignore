@@ -7,3 +7,7 @@ ks.cfg
 branding/
 BUILD
 .pytest_cache/
+
+# 脱敏词表与本机验收产物
+.public-safe.local
+test-results/

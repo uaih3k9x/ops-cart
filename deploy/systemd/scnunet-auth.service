@@ -1,8 +1,0 @@
-[Unit]
-Description=CAMPUSNET wireless web portal login (Ruijie ePortal), no-op when already online
-ConditionPathExists=/etc/ops-cart/campusnet.json
-After=NetworkManager.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 /opt/pxe/ruijie_portal.py /etc/ops-cart/campusnet.json

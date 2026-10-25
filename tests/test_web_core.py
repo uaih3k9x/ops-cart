@@ -9,14 +9,15 @@ import web_core as wc
 
 # ------------------------------------------------------------ 来源过滤
 
-@pytest.mark.parametrize("ip", ["127.0.0.1", "::1", "100.100.100.9", "100.127.255.1",
-                                "fd7a:115c:a1e0::1", "::ffff:100.100.100.10"])
+# tailnet 段 (CGNAT) 只能写这个段里的地址; 都是编的, 不对应真实设备
+@pytest.mark.parametrize("ip", ["127.0.0.1", "::1", "100.100.0.1", "100.127.255.1",  # public-safe-ignore
+                                "fd7a:115c:a1e0::1", "::ffff:100.100.0.2"])             # public-safe-ignore
 def test_tailnet_and_loopback_always_allowed(ip):
     assert wc.client_kind(ip) == "trusted"
     assert wc.client_allowed(ip, lan_open=False, pin_set=False)
 
 
-@pytest.mark.parametrize("ip", ["192.168.99.138", "10.0.0.5", "::ffff:192.168.99.1"])
+@pytest.mark.parametrize("ip", ["192.0.2.138", "10.0.0.5", "::ffff:192.0.2.1"])
 def test_lan_follows_switch(ip):
     assert wc.client_kind(ip) == "lan"
     assert not wc.client_allowed(ip, lan_open=False, pin_set=True)
@@ -24,7 +25,7 @@ def test_lan_follows_switch(ip):
 
 
 def test_lan_refused_without_pin_even_if_open():
-    assert not wc.client_allowed("192.168.99.138", lan_open=True, pin_set=False)
+    assert not wc.client_allowed("192.0.2.138", lan_open=True, pin_set=False)
 
 
 def test_garbage_ip_refused():
@@ -84,16 +85,16 @@ def test_cookie_token_parse():
 def test_status_payload_shape():
     src = {
         "services": lambda: {"pxe-server": (True, False)},
-        "nics": lambda: [{"role": "LAN2", "name": "enp3s0", "ip": "192.168.99.228/24",
+        "nics": lambda: [{"role": "LAN2", "name": "enp3s0", "ip": "192.0.2.228/24",
                           "method": "dhcp", "link": True}],
-        "misc": lambda: {"tailscale_ip": "100.100.100.10", "ch9329": True, "uptime": "up 3 days"},
+        "misc": lambda: {"tailscale_ip": "192.0.2.10", "ch9329": True, "uptime": "up 3 days"},
         "temps": lambda: [("CPU", 61.0)],
         "fans": lambda: [("FAN1", 1200)],
         "version": lambda: "1.00.00 (17 bfc0651)",
     }
     p = wc.status_payload(src, now=0)
     assert p["services"] == [{"name": "pxe-server", "enabled": True, "active": False}]
-    assert p["nics"][0]["ip"] == "192.168.99.228/24"
+    assert p["nics"][0]["ip"] == "192.0.2.228/24"
     assert p["temps"] == [{"name": "CPU", "c": 61.0, "level": "ok"}]
     assert p["fans"] == [{"name": "FAN1", "rpm": 1200}]
     assert p["version"].startswith("1.00.00")
@@ -188,3 +189,121 @@ def test_serial_ports_lists_running_brokers(tmp_path):
     (run / "notes.txt").write_text("x")
     assert wc.serial_ports(tmp_path) == [{"name": "ttyUSB0", "port": 40001}]
     assert wc.serial_ports(tmp_path / "missing") == []
+
+
+# ------------------------------------------------------------ 1.06.00: 来源原因 / 装机口排除
+
+LAN1_NET = ["192.0.2.0/24"]
+
+
+def test_source_reason_explains_refusal():
+    assert wc.source_reason("127.0.0.1", lan_open=False, pin_set=False) is None
+    assert wc.source_reason("198.51.100.7", lan_open=False, pin_set=True) == "未开放局域网访问"
+    assert "未设 PIN" in wc.source_reason("198.51.100.7", lan_open=True, pin_set=False)
+    assert wc.source_reason("198.51.100.7", lan_open=True, pin_set=True) is None
+    assert wc.source_reason("not-an-ip", lan_open=True, pin_set=True) is not None
+
+
+def test_install_port_net_refused_even_when_lan_open():
+    r = wc.source_reason("192.0.2.50", lan_open=True, pin_set=True, deny_nets=LAN1_NET)
+    assert r is not None and "装机口" in r
+    assert wc.source_reason("::ffff:192.0.2.50", True, True, deny_nets=LAN1_NET) is not None
+    assert wc.source_reason("198.51.100.7", True, True, deny_nets=LAN1_NET) is None
+
+
+def test_install_port_local_address_refused():
+    """被测机在 LAN1 上手配了别的网段: 看它连进来的是推车哪个地址."""
+    r = wc.source_reason("203.0.113.9", True, True, deny_nets=LAN1_NET, local_ip="192.0.2.1")
+    assert r is not None and "装机口" in r
+
+
+# ------------------------------------------------------------ PIN 状态: 读不到 != 没设
+
+def test_pin_state(tmp_path):
+    assert wc.pin_state(tmp_path / "none") == ("unset", None)
+    p = tmp_path / "kiosk.conf"
+    p.write_text('{"pin": "pbkdf2$1$aa$bb"}')
+    assert wc.pin_state(p) == ("set", "pbkdf2$1$aa$bb")
+    p.write_text('{"other": 1}')
+    assert wc.pin_state(p) == ("unset", None)
+    p.write_text("{oops")
+    assert wc.pin_state(p)[0] == "unreadable"
+    assert wc.pin_state(tmp_path)[0] == "unreadable"          # 是目录 / 没权限之类
+
+
+# ------------------------------------------------------------ 会话绑定 PIN 与来源
+
+def test_session_dies_when_pin_changes():
+    s = wc.Sessions()
+    tok = s.issue("trusted", pin_tag="A", now=0)
+    assert s.check(tok, now=1, pin_tag="A")
+    assert not s.check(tok, now=2, pin_tag="B")
+    assert not s.check(tok, now=3, pin_tag="A")            # 作废了就别复活
+
+
+def test_session_absolute_ttl():
+    s = wc.Sessions(ttl_s=100, max_age_s=250)
+    tok = s.issue("trusted", now=0)
+    for t in (90, 180):
+        assert s.check(tok, now=t)
+    assert not s.check(tok, now=260)                       # 一直在用也有上限
+
+
+def test_session_revoke_kind_returns_tokens():
+    s = wc.Sessions()
+    a, b = s.issue("lan", now=0), s.issue("trusted", now=0)
+    assert s.revoke_kind("lan") == [a]
+    assert not s.check(a, now=1) and s.check(b, now=1)
+
+
+def test_session_issue_prunes_expired():
+    s = wc.Sessions(ttl_s=10)
+    for i in range(5):
+        s.issue("lan", now=0)
+    s.issue("lan", now=100)
+    assert len(s) == 1
+
+
+# ------------------------------------------------------------ 键鼠请求校验
+
+def test_parse_hid_events_normalizes():
+    ev = wc.parse_hid_events({"events": [
+        {"t": "k", "code": "KeyA", "down": 1},
+        {"t": "m", "dx": 3.7, "dy": -2, "b": 9, "w": -5},
+        {"t": "release"}]})
+    assert ev == [{"t": "k", "code": "KeyA", "down": True},
+                  {"t": "m", "dx": 3, "dy": -2, "b": 1, "w": -1},
+                  {"t": "release"}]
+
+
+def test_parse_hid_events_clamps_huge_moves():
+    ev = wc.parse_hid_events({"events": [{"t": "m", "dx": 100000000, "dy": -1e9}]})
+    assert ev[0]["dx"] == wc.MOUSE_MAX and ev[0]["dy"] == -wc.MOUSE_MAX
+    assert len(wc.mouse_chunks(10 ** 8, 0, 0)) <= wc.MOUSE_MAX // 127 + 1
+
+
+@pytest.mark.parametrize("body", [
+    [1, 2], {"events": "xx"}, {"events": [1]}, {"events": [{"t": "m", "dx": "abc"}]},
+    {"events": [{"t": "m", "dx": float("inf")}]}, {"events": [{"t": "m", "dx": True}]},
+    {"events": [{"t": "k", "code": 5, "down": True}]}, {"events": [{"t": "zz"}]},
+    {"events": [{"t": "release"}] * (wc.HID_MAX_EVENTS + 1)},
+])
+def test_parse_hid_events_rejects_garbage(body):
+    with pytest.raises(ValueError):
+        wc.parse_hid_events(body)
+
+
+# ------------------------------------------------------------ 流: 定时复查鉴权
+
+def test_relay_stops_when_auth_lost():
+    chunks = iter([b"a", None, b"b", b"c", b"d"])
+    out, oks, clock = [], iter([True, False]), iter(range(0, 100, 3))
+    wc.relay(lambda: next(chunks), out.append, lambda: next(oks), clock=lambda: next(clock), every=2)
+    assert out == [b"a"]                  # 第二次复查不过: 读超时那一下就收摊, 后面的不再写
+
+
+def test_relay_ends_on_eof():
+    chunks = iter([b"a", b""])
+    out = []
+    wc.relay(lambda: next(chunks), out.append, lambda: True, clock=lambda: 0, every=2)
+    assert out == [b"a"]

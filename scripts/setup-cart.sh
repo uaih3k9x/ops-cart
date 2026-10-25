@@ -26,22 +26,10 @@ install -m 644 "$MNT/EFI/BOOT/grubx64.efi"        "$TFTP/grubx64.efi"
 install -m 644 "$MNT/images/pxeboot/vmlinuz"      "$TFTP/vmlinuz"
 install -m 644 "$MNT/images/pxeboot/initrd.img"   "$TFTP/initrd.img"
 
-echo "==> grub.cfg (HTTP 快速通道优先, TFTP 兜底)"
-cat > "$TFTP/grub.cfg" <<'EOF'
-set default=0
-set timeout=5
-
-menuentry 'Rocky 9.8 auto install (HTTP fast)' {
-    linux (http,192.168.200.1)/vmlinuz ip=dhcp inst.repo=http://192.168.200.1:8000/rocky inst.ks=http://192.168.200.1:8000/ks.cfg
-    initrd (http,192.168.200.1)/initrd.img
-}
-
-menuentry 'Rocky 9.8 auto install (TFTP slow)' {
-    linux /vmlinuz ip=dhcp inst.repo=http://192.168.200.1:8000/rocky inst.ks=http://192.168.200.1:8000/ks.cfg
-    initrd /initrd.img
-}
-EOF
-install -m 644 "$TFTP/grub.cfg" "$TFTP/EFI/BOOT/grub.cfg"
+echo "==> grub.cfg: 只写救援菜单 (装机菜单由推车上解锁时按 MAC 单独下发)"
+[ -f /etc/ops-cart/pxe.env ] || { echo "缺 /etc/ops-cart/pxe.env (照 deploy/pxe.env.example 写)"; exit 1; }
+python3 -c 'import sys; sys.path.insert(0, "/opt/pxe"); import kiosk_core as kc; kc.pxe_disarm()'
+rm -f "$TFTP/EFI/BOOT/grub.cfg"
 
 echo "==> 铺 HTTP 仓库 (约 2.5GB)"
 [ -f "$HTTP/rocky/.treeinfo" ] || cp -a "$MNT" "$HTTP/rocky"

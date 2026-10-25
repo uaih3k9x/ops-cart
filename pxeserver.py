@@ -2,7 +2,7 @@
 """单文件 PXE 服务端: DHCP + TFTP. Windows/Linux 通用, 无第三方依赖.
 
 用法:
-  python pxeserver.py serve --ip 192.168.200.1 --pool 192.168.200.10,192.168.200.20 \
+  python pxeserver.py serve --ip 192.0.2.1 --prefix 24 --pool 192.0.2.10,192.0.2.20 \
       --tftp-root D:/pxe/tftp --log D:/pxe/pxeserver.log
 
 DHCP: 按 option 93 (client system architecture) 分发 bootloader:
@@ -12,6 +12,7 @@ TFTP: 支持 blksize / tsize 协商, octet 模式, 拒绝根目录穿越.
 
 import argparse
 import errno
+import ipaddress
 import logging
 import os
 import socket
@@ -118,14 +119,18 @@ def open_dhcp_socket(sock, ip, port, iface=None, platform=sys.platform, sleep=ti
 
 
 class DhcpServer:
-    def __init__(self, ip, pool_start, pool_end, uefi_file, bios_file, log, port=67, iface=None):
+    def __init__(self, ip, pool_start, pool_end, uefi_file, bios_file, log, port=67, iface=None,
+                 prefix=24):
         self.ip = ip
         self.iface = iface
-        prefix, lo = pool_start.rsplit(".", 1)
-        hi = int(pool_end.rsplit(".", 1)[1])
-        if not pool_end.rsplit(".", 1)[0] == prefix:
-            raise ValueError("pool 起止必须在同一 /24 前缀内")
-        self.pool = [f"{prefix}.{i}" for i in range(int(lo), hi + 1)]
+        net = ipaddress.ip_interface(f"{ip}/{prefix}").network
+        lo, hi = ipaddress.ip_address(pool_start), ipaddress.ip_address(pool_end)
+        if lo not in net or hi not in net or lo > hi:
+            raise ValueError(f"地址池 {pool_start}-{pool_end} 必须在 {net} 内且起 <= 止")
+        if lo <= ipaddress.ip_address(ip) <= hi:
+            raise ValueError("地址池不能包含推车自己的地址")
+        self.pool = [str(ipaddress.ip_address(i)) for i in range(int(lo), int(hi) + 1)]
+        self.netmask, self.broadcast = str(net.netmask), str(net.broadcast_address)
         self.port = port
         self.uefi_file, self.bios_file = uefi_file, bios_file
         self.log = log
@@ -140,7 +145,7 @@ class DhcpServer:
                 self.leases[mac] = ip
                 self.assigned.add(ip)
                 return ip
-        return self.pool[0]
+        return None             # 池子用完: 宁可不回, 也不把同一个地址发给两台机器
 
     def handle(self, msg, addr):
         parsed = parse_dhcp(msg)
@@ -155,6 +160,9 @@ class DhcpServer:
                           vendor, opts.get(93, b"").hex(), addr[0], addr[1])
         if msg_type == b"\x01":  # DISCOVER
             ip = self.offer_ip(mac)
+            if ip is None:
+                self.log.warning("DHCP DISCOVER %s: 地址池已用完, 不回 OFFER", mac_hex)
+                return None
             bootfile = arch_bootfile(opts, self.uefi_file, self.bios_file)
             self.log.info("DHCP DISCOVER %s -> OFFER %s bootfile=%s", mac_hex, ip, bootfile)
             return build_dhcp_reply(msg, 2, ip, self.ip, [
@@ -162,12 +170,15 @@ class DhcpServer:
                 encode_opt(60, "PXEClient"),
                 encode_opt(54, (self.ip,)),
                 encode_opt(51, struct.pack("!I", 3600)),
-                encode_opt(1, ("255.255.255.0",)),
+                encode_opt(1, (self.netmask,)),
                 encode_opt(3, (self.ip,)),
                 encode_opt(66, self.ip),
                 encode_opt(67, bootfile),
             ], bootfile)
         if msg_type == b"\x03":  # REQUEST
+            server_id = opts.get(54)
+            if server_id and server_id != socket.inet_aton(self.ip):
+                return None     # 客户端选了别的 DHCP 服务器: 不 ACK 也不 NAK
             req_ip = opts.get(50)
             ip = socket.inet_ntoa(req_ip) if req_ip else self.leases.get(mac)
             if ip not in self.pool:
@@ -181,7 +192,7 @@ class DhcpServer:
                 encode_opt(60, "PXEClient"),
                 encode_opt(54, (self.ip,)),
                 encode_opt(51, struct.pack("!I", 3600)),
-                encode_opt(1, ("255.255.255.0",)),
+                encode_opt(1, (self.netmask,)),
                 encode_opt(3, (self.ip,)),
                 encode_opt(66, self.ip),
                 encode_opt(67, bootfile),
@@ -239,9 +250,9 @@ class DhcpServer:
                 continue
             if result:
                 port = addr[1] if addr[1] != 67 else 68
-                self.log.info("DHCP 回包 -> 255.255.255.255:%d + 192.168.200.255:%d", port, port)
+                self.log.info("DHCP 回包 -> 255.255.255.255:%d + %s:%d", port, self.broadcast, port)
                 s.sendto(result, ("255.255.255.255", port))
-                s.sendto(result, ("192.168.200.255", port))
+                s.sendto(result, (self.broadcast, port))
 
 
 # ---------------------------------------------------------------- TFTP
@@ -340,6 +351,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("serve")
     p.add_argument("--ip", required=True)
+    p.add_argument("--prefix", type=int, default=24, help="装机网段前缀长度, 算掩码和广播地址")
     p.add_argument("--pool", required=True)
     p.add_argument("--tftp-root", required=True)
     p.add_argument("--uefi-file", default="shimx64.efi")
@@ -355,10 +367,11 @@ def main():
                  ([logging.FileHandler(args.log, encoding="utf-8")] if args.log else []),
     )
     log = logging.getLogger("pxe")
-    log.info("PXE 服务启动 ip=%s pool=%s tftp-root=%s", args.ip, args.pool, args.tftp_root)
+    log.info("PXE 服务启动 ip=%s/%d pool=%s tftp-root=%s", args.ip, args.prefix, args.pool,
+             args.tftp_root)
 
     dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log,
-                      iface=args.iface)
+                      iface=args.iface, prefix=args.prefix)
     if sys.platform.startswith("linux") and not args.iface:
         log.warning("Linux 上没给 --iface: DHCP 只绑 %s, 收不到客户端的广播 DISCOVER", args.ip)
     tftp = TftpServer(args.ip, args.tftp_root, log)

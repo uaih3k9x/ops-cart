@@ -40,7 +40,7 @@
 没有剔除整条的发现，但调整了几条的修法：
 
 - LAN1 改地址：不修 `cfg_lan1`，直接删掉。在车机上重写 /etc/systemd 单元这件事本身就是风险来源，装机网段改为放进部署配置（EnvironmentFile）。
-- “pxe-server 默认不 enable”：改成由 pxeserver 自己兜底（见 A2、A4）。enable 与否作为部署决定，留给 op。
+- “pxe-server 默认不 enable”：改成由 pxeserver 自己兜底（见 A2、A4）。enable 与否作为部署决定，留给维护者。
 - “网页 PIN 至少 6 位”：暂不做。PIN 哈希里看不出长度，强制要求会让现有 PIN 失效。改用指数退避和按来源计数来压低穷举速度。
 - 审计员提出的数字（RSS 增长、并发试错次数、OCR 耗时）没有逐条复测，按“审计员实测”引用；验收时以修复后的测试和部署后观测为准。
 
@@ -150,10 +150,10 @@ tests/test_serial_panel.py、tests/test_cart_snap.py、tests/test_cart_ocr.py、
 
 ## 7. 暂不做（deferred）及理由
 
-- 重写 git 历史清除已泄露内容：会影响已有 clone 和 fork，需要 op 决定。本轮只修 HEAD，并在 docs/PUBLIC_SAFETY.md 里写明“历史中有已知泄露，未重写”。
+- 重写 git 历史清除已泄露内容：会影响已有 clone 和 fork，需要维护者决定。本轮只修 HEAD，并在 docs/PUBLIC_SAFETY.md 里写明“历史中有已知泄露，未重写”。
 - kiosk_core.py 按领域拆分、kiosk.py 拆出 LockScreen/BootScreen/Passthrough 等类：三条线并行时拆分会制造大量冲突，等本轮合并后单独做。
-- 一键部署工具（releases 目录加 current 软链接、manifest、自动写 CART-LOG）：涉及推车目录结构调整，需要和 op 一起定方案。推车上 77 个 .bak 和旧测试文件的清理也一并放到那时。
-- conbroker 改用 systemd-run 或 `conbroker@.service` 脱离 kiosk 的 cgroup：需要推车上的 sudo 规则和单元配合，部署要 op 确认。本轮 C12 只做 busy 守卫和错误回显。
+- 一键部署工具（releases 目录加 current 软链接、manifest、自动写 CART-LOG）：涉及推车目录结构调整，需要和维护者一起定方案。推车上 77 个 .bak 和旧测试文件的清理也一并放到那时。
+- conbroker 改用 systemd-run 或 `conbroker@.service` 脱离 kiosk 的 cgroup：需要推车上的 sudo 规则和单元配合，部署要维护者确认。本轮 C12 只做 busy 守卫和错误回显。
 - 网页留言页（读写 conbroker 的 chat.log）：新功能，优先级最低。
 - 网页口强制 6 位以上 PIN：见第 1 节，改用退避和按来源计数。
 - 校园网认证的 BSSID OUI 白名单、cart_ocr 的 `--region`：收益小，等 B11、C13 落地后再看。

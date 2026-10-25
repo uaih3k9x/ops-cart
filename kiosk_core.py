@@ -2,8 +2,8 @@
 """kiosk_core: 推车 Kiosk 的可测核心层. UI(curses)之外的逻辑都在这.
 
 - 状态采集: systemd 服务 / 网卡 / tailscale / CH9329
-- 命令生成: nmcli 改地址, PXE 服务重渲染 (纯函数, 测试不打真机)
-- 配置: /opt/pxe/pxe.conf (LAN1 的 PXE 网段与地址池)
+- 命令生成: nmcli 改地址 (纯函数, 测试不打真机)
+- 装机网段: 部署配置 /etc/ops-cart/pxe.env (pxe-* 单元和 grub 菜单共用同一份)
 """
 
 import json
@@ -13,21 +13,41 @@ import time
 
 import atomicfile
 
-PXE_CONF = "/opt/pxe/pxe.conf"
 LAN1_CON = "Lan1-pxe"   # eno1, 装机口
 LAN2_CON = "enp3s0"     # 管理口
 
-DEFAULT_PXE_CONF = {"ip": "192.168.200.1", "prefix": 24,
-                    "pool_start": "192.168.200.10", "pool_end": "192.168.200.20"}
+# 装机网段只在部署时定 (systemd EnvironmentFile), 车机不改; 仓库里只放示例值
+PXE_ENV = "/etc/ops-cart/pxe.env"
+DEFAULT_PXE_ENV = {"PXE_IP": "192.0.2.1", "PXE_PREFIX": "24", "PXE_POOL": "192.0.2.10,192.0.2.20"}
+
+
+def pxe_env_read(path=PXE_ENV):
+    """KEY=VALUE 形式 (systemd EnvironmentFile 子集): 认识的键覆盖默认, 引号去掉, 其余忽略."""
+    env = dict(DEFAULT_PXE_ENV)
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return env
+    for line in lines:
+        k, eq, v = line.strip().partition("=")
+        if eq and k in env and not k.startswith("#"):
+            env[k] = v.strip().strip("\"'")
+    return env
 
 
 def run(cmd, timeout=5):
-    """跑命令, 返回 (rc, stdout). 失败不抛异常, UI 层自己消化."""
+    """跑命令, 返回 (rc, stdout). 失败不抛异常, UI 层自己消化.
+    命令不存在 / 超时: stdout 给空串 (127 / 124), 错误文字不能被当成 IP、状态之类的值显示出去."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout.strip()
-    except Exception as e:
-        return 1, str(e)
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError:
+        return 127, ""
+    except Exception:           # noqa: BLE001  约定就是不抛
+        return 1, ""
 
 
 # ---------------------------------------------------------------- 状态
@@ -79,7 +99,7 @@ def misc_status():
 
 # ---------------------------------------------------------------- 顶栏网络标
 
-NET_PROBE_HOST = "223.5.5.5"        # 阿里 DNS: 校园网/5G 哪条出口都通, ping 得通就算有外网
+NET_PROBE_HOST = "223.5.5.5"        # 公共 DNS: 哪条出口都通, ping 得通就算有外网  public-safe-ignore
 ICON_DIR = "/opt/pxe/icons"
 
 
@@ -398,7 +418,7 @@ def wifi_status():
     import wifi_core as wc
     st = wc.status(run(wc.CMD_STATUS_SCAN)[1], run(["ip", "-4", "-br", "addr", "show", wc.IFACE])[1],
                    run(["ip", "route"])[1])
-    st["auth"] = rp._read_json(rp.STATUS)       # 校园网认证最近一次结果 (campusnet-auth 写)
+    st["auth"] = rp._read_json(rp.STATUS)       # 校园网认证最近一次结果 (campus-auth 写)
     return st
 
 
@@ -411,7 +431,7 @@ def selftest_rows(nics, misc, svcs, temps, fans, serial_ok):
 
 
 def selftest_line(row, width=24):
-    """"LAN2 ............ OK   192.168.99.228\""""
+    """"LAN2 ............ OK   192.0.2.5\""""
     return f"{row['label'] + ' ':.<{width}} {row['state']:<4} {row['detail']}".rstrip()
 
 
@@ -572,21 +592,6 @@ def notice_font_px(text, width, height, lo=24, hi=220):
     return max(lo, min(hi, px))
 
 
-def pxe_conf_read():
-    try:
-        with open(PXE_CONF) as f:
-            cfg = json.load(f)
-        for k, v in DEFAULT_PXE_CONF.items():
-            cfg.setdefault(k, v)
-        return cfg
-    except (OSError, ValueError):
-        return dict(DEFAULT_PXE_CONF)
-
-
-def pxe_conf_write(cfg):
-    atomicfile.write_json(PXE_CONF, cfg, indent=2)
-
-
 # ---------------------------------------------------------------- 命令生成 (纯函数)
 
 def nmcli_set_static(con, addr, gateway="", dns=""):
@@ -601,31 +606,6 @@ def nmcli_set_dhcp(con):
     return [["nmcli", "con", "mod", con, "ipv4.method", "auto",
              "ipv4.addresses", "", "ipv4.gateway", "", "ipv4.dns", ""],
             ["nmcli", "con", "up", con]]
-
-
-def render_pxe_service(cfg):
-    """由配置渲染 pxe-server.service 的 ExecStart."""
-    return (f"/usr/bin/python3 /opt/pxe/pxeserver.py serve "
-            f"--ip {cfg['ip']} --pool {cfg['pool_start']},{cfg['pool_end']} "
-            f"--tftp-root /opt/pxe/tftp --log /opt/pxe/pxeserver.log")
-
-
-def apply_pxe_conf(cfg, unit_path="/etc/systemd/system/pxe-server.service"):
-    """写配置 + 重渲染服务并重启. 返回 (ok, message). unit_path 参数便于测试."""
-    if not cfg["ip"] or "/" not in cfg["ip"]:
-        return False, "PXE 网卡地址需为 CIDR 形式 (如 192.168.200.1/24)"
-    for k in ("pool_start", "pool_end"):
-        if not cfg[k]:
-            return False, f"缺 {k}"
-    pxe_conf_write(cfg)
-    unit = ("[Unit]\nDescription=PXE server (DHCP+proxyDHCP+TFTP) on Lan1 install port\n"
-            "After=network.target\n\n[Service]\n"
-            f"ExecStart={render_pxe_service(cfg)}\n"
-            "Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n")
-    atomicfile.write_text(unit_path, unit)
-    rc, _ = run(["systemctl", "daemon-reload"])
-    rc2, out = run(["systemctl", "restart", "pxe-server"])
-    return rc == 0 and rc2 == 0, out or ("ok" if rc2 == 0 else "restart 失败")
 
 
 def power(off=True):
@@ -780,11 +760,16 @@ def pin_set(pin, path=None):
 
 
 class PinGate:
-    """PIN 校验 + 连续输错冷却. attempt() 返回 'ok' / 'bad' / 'locked'."""
+    """PIN 校验 + 连续输错冷却. attempt() 返回 'ok' / 'bad' / 'locked'.
+    max_lock_s 给了就指数退避: 每连续冷却一次时长翻倍, 封顶 max_lock_s; 输对一次回到起步.
+    网页口多线程同时试, 内部加锁, 计数不会被并发冲掉."""
 
-    def __init__(self, stored, max_fails=5, lock_s=60):
+    def __init__(self, stored, max_fails=5, lock_s=60, max_lock_s=None):
+        import threading as _th
         self.stored, self.max_fails, self.lock_s = stored, max_fails, lock_s
-        self.fails, self.locked_until = 0, 0.0
+        self.max_lock_s = max_lock_s or lock_s
+        self.fails, self.locked_until, self.lockouts = 0, 0.0, 0
+        self._lock = _th.Lock()
 
     @property
     def required(self):
@@ -794,16 +779,18 @@ class PinGate:
         now = time.time() if now is None else now
         if not self.required:
             return "ok"
-        if now < self.locked_until:
-            return "locked"
-        if pin_verify(pin, self.stored):
-            self.fails = 0
-            return "ok"
-        self.fails += 1
-        if self.fails >= self.max_fails:
-            self.fails, self.locked_until = 0, now + self.lock_s
-            return "locked"
-        return "bad"
+        with self._lock:
+            if now < self.locked_until:
+                return "locked"
+            if pin_verify(pin, self.stored):
+                self.fails, self.lockouts = 0, 0
+                return "ok"
+            self.fails += 1
+            if self.fails >= self.max_fails:
+                span = min(self.lock_s * 2 ** self.lockouts, self.max_lock_s)
+                self.fails, self.locked_until, self.lockouts = 0, now + span, self.lockouts + 1
+                return "locked"
+            return "bad"
 
 
 # ---------------------------------------------------------------- 装机模式
@@ -814,28 +801,35 @@ TFTP_ROOT = "/opt/pxe/tftp"
 PXE_MODE = "/opt/pxe/pxe-mode.json"
 PXE_LOG = "/opt/pxe/pxeserver.log"
 ARM_SECONDS = 30 * 60
-_HTTP = "(http,192.168.200.1)"
-_REPO = "http://192.168.200.1:8000"
 
 
-def _menu(entries, timeout):
+def _repo(env_path):
+    return f"http://{pxe_env_read(env_path)['PXE_IP']}:8000"
+
+
+def _menu(entries, timeout, env_path):
+    http = f"(http,{pxe_env_read(env_path)['PXE_IP']})"
     out = [f"set default=0\nset timeout={timeout}\n"]
     for title, args in entries:
-        for src, label in ((_HTTP, "HTTP fast"), ("", "TFTP slow")):
+        for src, label in ((http, "HTTP fast"), ("", "TFTP slow")):
             out.append(f"menuentry '{title} ({label})' {{\n"
                        f"    linux {src}/vmlinuz ip=dhcp {args}\n"
                        f"    initrd {src}/initrd.img\n}}\n")
     return "\n".join(out)
 
 
-def grub_cfg_rescue():
+def grub_cfg_rescue(env_path=None):
+    repo = _repo(env_path or PXE_ENV)
     return ("# 推车 Kiosk 生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
-            _menu([("Rescue shell", f"inst.stage2={_REPO}/rocky inst.rescue inst.sshd inst.text")], 10))
+            _menu([("Rescue shell", f"inst.stage2={repo}/rocky inst.rescue inst.sshd inst.text")], 10,
+                  env_path or PXE_ENV))
 
 
-def grub_cfg_install():
+def grub_cfg_install(env_path=None):
+    repo = _repo(env_path or PXE_ENV)
     return ("# 推车 Kiosk 生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
-            _menu([("Rocky 9.8 auto install", f"inst.repo={_REPO}/rocky inst.ks={_REPO}/ks.cfg")], 5))
+            _menu([("Rocky 9.8 auto install", f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg")], 5,
+                  env_path or PXE_ENV))
 
 
 def _norm_mac(mac):
@@ -874,10 +868,26 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
-    """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全."""
-    for name in os.listdir(root):
-        if name.startswith("grub.cfg-01-"):
-            os.remove(os.path.join(root, name))
+    """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
+    整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
+    只要带 inst.ks= 也一并删掉. grub.cfg.bak-* 这类手工备份 GRUB 不会去取, 不动."""
+    root = str(root)
+    for d, _dirs, files in os.walk(root):
+        for name in files:
+            full = os.path.join(d, name)
+            fetched = name == "grub.cfg" or name.startswith("grub.cfg-")
+            if not fetched or full == os.path.join(root, "grub.cfg"):
+                continue
+            if name.startswith("grub.cfg-01-") and d == root:
+                os.remove(full)
+                continue
+            try:
+                with open(full, errors="replace") as f:
+                    armed = "inst.ks=" in f.read()
+            except OSError:
+                continue
+            if armed:
+                os.remove(full)
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
     try:
         os.remove(path)
@@ -1104,7 +1114,6 @@ MENU = {
         {"text": "PXE 装机服务:  开 / 关", "do": "toggle_pxe"},
         {"text": "装机模式:  救援 (安全)", "do": "toggle_install_mode", "attr": "btn_install"},
         {"text": "Kickstart 编辑", "do": "toggle_ks", "attr": "btn_ks"},
-        {"text": "LAN1 装机口配置", "do": "cfg_lan1"},
     ],
     "net": [
         {"text": "无线网络", "do": "toggle_wifi", "attr": "btn_wifi"},

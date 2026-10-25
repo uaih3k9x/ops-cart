@@ -19,7 +19,7 @@ $wmi = @{MethodName = "Create"}
 
 # DHCP + TFTP
 $r = Invoke-CimMethod Win32_Process @wmi -Arguments @{
-    CommandLine = "`"$py`" D:\pxe\pxeserver.py serve --ip 192.168.200.1 --pool 192.168.200.10,192.168.200.20 --tftp-root D:\pxe\tftp --log D:\pxe\pxeserver.log"
+    CommandLine = "`"$py`" D:\pxe\pxeserver.py serve --ip 192.0.2.1 --pool 192.0.2.10,192.0.2.20 --tftp-root D:\pxe\tftp --log D:\pxe\pxeserver.log"
     CurrentDirectory = "D:\pxe"
 }
 Write-Output ("pxeserver pid: " + $r.ProcessId)

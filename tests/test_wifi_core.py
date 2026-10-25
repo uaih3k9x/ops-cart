@@ -1,19 +1,19 @@
 import wifi_core as wc
 
 SCAN = "\n".join([
-    r"*:94\:14\:57\:86\:AE\:37:CAMPUSNET:73:",
-    r" :94\:14\:57\:86\:AE\:38:CAMPUSNET:88:",
-    r" :AA\:BB\:CC\:00\:00\:01:ExampleCoLtd:92:WPA2 WPA3",
+    r"*:02\:00\:00\:00\:00\:AB:CAMPUS-NET:73:",
+    r" :02\:00\:00\:00\:00\:AA:CAMPUS-NET:88:",
+    r" :AA\:BB\:CC\:00\:00\:01:LabNet:92:WPA2 WPA3",
     r" :AA\:BB\:CC\:00\:00\:02::92:WPA2",                      # 隐藏 SSID 不列
     r" :AA\:BB\:CC\:00\:00\:03:a\:b 咖啡:40:WPA1 WPA2",          # SSID 里带冒号
     r" :AA\:BB\:CC\:00\:00\:04:OnlyWPA3:60:WPA3",
 ])
 
 SAVED = "\n".join([
-    "campusnet:6c4d-1:802-11-wireless:yes:0:yes",
+    "campus-net:6c4d-1:802-11-wireless:yes:0:yes",
     "tailscale0:0d31-2:tun:yes:0:yes",
     "enp3s0:1603-3:802-3-ethernet:yes:0:no",
-    "ExampleCo:aaaa-4:802-11-wireless:yes:20:no",
+    "LabNet:aaaa-4:802-11-wireless:yes:20:no",
     "Home:bbbb-5:802-11-wireless:no:10:no",
 ])
 
@@ -24,7 +24,7 @@ def test_split_terse_handles_escaped_colons():
 
 def test_parse_scan_dedups_by_ssid_and_sorts():
     nets = wc.parse_scan(SCAN)
-    assert [n["ssid"] for n in nets] == ["CAMPUSNET", "ExampleCoLtd", "OnlyWPA3", "a:b 咖啡"]
+    assert [n["ssid"] for n in nets] == ["CAMPUS-NET", "LabNet", "OnlyWPA3", "a:b 咖啡"]
     sc = nets[0]
     assert sc["in_use"] is True and sc["signal"] == 88      # 同名取最强信号, 在用标记保留
     assert sc["security"] == ""
@@ -40,7 +40,7 @@ def test_key_mgmt():
 def test_parse_saved_only_wifi_sorted_by_priority():
     saved = wc.parse_saved(SAVED)
     assert [(s["name"], s["priority"], s["active"]) for s in saved] == [
-        ("ExampleCo", 20, False), ("Home", 10, False), ("campusnet", 0, True)]
+        ("LabNet", 20, False), ("Home", 10, False), ("campus-net", 0, True)]
     assert saved[1]["autoconnect"] is False and saved[0]["uuid"] == "aaaa-4"
 
 
@@ -53,10 +53,10 @@ def test_move_and_priorities():
 
 
 def test_cmd_add_secured_keeps_wired_preferred():
-    cmd = wc.cmd_add("ExampleCo", "pw 1", "WPA2 WPA3", priority=40, iface="wlp4s0")
+    cmd = wc.cmd_add("LabNet", "pw 1", "WPA2 WPA3", priority=40, iface="wlp4s0")
     assert cmd[:4] == ["nmcli", "con", "add", "type"]
     s = " ".join(cmd)
-    assert "ssid ExampleCo" in s and "con-name ExampleCo" in s
+    assert "ssid LabNet" in s and "con-name LabNet" in s
     assert cmd[cmd.index("wifi-sec.key-mgmt") + 1] == "wpa-psk"
     assert cmd[cmd.index("wifi-sec.psk") + 1] == "pw 1"
     assert cmd[cmd.index("ipv4.route-metric") + 1] == str(wc.WIFI_METRIC)
@@ -64,7 +64,7 @@ def test_cmd_add_secured_keeps_wired_preferred():
 
 
 def test_cmd_add_open_network_has_no_security():
-    cmd = wc.cmd_add("CAMPUSNET", "", "", priority=10)
+    cmd = wc.cmd_add("CAMPUS-NET", "", "", priority=10)
     assert "wifi-sec.key-mgmt" not in cmd and "wifi-sec.psk" not in cmd
 
 
@@ -87,21 +87,21 @@ def test_next_priority_goes_on_top():
 # 状态板一行 (2026-10-21): SSID / 信号 / IP, 网线拔了时标出"当前出口"
 
 def test_status_connected_and_is_default_route():
-    st = wc.status(scan=r"*:CAMPUSNET:89" + "\n" + r" :ExampleCoLtd:97",
-                   addr="wlp4s0           UP             10.99.97.104/20 2001:db8::1/64",
-                   routes="default via 10.99.96.1 dev wlp4s0 proto dhcp metric 900")
-    assert st == {"ssid": "CAMPUSNET", "signal": 89, "ip": "10.99.97.104/20", "egress": True}
+    st = wc.status(scan=r"*:CAMPUS-NET:89" + "\n" + r" :LabNet:97",
+                   addr="wlp4s0           UP             198.51.100.104/20 2001:db8::1/64",
+                   routes="default via 198.51.100.1 dev wlp4s0 proto dhcp metric 900")
+    assert st == {"ssid": "CAMPUS-NET", "signal": 89, "ip": "198.51.100.104/20", "egress": True}
 
 
 def test_status_backup_when_wired_wins():
-    st = wc.status(scan=r"*:CAMPUSNET:70", addr="wlp4s0 UP 10.0.0.5/20",
-                   routes="default via 192.168.99.1 dev enp3s0 metric 100\n"
+    st = wc.status(scan=r"*:CAMPUS-NET:70", addr="wlp4s0 UP 10.0.0.5/20",
+                   routes="default via 192.0.2.1 dev enp3s0 metric 100\n"
                           "default via 10.0.0.1 dev wlp4s0 metric 900")
     assert st["egress"] is False
 
 
 def test_status_disconnected():
-    st = wc.status(scan=r" :CAMPUSNET:70", addr="wlp4s0 DOWN", routes="")
+    st = wc.status(scan=r" :CAMPUS-NET:70", addr="wlp4s0 DOWN", routes="")
     assert st["ssid"] is None
 
 
@@ -116,42 +116,42 @@ def _scan(*pairs):
     return [{"ssid": s, "signal": sig, "security": "WPA2", "in_use": False} for s, sig in pairs]
 
 
-SAVED_P = [_saved("ExampleCo5G", 20), _saved("ExampleCo", 10), _saved("campusnet", 0, active=True)]
+SAVED_P = [_saved("LabNet5G", 20), _saved("LabNet", 10), _saved("campus-net", 0, active=True)]
 
 
 def test_pick_switch_prefers_highest_visible():
-    got = wc.pick_switch(SAVED_P, _scan(("ExampleCo5G", 67), ("ExampleCo", 84), ("campusnet", 29)), now=0)
-    assert got["ssid"] == "ExampleCo5G"
+    got = wc.pick_switch(SAVED_P, _scan(("LabNet5G", 67), ("LabNet", 84), ("campus-net", 29)), now=0)
+    assert got["ssid"] == "LabNet5G"
 
 
 def test_pick_switch_needs_enough_signal():
-    got = wc.pick_switch(SAVED_P, _scan(("ExampleCo5G", 25), ("ExampleCo", 84)), now=0)
-    assert got["ssid"] == "ExampleCo"                            # 5G 太弱, 退而求其次
+    got = wc.pick_switch(SAVED_P, _scan(("LabNet5G", 25), ("LabNet", 84)), now=0)
+    assert got["ssid"] == "LabNet"                            # 5G 太弱, 退而求其次
 
 
 def test_pick_switch_none_when_already_best_or_nothing_better():
-    best = [_saved("ExampleCo5G", 20, active=True), _saved("campusnet", 0)]
-    assert wc.pick_switch(best, _scan(("ExampleCo5G", 60), ("campusnet", 80)), now=0) is None
-    assert wc.pick_switch(SAVED_P, _scan(("campusnet", 29)), now=0) is None
+    best = [_saved("LabNet5G", 20, active=True), _saved("campus-net", 0)]
+    assert wc.pick_switch(best, _scan(("LabNet5G", 60), ("campus-net", 80)), now=0) is None
+    assert wc.pick_switch(SAVED_P, _scan(("campus-net", 29)), now=0) is None
 
 
 def test_pick_switch_leaves_disconnected_to_nm():
-    idle = [_saved("ExampleCo5G", 20), _saved("campusnet", 0)]
-    assert wc.pick_switch(idle, _scan(("ExampleCo5G", 90)), now=0) is None   # 没连着 = NM 自己会按优先级连
+    idle = [_saved("LabNet5G", 20), _saved("campus-net", 0)]
+    assert wc.pick_switch(idle, _scan(("LabNet5G", 90)), now=0) is None   # 没连着 = NM 自己会按优先级连
 
 
 def test_pick_switch_respects_cooldown_and_autoconnect_off():
-    cool = {"ExampleCo5G": 1000}                                 # 冷却到 t=1000
-    got = wc.pick_switch(SAVED_P, _scan(("ExampleCo5G", 90), ("ExampleCo", 90)), now=500, cooldown=cool)
-    assert got["ssid"] == "ExampleCo"
-    assert wc.pick_switch(SAVED_P, _scan(("ExampleCo5G", 90)), now=1001, cooldown=cool)["ssid"] == "ExampleCo5G"
-    off = [_saved("Home", 30, auto=False), _saved("campusnet", 0, active=True)]
+    cool = {"LabNet5G": 1000}                                 # 冷却到 t=1000
+    got = wc.pick_switch(SAVED_P, _scan(("LabNet5G", 90), ("LabNet", 90)), now=500, cooldown=cool)
+    assert got["ssid"] == "LabNet"
+    assert wc.pick_switch(SAVED_P, _scan(("LabNet5G", 90)), now=1001, cooldown=cool)["ssid"] == "LabNet5G"
+    off = [_saved("Home", 30, auto=False), _saved("campus-net", 0, active=True)]
     assert wc.pick_switch(off, _scan(("Home", 90)), now=0) is None        # 用户关了自动连的不碰
 
 
 def test_check_wifi_shows_auth_failure():
     import kiosk_core as kc
-    st = {"ssid": "CAMPUSNET", "signal": 70, "ip": "10.0.0.2", "egress": False,
+    st = {"ssid": "CAMPUS-NET", "signal": 70, "ip": "10.0.0.2", "egress": False,
           "auth": {"state": "login fail", "ok": False, "message": "密码错误"}}
     level, text = kc.check_wifi({"wifi": lambda: st})
     assert level == "WARN" and "AUTH" in text and "密码错误" in text

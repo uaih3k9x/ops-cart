@@ -3,7 +3,8 @@ Description=PXE HTTP repo+ks (:8000)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/pxe/httpserve.py 8000 --directory /opt/pxe/http --bind 192.168.200.1
+EnvironmentFile=/etc/ops-cart/pxe.env
+ExecStart=/usr/bin/python3 /opt/pxe/httpserve.py 8000 --directory /opt/pxe/http --bind ${PXE_IP}
 Restart=on-failure
 RestartSec=3
 

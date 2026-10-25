@@ -8,57 +8,42 @@ import pytest
 import kiosk_core as kc
 
 
-def test_default_conf_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setattr(kc, "PXE_CONF", str(tmp_path / "pxe.conf"))
-    cfg = kc.pxe_conf_read()          # 不存在 -> 默认
-    assert cfg == kc.DEFAULT_PXE_CONF
-    cfg["pool_end"] = "192.168.200.99"
-    kc.pxe_conf_write(cfg)
-    assert kc.pxe_conf_read()["pool_end"] == "192.168.200.99"
+# ------------------------------------------------------------ 装机网段: 只来自部署配置 /etc/ops-cart/pxe.env
+
+def test_pxe_env_missing_gives_example_defaults(tmp_path):
+    env = kc.pxe_env_read(tmp_path / "none")
+    assert env == kc.DEFAULT_PXE_ENV and env["PXE_IP"] == "192.0.2.1"
 
 
-def test_conf_read_merges_missing_keys(tmp_path, monkeypatch):
-    monkeypatch.setattr(kc, "PXE_CONF", str(tmp_path / "pxe.conf"))
-    (tmp_path / "pxe.conf").write_text(json.dumps({"ip": "10.1.1.1/24"}))
-    cfg = kc.pxe_conf_read()
-    assert cfg["ip"] == "10.1.1.1/24"
-    assert cfg["pool_start"] == kc.DEFAULT_PXE_CONF["pool_start"]
+def test_pxe_env_parses_shell_style(tmp_path):
+    p = tmp_path / "pxe.env"
+    p.write_text('# 注释\nPXE_IP=198.51.100.1\nPXE_PREFIX="25"\n\nPXE_POOL=\'198.51.100.10,198.51.100.20\'\n'
+                 "JUNK LINE\n")
+    env = kc.pxe_env_read(p)
+    assert env == {"PXE_IP": "198.51.100.1", "PXE_PREFIX": "25",
+                   "PXE_POOL": "198.51.100.10,198.51.100.20"}
 
 
-def test_render_pxe_service():
-    cfg = {"ip": "172.16.0.1", "pool_start": "172.16.0.50", "pool_end": "172.16.0.60"}
-    line = kc.render_pxe_service(cfg)
-    assert line.startswith("/usr/bin/python3 /opt/pxe/pxeserver.py serve")
-    assert "--ip 172.16.0.1" in line
-    assert "--pool 172.16.0.50,172.16.0.60" in line
-    assert "--tftp-root /opt/pxe/tftp" in line
+def test_menus_use_env_address(tmp_path):
+    p = tmp_path / "pxe.env"
+    p.write_text("PXE_IP=198.51.100.1\n")
+    for cfg in (kc.grub_cfg_rescue(env_path=p), kc.grub_cfg_install(env_path=p)):
+        assert "(http,198.51.100.1)/vmlinuz" in cfg and "http://198.51.100.1:8000/rocky" in cfg
 
 
-def test_apply_pxe_conf_validates_cidr(tmp_path, monkeypatch):
-    monkeypatch.setattr(kc, "PXE_CONF", str(tmp_path / "pxe.conf"))
-    ok, msg = kc.apply_pxe_conf({"ip": "192.168.200.1", "pool_start": "a", "pool_end": "b"})
-    assert not ok and "CIDR" in msg
-
-
-def test_apply_pxe_conf_writes_conf_and_unit(tmp_path, monkeypatch):
-    conf_path = tmp_path / "pxe.conf"
-    unit_path = tmp_path / "pxe-server.service"
-    monkeypatch.setattr(kc, "PXE_CONF", str(conf_path))
-    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (0, ""))
-    cfg = {"ip": "192.168.78.1/24", "prefix": 24,
-           "pool_start": "192.168.78.10", "pool_end": "192.168.78.20"}
-    ok, msg = kc.apply_pxe_conf(cfg, unit_path=str(unit_path))
-    assert ok
-    assert json.loads(conf_path.read_text())["ip"] == "192.168.78.1/24"
-    assert "ExecStart=" in unit_path.read_text()
+def test_lan1_unit_rewrite_path_is_gone():
+    """LAN1 地址改为部署配置, 车机不再重写 systemd 单元."""
+    for name in ("apply_pxe_conf", "render_pxe_service", "pxe_conf_read", "pxe_conf_write"):
+        assert not hasattr(kc, name)
+    assert all(it.get("do") != "cfg_lan1" for items in kc.MENU.values() for it in items)
 
 
 def test_nmcli_set_static_builds_correct_cmd():
-    cmds = kc.nmcli_set_static("Lan1-pxe", "192.168.99.5/24", "192.168.99.254", "203.0.113.41")
+    cmds = kc.nmcli_set_static("Lan1-pxe", "192.0.2.5/24", "192.0.2.254", "198.51.100.53")
     assert cmds[0][:6] == ["nmcli", "con", "mod", "Lan1-pxe", "ipv4.method", "manual"]
-    assert "192.168.99.5/24" in cmds[0]
-    assert cmds[0][-1] == "203.0.113.41"      # dns
-    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == "192.168.99.254"
+    assert "192.0.2.5/24" in cmds[0]
+    assert cmds[0][-1] == "198.51.100.53"     # dns
+    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == "192.0.2.254"
     assert cmds[1] == ["nmcli", "con", "up", "Lan1-pxe"]
 
 
@@ -85,13 +70,13 @@ def test_services_status_shape(monkeypatch):
 def test_nics_status_marks_no_carrier(monkeypatch):
     def fake_run(cmd, timeout=5):
         if cmd[:2] == ["ip", "-4"]:
-            return 0, "eno1            UP      192.168.200.1/24"
+            return 0, "eno1            UP      203.0.113.1/24"
         if cmd[0] == "nmcli":
             return 0, "manual"
         return 1, ""   # carrier 文件读不到 = 没插线
     monkeypatch.setattr(kc, "run", fake_run)
     nics = kc.nics_status()
-    assert nics[0]["ip"] == "192.168.200.1/24"
+    assert nics[0]["ip"] == "203.0.113.1/24"
     assert nics[0]["link"] is False
     assert nics[0]["method"] == "manual"
 
@@ -297,9 +282,9 @@ def test_notice_read_missing_and_blank(tmp_path):
 
 def test_notice_read_strips_and_limits(tmp_path):
     p = tmp_path / "n.txt"
-    p.write_text("\nR5C 机房 → 左转\n\n" + "\n".join(f"l{i}" for i in range(30)) + "\n")
+    p.write_text("\nA101 机房 → 左转\n\n" + "\n".join(f"l{i}" for i in range(30)) + "\n")
     text = kc.notice_read(str(p), max_lines=5)
-    assert text.splitlines()[0] == "R5C 机房 → 左转"
+    assert text.splitlines()[0] == "A101 机房 → 左转"
     assert len(text.splitlines()) == 5
 
 
@@ -312,8 +297,8 @@ def test_notice_read_limits_chars(tmp_path):
 # ---------------------------------------------------------------- 开机自检 / 品牌
 
 NICS_OK = [{"name": "eno1", "role": "PXE 装机口", "ip": "-", "link": False},
-           {"name": "enp3s0", "role": "管理口", "ip": "192.168.99.228/24", "link": True}]
-MISC_OK = {"tailscale_ip": "100.100.100.10", "ch9329": False, "uptime": "up 1 min"}
+           {"name": "enp3s0", "role": "管理口", "ip": "192.0.2.228/24", "link": True}]
+MISC_OK = {"tailscale_ip": "192.0.2.10", "ch9329": False, "uptime": "up 1 min"}
 
 
 def _rows(**kw):
@@ -325,7 +310,7 @@ def _rows(**kw):
 
 def test_selftest_all_good():
     rows = _rows()
-    assert rows["LAN2"]["state"] == "OK" and rows["LAN2"]["detail"] == "192.168.99.228"
+    assert rows["LAN2"]["state"] == "OK" and rows["LAN2"]["detail"] == "192.0.2.228"
     assert rows["TAILSCALE"]["state"] == "OK"
     assert rows["CONSOLE"]["state"] == "OK"
     assert rows["CH9329"]["state"] == "--"          # 没插不算故障
@@ -346,7 +331,7 @@ def test_selftest_failures():
 
 
 def test_selftest_pxe_running_and_no_sensors():
-    nics = [dict(NICS_OK[0], link=True, ip="192.168.200.1/24"), NICS_OK[1]]
+    nics = [dict(NICS_OK[0], link=True, ip="203.0.113.1/24"), NICS_OK[1]]
     rows = _rows(nics=nics, svcs={"pxe-server": (True, True)}, temps=[], fans=[])
     assert rows["LAN1 / PXE"]["state"] == "OK" and "RUNNING" in rows["LAN1 / PXE"]["detail"]
     assert rows["CPU"]["state"] == "--" and rows["FAN"]["state"] == "--"
@@ -388,7 +373,7 @@ def test_check_serial_uses_dev_param():
 
 
 def test_check_ping():
-    assert kc.check_ping(_ctx(), host="100.100.100.8") == ("OK", "100.100.100.8")
+    assert kc.check_ping(_ctx(), host="192.0.2.8") == ("OK", "192.0.2.8")
     assert kc.check_ping(_ctx(ping=lambda h: False), host="nas") == ("WARN", "UNREACHABLE")
 
 
@@ -426,8 +411,8 @@ def test_selftest_plan_read(tmp_path):
 
 
 def test_selftest_line_format():
-    line = kc.selftest_line({"label": "LAN2", "state": "OK", "detail": "1.2.3.4"}, width=20)
-    assert line.startswith("LAN2 ") and ". OK" in line and line.endswith("1.2.3.4")
+    line = kc.selftest_line({"label": "LAN2", "state": "OK", "detail": "203.0.113.4"}, width=20)
+    assert line.startswith("LAN2 ") and ". OK" in line and line.endswith("203.0.113.4")
 
 
 def test_branding_defaults_and_override(tmp_path):
@@ -461,7 +446,7 @@ def test_version_string_dirty_and_missing(tmp_path):
 
 def test_notice_font_px_fills_box():
     # 中文一格=1 字宽, ASCII 0.6; 行高 1.3
-    px = kc.notice_font_px("请前往R6上课", 1000, 1000)    # 5 中文 + 3 数字 = 6.8 字宽
+    px = kc.notice_font_px("请前往101上课", 1000, 1000)    # 5 中文 + 3 数字 = 6.8 字宽
     assert px == int(1000 / 6.8)
 
 
@@ -502,10 +487,10 @@ def test_next_video_device_cycles():
 def test_ch9329_port_prefers_stable_by_id(tmp_path):
     byid = tmp_path / "by-id"
     byid.mkdir()
-    (byid / "usb-1a86_USB_Single_Serial_CAPSN019212-if00").touch()
+    (byid / "usb-1a86_USB_Single_Serial_0000000001-if00").touch()
     (byid / "usb-0403_FT232R_XYZ-if00-port0").touch()          # FTDI console 线不算
     got = kc.ch9329_port(str(byid / "usb-1a86_*-if00"), fallback="/dev/ttyACM0")
-    assert got == str(byid / "usb-1a86_USB_Single_Serial_CAPSN019212-if00")
+    assert got == str(byid / "usb-1a86_USB_Single_Serial_0000000001-if00")
 
 
 def test_ch9329_port_fallback_when_absent(tmp_path):
@@ -515,12 +500,12 @@ def test_ch9329_port_fallback_when_absent(tmp_path):
 # ------------------------------------------------------------ 装机模式 (2026-10-21)
 # 默认只有救援菜单; 推车上输屏幕随机码解锁, 只对选定 MAC 下发装机菜单, 30 分钟或被取走即上锁
 
-MAC = "02:00:00:41:b5:a2"
+MAC = "02:00:00:00:00:01"
 
 
 def test_mac_cfg_name_is_grub_per_mac_file():
-    assert kc.mac_cfg_name(MAC) == "grub.cfg-01-02-00-00-41-b5-a2"
-    assert kc.mac_cfg_name("02-00-00-41-b5-a2") == "grub.cfg-01-02-00-00-41-b5-a2"
+    assert kc.mac_cfg_name(MAC) == "grub.cfg-01-02-00-00-00-00-01"
+    assert kc.mac_cfg_name("02-00-00-00-00-01") == "grub.cfg-01-02-00-00-00-00-01"
     with pytest.raises(ValueError):
         kc.mac_cfg_name("not-a-mac")
 
@@ -538,7 +523,7 @@ def test_install_menu_has_kickstart():
 def test_arm_writes_per_mac_menu_only(tmp_path):
     state = tmp_path / "pxe-mode.json"
     kc.pxe_arm(MAC, now=1000, root=tmp_path, path=state)
-    assert "inst.ks" in (tmp_path / "grub.cfg-01-02-00-00-41-b5-a2").read_text()
+    assert "inst.ks" in (tmp_path / "grub.cfg-01-02-00-00-00-00-01").read_text()
     assert "inst.ks" not in (tmp_path / "grub.cfg").read_text()        # 别的机器照样只能救援
     st = kc.pxe_mode_read(path=state, now=1001)
     assert st == {"mode": "install", "mac": MAC, "since": 1000, "until": 1000 + 1800}
@@ -549,7 +534,7 @@ def test_disarm_and_expiry(tmp_path):
     kc.pxe_arm(MAC, now=1000, root=tmp_path, path=state)
     assert kc.pxe_mode_read(path=state, now=1000 + 1801)["mode"] == "expired"
     kc.pxe_disarm(root=tmp_path, path=state)
-    assert not (tmp_path / "grub.cfg-01-02-00-00-41-b5-a2").exists()
+    assert not (tmp_path / "grub.cfg-01-02-00-00-00-00-01").exists()
     assert kc.pxe_mode_read(path=state, now=2000) == {"mode": "rescue"}
     assert "inst.ks" not in (tmp_path / "grub.cfg").read_text()
 
@@ -560,10 +545,10 @@ def test_mode_read_missing_or_garbage_is_rescue(tmp_path):
     assert kc.pxe_mode_read(path=tmp_path / "bad", now=0) == {"mode": "rescue"}
 
 
-LOG = """2026-10-21 15:11:01,729 TFTP RRQ /grub.cfg-01-02-00-00-41-b5-a2 失败: [Errno 2] No such file
-2026-10-21 15:19:22,118 DHCP 客户端 02:00:00:41:b5:a2 vendor='PXEClient:Arch:00007' arch=7 src=0.0.0.0:68
+LOG = """2026-10-21 15:11:01,729 TFTP RRQ /grub.cfg-01-02-00-00-00-00-01 失败: [Errno 2] No such file
+2026-10-21 15:19:22,118 DHCP 客户端 02:00:00:00:00:01 vendor='PXEClient:Arch:00007' arch=7 src=0.0.0.0:68
 2026-10-21 15:19:30,001 DHCP 客户端 aa:bb:cc:dd:ee:ff vendor='PXEClient:Arch:00007' arch=7 src=0.0.0.0:68
-2026-10-21 15:20:00,000 TFTP RRQ /grub.cfg-01-02-00-00-41-b5-a2 (900 bytes, blksize=1024) from 192.168.200.10
+2026-10-21 15:20:00,000 TFTP RRQ /grub.cfg-01-02-00-00-00-00-01 (900 bytes, blksize=1024) from 203.0.113.10
 """
 
 
@@ -796,7 +781,7 @@ def test_menu_pages_reachable_and_actions_unique():
 def test_menu_keeps_every_existing_action():
     actions = {it["do"] for items in kc.MENU.values() for it in items if "do" in it}
     assert actions == {"toggle_preview", "switch_source", "toggle_mouse_mode", "cycle_kvm", "toggle_serial",
-                       "toggle_ks", "toggle_pxe", "toggle_install_mode", "cfg_lan1", "cfg_lan2",
+                       "toggle_ks", "toggle_pxe", "toggle_install_mode", "cfg_lan2",
                        "toggle_wifi", "toggle_netprof", "toggle_wol", "lock_now", "reboot", "poweroff"}
 
 
@@ -820,9 +805,9 @@ def test_check_service_states():
 
 
 def test_check_wifi():
-    st = lambda **k: (lambda: {"ssid": "CAMPUSNET", "signal": 68, "ip": "10.0.0.5/20", "egress": False, **k})
-    assert kc.check_wifi(_ctx(wifi=st())) == ("OK", "CAMPUSNET 68% STANDBY")
-    assert kc.check_wifi(_ctx(wifi=st(egress=True))) == ("WARN", "CAMPUSNET 68% IN USE")   # 网线断了在顶班
+    st = lambda **k: (lambda: {"ssid": "CAMPUS-NET", "signal": 68, "ip": "10.0.0.5/20", "egress": False, **k})
+    assert kc.check_wifi(_ctx(wifi=st())) == ("OK", "CAMPUS-NET 68% STANDBY")
+    assert kc.check_wifi(_ctx(wifi=st(egress=True))) == ("WARN", "CAMPUS-NET 68% IN USE")   # 网线断了在顶班
     assert kc.check_wifi(_ctx(wifi=lambda: {"ssid": None})) == ("--", "NOT CONNECTED")
 
 
@@ -838,8 +823,8 @@ def test_check_signal_by_friendly_name():
 
 def test_status_board_lines_tags_by_state():
     rows = [{"label": "LAN2", "state": "FAIL", "detail": "NO LINK"},
-            {"label": "WIFI", "state": "WARN", "detail": "CAMPUSNET 68% IN USE"},
-            {"label": "TAILSCALE", "state": "OK", "detail": "100.100.100.10"},
+            {"label": "WIFI", "state": "WARN", "detail": "CAMPUS-NET 68% IN USE"},
+            {"label": "TAILSCALE", "state": "OK", "detail": "192.0.2.10"},
             {"label": "CONSOLE", "state": "--", "detail": "NOT CONNECTED"}]
     lines = kc.status_board_lines(rows, temps=[("CPU", 57.0)], fans=[("fan2", 2393)], uptime="up 1 hour")
     assert [t for _, t in lines[:4]] == ["bad", "t_warn", "ok", "dim"]
@@ -946,14 +931,14 @@ def test_video_nodes_usb_key_from_sysfs_when_name_has_no_ids(tmp_path):
     assert cam["key"] == "2bdf:0294"
 
 
-ROUTE_WIRED = "default via 192.168.99.1 dev enp3s0 proto dhcp src 192.168.99.228 metric 100\n" \
-              "default via 192.168.166.1 dev wlp4s0 proto dhcp metric 600\n"
-ROUTE_WIFI = "default via 192.168.166.1 dev wlp4s0 proto dhcp src 192.168.166.20 metric 600\n"
+ROUTE_WIRED = "default via 192.0.2.1 dev enp3s0 proto dhcp src 192.0.2.228 metric 100\n" \
+              "default via 198.51.100.1 dev wlp4s0 proto dhcp metric 600\n"
+ROUTE_WIFI = "default via 198.51.100.1 dev wlp4s0 proto dhcp src 198.51.100.20 metric 600\n"
 
 
 def test_default_route_dev_takes_first_default():
     assert kc.default_route_dev(ROUTE_WIRED) == "enp3s0"
-    assert kc.default_route_dev("10.0.0.0/8 via 1.1.1.1 dev eno1\n") is None
+    assert kc.default_route_dev("10.0.0.0/8 via 203.0.113.11 dev eno1\n") is None
     assert kc.default_route_dev("") is None
 
 
@@ -967,3 +952,84 @@ def test_net_state_three_levels():
 
 def test_net_icon_paths(tmp_path):
     assert kc.net_icon("warn", d=str(tmp_path)) == str(tmp_path / "net-warn.png")
+
+
+# ------------------------------------------------------------ disarm 扫整棵 tftp 树 (1.06.00)
+
+def test_disarm_scrubs_install_menus_anywhere_in_tree(tmp_path):
+    (tmp_path / "EFI" / "BOOT").mkdir(parents=True)
+    auto = "set default=0\nmenuentry 'x' { linux /vmlinuz inst.ks=http://192.0.2.1:8000/ks.cfg }\n"
+    (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text(auto)
+    (tmp_path / "grub.cfg-C000020A").write_text(auto)              # 按 IP (十六进制) 命名的菜单
+    (tmp_path / "grub.cfg").write_text(auto)
+    (tmp_path / "grub.cfg.bak-20261021").write_text(auto)          # 手工备份: GRUB 不会自己去取, 留着
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "pxe-mode.json")
+    menus = {str(p.relative_to(tmp_path)): p.read_text() for p in tmp_path.rglob("grub.cfg*")
+             if not p.name.startswith("grub.cfg.")}
+    assert not any("inst.ks" in t for t in menus.values()), menus
+    assert set(menus) == {"grub.cfg"}
+    assert (tmp_path / "grub.cfg.bak-20261021").exists()
+
+
+def test_tracked_grub_templates_default_to_rescue():
+    import pathlib
+    here = pathlib.Path(__file__).resolve().parent.parent
+    for p in [here / "windows" / "grub.cfg", here / "scripts" / "setup-cart.sh"]:
+        assert "inst.ks" not in p.read_text(), p
+
+
+# ------------------------------------------------------------ PinGate 退避 + 线程安全 (1.06.00)
+
+def test_pin_gate_backoff_grows_and_caps():
+    h = kc.pin_hash("2468")
+    g = kc.PinGate(h, max_fails=2, lock_s=60, max_lock_s=200)
+    t, locks = 0, []
+    for _ in range(4):
+        g.attempt("0000", now=t)
+        assert g.attempt("0000", now=t) == "locked"
+        locks.append(g.locked_until - t)
+        t = g.locked_until
+    assert locks == [60, 120, 200, 200]
+    assert g.attempt("2468", now=t) == "ok"
+    g.attempt("0000", now=t)
+    g.attempt("0000", now=t)
+    assert g.locked_until - t == 60                       # 输对一次就回到起步
+
+
+def test_pin_gate_default_keeps_fixed_lock():
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=1, lock_s=60)
+    g.attempt("0000", now=0)
+    g.attempt("0000", now=60)
+    assert g.locked_until == 120
+
+
+def test_pin_gate_concurrent_bad_attempts_counted_once_each():
+    import threading
+    g = kc.PinGate(kc.pin_hash("2468"), max_fails=5, lock_s=60)
+    res = []
+    ts = [threading.Thread(target=lambda: res.append(g.attempt("0000", now=0))) for _ in range(20)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert res.count("bad") == 4 and res.count("locked") == 16
+
+
+# ------------------------------------------------------------ run(): 出错不把错误文字当输出 (1.06.00)
+
+def test_run_failure_gives_empty_stdout():
+    rc, out = kc.run(["definitely-not-a-command-xyz"])
+    assert rc != 0 and out == ""
+
+
+def test_run_timeout_gives_empty_stdout():
+    rc, out = kc.run(["sleep", "3"], timeout=0.2)
+    assert rc != 0 and out == ""
+
+
+def test_status_fields_dash_when_commands_missing(monkeypatch):
+    monkeypatch.setattr(kc.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("x")))
+    for n in kc.nics_status():
+        assert n["ip"] == "-" and n["method"] == "-" and n["link"] is False
+    m = kc.misc_status()
+    assert m["tailscale_ip"] == "-" and m["uptime"] == "-"

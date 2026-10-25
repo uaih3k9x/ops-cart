@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Kiosk 无线管理面板: 扫描/连接/输密码(可显示)/已保存网络按优先级排序/忘记;
-底部是校园网 (CAMPUSNET) 认证: 改账号密码、立即认证、看最近一次结果.
+底部是校园网认证: 改账号密码、立即认证、看最近一次结果.
 
 nmcli 调用放后台线程, 结果用 after() 回到 Tk 线程. 规则见 wifi_core.
 """
@@ -101,12 +101,12 @@ class WifiPanel(tk.Frame):
         self._build_auth()
 
     def _build_auth(self):
-        box = tk.LabelFrame(self, text=" 校园网认证 (只在连着 CAMPUSNET 时自动跑, 每 2 分钟) ", font=FONT,
-                            bg=BG, fg="#8b93a7", bd=1, relief="groove")
+        conf = rp._read_json(rp.CONF) or {}
+        title = f" 校园网认证 (只在连着 {conf.get('ssid') or '配置的无线'} 时自动跑, 每 2 分钟) "
+        box = tk.LabelFrame(self, text=title, font=FONT, bg=BG, fg="#8b93a7", bd=1, relief="groove")
         box.pack(fill="x", padx=16, pady=(0, 10))
         row = tk.Frame(box, bg=BG)
         row.pack(fill="x", pady=4)
-        conf = rp._read_json(rp.CONF) or {}
         self.auth_user = tk.StringVar(value=conf.get("user", ""))
         self.auth_pw = tk.StringVar(value=conf.get("password", ""))
         tk.Label(row, text="账号:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
@@ -141,7 +141,9 @@ class WifiPanel(tk.Frame):
 
     def auth_save(self):
         try:
-            conf = rp.conf_update(rp._read_json(rp.CONF), self.auth_user.get(), self.auth_pw.get())
+            old = rp._read_json(rp.CONF) or {}
+            ssid = None if old.get("ssid") else rp.current_ssid(old.get("iface", "wlp4s0"))
+            conf = rp.conf_update(old, self.auth_user.get(), self.auth_pw.get(), ssid=ssid)
             rp.conf_save(conf)
         except (ValueError, OSError) as ex:
             return self._say(f"保存失败: {ex}", ok=False)
@@ -152,7 +154,7 @@ class WifiPanel(tk.Frame):
             self._auth_render()
             ok = not isinstance(res, Exception) and res[0] == 0
             self._say("认证完成" if ok else "认证没成功, 原因见下面一行", ok)
-        self._bg(lambda: _run(["systemctl", "start", "campusnet-auth.service"], timeout=60), done, "认证中…")
+        self._bg(lambda: _run(["systemctl", "start", "campus-auth.service"], timeout=60), done, "认证中…")
 
     def _toggle_show(self):
         self.pw_entry.config(show="" if self.show_var.get() else "•")
@@ -187,7 +189,7 @@ class WifiPanel(tk.Frame):
             _, scan = _run(wc.cmd_scan(rescan=rescan))
             _, saved = _run(wc.CMD_SAVED)
             saved = wc.parse_saved(saved)
-            for s in saved:                 # 连接名和 SSID 可能不同 (campusnet / CAMPUSNET)
+            for s in saved:                 # 连接名和 SSID 可能不同 (大小写、改过名)
                 s["ssid"] = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", "uuid", s["uuid"]])[1]
             return wc.parse_scan(scan), saved
 

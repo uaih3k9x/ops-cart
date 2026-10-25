@@ -12,7 +12,7 @@
   {"check": "signal",    "label": "CAPTURE 1",     "match": "卡1"},
   {"check": "signal",    "label": "CAPTURE 2",     "match": "卡2"},
   {"check": "video",     "label": "MS2130",        "match": "345f:2109"},
-  {"check": "ping",      "label": "NAS",           "host": "192.168.1.10"},
+  {"check": "ping",      "label": "NAS",           "host": "192.0.2.10"},
   {"check": "cpu"},
   {"check": "fan"}
 ]

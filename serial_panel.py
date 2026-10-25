@@ -19,7 +19,7 @@ import threading
 import tkinter as tk
 
 SERIAL_CONF = "/opt/pxe/serial.conf"
-_SERIAL_DEFAULT = {"user": "ops", "conbroker_home": "/home/ops/conbroker"}
+_SERIAL_DEFAULT = {"user": "ops", "conbroker_home": "/home/ops/conbroker", "chat_name": "operator"}
 
 
 def serial_conf_read(path=None):
@@ -388,7 +388,7 @@ class SerialPanel(tk.Frame):
         log = self.chat_log
         log.config(state="normal")
         log.insert("end", f"{hhmm} ", "ts")
-        log.insert("end", f"{who}\n", "me" if who == "op" else "them")
+        log.insert("end", f"{who}\n", "me" if who == serial_conf_read()["chat_name"] else "them")
         log.insert("end", f"{text}\n\n")
         log.see("end")
         log.config(state="disabled")
@@ -399,7 +399,7 @@ class SerialPanel(tk.Frame):
             return
         self.chat_var.set("")
         # 经 conbroker say 写入 (以服务用户身份), 自己的消息由轮询显示出来
-        threading.Thread(target=_run, args=(["say", "op", msg],), daemon=True).start()
+        threading.Thread(target=_run, args=(["say", serial_conf_read()["chat_name"], msg],), daemon=True).start()
 
     # ------------------------------------------------------------ 服务
 

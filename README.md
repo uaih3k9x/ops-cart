@@ -36,7 +36,7 @@
 | [`pxeserver.py`](pxeserver.py) | PXE 服务端,单文件,Linux / Windows 通用 |
 | [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);LAN1 没插线就等地址出现,不退出 |
 | [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter) |
-| [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、nmcli 命令、PXE 配置、菜单定义 |
+| [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、nmcli 命令、装机菜单与装机网段(读 `pxe.env`)、菜单定义 |
 | [`serial_panel.py`](serial_panel.py) | 串口会话面板 |
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
 | [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序;面板底部改校园网认证账号、立即认证、看最近结果 |
@@ -45,10 +45,11 @@
 | [`wol_panel.py`](wol_panel.py) · [`wol_core.py`](wol_core.py) | 网络唤醒:常用目标清单 + 临时输 MAC,从选定网口广播魔术包 |
 | [`atomicfile.py`](atomicfile.py) | 防断电写文件:临时文件 → fsync → 改名,配置要么旧要么新 |
 | [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
-| [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版 Kiosk(标准库 http.server + xterm.js) |
-| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着 CAMPUSNET 时跑;结果写 `/run/ops-cart/campusnet-status.json` 给面板和状态板 |
+| [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版远程管理口(标准库 http.server + xterm.js);单独的 `webkiosk.service`,默认不开机自启 |
+| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着配置里写的那个 SSID 时跑(配置没写 SSID 就不跑);结果写 `/run/ops-cart/campus-auth-status.json` 给面板和状态板 |
 | [`kvm_core.py`](kvm_core.py) | 画面源 ↔ 键鼠绑定:CH9329 按 CH343 序列号认身份;没绑或不在线 = 只看不操作,绝不退回随便一块 |
 | [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈,也可当命令行工具用 |
+| [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿) |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract) |
 
 | 目录 | 内容 |
@@ -56,7 +57,8 @@
 | [`tests/`](tests/) | 离线单测,不接任何硬件也能全绿 |
 | [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
-| [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库,`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟 |
+| [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查 |
+| [`docs/`](docs/) | 优化方案、版本部署清单 |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例 |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
@@ -71,9 +73,12 @@ python3 -m pytest -q
 python3 ch9329.py --port /dev/ttyACM0 type "hello from cart"
 python3 ch9329.py --port /dev/ttyACM0 combo ctrl alt delete
 
-# PXE 服务端
-python3 pxeserver.py serve --ip 192.168.200.1 \
-    --pool 192.168.200.10,192.168.200.20 --tftp-root /opt/pxe/tftp
+# PXE 服务端(地址是示例;推车上由 /etc/ops-cart/pxe.env 给出)
+python3 pxeserver.py serve --ip 192.0.2.1 --prefix 24 \
+    --pool 192.0.2.10,192.0.2.20 --tftp-root /opt/pxe/tftp --iface eno1
+
+# 公开仓库脱敏检查(本地词表放 .public-safe.local,不进仓库)
+python3 scripts/check_public_safe.py .
 
 # 截图找字
 python3 cart_ocr.py shot.png --find "Boot Menu"
@@ -81,9 +86,13 @@ python3 cart_ocr.py shot.png --find "Boot Menu"
 
 ## 部署到推车
 
+升级已有推车按 `docs/DEPLOY_<版本>.md` 一步步来(备份、重启顺序、验证、回滚)。从零装:
+
 ```bash
 scripts/stamp-build.sh                         # 生成 BUILD(提交数 + 哈希)
 scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web icons cart:/opt/pxe/
+sudo install -d -m 755 /etc/ops-cart
+sudo install -m 644 deploy/pxe.env.example /etc/ops-cart/pxe.env   # 改成现场的装机网段
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo cp deploy/sysctl.d/* /etc/sysctl.d/ && sudo sysctl --system
 sudo mkdir -p /etc/systemd/journald.conf.d && sudo cp deploy/journald.conf.d/* /etc/systemd/journald.conf.d/ && sudo systemctl restart systemd-journald
@@ -91,8 +100,12 @@ sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/ && sudo cp deploy/tmpfiles
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
 sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk
 sudo cp deploy/bin/kiosk-setpin /usr/local/bin/ && sudo kiosk-setpin
-sudo systemctl enable --now kiosk.service cart-boot-success.timer campusnet-auth.timer wifi-prefer.timer
+sudo systemctl enable --now kiosk.service cart-boot-success.timer campus-auth.timer wifi-prefer.timer
+# 网页管理口按需: sudo systemctl enable --now webkiosk.service
 ```
+
+装机网段只在 `/etc/ops-cart/pxe.env` 里定(`pxe-*` 三个单元和车机生成的 grub 菜单共用),车机界面不再改 LAN1 地址;
+`pxe-server` 的 `--iface eno1` 写死在单元里。校园网认证配置在 `/etc/ops-cart/campus-auth.json`(要写 `ssid`)。
 
 开机自检和状态板共用一张计划表 `/opt/pxe/selftest.json`
 (照 [`examples/selftest.example.json`](examples/selftest.example.json) 改网卡名、串口、PCI ID、要 ping 的主机),

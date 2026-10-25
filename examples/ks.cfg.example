@@ -14,7 +14,7 @@ selinux --enforcing
 firewall --enabled --service=ssh
 firstboot --disable
 
-# DANGER: wipes ALL disks (approved by op)
+# DANGER: wipes ALL disks (approved by the maintainer)
 zerombr
 clearpart --all --initlabel
 bootloader --timeout=1
@@ -26,6 +26,6 @@ autopart --type=lvm
 
 %post --log=/root/ks-post.log
 # Allow root password ssh for first-login verification (default is prohibit-password).
-# op: tighten this after taking over the machine.
+# Maintainer: tighten this after taking over the machine.
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 %end

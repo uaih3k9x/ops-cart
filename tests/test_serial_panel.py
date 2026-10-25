@@ -139,5 +139,12 @@ def test_term_feed_utf8_split_across_chunks():
 
 def test_parse_chat_line():
     assert sp.parse_chat_line("[2026-10-19 10:21:05 Claude] 收到") == ("10:21", "Claude", "收到")
-    assert sp.parse_chat_line("[2026-10-19 10:22:00 op] 已切 U6") == ("10:22", "op", "已切 U6")
+    assert sp.parse_chat_line("[2026-10-19 10:22:00 ops] 已切 U6") == ("10:22", "ops", "已切 U6")
     assert sp.parse_chat_line("garbage") is None
+
+
+def test_chat_name_comes_from_conf(tmp_path):
+    assert sp.serial_conf_read(str(tmp_path / "none"))["chat_name"] == "operator"
+    p = tmp_path / "serial.conf"
+    p.write_text('{"chat_name": "alice"}')
+    assert sp.serial_conf_read(str(p))["chat_name"] == "alice"

@@ -235,7 +235,7 @@ class Kiosk(tk.Tk):
             self.status_wrap.pack_forget()
             self.serial_panel = SerialPanel(self.body)
             self.serial_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-            self.banner.config(text="串口会话 · conbroker (display 类只读命令可直接发, 改配置先问 op)")
+            self.banner.config(text="串口会话 · conbroker (display 类只读命令可直接发, 改配置先问管理员)")
 
     def toggle_ks(self):
         if getattr(self, "ks_panel", None):
@@ -576,23 +576,6 @@ class Kiosk(tk.Tk):
         subprocess.run(["systemctl", "stop" if active else "start",
                         "pxe-server", "pxe-http-repo", "pxe-http-boot"],
                        capture_output=True)
-
-    def cfg_lan1(self):
-        cfg = kc.pxe_conf_read()
-        ip = simpledialog.askstring("LAN1 装机口", "PXE 网卡地址 (CIDR):",
-                                    initialvalue=f"{cfg['ip']}/{cfg['prefix']}")
-        if not ip:
-            return
-        pool_s = simpledialog.askstring("地址池", "起始:", initialvalue=cfg["pool_start"]) or ""
-        pool_e = simpledialog.askstring("地址池", "结束:", initialvalue=cfg["pool_end"]) or ""
-        ip_body, _, prefix = ip.partition("/")
-        new_cfg = {"ip": ip_body, "prefix": int(prefix or 24),
-                   "pool_start": pool_s, "pool_end": pool_e}
-        for cmd in kc.nmcli_set_static(kc.LAN1_CON, ip_body + "/" + (prefix or "24")):
-            subprocess.run(cmd, capture_output=True)
-        ok, msg = kc.apply_pxe_conf(new_cfg)
-        (messagebox.showinfo if ok else messagebox.showerror)(
-            "LAN1", "已应用:\n" + kc.render_pxe_service(new_cfg) if ok else f"失败: {msg}")
 
     def cfg_lan2(self):
         warn = ("注意: LAN2 是管理口(远程/SSH/tailscale 走这里)!\n"

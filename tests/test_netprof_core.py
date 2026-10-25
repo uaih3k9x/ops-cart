@@ -7,7 +7,7 @@ import pytest
 import netprof_core as np_
 
 CONS = "\n".join([
-    "campusnet:6c4d-1:802-11-wireless:wlp4s0:yes",
+    "campus-net:6c4d-1:802-11-wireless:wlp4s0:yes",
     "tailscale0:0659-2:tun:tailscale0:yes",
     "enp3s0:1603-3:802-3-ethernet::no",
     "Lan1-pxe:a737-4:802-3-ethernet:eno1:yes",
@@ -144,7 +144,7 @@ def test_build_discover():
     assert pkt.rstrip(b"\x00").endswith(b"\xff")
 
 
-def _offer(xid, msg_type=2, server=b"\xc0\xa8\x09\x01", yiaddr=b"\xc0\xa8\x09\x63"):
+def _offer(xid, msg_type=2, server=b"\xc0\x00\x02\x01", yiaddr=b"\xc0\x00\x02\x63"):
     head = struct.pack("!BBBBIHH", 2, 1, 6, 0, xid, 0, 0x8000)
     body = head + b"\x00" * 4 + yiaddr + b"\x00" * 8 + MAC + b"\x00" * 10 + b"\x00" * 192
     opts = b"\x63\x82\x53\x63" + bytes([53, 1, msg_type]) + b"\x36\x04" + server + b"\xff"
@@ -152,7 +152,7 @@ def _offer(xid, msg_type=2, server=b"\xc0\xa8\x09\x01", yiaddr=b"\xc0\xa8\x09\x6
 
 
 def test_parse_offer():
-    assert np_.parse_offer(_offer(7), 7) == {"server": "192.168.99.1", "yiaddr": "192.168.99.99"}
+    assert np_.parse_offer(_offer(7), 7) == {"server": "192.0.2.1", "yiaddr": "192.0.2.99"}
 
 
 def test_parse_offer_ignores_wrong_xid_type_and_garbage():

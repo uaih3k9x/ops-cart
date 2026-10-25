@@ -1,5 +1,5 @@
 [Unit]
-Description=Every 2 min: re-login CAMPUSNET portal if kicked out
+Description=Every 2 min: re-login campus portal if kicked out
 
 [Timer]
 OnBootSec=45

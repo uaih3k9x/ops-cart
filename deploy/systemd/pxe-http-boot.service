@@ -3,7 +3,8 @@ Description=PXE HTTP for grub kernel loading (:80)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/pxe/httpserve.py 80 --directory /opt/pxe/tftp --bind 192.168.200.1
+EnvironmentFile=/etc/ops-cart/pxe.env
+ExecStart=/usr/bin/python3 /opt/pxe/httpserve.py 80 --directory /opt/pxe/tftp --bind ${PXE_IP}
 Restart=on-failure
 RestartSec=3
 

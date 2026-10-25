@@ -32,7 +32,7 @@ def _load(path):
 
 def main():
     saved = wc.parse_saved(_run(wc.CMD_SAVED)[1])
-    for s in saved:                     # 连接名和 SSID 可能不同 (campusnet / CAMPUSNET)
+    for s in saved:                     # 连接名和 SSID 可能不同 (大小写、改过名)
         s["ssid"] = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", "uuid", s["uuid"]])[1]
     scan = wc.parse_scan(_run(wc.cmd_scan(rescan="auto"))[1])
     now = time.time()

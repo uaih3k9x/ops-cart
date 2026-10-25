@@ -2,7 +2,7 @@
 """静态文件 HTTP 服务, 替代 `python3 -m http.server`: 地址还没配上 (LAN1 没插线) 就每 2 秒重试,
 不退出也不被 systemd 反复拉起刷日志. 绑定逻辑复用 pxeserver.bind_retry.
 
-    httpserve.py 8000 --directory /opt/pxe/http --bind 192.168.200.1
+    httpserve.py 8000 --directory /opt/pxe/http --bind 192.0.2.1
 """
 
 import argparse

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ops-cart</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="vendor/xterm.css">
 <style>
   :root { --bg:#12161e; --panel:#1a2130; --btn:#1f2a3d; --fg:#e8eaf0; --dim:#8b95a5;
@@ -121,8 +122,16 @@ const api = async (path, body) => {
   const r = await fetch(path, body === undefined ? {} :
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (r.status === 401) { showLogin(); throw new Error("401"); }
+  if (r.status === 403 && !(r.headers.get("Content-Type") || "").includes("json")) {
+    denied(await r.text()); throw new Error("403");
+  }
   return r.json();
 };
+// 来源被拒 (局域网开关关了 / 未设 PIN / 装机口): 整页换成原因, 别留着一堆失效按钮
+function denied(why) {
+  $("#login").classList.remove("hidden");
+  $("#login .card").innerHTML = `<h3>ops-cart</h3><div class="bad">${esc(why)}</div>`;
+}
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 let me = {};
 
@@ -131,7 +140,7 @@ function showLogin() { $("#login").classList.remove("hidden"); $("#pin").focus()
 async function doLogin() {
   const r = await api("/api/login", { pin: $("#pin").value });
   if (r.result === "ok") { $("#login").classList.add("hidden"); $("#pin").value = ""; boot(); }
-  else $("#msg").textContent = r.result === "locked" ? "输错太多次, 稍后再试" : "PIN 不对";
+  else $("#msg").textContent = { locked: "输错太多次, 稍后再试", unavailable: "推车上的 PIN 配置读不到, 网页口暂不可用" }[r.result] || "PIN 不对";
 }
 $("#go").onclick = doLogin;
 $("#pin").onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
@@ -141,7 +150,9 @@ document.querySelectorAll("nav button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x === b));
   document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.id === "p-" + b.dataset.p));
   if (b.dataset.p === "serial") setTimeout(() => fit(), 0);
+  if (b.dataset.p !== "kvm") stopVideo();       // 不看就别占着采集卡 (车机本地预览要用)
 });
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopVideo(); });
 
 // ---------------------------------------------------------------- 状态
 function card(title, rows) {
@@ -172,13 +183,22 @@ $("#st-run").onclick = async () => {
 };
 
 // ---------------------------------------------------------------- KVM: 画面
+// 画面源列表带键鼠绑定: 没绑 / 不在线的只能看, 键鼠事件后端也会拒 (409)
+const KVM_NOTE = { ok: "", unbound: " (未绑键鼠, 只看)", offline: " (键鼠不在线, 只看)" };
 async function loadVideos() {
   const { devices } = await api("/api/videos");
-  $("#vdev").innerHTML = devices.map((d) => `<option>${esc(d)}</option>`).join("") || "<option value=''>没有采集设备</option>";
+  $("#vdev").innerHTML = devices.map((d) =>
+    `<option value="${esc(d.dev)}">${esc(d.name)}${esc(KVM_NOTE[d.kvm] || "")}</option>`).join("")
+    || "<option value=''>没有采集设备</option>";
 }
+const HINT = "单击画面进入键鼠透传 · Esc 释放";
+function stopVideo() { if ($("#vimg").getAttribute("src")) { $("#vimg").removeAttribute("src"); } }
+$("#vimg").onerror = () => { if ($("#vimg").getAttribute("src")) $("#hint").textContent = "画面打不开 (设备忙或没有信号)"; };
+$("#vimg").onload = () => { $("#hint").textContent = HINT; };
 $("#v-go").onclick = () => {
   const d = $("#vdev").value;
   if (!d) return;
+  $("#hint").textContent = "正在打开画面…";
   $("#vimg").src = `/api/video?dev=${encodeURIComponent(d)}&fps=${$("#fps").value}&t=${Date.now()}`;
 };
 $("#fs").onclick = async () => {
@@ -198,8 +218,11 @@ async function pump() {
                          mouse.dx = mouse.dy = mouse.w = 0; mouse.dirty = false; }
       const batch = q.splice(0, q.length);
       const r = await fetch("/api/hid", { method: "POST", headers: { "Content-Type": "application/json" },
-                                          body: JSON.stringify({ events: batch }) });
-      if (!r.ok) { $("#hint").textContent = "CH9329 未连接或发送失败"; q.length = 0; break; }
+                                          body: JSON.stringify({ src: $("#vdev").value, events: batch }) });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        $("#hint").textContent = e.error || "键鼠发送失败"; q.length = 0; break;
+      }
     }
   } finally { sending = false; }
 }
@@ -209,7 +232,7 @@ const locked = () => document.pointerLockElement === $("#vimg");
 $("#vimg").onclick = () => { if (!locked()) $("#vimg").requestPointerLock(); };
 document.addEventListener("pointerlockchange", () => {
   $("#screen").classList.toggle("lock", locked());
-  $("#hint").textContent = locked() ? "🔒 透传中 · Esc 释放" : "单击画面进入键鼠透传 · Esc 释放";
+  $("#hint").textContent = locked() ? "[透传中] Esc 释放" : HINT;
   if (!locked()) push({ t: "release" });
 });
 document.addEventListener("mousemove", (e) => {
@@ -241,7 +264,9 @@ document.querySelectorAll("[data-combo]").forEach((b) => b.onclick = () => {
 });
 $("#type").onclick = async () => {
   const text = $("#paste").value;
-  if (text) await api("/api/type", { text });
+  if (!text) return;
+  const r = await api("/api/type", { src: $("#vdev").value, text });
+  if (r.error) $("#hint").textContent = r.error;
 };
 
 // ---------------------------------------------------------------- 串口
@@ -255,7 +280,19 @@ function fit() {   // 不带 fit 插件, 按字符格子粗算
 window.addEventListener("resize", fit);
 let es = null;
 const b64 = (s) => { let bin = ""; new TextEncoder().encode(s).forEach((x) => bin += String.fromCharCode(x)); return btoa(bin); };
-term.onData((d) => { if (es) api("/api/serial/send", { data: b64(d) }).catch(() => {}); });
+// 按键串行发: 上一个 POST 回来之前的输入先攒着, 回来后合并成一批; 并发发会乱序 (方向键序列会被打散)
+let serialBuf = "", serialBusy = false;
+async function serialPump() {
+  if (serialBusy) return;
+  serialBusy = true;
+  try {
+    while (serialBuf && es) {
+      const chunk = serialBuf; serialBuf = "";
+      await api("/api/serial/send", { data: b64(chunk) }).catch(() => {});
+    }
+  } finally { serialBusy = false; serialBuf = es ? serialBuf : ""; }
+}
+term.onData((d) => { if (!es) return; serialBuf += d; serialPump(); });
 async function loadPorts() {
   const { ports } = await api("/api/serial/ports");
   $("#sport").innerHTML = ports.map((p) => `<option>${esc(p)}</option>`).join("") || "<option value=''>没有在跑的串口服务</option>";
@@ -281,11 +318,13 @@ $("#logout").onclick = async () => { await api("/api/logout", {}); location.relo
 // ---------------------------------------------------------------- 启动
 let timer = null;
 async function boot() {
-  me = await (await fetch("/api/whoami")).json();
+  const w = await fetch("/api/whoami");
+  if (w.status === 403) return denied(await w.text());
+  me = await w.json();
   if (!me.authed) return showLogin();
   $("#lan").checked = me.lan_open;
   $("#lan").disabled = me.kind !== "trusted";
-  $("#lan-note").textContent = me.kind === "trusted" ? "关闭后局域网立即无法访问, tailnet 不受影响。未设 PIN 时局域网始终拒绝。"
+  $("#lan-note").textContent = me.kind === "trusted" ? "关闭后局域网的会话和画面 / 串口连接立即断开, tailnet 不受影响。未设 PIN 时局域网始终拒绝, 装机口 (LAN1) 来的连接无论开关都拒绝。"
                                                      : "你正通过局域网访问, 只能从 tailnet 或推车本机切换。";
   await Promise.all([refresh(), loadVideos(), loadPorts()]);
   clearInterval(timer);

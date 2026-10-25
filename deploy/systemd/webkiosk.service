@@ -1,0 +1,24 @@
+[Unit]
+Description=ops-cart 网页版远程管理口 (tailnet 放行, 局域网需开关 + PIN, 装机口永远拒绝)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# 不依赖 kiosk.service: 车机界面崩了, 网页口照样能进来看
+
+[Service]
+WorkingDirectory=/opt/pxe
+ExecStart=/usr/bin/python3 /opt/pxe/webkiosk.py
+# 要读 root 0600 的 PIN、开 CH9329 和采集卡、写 /opt/pxe/web.conf, 所以是 root; 用沙箱收紧
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/pxe
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

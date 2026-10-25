@@ -8,7 +8,8 @@ $if = $if[0]
 Write-Output ("NIC: " + $if.Name + " (" + $if.InterfaceDescription + ")")
 
 # drop APIPA, set static install IP
-netsh interface ipv4 set address name="$($if.Name)" static 192.168.200.1 255.255.255.0 | Out-Null
+# 示例地址, 按实际装机网段改
+netsh interface ipv4 set address name="$($if.Name)" static 192.0.2.1 255.255.255.0 | Out-Null
 Get-NetIPAddress -InterfaceIndex $if.ifIndex -AddressFamily IPv4 |
     Select-Object InterfaceAlias, IPAddress | Format-Table -AutoSize
 

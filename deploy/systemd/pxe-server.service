@@ -3,7 +3,10 @@ Description=PXE server (DHCP+proxyDHCP+TFTP) on Lan1 install port
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/pxe/pxeserver.py serve --ip 192.168.200.1 --pool 192.168.200.10,192.168.200.20 --tftp-root /opt/pxe/tftp --log /opt/pxe/pxeserver.log --iface eno1
+# 装机网段在 /etc/ops-cart/pxe.env (照 deploy/pxe.env.example); 文件不在就起不来, 不会拿默认值乱发
+EnvironmentFile=/etc/ops-cart/pxe.env
+# --iface eno1 写死: 发 DHCP / PXE 只许 LAN1
+ExecStart=/usr/bin/python3 /opt/pxe/pxeserver.py serve --ip ${PXE_IP} --prefix ${PXE_PREFIX} --pool ${PXE_POOL} --tftp-root /opt/pxe/tftp --log /opt/pxe/pxeserver.log --iface eno1
 Restart=on-failure
 RestartSec=3
 
