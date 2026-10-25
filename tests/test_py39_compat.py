@@ -45,6 +45,33 @@ class _NewSyntax(ast.NodeVisitor):
         self._ann(node.annotation)
         self.generic_visit(node)
 
+    def visit_Call(self, node):                           # isinstance(x, int | str) 也是 3.10+
+        if getattr(node.func, "id", None) in ("isinstance", "issubclass") and len(node.args) == 2:
+            t = node.args[1]
+            if isinstance(t, ast.BinOp) and isinstance(t.op, ast.BitOr):
+                self.hits.append((node.lineno, "isinstance 里的 X | Y (3.9 运行时会炸)"))
+        self.generic_visit(node)
+
+
+def _hits(src):
+    v = _NewSyntax("from __future__ import annotations" in src)
+    v.visit(ast.parse(src))
+    return [why for _n, why in v.hits]
+
+
+def test_checker_catches_runtime_union_and_match():
+    assert _hits("def f(x: int | None): pass") != []
+    assert _hits("def f() -> int | None: pass") != []
+    assert _hits("x: int | str = 1") != []
+    assert _hits("isinstance(1, int | str)") != []
+    assert _hits("match x:\n    case 1: pass") != []
+
+
+def test_checker_allows_safe_forms():
+    assert _hits("from __future__ import annotations\ndef f(x: int | None): pass") == []
+    assert _hits("flags = 1 | 2\nisinstance(1, (int, str))") == []
+    assert _hits("def f(x: 'int | None'): pass") == []
+
 
 @pytest.mark.parametrize("rel", _py_files())
 def test_parses_as_python39(rel):
