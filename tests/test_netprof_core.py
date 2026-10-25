@@ -160,3 +160,61 @@ def test_parse_offer_ignores_wrong_xid_type_and_garbage():
     assert np_.parse_offer(_offer(7, msg_type=5), 7) is None    # ACK 不算
     assert np_.parse_offer(b"\x02" * 50, 7) is None
     assert np_.parse_offer(np_.build_discover(MAC, 7), 7) is None   # 自己发的请求
+
+
+# ------------------------------------------------------------ 探测前先看有没有插线 (2026-10-25)
+# 没插线时探测不到任何 OFFER, 以前会被当成"对面没有 DHCP"放行; 现在返回"未知"
+
+def test_carrier_reads_sysfs(tmp_path):
+    (tmp_path / "eno1").mkdir()
+    (tmp_path / "eno1" / "carrier").write_text("1\n")
+    (tmp_path / "enp3s0").mkdir()
+    (tmp_path / "enp3s0" / "carrier").write_text("0\n")
+    assert np_.carrier("eno1", root=str(tmp_path)) is True
+    assert np_.carrier("enp3s0", root=str(tmp_path)) is False
+    assert np_.carrier("nope", root=str(tmp_path)) is None              # 读不到 = 不知道
+
+
+@pytest.mark.parametrize("link", [False, None])
+def test_dhcp_probe_without_carrier_is_unknown_and_sends_nothing(monkeypatch, link):
+    monkeypatch.setattr(np_.socket, "socket", lambda *a: pytest.fail("没插线不该开 socket"))
+    res = np_.dhcp_probe("eno1", carrier=lambda iface: link)
+    assert res == [] and not res and res.unknown and res.carrier is link
+    assert isinstance(res, list)                                         # 形状兼容: 还是 list
+
+
+class _FakeSock:
+    def __init__(self, replies):
+        self.replies, self.sent, self.closed = list(replies), [], False
+
+    def setsockopt(self, *a):
+        pass
+
+    def bind(self, addr):
+        pass
+
+    def sendto(self, data, addr):
+        self.sent.append(data)
+
+    def recv(self, n):
+        return self.replies.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def test_dhcp_probe_with_carrier_collects_offers(monkeypatch):
+    fake = {}
+
+    def make(*a):
+        xid = 0x11223344
+        fake["s"] = _FakeSock([_offer(xid)])
+        return fake["s"]
+    monkeypatch.setattr(np_.socket, "socket", make)
+    monkeypatch.setattr(np_.os, "urandom", lambda n: b"\x11\x22\x33\x44")
+    monkeypatch.setattr(np_, "iface_mac", lambda iface: MAC)
+    calls = iter([True, False])
+    monkeypatch.setattr(np_.select, "select", lambda r, w, x, t: (r if next(calls) else [], [], []))
+    res = np_.dhcp_probe("eno1", timeout=1, carrier=lambda iface: True)
+    assert res == [{"server": "192.0.2.1", "yiaddr": "192.0.2.99"}]
+    assert not res.unknown and res.carrier is True and fake["s"].closed
