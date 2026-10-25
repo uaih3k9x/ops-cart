@@ -889,3 +889,12 @@ def test_parse_args_defaults_point_at_cart_state_files():
     from pxeserver import GUARD_STATE, PXE_MODE, parse_args
     a = parse_args(["serve", "--ip", "192.0.2.1", "--pool", "192.0.2.10,192.0.2.20", "--tftp-root", "/x"])
     assert (a.prefix, a.pxe_mode, a.guard_state, a.iface) == (24, PXE_MODE, GUARD_STATE, None)
+
+
+def test_tmpfiles_log_dir_readable_by_wheel_and_run_dir_exists():
+    import pathlib
+    t = (pathlib.Path(__file__).resolve().parent.parent / "deploy" / "tmpfiles.d" / "ops-cart.conf").read_text()
+    rows = {l.split()[1]: l.split() for l in t.splitlines() if l.strip() and not l.startswith("#")}
+    for d in ("/var/log/ops-cart", "/var/log/ops-cart/reports"):
+        assert rows[d][2:5] == ["0750", "root", "wheel"], rows[d]
+    assert rows["/run/ops-cart"][0] == "d"                  # pxe-guard.json / pin-gate.json 放这
