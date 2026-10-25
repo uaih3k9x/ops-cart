@@ -56,27 +56,46 @@ def run(cmd, timeout=5):
 
 # ---------------------------------------------------------------- 状态
 
-def services_status(names=("pxe-server", "pxe-http-repo", "pxe-http-boot")):
-    """{服务名: (enabled, active)}"""
+def parse_systemctl_show(text, names):
+    """`systemctl show -p Id,ActiveState,UnitFileState a b c` 的输出 -> {名字: (enabled, active)}.
+    每个单元一段, 段间空行; 段内属性顺序不定. 先按 Id 认, 认不出再按段的顺序. 缺的给 (False, False)."""
+    blocks = []
+    for chunk in text.split("\n\n"):
+        kv = dict(line.split("=", 1) for line in chunk.splitlines() if "=" in line)
+        if kv:
+            blocks.append(kv)
+    by_id = {b.get("Id", ""): b for b in blocks}
     out = {}
-    for n in names:
-        _, en = run(["systemctl", "is-enabled", n])
-        _, ac = run(["systemctl", "is-active", n])
-        out[n] = (en.strip() == "enabled", ac.strip() == "active")
+    for i, n in enumerate(names):
+        b = by_id.get(n) or by_id.get(n + ".service")
+        if b is None and len(blocks) == len(names) and not blocks[i].get("Id"):
+            b = blocks[i]
+        b = b or {}
+        out[n] = (b.get("UnitFileState") == "enabled", b.get("ActiveState") == "active")
     return out
 
 
-def nics_status():
-    """[{name, con, ip, method, link}] 只看两个业务口."""
+def services_status(names=("pxe-server", "pxe-http-repo", "pxe-http-boot")):
+    """{服务名: (enabled, active)}; 一次 systemctl show 查全部."""
+    names = list(names)
+    _, out = run(["systemctl", "show", "-p", "Id,ActiveState,UnitFileState"] + names)
+    return parse_systemctl_show(out, names)
+
+
+SYS_NET = "/sys/class/net"
+
+
+def nics_status(sysfs=SYS_NET):
+    """[{name, con, ip, method, link}] 只看两个业务口. carrier 直接读 sysfs, 读不到 = 没插线."""
     result = []
     for con, name, role in ((LAN1_CON, "eno1", "PXE 装机口"),
                             (LAN2_CON, "enp3s0", "管理口")):
         _, ip = run(["ip", "-4", "-br", "addr", "show", name])
         ip = ip.split()[-1] if ip else "-"
         _, method = run(["nmcli", "-g", "ipv4.method", "con", "show", con])
-        _, link = run(["cat", f"/sys/class/net/{name}/carrier"])
+        link = _read(f"{sysfs}/{name}/carrier") == "1"
         result.append({"name": name, "con": con, "role": role, "ip": ip,
-                       "method": method or "-", "link": link.strip() == "1"})
+                       "method": method or "-", "link": link})
     return result
 
 
@@ -94,11 +113,28 @@ def ch9329_port(pattern=CH9329_BY_ID, fallback="/dev/ttyACM0"):
     return hits[0] if hits else fallback
 
 
+PROC_UPTIME = "/proc/uptime"
+
+
+def uptime_text(seconds):
+    """秒 -> 和 `uptime -p` 一样的说法: "up 1 day, 2 hours, 5 minutes"."""
+    m = int(seconds) // 60
+    d, h, m = m // 1440, m // 60 % 24, m % 60
+
+    def unit(n, word):
+        return f"{n} {word}" + ("" if n == 1 else "s")
+    parts = ([unit(d, "day")] if d else []) + ([unit(h, "hour")] if d or h else []) + [unit(m, "minute")]
+    return "up " + ", ".join(parts)
+
+
 def misc_status():
     _, ts_ip = run(["tailscale", "ip", "-4"])
     ch = os.path.exists(ch9329_port())
-    _, up = run(["uptime", "-p"])
-    return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up or "-"}
+    try:
+        up = uptime_text(float((_read(PROC_UPTIME) or "").split()[0]))
+    except (ValueError, IndexError):
+        up = "-"
+    return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up}
 
 
 # ---------------------------------------------------------------- 顶栏网络标
@@ -378,19 +414,35 @@ def selftest_plan_read(path=SELFTEST_PLAN):
         return DEFAULT_PLAN
 
 
+def _selftest_fail(detail, label="SELFTEST", check="selftest"):
+    return {"label": label, "state": "FAIL", "detail": detail, "check": check}
+
+
 def selftest_run(plan, ctx, checks=CHECKS):
-    """按计划逐项跑; 单项抛异常只把那一行标 FAIL, 不拖垮整页."""
+    """按计划逐项跑; 单项抛异常只把那一行标 FAIL, 不拖垮整页. 永不抛异常.
+    ctx 可以是快照, 也可以是采集函数 (采集出错 -> 一行 SELFTEST / FAIL)."""
+    if callable(ctx):
+        try:
+            ctx = ctx()
+        except Exception:       # noqa: BLE001
+            return [_selftest_fail("CONTEXT ERROR")]
+    if not isinstance(plan, list):
+        return [_selftest_fail("BAD PLAN")]
     rows = []
     for item in plan:
-        params = {k: v for k, v in item.items() if k not in ("check", "label")}
-        label = item.get("label", item.get("check", "?").upper())
-        fn = checks.get(item.get("check"))
+        try:
+            params = {k: v for k, v in item.items() if k not in ("check", "label")}
+            label = str(item.get("label", str(item.get("check", "?")).upper()))
+            fn = checks.get(item.get("check"))
+        except Exception:       # noqa: BLE001  计划里混进了不是对象的东西
+            rows.append(_selftest_fail("BAD ITEM", check=None))
+            continue
         if fn is None:
             state, detail = "FAIL", "UNKNOWN CHECK"
         else:
             try:
                 state, detail = fn(ctx, **params)
-            except Exception:
+            except Exception:   # noqa: BLE001
                 state, detail = "FAIL", "ERROR"
         rows.append({"label": label, "state": state, "detail": detail, "check": item.get("check")})
     return rows
@@ -408,10 +460,18 @@ def pci_devices(vid, did, root="/sys/bus/pci/devices"):
     return out
 
 
+def _safe(fn, default):
+    try:
+        return fn()
+    except Exception:           # noqa: BLE001  一样采不到不拖垮整个自检
+        return default
+
+
 def selftest_context():
-    """真机快照. SMART 要 sudo 且慢, 自检不读."""
-    return {"nics": nics_status(), "misc": misc_status(), "svcs": services_status(),
-            "temps": temps_status(smart=lambda: None), "fans": fans_status(),
+    """真机快照. SMART 要 sudo 且慢, 自检不读. 每一样都兜住, 本函数不抛."""
+    return {"nics": _safe(nics_status, []), "misc": _safe(misc_status, {}),
+            "svcs": _safe(services_status, {}),
+            "temps": _safe(lambda: temps_status(smart=lambda: None), []), "fans": _safe(fans_status, []),
             "exists": os.path.exists, "pci": pci_devices,
             "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0,
             "videos": video_nodes, "signal": lambda dev: video_signal(dev), "wifi": wifi_status}
