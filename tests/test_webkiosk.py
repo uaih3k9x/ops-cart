@@ -24,7 +24,7 @@ def make_app(tmp_path, pin="2468", lan_open=False, bound=True):
                             "fans": [], "version": "Ver test"}[k]) for k in wc.STATUS_KEYS}
     app = webkiosk.App(conf_path=conf, pin_path=pin_path, status_src=src,
                        selftest=lambda: [{"label": "LAN2", "state": "OK", "detail": "x"}],
-                       static_dir=tmp_path, pxe_env=env)
+                       static_dir=tmp_path, pxe_env=env, audit_log=str(tmp_path / "audit.log"))
     # 画面源 / 键鼠绑定: 一块采集卡 video0 绑在一块在线的 CH9329 上; video1 是没绑的摄像头
     app.video_nodes = lambda: [{"dev": "/dev/video0", "name": "SC0710 PCI", "key": "0000:02:00.0",
                                 "friendly": "SC0710 卡1"},
@@ -828,3 +828,40 @@ def test_web_page_mouse_defaults_to_absolute():
 
 def test_web_page_reports_type_result():
     assert "r.skipped" in _page()
+
+
+# ------------------------------------------------------------ 部署单元: 专用用户 + 加固
+
+def test_webkiosk_unit_runs_as_dedicated_user():
+    import pathlib
+    u = (pathlib.Path(webkiosk.__file__).parent / "deploy" / "systemd" / "webkiosk.service").read_text()
+    body = [l.strip() for l in u.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    assert "User=ops-web" in body and "Group=ops-web" in body
+    assert "SupplementaryGroups=dialout video" in body
+    # 读 root 0600 的 PIN 和 conbroker 状态只给读权限的能力, 别的都不给
+    assert "AmbientCapabilities=CAP_DAC_READ_SEARCH" in body
+    assert "CapabilityBoundingSet=CAP_DAC_READ_SEARCH" in body
+    assert "ReadWritePaths=/opt/pxe/web.conf" in body               # 只开放要写的那一个文件
+    assert "LogsDirectory=ops-cart-web" in body
+    assert "Environment=OPS_CART_WEB_LOG=/var/log/ops-cart-web/audit.log" in body
+    for k in ("NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateTmp=yes", "ProtectHome=read-only",
+              "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"):
+        assert k in body, k
+
+
+def test_audit_log_path_from_env(monkeypatch):
+    monkeypatch.delenv("OPS_CART_WEB_LOG", raising=False)
+    import cartlog
+    assert webkiosk.audit_path() == cartlog.EVENTS
+    monkeypatch.setenv("OPS_CART_WEB_LOG", "/var/log/ops-cart-web/audit.log")
+    assert webkiosk.audit_path() == "/var/log/ops-cart-web/audit.log"
+
+
+def test_audit_written_to_file_or_stderr(tmp_path, capsys):
+    app = make_app(tmp_path)
+    call(app, "POST", "/api/login", TAIL, {"pin": "0000"})
+    assert "act=login" in (tmp_path / "audit.log").read_text()
+    (tmp_path / "file").write_text("")
+    app.audit_log = str(tmp_path / "file" / "audit.log")          # 写不进去: 退到 stderr (journald)
+    call(app, "POST", "/api/login", TAIL, {"pin": "0000"})
+    assert "act=login" in capsys.readouterr().err

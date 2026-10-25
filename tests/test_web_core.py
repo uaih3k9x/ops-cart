@@ -354,3 +354,15 @@ def test_parse_hid_events_abs():
     assert out == [{"t": "a", "x": 2048, "y": 2048, "inside": True, "b": 1, "w": 1}]
     with pytest.raises(ValueError):
         wc.parse_hid_events({"events": [{"t": "a", "x": "1", "y": 0, "vw": 1, "vh": 1}]})
+
+
+def test_web_conf_set_falls_back_to_in_place_write(tmp_path, monkeypatch):
+    """专用用户只能写 web.conf 这一个文件 (目录只读, 改名换不了): 退回原地写."""
+    p = tmp_path / "web.conf"
+    p.write_text('{"lan_open": false, "port": 8088}')
+
+    def ro(*a, **k):
+        raise PermissionError(13, "read-only dir")
+    monkeypatch.setattr(wc.atomicfile, "write_json", ro)
+    wc.web_conf_set(p, lan_open=True)
+    assert wc.web_conf_read(p)["lan_open"] is True and wc.web_conf_read(p)["port"] == 8088

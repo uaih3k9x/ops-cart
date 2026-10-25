@@ -59,20 +59,26 @@ def _real_ch_open(path):
         return None
 
 
+def audit_path():
+    """审计日志写哪: 专用用户跑时单元用 OPS_CART_WEB_LOG 指到自己的日志目录."""
+    return os.environ.get("OPS_CART_WEB_LOG") or cartlog.EVENTS
+
+
 def _real_serial_dir():
     return sp.data_dir(sp.serial_conf_read())
 
 
 class App:
     def __init__(self, conf_path=wc.WEB_CONF, pin_path=None, status_src=None,
-                 selftest=None, static_dir=STATIC_DIR, pxe_env=kc.PXE_ENV):
+                 selftest=None, static_dir=STATIC_DIR, pxe_env=kc.PXE_ENV, audit_log=None):
         self.conf_path, self.static_dir, self.pxe_env = conf_path, str(static_dir), pxe_env
         self.pin_path = pin_path or kc.KIOSK_CONF
         self.status_src = status_src or wc.default_status_sources()
         self.selftest = selftest or (lambda: kc.selftest_run(kc.selftest_plan_read(),
                                                              kc.selftest_context()))
         self.sessions = wc.Sessions()
-        self.audit = lambda kind, msg: cartlog.event(kind, msg)
+        self.audit_log = audit_log or audit_path()
+        self.audit = self._audit_write
         self._state_lock = threading.Lock()
         self._pin_tag, self._gates = None, {}
         # 键鼠
@@ -139,6 +145,10 @@ class App:
 
     def stream_ok(self, ip, tok, local_ip=None):
         return self.source_reason(ip, local_ip) is None and self._session_ok(tok)
+
+    def _audit_write(self, kind, msg):
+        if not cartlog.event(kind, msg, path=self.audit_log):      # 写不进去也别丢: 给 journald
+            print(f"webkiosk audit [{kind}] {msg}", file=sys.stderr, flush=True)
 
     def log(self, act, ip, tok=None, **kv):
         """审计一行; 日志坏了不影响服务."""

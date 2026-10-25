@@ -5,18 +5,42 @@ Wants=network-online.target
 # 不依赖 kiosk.service: 车机界面崩了, 网页口照样能进来看
 
 [Service]
+# 专用用户, 不用 root. 部署前 (一次):
+#   useradd -r -s /sbin/nologin ops-web
+#   install -o ops-web -g ops-web -m 0600 /dev/null /opt/pxe/web.conf   (已有就只 chown/chmod)
+# 权限从哪来:
+#   CH9329 串口 = dialout 组, 采集卡 = video 组;
+#   root 0600 的 PIN 文件和 conbroker 的状态/日志只读不写 = CAP_DAC_READ_SEARCH (只读能力, 不能写别人的文件);
+#   局域网开关写 /opt/pxe/web.conf 这一个文件 (目录只读, web_core 会原地写);
+#   审计日志写 /var/log/ops-cart-web/audit.log (systemd 建目录), 写不进去时进 journald.
+User=ops-web
+Group=ops-web
+SupplementaryGroups=dialout video
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 WorkingDirectory=/opt/pxe
 ExecStart=/usr/bin/python3 /opt/pxe/webkiosk.py
-# 要读 root 0600 的 PIN、开 CH9329 和采集卡、写 /opt/pxe/web.conf, 所以是 root; 用沙箱收紧
+Environment=OPS_CART_WEB_LOG=/var/log/ops-cart-web/audit.log
+LogsDirectory=ops-cart-web
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/opt/pxe
+ReadWritePaths=/opt/pxe/web.conf
 ProtectHome=read-only
+InaccessiblePaths=-/etc/shadow -/etc/gshadow -/root
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
 RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
 Restart=on-failure
 RestartSec=5
 

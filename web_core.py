@@ -151,12 +151,21 @@ def web_conf_read(path=WEB_CONF):
 
 
 def web_conf_set(path=WEB_CONF, **kv):
+    """先试原子写 (写临时文件再改名); 专用用户跑时目录只读、只有这个文件可写, 退回原地写.
+    原地写断电写坏了也不怕: 读不出来就按默认 (局域网关) 处理."""
     try:
         cfg = json.load(open(path))
     except (OSError, ValueError):
         cfg = {}
     cfg.update(kv)
-    atomicfile.write_json(path, cfg)
+    try:
+        atomicfile.write_json(path, cfg)
+    except OSError:
+        with open(path, "r+", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, ensure_ascii=False))
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
 
 
 # ------------------------------------------------------------ 会话
