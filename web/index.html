@@ -168,6 +168,12 @@ function card(title, rows) {
     `<div class="row"><span>${esc(l)}</span><span class="${cls || ""}">${esc(r)}</span></div>`).join("")}</div>`;
 }
 let selftest = null;
+// 绑了但一块都不在线 (板子拔了) 和从没绑过要分得开
+function kvmRow(k) {
+  const online = (k && k.online) || 0, bound = (k && k.bound) || 0;
+  if (!online && !bound) return ["CH9329 键鼠", "未连接", "bad"];
+  return ["CH9329 键鼠", `${online} 块在线 / ${bound} 个画面源已绑定`, online ? "ok" : "bad"];
+}
 async function refresh() {
   const s = await api("/api/status");
   $("#ver").textContent = s.version;
@@ -175,7 +181,7 @@ async function refresh() {
   const cards = [
     card("服务", s.services.map((x) => [x.name, (x.active ? "正常" : "停止") + (x.enabled ? "" : " (未自启)"), x.active ? "ok" : "bad"])),
     card("网卡", s.nics.flatMap((n) => [[`${n.role} ${n.name}`, n.link ? "已插线" : "未插线", n.link ? "ok" : "dim"], ["", `${n.ip} ${n.method}`, "dim"]])),
-    card("连接", [["tailscale", m.tailscale_ip || "-"], ["CH9329 键鼠", (m.kvm && m.kvm.online) ? `${m.kvm.online} 块在线 / ${m.kvm.bound} 个画面源已绑定` : "未连接", (m.kvm && m.kvm.online) ? "ok" : "bad"], ["", m.uptime || "", "dim"]]),
+    card("连接", [["tailscale", m.tailscale_ip || "-"], kvmRow(m.kvm), ["", m.uptime || "", "dim"]]),
     card("温度 / 风扇", s.temps.map((t) => [t.name, `${t.c.toFixed(0)}°C`, t.level]).concat(
       s.fans.map((f) => [f.name, `${f.rpm} RPM`, f.rpm ? "ok" : "hot"]))),
   ];
@@ -203,12 +209,21 @@ const mode = () => $("#mmode").value;
 const hint = () => mode() === "abs" ? "单击画面开始键鼠透传 · 点画面外或「释放键鼠」结束 (Esc 会发给目标机)"
                                     : "单击画面进入键鼠透传 · Esc 释放";
 function stopVideo() { if ($("#vimg").getAttribute("src")) { $("#vimg").removeAttribute("src"); } }
-$("#vimg").onerror = () => { if ($("#vimg").getAttribute("src")) $("#hint").textContent = "画面打不开 (设备忙或没有信号)"; };
-$("#vimg").onload = () => { if (!capturing()) $("#hint").textContent = hint(); };
+// 后端打不开会回 503 (onerror); 设备开着却一直不出帧时靠这个超时兜底
+const VIDEO_OPEN_TIMEOUT_MS = 10000;
+let videoWait = null;
+function videoFailed() {
+  clearTimeout(videoWait);
+  if ($("#vimg").getAttribute("src")) $("#hint").textContent = "画面打不开 (设备忙或没有信号)";
+}
+$("#vimg").onerror = videoFailed;
+$("#vimg").onload = () => { clearTimeout(videoWait); if (!capturing()) $("#hint").textContent = hint(); };
 $("#v-go").onclick = () => {
   const d = $("#vdev").value;
   if (!d) return;
   $("#hint").textContent = "正在打开画面…";
+  clearTimeout(videoWait);
+  videoWait = setTimeout(() => { videoFailed(); stopVideo(); }, VIDEO_OPEN_TIMEOUT_MS);
   $("#vimg").src = `/api/video?dev=${encodeURIComponent(d)}&fps=${$("#fps").value}&t=${Date.now()}`;
 };
 $("#fs").onclick = async () => {

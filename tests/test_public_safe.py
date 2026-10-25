@@ -20,7 +20,7 @@ def kinds(text, **kw):
 
 # ------------------------------------------------------------ IPv4
 
-@pytest.mark.parametrize("ip", ["8.8.4.4", "100.100.100.7", "100.127.1.1"])
+@pytest.mark.parametrize("ip", ["8.8.4.4", "100.100.100.100", "100.127.1.1"])  # public-safe-ignore
 def test_public_and_cgnat_ipv4_flagged(ip):
     assert kinds(f"addr {ip} here") == ["ipv4"]
 
@@ -47,13 +47,13 @@ def test_inline_ignore_marker():
 # ------------------------------------------------------------ IPv6 / MAC / 路径
 
 def test_global_ipv6_flagged_doc_prefix_passes():
-    assert kinds("2001:250:1:2::1/64") == ["ipv6"]
+    assert kinds("2001:250:1:2::1/64") == ["ipv6"]  # public-safe-ignore
     assert kinds("2001:db8::1/64 fe80::1 ::1 fd00::1") == []
 
 
 def test_universal_mac_flagged_local_mac_passes():
-    assert kinds("mac 00:1b:21:aa:bb:cc") == ["mac"]
-    assert kinds("grub.cfg-01-00-1b-21-aa-bb-cc") == ["mac"]
+    assert kinds("mac 00:1b:21:aa:bb:cc") == ["mac"]  # public-safe-ignore
+    assert kinds("grub.cfg-01-00-1b-21-aa-bb-cc") == ["mac"]  # public-safe-ignore
     assert kinds("02:00:00:00:00:01 ff:ff:ff:ff:ff:ff 00:00:00:00:00:00") == []
 
 
@@ -62,8 +62,8 @@ def test_time_is_not_mac():
 
 
 def test_home_paths():
-    assert kinds("/Users/alice/code/x") == ["path"]
-    assert kinds("/home/alice/conbroker") == ["path"]
+    assert kinds("/Users/alice/code/x") == ["path"]  # public-safe-ignore
+    assert kinds("/home/alice/conbroker") == ["path"]  # public-safe-ignore
     assert kinds("/home/ops/conbroker /home/<user>/x") == []
 
 
@@ -83,31 +83,31 @@ def test_local_list_parsing(tmp_path):
 
 
 def test_scan_text_reports_line_numbers_and_every_hit():
-    text = "ok 192.0.2.1\nbad 8.8.4.4 and 00:1b:21:aa:bb:cc\n/home/alice/x"
-    assert cps.scan_text(text) == [(2, "ipv4", "8.8.4.4"), (2, "mac", "00:1b:21:aa:bb:cc"),
-                                   (3, "path", "/home/alice")]
+    text = "ok 192.0.2.1\nbad 8.8.4.4 and 00:1b:21:aa:bb:cc\n/home/alice/x"  # public-safe-ignore
+    assert cps.scan_text(text) == [(2, "ipv4", "8.8.4.4"), (2, "mac", "00:1b:21:aa:bb:cc"),  # public-safe-ignore
+                                   (3, "path", "/home/alice")]  # public-safe-ignore
 
 
 def test_inline_ignore_only_covers_its_own_line():
     text = "a 8.8.4.4  # public-safe-ignore\nb 8.8.4.4"
-    assert cps.scan_text(text) == [(2, "ipv4", "8.8.4.4")]
+    assert cps.scan_text(text) == [(2, "ipv4", "8.8.4.4")]  # public-safe-ignore
 
 
 def test_deny_words_from_local_file_drive_scan(tmp_path):
     p = tmp_path / ".public-safe.local"
-    p.write_text("# 现场 SSID 和私网段\nSomeNet\nre:\\b192\\.168\\.77\\.\n")
+    p.write_text("# 现场 SSID 和私网段\nSomeNet\nre:\\b192\\.168\\.200\\.\n")
     words = cps.load_local(str(p))
-    assert kinds("ssid somenet / gw 192.168.200.1 / 192.168.7.1", deny_words=words) == ["word", "word"]
+    assert kinds("ssid somenet / gw 192.168.200.1 / 192.168.20.1", deny_words=words) == ["word", "word"]
 
 
 def test_scan_repo_checks_file_names_and_skips_vendor(tmp_path):
-    (tmp_path / "grub.cfg-01-00-1b-21-aa-bb-cc").write_text("menuentry")
+    (tmp_path / "grub.cfg-01-00-1b-21-aa-bb-cc").write_text("menuentry")  # public-safe-ignore
     (tmp_path / "web").mkdir()
     (tmp_path / "web" / "vendor").mkdir()
-    (tmp_path / "web" / "vendor" / "lib.js").write_text("8.8.4.4")
-    (tmp_path / "bin").write_bytes(b"\xff\xfe\x00 8.8.4.4")
-    found = cps.scan_repo(str(tmp_path), ["grub.cfg-01-00-1b-21-aa-bb-cc", "web/vendor/lib.js", "bin"])
-    assert found == [("grub.cfg-01-00-1b-21-aa-bb-cc", 0, "mac", "00-1b-21-aa-bb-cc")]
+    (tmp_path / "web" / "vendor" / "lib.js").write_text("8.8.4.4")  # public-safe-ignore
+    (tmp_path / "bin").write_bytes(b"\xff\xfe\x00 8.8.4.4")  # public-safe-ignore
+    found = cps.scan_repo(str(tmp_path), ["grub.cfg-01-00-1b-21-aa-bb-cc", "web/vendor/lib.js", "bin"])  # public-safe-ignore
+    assert found == [("grub.cfg-01-00-1b-21-aa-bb-cc", 0, "mac", "00-1b-21-aa-bb-cc")]  # public-safe-ignore
 
 
 # ------------------------------------------------------------ 整个仓库
@@ -127,3 +127,8 @@ def test_repo_has_no_findings():
         pytest.skip("不是 git 工作区")
     found = cps.scan_repo(_HERE, files, cps.load_local(os.path.join(_HERE, ".public-safe.local")))
     assert found == [], "\n".join(f"{f}:{n}: {k} {s}" for f, n, k, s in found)
+
+
+def test_sample_file_itself_is_scanned():
+    """样例文件不整份豁免: 反例逐行标 public-safe-ignore, 其余行照扫 (免得真值混进样例没人发现)."""
+    assert not any("test_public_safe" in p for p in cps.SKIP_PREFIXES)

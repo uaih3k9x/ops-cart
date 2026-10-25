@@ -16,12 +16,12 @@ sudo 和 tee 会抢 stdin，文件可能被写成空的。
 | pxeserver 租约 | 租约表：ACK 给 3600 秒，没人 REQUEST 的 OFFER 留 60 秒，到期回收；不是自己的租约不回，只在客户端选了自己时才 NAK；处理 RELEASE / DECLINE（DECLINE 的地址隔离 600 秒）；修了 xid 读错位置的 bug | 无需操作 |
 | pxeserver 守卫 | 启动时和 eno1 从没插线变成插线时主动探测一次别人的 DHCP，平时被动监听 UDP/68；发现别人就停止应答、写 cartlog、以退出码 3 退出且**不再自动拉起**（单元 `RestartPreventExitStatus=2 3 4`）。只有 eno1 的**主地址**等于 `PXE_IP` 才回包。状态写 `/run/ops-cart/pxe-guard.json` | 依赖 `cartlog.py`、`netprof_core.py` 和 pxeserver.py 放在同一目录（`*.py` 一起拷就满足）；第 1 步先确认主地址 |
 | TFTP | 块号 16 位回绕、按块读文件（大镜像不再整个读进内存）、blksize 限 8..65464、畸形请求回 ERROR；工作线程死了进程以退出码 1 退出交给 systemd 拉起 | 无需操作 |
-| 装机两头核对 | TFTP 只在装机模式已解锁、没过期、文件名对得上解锁的 MAC 时才发带 `inst.ks=` 的菜单，否则发救援菜单；HTTP 只在请求头 `X-RHN-Provisioning-MAC` 含解锁的 MAC 时才给 ks 和装机菜单，否则 403；`*.bak*` 一律 404。装机菜单加了 `inst.ks.sendmac` | kiosk 重启时 `pxe_disarm` 会清掉旧菜单，之后解锁生成的都带 sendmac。**Windows 脚本和手工放的自动装机菜单从此装不了机**（故意的） |
+| 装机两头核对 | TFTP 只在装机模式已解锁、没过期、文件名对得上解锁的 MAC 时才发带 `inst.ks=` 的菜单，否则发救援菜单；HTTP 只在请求头 `X-RHN-Provisioning-MAC` 含解锁的 MAC 时才给 ks 和装机菜单，否则 403；`*.bak*` 一律 404。装机菜单加了 `inst.ks.sendmac`。MAC 头和 TFTP 文件名都是客户端自报的，这是防误装的核对，不是访问控制，边界仍是「LAN1 只接一台被测机」 | kiosk 重启时 `pxe_disarm` 会清掉旧菜单，之后解锁生成的都带 sendmac。**Windows 脚本和手工放的自动装机菜单从此装不了机**（故意的） |
 | 菜单模板 | grub 菜单模板只在 `pxeserver.grub_menu` 一处；`setup-cart.sh` 改调 `kiosk_core.py --write-rescue`，并删掉 `EFI/BOOT/grub.cfg` | 以后重铺 tftp 树也只会有救援菜单 |
 | 装机菜单 | `pxe_disarm`（kiosk 启动时会调）删掉 tftp 树里所有带 `inst.ks=` 的 `grub.cfg` / `grub.cfg-*`，包括 `EFI/BOOT/grub.cfg`；`grub.cfg.bak-*` 这类手工备份不动 | 推车上现在 `EFI/BOOT/grub.cfg` 是自动装机菜单，kiosk 重启后会被删掉（第 2 步先备份） |
 | 校园网认证 | 单元改名 `campus-auth.service/.timer`，配置 `/etc/ops-cart/campus-auth.json`，状态 `/run/ops-cart/campus-auth-status.json`；代码里不再有默认 SSID，**配置里没写 `ssid` 就不认证** | 迁移配置、换单元（第 4、6 步） |
 | 串口留言 | 留言署名从 `serial.conf` 的 `chat_name` 读，默认 `operator` | 想保留原署名就在 serial.conf 里加上（第 5 步） |
-| 网页管理口 | 第一次部署到推车。会话绑定 PIN、关局域网开关时断开局域网会话和长连接、输错锁定按来源 IP 分开（局域网指数退避）、装机口网段来源一律拒绝、键鼠按画面源绑定走、畸形请求回 400、HTTP/1.1。Host 只认 IP 字面量、localhost、本机名和 `web.conf` 的 `hosts`；POST 必须同源，否则 403（在读请求体之前）。打字分块发送并返回发了几个、跳过哪些；鼠标默认绝对坐标；串口不再连上就发回车（改为「唤醒」按钮），多个标签页各自一条连接。审计日志写 `/var/log/ops-cart-web/audit.log`（PIN、令牌、打字内容不记）。`webkiosk.service` 以专用用户 `ops-web` 跑（`dialout`、`video` 组 + 只读能力 `CAP_DAC_READ_SEARCH`，只能写 `/opt/pxe/web.conf`） | 拷文件但默认不启用；要启用得先建用户、预建 `web.conf`（第 7 步）；用 MagicDNS 名字访问要把名字写进 `web.conf` 的 `hosts` |
+| 网页管理口 | 第一次部署到推车。会话绑定 PIN、关局域网开关时断开局域网会话和长连接、输错锁定按来源 IP 分开（局域网指数退避）、装机口网段来源一律拒绝、键鼠按画面源绑定走、畸形请求回 400、HTTP/1.1。Host 只认 IP 字面量、localhost、本机名和 `web.conf` 的 `hosts`；POST 必须同源，否则 403（在读请求体之前）。打字分块发送并返回发了几个、跳过哪些；鼠标默认绝对坐标；串口不再连上就发回车（改为「唤醒」按钮），多个标签页各自一条连接。审计日志写 `/var/log/ops-cart-web/audit.log`（PIN、令牌、打字内容不记），PIN 输错进入冷却也记在这里。键鼠空闲 3 秒或退出登录就放掉 CH9329（它是独占打开的），车机那头随后能接手。输错闸门表满了只清没输错过的，清不出来新来源共用一个闸门，换源地址重置不了冷却。ffmpeg 打不开采集卡时回 503，页面提示「画面打不开」，一直不出帧 10 秒后也提示。PIN 文件读不到时局域网的拒绝原因写「读不到」而不是「未设」。`webkiosk.service` 以专用用户 `ops-web` 跑（`dialout`、`video` 组 + 只读能力 `CAP_DAC_READ_SEARCH`，只能写 `/opt/pxe/web.conf`；地址族放行 `AF_UNIX AF_INET AF_INET6 AF_NETLINK`，`ip` 命令要 netlink） | 拷文件但默认不启用；要启用得先建用户、预建 `web.conf`（第 7 步）；用 MagicDNS 名字访问要把名字写进 `web.conf` 的 `hosts` |
 | PinGate | 加锁；冷却从 60 秒起逐次翻倍、封顶 15 分钟，进入冷却写 cartlog；车机的输错计数落 `/run/ops-cart/pin-gate.json`，重启 kiosk 不清零（重启推车清零） | 需要 tmpfiles 建好 `/run/ops-cart`（第 6 步） |
 | 车机界面 | 外部命令、开关装机服务、关机重启都放到后台线程，结果经队列回主线程；左侧面板改成状态机（同时只开一个）；开机自检加 30 秒看门狗，出错变成一行 SELFTEST FAIL；退出时只上锁一次装机模式；小键盘数字不再依赖 NumLock；界面文案去掉了符号字符 | 无需操作 |
 | 键鼠 | CH9329 独占打开（双开第二个报"键鼠被占用"），拔线只报一次；车机侧发送移到工作线程，相对位移每帧拆到 ±127 以内；win/super 改成修饰键，补了 F13-F24 等键名；有打不出的字时整串不发 | 无需操作 |
@@ -163,6 +163,8 @@ sudo systemctl enable --now campus-auth.timer
 sudo systemctl restart pxe-http-boot pxe-http-repo
 sudo systemctl restart pxe-server
 sudo systemctl restart kiosk
+# 网页口 (第 7 步启用过的话) 最后重启; 它不依赖 kiosk, 但要等新的 *.py 和 web/ 都到位
+systemctl is-enabled webkiosk 2>/dev/null && sudo systemctl restart webkiosk
 ```
 
 `pxe-server` 是否继续开机自启、`Lan1-pxe` 是否自动连接，部署时由维护者决定，本版不改。
@@ -180,8 +182,17 @@ journalctl -u webkiosk -n 20 --no-pager           # 看有没有权限报错
 ```
 
 以 `ops-web` 跑时没在推车上验证过的几处，启用后顺手看一眼：PIN 文件能读（登录正常）、
-conbroker 的状态和日志能读（网页串口列表不空）、`/var/log/ops-cart-web/audit.log` 有新行。
-网页口里 PIN 输错进入冷却时的 cartlog 事件写不进 `/var/log/ops-cart`（ops-web 没权限），只会少这一条，不影响校验。
+conbroker 的状态和日志能读（网页串口列表不空）、`/var/log/ops-cart-web/audit.log` 有新行、
+状态页「网卡」卡片显示了 IP（单元的地址族过滤会传给 `ip` 子进程，少了 netlink 这里会全是 `-`）。
+建好用户以后、enable 之前，也可以在推车上单独模拟一遍单元里的过滤：
+
+```bash
+sudo systemd-run --pipe --wait -p User=ops-web -p NoNewPrivileges=yes \
+  -p RestrictAddressFamilies='AF_UNIX AF_INET AF_INET6 AF_NETLINK' ip -4 -br addr show eno1
+# 能打印出地址 = 网卡卡片能出 IP; 去掉 AF_NETLINK 再跑一次应当报 Address family not supported
+```
+
+网页口的 PIN 冷却事件写到网页审计日志（`[pin] ... src=<来源>`），不进 `/var/log/ops-cart/events.log`。
 
 局域网访问默认关闭，只在 tailnet 和本机可用；推车没设 PIN 时局域网永远拒绝。
 
@@ -224,6 +235,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example' http://<推车 
 ```
 
 从 LAN1 上的被测机访问 8088 应当返回 403「装机口 (LAN1) 不提供管理访问」。
+
+键鼠交接：网页上对绑了键鼠的画面源按一个键，停手 3 秒以上，再到车机上单击画面进入透传，应当能接手
+（不会弹「CH9329 打不开」）。反过来车机透传时网页按键会提示被占用，车机退出透传后网页再按就好。
+
+画面打不开：车机正在本地预览同一块采集卡时，网页「打开画面」应当很快提示「画面打不开 (设备忙或没有信号)」，
+不会一直停在「正在打开画面…」。
 画面源没绑键鼠时，网页上的画面源会标「未绑键鼠, 只看」，键鼠操作提示原因。
 
 ## 9. 回滚

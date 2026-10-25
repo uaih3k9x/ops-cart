@@ -844,9 +844,21 @@ def test_webkiosk_unit_runs_as_dedicated_user():
     assert "ReadWritePaths=/opt/pxe/web.conf" in body               # 只开放要写的那一个文件
     assert "LogsDirectory=ops-cart-web" in body
     assert "Environment=OPS_CART_WEB_LOG=/var/log/ops-cart-web/audit.log" in body
-    for k in ("NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateTmp=yes", "ProtectHome=read-only",
-              "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"):
+    for k in ("NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateTmp=yes", "ProtectHome=read-only"):
         assert k in body, k
+
+
+def test_webkiosk_unit_allows_what_status_sources_need():
+    """状态 / 自检在子进程里跑 ip (要 netlink)、nmcli/systemctl (D-Bus = AF_UNIX)、ping (ICMP 数据报).
+    RestrictAddressFamilies 会被子进程继承, 少了 AF_NETLINK 网页上网卡就全是没 IP."""
+    import inspect
+    import pathlib
+    u = (pathlib.Path(webkiosk.__file__).parent / "deploy" / "systemd" / "webkiosk.service").read_text()
+    line = next(l for l in u.splitlines() if l.startswith("RestrictAddressFamilies="))
+    fams = set(line.split("=", 1)[1].split())
+    assert '"ip", ' in inspect.getsource(kc.nics_status)          # 前提: 网卡状态确实靠 ip 命令
+    assert {"AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"} <= fams
+    assert "AF_PACKET" not in fams                                 # 网页口不需要也不该能发原始帧
 
 
 def test_audit_log_path_from_env(monkeypatch):
@@ -870,3 +882,201 @@ def test_audit_written_to_file_or_stderr(tmp_path, capsys):
 def test_web_page_status_uses_kvm_counts():
     html = _page()
     assert "m.ch9329" not in html and "m.kvm" in html
+
+
+# ------------------------------------------------------------ 复审修正: 键鼠句柄空闲释放
+
+class ClosableCh(FakeCh):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _clocked(app, t0=1000.0):
+    now = [t0]
+    app.clock = lambda: now[0]
+    return now
+
+
+def test_ch_released_after_idle_so_cart_can_take_over(tmp_path):
+    app = make_app(tmp_path)
+    now = _clocked(app)
+    fake = ClosableCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    call(app, "POST", "/api/hid", TAIL, {"src": "video0", "events": [{"t": "release"}]}, ck)
+    now[0] += webkiosk.CH_IDLE_S - 0.5
+    app.ch_reap()
+    assert not fake.closed                       # 还在用: 不放
+    now[0] += 1.0
+    app.ch_reap()
+    assert fake.closed and app._ch is None       # 空闲够久: 放掉 flock, 车机能接手
+
+
+def test_ch_idle_release_lets_go_of_held_keys_first(tmp_path):
+    app = make_app(tmp_path)
+    now = _clocked(app)
+    fake = ClosableCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    call(app, "POST", "/api/hid", TAIL,
+         {"src": "video0", "events": [{"t": "k", "code": "ShiftLeft", "down": True}]}, ck)
+    now[0] += webkiosk.CH_IDLE_S + 1
+    app.ch_reap()
+    assert fake.frames[-1] == bytes(8) and fake.closed
+    assert app.kbd.report() == bytes(8)
+
+
+def test_ch_reopened_after_idle_release(tmp_path):
+    app = make_app(tmp_path)
+    now = _clocked(app)
+    opened = []
+    app.ch_open = lambda path: opened.append(ClosableCh()) or opened[-1]
+    ck = login(app)
+    body = {"src": "video0", "events": [{"t": "release"}]}
+    call(app, "POST", "/api/hid", TAIL, body, ck)
+    now[0] += webkiosk.CH_IDLE_S + 1
+    app.ch_reap()
+    assert call(app, "POST", "/api/hid", TAIL, body, ck)[0] == 200
+    assert len(opened) == 2 and opened[0].closed and not opened[1].closed
+
+
+def test_logout_releases_ch(tmp_path):
+    app = make_app(tmp_path)
+    fake = ClosableCh()
+    app.ch_open = lambda path: fake
+    ck = login(app)
+    call(app, "POST", "/api/hid", TAIL, {"src": "video0", "events": [{"t": "release"}]}, ck)
+    call(app, "POST", "/api/logout", TAIL, {}, ck)
+    assert fake.closed and app._ch is None
+
+
+def test_ch_reap_without_handle_is_noop(tmp_path):
+    app = make_app(tmp_path)
+    app.ch_reap()
+    assert app._ch is None
+
+
+# ------------------------------------------------------------ 复审修正: 输错闸门表满了不清空
+
+def _lock_out(app, ip):
+    for _ in range(5):
+        r = call(app, "POST", "/api/login", ip, {"pin": "0000"})[2]["result"]
+    assert r == "locked"
+
+
+def test_gate_table_full_keeps_locked_gates(tmp_path, monkeypatch):
+    monkeypatch.setattr(webkiosk, "GATES_MAX", 4)
+    app = make_app(tmp_path, lan_open=True)
+    _lock_out(app, LAN)
+    for i in range(20):                          # 换着源地址刷满闸门表 (每个都只问一次 whoami 级别的干净闸门)
+        app.gate_for(f"198.51.100.{100 + i}")
+    assert call(app, "POST", "/api/login", LAN, {"pin": "2468"})[2]["result"] == "locked"
+    assert len(app._gates) <= 4 + 2
+
+
+def test_gate_table_full_of_failures_shares_one_lan_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(webkiosk, "GATES_MAX", 4)
+    app = make_app(tmp_path, lan_open=True)
+    for i in range(4):                           # 表里全是输错过的
+        call(app, "POST", "/api/login", f"198.51.100.{10 + i}", {"pin": "0000"})
+    for i in range(5):                           # 再换新地址试: 落到同一个共享闸门, 冷却照样生效
+        call(app, "POST", "/api/login", f"198.51.100.{50 + i}", {"pin": "0000"})
+    assert call(app, "POST", "/api/login", "198.51.100.99", {"pin": "2468"})[2]["result"] == "locked"
+    assert call(app, "POST", "/api/login", TAIL, {"pin": "2468"})[2]["result"] == "ok"   # tailnet 不受牵连
+    assert len(app._gates) <= 4 + 2
+
+
+# ------------------------------------------------------------ 复审修正: PIN 冷却事件进网页审计
+
+def test_pin_lockout_event_goes_to_web_audit(tmp_path):
+    app = make_app(tmp_path)
+    logged = []
+    app.audit = lambda kind, msg: logged.append((kind, msg))
+    for _ in range(5):
+        call(app, "POST", "/api/login", TAIL, {"pin": "0000"})
+    assert any(k == "pin" and "冷却" in m for k, m in logged)
+
+
+# ------------------------------------------------------------ 复审修正: PIN 读不到时局域网的拒绝原因
+
+def test_lan_refused_with_unreadable_pin_says_unreadable(tmp_path):
+    app = make_app(tmp_path, lan_open=True)
+    (tmp_path / "kiosk.conf").write_text("{broken")
+    status, _, body = call(app, "GET", "/api/whoami", LAN)
+    assert status == 403 and "读不到" in body.decode() and "未设" not in body.decode()
+
+
+# ------------------------------------------------------------ 复审修正: 画面打不开要回错误, 不能先回 200
+
+class FakeProc:
+    def __init__(self, chunks):
+        import io
+        self.stdout = io.BytesIO(b"".join(chunks))
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_video_that_never_starts_is_503(served):
+    app, port = served
+    procs = []
+    app.popen = lambda *a, **k: procs.append(FakeProc([])) or procs[-1]
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", "/api/video?dev=video0", headers={"Cookie": login(app)})
+    r = c.getresponse()
+    assert r.status == 503 and "画面打不开" in r.read().decode()
+    assert procs[0].killed and app._videos == {}
+
+
+def test_video_first_chunk_is_not_lost(served):
+    app, port = served
+    app.popen = lambda *a, **k: FakeProc([b"--ffmpeg\r\nframe1", b"frame2"])
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", "/api/video?dev=video0", headers={"Cookie": login(app)})
+    r = c.getresponse()
+    assert r.status == 200 and "multipart" in r.getheader("Content-Type")
+    assert r.read() == b"--ffmpeg\r\nframe1frame2"
+
+
+def test_web_page_video_open_has_timeout_hint():
+    html = _page()
+    assert "VIDEO_OPEN_TIMEOUT_MS" in html
+
+
+def test_web_page_kvm_row_keeps_bound_count_when_offline():
+    """绑了但板子不在线 -> 0 块在线 / N 个已绑定 (红); 都是 0 才说未连接. 有 node 就真跑一遍."""
+    import re
+    import shutil
+    import subprocess
+    html = _page()
+    m = re.search(r"function kvmRow\(k\) \{.*?\n\}", html, re.S)
+    assert m and "kvmRow(m.kvm)" in html
+    if not shutil.which("node"):
+        pytest.skip("没有 node")
+    js = m.group(0) + """
+for (const k of [null, {online: 0, bound: 0}, {online: 0, bound: 2}, {online: 1, bound: 1}])
+  console.log(JSON.stringify(kvmRow(k)));"""
+    out = subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout
+    rows = [json.loads(l) for l in out.splitlines()]
+    assert rows[0][1:] == ["未连接", "bad"] and rows[1][1:] == ["未连接", "bad"]
+    assert rows[2][1:] == ["0 块在线 / 2 个画面源已绑定", "bad"]
+    assert rows[3][1:] == ["1 块在线 / 1 个画面源已绑定", "ok"]
+
+
+def test_ch_reaper_keeps_running_after_errors(tmp_path):
+    calls = []
+
+    class A:
+        def ch_reap(self):
+            calls.append(1)
+            raise OSError("boom")
+    webkiosk.ch_reaper(A(), sleep=lambda s: None, rounds=3)
+    assert len(calls) == 3

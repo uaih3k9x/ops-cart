@@ -40,7 +40,7 @@
 | 文件 | 职责 |
 |---|---|
 | [`pxeserver.py`](pxeserver.py) | PXE 服务端:DHCP 租约表、TFTP(块号回绕、流式读)、装机口守卫 `PxeGuard`(状态写 `/run/ops-cart/pxe-guard.json`)、grub 菜单模板(全仓库只此一处);Linux / Windows 通用 |
-| [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);ks 和装机菜单只给装机模式里解锁的那个 MAC,`.bak` 一律 404;LAN1 没插线就等地址出现,不退出 |
+| [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);ks 和装机菜单只给报出解锁 MAC 的请求(防误装,MAC 是客户端自报的,不是访问控制),`.bak` 一律 404;LAN1 没插线就等地址出现,不退出 |
 | [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter) |
 | [`kiosk_ui_core.py`](kiosk_ui_core.py) | GUI 的界面逻辑:`UiBridge`(后台结果回主线程)、左侧面板状态机、右侧菜单定义、装机定时器判定、CH9329 发送线程与鼠标位移拆分 |
 | [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、状态采集、nmcli 命令、装机模式与装机网段(读 `pxe.env`)、PIN 闸门;`python3 kiosk_core.py --write-rescue` 给部署脚本写救援菜单 |

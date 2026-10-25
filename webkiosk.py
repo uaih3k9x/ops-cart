@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cartlog
@@ -38,7 +39,8 @@ TYPE_MAX = 4096             # /api/type 一次最多几个字符 (115200 波特�
 TYPE_CHUNK = 32             # 打字分块发, 块间放开键鼠锁, 别的键鼠请求插得进来
 STREAM_RECHECK_S = 2.0      # 长连接多久复查一次来源和会话
 LAN_MAX_LOCK_S = 3600       # 局域网输错冷却: 60 秒起翻倍, 封顶 1 小时
-GATES_MAX = 1024            # 按来源 IP 记的输错闸门上限
+GATES_MAX = 1024            # 按来源 IP 记的输错闸门上限; 满了只清干净的, 清不出来就共用一个
+CH_IDLE_S = 3.0             # 键鼠空闲多久放掉 CH9329 (独占锁), 车机那头才接得过去
 
 
 def _json(status, obj, extra=None):
@@ -83,6 +85,7 @@ class App:
         self._pin_tag, self._gates = None, {}
         # 键鼠
         self.ch_open, self._ch, self._ch_path, self._ch_lock = _real_ch_open, None, None, threading.Lock()
+        self.clock, self._ch_used = time.monotonic, 0.0
         self.kbd = wc.KeyboardState()
         self.video_nodes, self.kvm_load, self.kvm_ports = kc.video_nodes, kvm.load, kvm.ports
         # 画面 / 串口 / 长连接
@@ -108,16 +111,24 @@ class App:
         return state, stored
 
     def gate_for(self, ip):
-        """输错冷却按来源 IP 分开: 一台机器试错锁不到别人, 更锁不到 tailnet; 局域网冷却指数退避."""
+        """输错冷却按来源 IP 分开: 一台机器试错锁不到别人, 更锁不到 tailnet; 局域网冷却指数退避.
+        表满了 (防内存涨) 只清从没输错过的闸门; 还是满的, 新来源按类别共用一个闸门 ——
+        换着源地址刷表也重置不了自己的冷却."""
         _state, stored = self.pin()
         kind = wc.client_kind(ip)
         with self._state_lock:
-            g = self._gates.get(ip)
+            key = ip
+            if key not in self._gates and len(self._gates) >= GATES_MAX:
+                now = time.time()
+                self._gates = {k: g for k, g in self._gates.items()
+                               if g.fails or g.lockouts or g.locked_until > now}
+                if len(self._gates) >= GATES_MAX:
+                    key = f"overflow-{kind}"
+            g = self._gates.get(key)
             if g is None:
-                if len(self._gates) >= GATES_MAX:       # 防内存涨: 满了从头记
-                    self._gates = {}
-                g = self._gates[ip] = kc.PinGate(
-                    stored, lock_s=60, max_lock_s=LAN_MAX_LOCK_S if kind == "lan" else None)
+                g = self._gates[key] = kc.PinGate(
+                    stored, lock_s=60, max_lock_s=LAN_MAX_LOCK_S if kind == "lan" else None,
+                    event=lambda m, k=key: self.audit("pin", f"{m} src={k}"))
         return g
 
     def request_reason(self, method, headers):
@@ -133,8 +144,9 @@ class App:
 
     def source_reason(self, ip, local_ip=None):
         conf = wc.web_conf_read(self.conf_path)
-        return wc.source_reason(ip, bool(conf.get("lan_open")), self.pin()[0] == "set",
-                                self.deny_nets(conf), local_ip)
+        state = self.pin()[0]
+        return wc.source_reason(ip, bool(conf.get("lan_open")), state == "set",
+                                self.deny_nets(conf), local_ip, pin_unreadable=state == "unreadable")
 
     def _session_ok(self, tok):
         state, stored = self.pin()
@@ -207,6 +219,7 @@ class App:
         if (method, path) == ("POST", "/api/logout"):
             self.sessions.revoke(tok)
             self._close_streams([tok])
+            self.ch_release()
             self.log("logout", ip, tok)
             return _json(200, {"ok": True})
         if (method, path) == ("GET", "/api/status"):
@@ -298,7 +311,24 @@ class App:
                 self._drop_ch()
                 self.kbd.release_all()
                 return _json(503, {"error": f"CH9329 发送失败: {e}"})
+            self._ch_used = self.clock()
             return None
+
+    def ch_release(self, idle_s=0.0):
+        """空闲够 idle_s 秒就放掉 CH9329: 先发一次全部松开 (免得目标机上键一直按着), 再关口解锁.
+        退出登录时立刻放; 平时由 ch_reaper 线程每秒问一次."""
+        with self._ch_lock:
+            if self._ch is None or self.clock() - self._ch_used < idle_s:
+                return
+            try:
+                self._ch.send_report(self.kbd.release_all())
+                self._ch.send_mouse(0, 0, 0, 0)
+            except (OSError, ValueError):
+                pass
+            self._drop_ch()
+
+    def ch_reap(self):
+        self.ch_release(CH_IDLE_S)
 
     def _hid(self, req):
         try:
@@ -565,7 +595,12 @@ class Handler(BaseHTTPRequestHandler):
         app.log("video-open", ip, tok, dev=dev, fps=fps)
         unregister = app.stream_register(tok, proc.kill)
         try:
+            first = proc.stdout.read(65536)     # 先等第一块: ffmpeg 打不开设备会直接退出, 这时回 503
+            if not first:                       # 而不是先回 200 再断 (那样页面上 <img> 不报错, 一直转圈)
+                app.log("video-fail", ip, tok, dev=dev)
+                return self._send(*_text(503, "画面打不开 (设备忙或没有信号)"))
             self._stream_head("multipart/x-mixed-replace; boundary=ffmpeg")
+            self.wfile.write(first)
             wc.relay(lambda: proc.stdout.read(65536), self.wfile.write, still_ok,
                      every=STREAM_RECHECK_S)
         except OSError:
@@ -629,13 +664,26 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def ch_reaper(app, sleep=time.sleep, rounds=None):
+    """每秒看一次键鼠空不空闲 (rounds 只给测试用)."""
+    n = 0
+    while rounds is None or n < rounds:
+        sleep(1.0)
+        try:
+            app.ch_reap()
+        except Exception as e:          # noqa: BLE001  巡检线程不能死
+            print(f"webkiosk: ch_reap: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        n += 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="ops-cart 网页版 Kiosk")
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--bind", default="0.0.0.0",
                     help="监听地址; 装机口网段的来源无论绑在哪都会被拒绝")
     a = ap.parse_args()
-    Handler.app = App()
+    Handler.app = app = App()
+    threading.Thread(target=ch_reaper, args=(app,), daemon=True).start()
     port = a.port or wc.web_conf_read()["port"]
     print(f"webkiosk on {a.bind}:{port}", flush=True)
     Server((a.bind, port), Handler).serve_forever()

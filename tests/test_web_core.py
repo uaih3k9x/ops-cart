@@ -366,3 +366,9 @@ def test_web_conf_set_falls_back_to_in_place_write(tmp_path, monkeypatch):
     monkeypatch.setattr(wc.atomicfile, "write_json", ro)
     wc.web_conf_set(p, lan_open=True)
     assert wc.web_conf_read(p)["lan_open"] is True and wc.web_conf_read(p)["port"] == 8088
+
+
+def test_source_reason_unreadable_pin_is_not_called_unset():
+    r = wc.source_reason("198.51.100.7", lan_open=True, pin_set=False, pin_unreadable=True)
+    assert "读不到" in r and "未设" not in r
+    assert wc.source_reason("127.0.0.1", lan_open=True, pin_set=False, pin_unreadable=True) is None

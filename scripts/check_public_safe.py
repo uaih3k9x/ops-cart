@@ -22,7 +22,7 @@ import sys
 
 IGNORE_MARK = "public-safe-ignore"
 SKIP_PREFIXES = ("web/vendor/",             # 第三方原样拷贝, 不归我们管
-                 "scripts/check_public_safe.py", "tests/test_public_safe.py")   # 规则和样例本身
+                 "scripts/check_public_safe.py")    # 规则本身; 样例测试不豁免, 反例逐行标 ignore
 _DOC_V4 = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
                                               "127.0.0.0/8")]
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")

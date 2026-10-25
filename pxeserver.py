@@ -527,7 +527,8 @@ PXE_MODE = "/opt/pxe/pxe-mode.json"
 
 def grub_menu(ip, install=False):
     """GRUB 菜单: 救援 (默认, 不装系统) / 自动装机. 每项都给 HTTP (快) 和 TFTP (慢) 两条路.
-    装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此只发给解锁的那台."""
+    装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此核对是不是解锁的那台
+    (防误装; MAC 头是客户端自报的, 不当访问控制)."""
     repo = f"http://{ip}:8000"
     if install:
         title, args, timeout = ("Rocky 9.8 auto install",

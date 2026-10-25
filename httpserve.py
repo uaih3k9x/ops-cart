@@ -9,6 +9,10 @@
   带来的 X-RHN-Provisioning-MAC-N 头 (装机菜单里有); 不报 MAC 的 (浏览器、curl) 一律 403
 - 带 inst.ks= 的 grub.cfg* 同样只给文件名里那台 MAC
 - *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希) 永远 404
+
+这是防"误装"的核对, 不是访问控制: MAC 头 (和 TFTP 的文件名一样) 是客户端自己报的, LAN1 上能抓到
+DHCP 的机器可以冒充. 真正的边界是物理的 —— LAN1 只接一台被测机、守卫发现别的 DHCP 就停服、
+解锁要在车机屏幕上输码且 30 分钟过期. ks 里的 root 哈希按"LAN1 上的人看得到"来对待.
 """
 
 import argparse

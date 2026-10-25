@@ -65,10 +65,11 @@ def _in_nets(ip, nets):
     return False
 
 
-def source_reason(ip, lan_open, pin_set, deny_nets=(), local_ip=None):
+def source_reason(ip, lan_open, pin_set, deny_nets=(), local_ip=None, pin_unreadable=False):
     """放行返回 None, 否则返回给人看的拒绝原因.
     deny_nets = 装机口网段: 被测机插在 LAN1 上, 开了局域网开关也不许碰管理口;
-    local_ip = 连接落在推车哪个地址上, 被测机手配了别的网段时靠它认出是从 LAN1 进来的."""
+    local_ip = 连接落在推车哪个地址上, 被测机手配了别的网段时靠它认出是从 LAN1 进来的;
+    pin_unreadable = PIN 文件坏了 / 没权限读 (和没设分开说, 免得现场去重设 PIN)."""
     kind = client_kind(ip)
     if kind is None:
         return "来源地址无法识别"
@@ -78,6 +79,8 @@ def source_reason(ip, lan_open, pin_set, deny_nets=(), local_ip=None):
         return "装机口 (LAN1) 不提供管理访问"
     if not lan_open:
         return "未开放局域网访问"
+    if pin_unreadable:
+        return "推车 PIN 配置读不到, 局域网访问不可用"
     if not pin_set:
         return "推车未设 PIN, 局域网访问不可用"
     return None

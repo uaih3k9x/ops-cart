@@ -39,7 +39,8 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: 状态 / 自检在子进程里跑 ip 命令读地址和路由 (过滤器会被子进程继承)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0077
 Restart=on-failure
 RestartSec=5
