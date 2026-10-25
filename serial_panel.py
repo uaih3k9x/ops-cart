@@ -4,6 +4,9 @@
 左宽右窄分屏: 左边实时控制台 (直连 conbroker 的 human 通道, 键盘直通串口),
 右边和 Claude 的留言板 (chat.log). Tk 8.6 接不上 ibus 的 XIM, 聊天先用英文/拼音.
 开停服务/留言经 conbroker 命令行; 控制台只连它的本地 socket, 不直接碰串口设备.
+
+线程纪律: 后台线程只往 self.ui / self.rx 两个队列放东西, 界面只在 _drain 里改 (Tk 不是线程安全的).
+开服务优先用 /dev/serial/by-id 路径 (重插后 ttyUSBn 变了也认得); 键鼠 CH9329 的口标出来, 不许当控制台.
 """
 
 import codecs
@@ -14,9 +17,13 @@ import queue
 import re
 import socket
 import subprocess
+import tempfile
 import threading
+import time
 
 import tkinter as tk
+
+import kvm_core as kvm
 
 SERIAL_CONF = "/opt/pxe/serial.conf"
 _SERIAL_DEFAULT = {"user": "ops", "conbroker_home": "/home/ops/conbroker", "chat_name": "operator"}
@@ -45,6 +52,9 @@ def _conbroker_cmd():
 # CONBROKER 不做模块级缓存: serial.conf 可能在运行中被改 (Kiosk 里保存)
 
 BAUDS = ["9600", "115200", "57600", "38400", "4800"]
+BYID_DIR = "/dev/serial/by-id"
+RECONNECT_MS = 3000         # 服务断了以后多久看一次它回来没有
+PASTE_LINE_S = 0.05         # 粘贴按行发, 行间停一下, 交换机 CLI 吃得消
 
 
 def _run(args, timeout=8):
@@ -76,6 +86,70 @@ def broker_port(ddir, name):
         return _json.load(open(os.path.join(ddir, "run", f"{safe}.json")))["port"]
     except (OSError, ValueError, KeyError):
         return None
+
+
+def parse_list(text):
+    """conbroker list 的输出 -> (串口列表, {活着的服务名: 波特率}). 已死的残留状态不算服务."""
+    ports, serves, section = [], {}, None
+    for ln in text.splitlines():
+        if ln.startswith("串口"):
+            section = "p"
+            continue
+        if ln.startswith("服务"):
+            section = "s"
+            continue
+        if not ln.startswith(" "):           # [stderr] / [错误] 之类
+            section = None if ln.strip() else section
+            continue
+        parts = ln.split()
+        if section == "p" and parts:
+            ports.append(parts[0])
+        elif section == "s" and len(parts) >= 3 and parts[2] == "在跑":
+            serves[parts[0]] = parts[1]
+    return ports, serves
+
+
+def byid_paths(byid_dir=BYID_DIR):
+    try:
+        return [os.path.join(byid_dir, n) for n in sorted(os.listdir(byid_dir))]
+    except OSError:
+        return []
+
+
+def prefer_byid(dev, paths, realpath=os.path.realpath):
+    """同一个口有 by-id 路径就用它 (按序列号认口, 重插不变)."""
+    r = realpath(dev)
+    return next((p for p in sorted(paths) if realpath(p) == r), dev)
+
+
+def match_service(dev, serves, realpath=os.path.realpath):
+    """选中的口对应哪个在跑的服务 (服务名可能是 by-id 路径, 也可能是 ttyUSBn)."""
+    if dev in serves:
+        return dev
+    r = realpath(dev)
+    return next((n for n in serves if realpath(n) == r), None)
+
+
+def kvm_devices(kvm_ports, realpath=os.path.realpath):
+    """键鼠 CH9329 占着的真实设备 (kvm_core.ports() 的 by-id 路径解析出来)."""
+    return {realpath(p) for p in kvm_ports.values()}
+
+
+def port_label(dev, kvm_devs):
+    return f"{dev} (键鼠 CH9329)" if dev in kvm_devs else dev
+
+
+def paste_chunks(text):
+    """粘贴的文字 -> 按行切的字节块, 换行统一成回车 (串口设备认 \\r)."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = [ln.encode() + b"\r" for ln in lines[:-1]]
+    return out + ([lines[-1].encode()] if lines[-1] else [])
+
+
+def serve_error(rc, stderr):
+    """开服务的进程提前退出时给人看的一句: stderr 最后一行, 没有就退出码."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else f"退出码 {rc}"
 
 
 _KEY_SEQ = {
@@ -181,9 +255,12 @@ class SerialPanel(tk.Frame):
         self.cfg = serial_conf_read()
         self.ddir = data_dir(self.cfg)
         self.sock = None
-        self.rx = queue.Queue()
+        self.rx = queue.Queue()             # 读线程 -> (socket, 字节)
+        self.ui = queue.Queue()             # 后台线程 -> 要在主线程里执行的函数
         self.term = TermFeed()
         self.chat_off = None
+        self._serves, self._kvm_devs, self._byid = {}, set(), []
+        self._busy = self._pasting = self._reconnect = False
         self._build()
         self.refresh_ports()
         self.after(30, self._drain)
@@ -272,11 +349,28 @@ class SerialPanel(tk.Frame):
         return "break"
 
     def _on_paste(self, _e=None):
+        """后台按行限速发, 大段粘贴不卡界面, 也不把设备的接收缓冲冲爆."""
         try:
             text = self.clipboard_get()
         except tk.TclError:
             return "break"
-        self._tx(text.replace("\r\n", "\r").replace("\n", "\r").encode())
+        sock, chunks = self.sock, paste_chunks(text)
+        if not sock:
+            return self._tx(b"") or "break"
+        if self._pasting or not chunks:
+            return "break"
+        self._pasting = True
+
+        def work():
+            try:
+                for c in chunks:
+                    sock.sendall(c)
+                    time.sleep(PASTE_LINE_S)
+            except OSError:
+                pass                        # 读线程会收到断开, 由 _drain 处理
+            finally:
+                self.ui.put(lambda: setattr(self, "_pasting", False))
+        threading.Thread(target=work, daemon=True).start()
         return "break"
 
     def _tx(self, data):
@@ -288,12 +382,13 @@ class SerialPanel(tk.Frame):
         except OSError:
             self._disconnect()
 
-    def _connect(self):
+    def _connect(self, wake=True):
         self._disconnect()
-        name = self.port_var.get()
-        port = broker_port(self.ddir, name)
+        dev = self.port_var.get()
+        name = match_service(dev, self._serves)
+        port = broker_port(self.ddir, name) if name else None
         if not port:
-            self.con_title.config(text=f"控制台 · {name} 没有在跑的服务", fg=DIM)
+            self.con_title.config(text=f"控制台 · {dev} 没有在跑的服务", fg=DIM)
             return
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=2)
@@ -302,12 +397,13 @@ class SerialPanel(tk.Frame):
         except OSError as e:
             self.con_title.config(text=f"控制台 · 连接失败: {e}", fg="#ff7b72")
             return
-        self.sock = s
+        self.sock, self._reconnect = s, False
         self.term = TermFeed()
-        self.con_title.config(text=f"控制台 · {name} @ {self.baud_var.get()} · 键盘直通串口",
+        self.con_title.config(text=f"控制台 · {dev} @ {self._serves.get(name, '?')} · 键盘直通串口",
                               fg="#7ee787")
         threading.Thread(target=self._reader, args=(s,), daemon=True).start()
-        self._tx(b"\r")
+        if wake:
+            self._tx(b"\r")
 
     def _reader(self, s):
         while True:
@@ -328,7 +424,15 @@ class SerialPanel(tk.Frame):
             self.sock = None
             self.con_title.config(text="控制台 · 未连接", fg=DIM)
 
+    def _run_ui(self):
+        try:
+            while True:
+                self.ui.get_nowait()()
+        except queue.Empty:
+            pass
+
     def _drain(self):
+        self._run_ui()
         try:
             while True:
                 s, data = self.rx.get_nowait()
@@ -336,13 +440,21 @@ class SerialPanel(tk.Frame):
                     continue
                 if not data:
                     self._disconnect()
-                    self._con_write([("text", "\n[服务已断开]\n")], "mark")
+                    self._con_write([("text", "\n[服务已断开, 回来后自动重连]\n")], "mark")
+                    self._reconnect = True
+                    self.after(RECONNECT_MS, self._reconnect_tick)
                 else:
                     self._con_write(self.term.feed(data))
         except queue.Empty:
             pass
         if self.winfo_exists():
             self.after(30, self._drain)
+
+    def _reconnect_tick(self):
+        if not self._reconnect or self.sock or not self.winfo_exists():
+            return
+        self.refresh_ports(wake=False)          # 服务回来了就会自动接上
+        self.after(RECONNECT_MS, self._reconnect_tick)
 
     def _con_write(self, ops, tag=None):
         c = self.console
@@ -404,52 +516,78 @@ class SerialPanel(tk.Frame):
     # ------------------------------------------------------------ 服务
 
     def _async(self, fn, done=None):
+        """fn 在后台跑; done 经 self.ui 回到主线程执行 (后台线程不碰 Tk, 包括 after)."""
         def work():
             r = fn()
             if done:
-                self.after(0, lambda: done(r))
+                self.ui.put(lambda: done(r))
         threading.Thread(target=work, daemon=True).start()
 
-    def refresh_ports(self):
-        def done(text):
-            ports, serves, section = [], {}, None
-            for ln in text.splitlines():
-                if ln.startswith("串口"):
-                    section = "p"; continue
-                if ln.startswith("服务"):
-                    section = "s"; continue
-                parts = ln.split()
-                if section == "p" and parts:
-                    ports.append(parts[0])
-                elif section == "s" and parts:
-                    serves[parts[0]] = True
+    def _select(self, dev):
+        self._reconnect = False
+        self.port_var.set(dev)
+        self._connect()
+
+    def refresh_ports(self, wake=True):
+        def fetch():
+            return _run(["list"]), kvm_devices(kvm.ports()), byid_paths()
+
+        def done(res):
+            text, self._kvm_devs, self._byid = res
+            ports, self._serves = parse_list(text)
             menu = self.port_menu["menu"]
             menu.delete(0, "end")
             for p in ports:
-                menu.add_command(label=p, command=lambda v=p: (self.port_var.set(v), self._connect()))
+                menu.add_command(label=port_label(p, self._kvm_devs), command=lambda v=p: self._select(v))
             if ports and self.port_var.get() not in ports:
-                self.port_var.set(ports[0])
-            self.serve_label.config(text=f"服务: {', '.join(serves) or '未开'}")
-            if not self.sock and self.port_var.get() in serves:
-                self._connect()
-        self._async(lambda: _run(["list"]), done)
+                free = [p for p in ports if p not in self._kvm_devs]
+                self.port_var.set((free or ports)[0])
+            shown = [f"{os.path.basename(n)} @ {b}" for n, b in self._serves.items()]
+            self.serve_label.config(text=f"服务: {', '.join(shown) or '未开'}")
+            if not self.sock and match_service(self.port_var.get(), self._serves):
+                self._connect(wake=wake)
+        self._async(fetch, done)
 
     def start_serve(self):
+        """开服务: 防连点; 进程提前退出时把它的报错显示出来, 不再静默失败."""
         port = self.port_var.get()
-        if port == "(无)" or not port:
+        if self._busy or port == "(无)" or not port:
             return
-        self._con_write([("text", f"\n[开服务] {port} @ {self.baud_var.get()}\n")], "mark")
-        # serve 是常驻前台设计: nohup+setsid 丢后台, 立刻返回, 用 list 验证
-        cmd = _conbroker_cmd() + ["serve", port, "-b", self.baud_var.get()]
-        subprocess.Popen(["nohup", "setsid"] + cmd, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-        self.after(1500, self.refresh_ports)
+        if os.path.realpath(port) in self._kvm_devs:
+            self._con_write([("text", f"\n[{port} 是键鼠 CH9329 的口, 不能当控制台]\n")], "mark")
+            return
+        target = prefer_byid(port, self._byid)
+        self._busy = True
+        self._con_write([("text", f"\n[开服务] {target} @ {self.baud_var.get()}\n")], "mark")
+        # serve 是常驻前台设计: nohup+setsid 丢后台, 立刻返回; stderr 落临时文件, 1.5 秒后看它死没死
+        err = tempfile.TemporaryFile()
+        try:
+            proc = subprocess.Popen(["nohup", "setsid"] + _conbroker_cmd() + ["serve", target, "-b", self.baud_var.get()],
+                                    stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL)
+        except OSError as e:
+            err.close()
+            self._busy = False
+            self._con_write([("text", f"[开服务失败] {e}\n")], "mark")
+            return
+        self.after(1500, lambda: self._serve_check(proc, err))
+
+    def _serve_check(self, proc, err):
+        rc = proc.poll()
+        if rc is not None:
+            err.seek(0)
+            msg = serve_error(rc, err.read().decode(errors="replace"))
+            self._con_write([("text", f"[开服务失败] {msg}\n")], "mark")
+        err.close()
+        self._busy = False
+        self.refresh_ports()
 
     def stop_serve(self):
         port = self.port_var.get()
+        name = match_service(port, self._serves) or port
+        self._reconnect = False
         self._disconnect()
-        self._con_write([("text", f"\n[停服务] {port}\n")], "mark")
-        self._async(lambda: _run(["stop", port], timeout=30), lambda t: self.refresh_ports())
+        self._con_write([("text", f"\n[停服务] {name}\n")], "mark")
+        self._async(lambda: _run(["stop", name], timeout=30), lambda t: self.refresh_ports())
 
     def destroy(self):
         self._disconnect()
