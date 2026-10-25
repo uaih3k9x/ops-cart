@@ -163,3 +163,77 @@ def test_cmd_scan_rescan_modes():
     assert wc.cmd_scan(rescan=True)[-1] == "yes"
     assert wc.cmd_scan(rescan=False)[-1] == "no"
     assert wc.cmd_scan(rescan="auto")[-1] == "auto"
+
+
+# ------------------------------------------------------------ 不切断唯一出口 (2026-10-25)
+# 重输密码 = 先建新连接并连上, 成功了才删旧的; 失败按回滚序列回到原样
+
+def _runner(fail_on=()):
+    calls = []
+
+    def run(cmd):
+        calls.append(cmd)
+        return (1, "boom") if any(cmd[:len(f)] == f for f in fail_on) else (0, "")
+    return run, calls
+
+
+OLD = [{"name": "LabNet", "uuid": "old-1", "ssid": "LabNet", "active": True, "priority": 20, "autoconnect": True},
+       {"name": "Other", "uuid": "o-2", "ssid": "Other", "active": False, "priority": 10, "autoconnect": True}]
+
+
+def test_cmd_add_can_pin_uuid():
+    cmd = wc.cmd_add("LabNet", "pw123456", "WPA2", 30, uuid="new-9")
+    assert cmd[cmd.index("connection.uuid") + 1] == "new-9"
+    assert "connection.uuid" not in wc.cmd_add("LabNet", "pw123456", "WPA2", 30)
+
+
+def test_plan_replace_builds_before_deleting():
+    p = wc.plan_replace(OLD, "LabNet", "pw123456", "WPA2", 30, new_uuid="new-9")
+    assert p["do"][0][:3] == ["nmcli", "con", "add"] and p["do"][1] == wc.cmd_up("new-9")
+    assert p["then"] == [wc.cmd_delete("old-1")]                         # 别的网络不动
+    assert p["rollback"] == [wc.cmd_delete("new-9"), wc.cmd_up("old-1")]
+
+
+def test_plan_replace_new_network_has_nothing_to_delete():
+    p = wc.plan_replace(OLD, "Fresh", "", "", 30, new_uuid="n")
+    assert p["then"] == [] and p["rollback"] == [wc.cmd_delete("n")]
+
+
+def test_run_plan_success_runs_then():
+    run, calls = _runner()
+    p = wc.plan_replace(OLD, "LabNet", "pw123456", "WPA2", 30, new_uuid="new-9")
+    assert wc.run_plan(p, run) == (True, "", False)
+    assert calls == p["do"] + p["then"]
+
+
+def test_run_plan_up_fails_rolls_back_and_keeps_old():
+    run, calls = _runner(fail_on=[wc.cmd_up("new-9")])
+    p = wc.plan_replace(OLD, "LabNet", "pw123456", "WPA2", 30, new_uuid="new-9")
+    ok, out, rolled = wc.run_plan(p, run)
+    assert not ok and rolled and "boom" in out
+    assert wc.cmd_delete("old-1") not in calls                           # 旧的从没删
+    assert calls[-2:] == p["rollback"]
+
+
+def test_run_plan_first_step_fails_no_rollback():
+    run, calls = _runner(fail_on=[["nmcli", "con", "add"]])
+    p = wc.plan_replace(OLD, "LabNet", "pw123456", "WPA2", 30, new_uuid="new-9")
+    assert wc.run_plan(p, run)[:2] == (False, "boom") and len(calls) == 1
+
+
+def test_plan_change_psk_writes_back_old_on_failure():
+    p = wc.plan_change_psk("u1", old="oldpass1", new="newpass1")
+    assert p["do"] == [wc.cmd_set_psk("u1", "newpass1"), wc.cmd_up("u1")]
+    assert p["rollback"] == [wc.cmd_set_psk("u1", "oldpass1"), wc.cmd_up("u1")]
+    run, calls = _runner(fail_on=[wc.cmd_up("u1")])
+    ok, _out, rolled = wc.run_plan(p, run)
+    assert not ok and rolled and wc.cmd_set_psk("u1", "oldpass1") in calls
+
+
+def test_is_egress_only_when_active_and_default_route_on_wifi():
+    wifi_first = "default via 198.51.100.1 dev wlp4s0 metric 900"
+    wired_first = "default via 192.0.2.1 dev enp3s0 metric 100\n" + wifi_first
+    assert wc.is_egress(OLD[0], wifi_first) is True
+    assert wc.is_egress(OLD[0], wired_first) is False
+    assert wc.is_egress(OLD[1], wifi_first) is False                    # 没连着的不是出口
+    assert wc.is_egress(OLD[0], "") is False

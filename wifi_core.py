@@ -92,10 +92,13 @@ def next_priority(saved):
     return max([s["priority"] for s in saved] + [0]) + 10
 
 
-def cmd_add(ssid, password, security, priority, iface=IFACE):
+def cmd_add(ssid, password, security, priority, iface=IFACE, uuid=None):
+    """uuid: 预先定好新连接的 uuid, 同名的旧连接还在时也能精确地连/删它."""
     cmd = ["nmcli", "con", "add", "type", "wifi", "ifname", iface, "con-name", ssid, "ssid", ssid,
            "ipv4.route-metric", str(WIFI_METRIC), "ipv6.route-metric", str(WIFI_METRIC),
            "connection.autoconnect", "yes", "connection.autoconnect-priority", str(priority)]
+    if uuid:
+        cmd += ["connection.uuid", uuid]
     km = key_mgmt(security)
     if km:
         cmd += ["wifi-sec.key-mgmt", km, "wifi-sec.psk", password]
@@ -122,6 +125,50 @@ def cmd_set_psk(uuid, psk):
     return ["nmcli", "con", "mod", "uuid", uuid, "802-11-wireless-security.psk", psk]
 
 
+# ---------------------------------------------------------------- 不切断唯一出口
+# 计划 = {"do": 必须全成功的步骤, "rollback": do 做了一半失败时执行, "then": do 成功后的收尾 (尽力而为)}.
+# 网线拔了时无线可能是推车唯一的出口 (远程就靠它), 所以永远先建新的、连上了再删旧的.
+
+def plan_replace(saved, ssid, password, security, priority, new_uuid, iface=IFACE):
+    """重输密码 / 新连一个网络: 建新连接 (定好 uuid) -> 连上 -> 删同名旧连接. 连不上就删新的、回到旧的."""
+    old = [s for s in saved if s["ssid"] == ssid]
+    return {"do": [cmd_add(ssid, password, security, priority, iface=iface, uuid=new_uuid), cmd_up(new_uuid)],
+            "then": [cmd_delete(s["uuid"]) for s in old],
+            "rollback": [cmd_delete(new_uuid)] + [cmd_up(s["uuid"]) for s in old if s["active"]]}
+
+
+def plan_change_psk(uuid, old, new):
+    """只改密码: 改完重连; 连不上就写回旧密码再连."""
+    return {"do": [cmd_set_psk(uuid, new), cmd_up(uuid)], "then": [],
+            "rollback": [cmd_set_psk(uuid, old), cmd_up(uuid)]}
+
+
+def run_plan(plan, run):
+    """run(cmd) -> (rc, out). -> (成功, 出错输出, 是否回滚过). 第一步就失败时什么都没改, 不回滚."""
+    for i, cmd in enumerate(plan["do"]):
+        rc, out = run(cmd)
+        if rc:
+            if i == 0:
+                return False, out, False
+            for rb in plan["rollback"]:
+                run(rb)
+            return False, out, True
+    for cmd in plan.get("then", []):
+        run(cmd)
+    return True, "", False
+
+
+def default_dev(routes):
+    """ip route 输出里第一条默认路由 (metric 最小) 走的网口."""
+    first = next((l.split() for l in routes.splitlines() if l.startswith("default")), [])
+    return first[first.index("dev") + 1] if "dev" in first[:-1] else None
+
+
+def is_egress(item, routes, iface=IFACE):
+    """这个已保存连接是不是推车眼下的上网出口 (连着, 且默认路由第一条走无线)."""
+    return bool(item.get("active")) and default_dev(routes) == iface
+
+
 # ---------------------------------------------------------------- 状态板一行
 
 CMD_STATUS_SCAN = ["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL", "dev", "wifi", "list",
@@ -135,9 +182,8 @@ def status(scan, addr, routes, iface=IFACE):
     ip = next((w for w in addr.split()[2:] if "." in w), None)
     if not cur or not ip:
         return {"ssid": None, "signal": 0, "ip": None, "egress": False}
-    first = next((l.split() for l in routes.splitlines() if l.startswith("default")), [])
     return {"ssid": cur[1], "signal": int(cur[2]) if cur[2].isdigit() else 0, "ip": ip,
-            "egress": "dev" in first and first[first.index("dev") + 1] == iface}
+            "egress": default_dev(routes) == iface}
 
 
 

@@ -30,25 +30,28 @@ def _load(path):
         return {}
 
 
-def main():
-    saved = wc.parse_saved(_run(wc.CMD_SAVED)[1])
+def main(run=_run, now=time.time, cooldown_path=COOLDOWN, log=None):
+    """跑一轮; 切了 (不管成没成) 返回目标那条已保存连接, 不用切返回 None. 参数都可注入, 方便测试."""
+    log = log or cartlog.event
+    saved = wc.parse_saved(run(wc.CMD_SAVED)[1])
     for s in saved:                     # 连接名和 SSID 可能不同 (大小写、改过名)
-        s["ssid"] = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", "uuid", s["uuid"]])[1]
-    scan = wc.parse_scan(_run(wc.cmd_scan(rescan="auto"))[1])
-    now = time.time()
-    cool = _load(COOLDOWN)
-    pick = wc.pick_switch(saved, scan, now, cooldown=cool)
+        s["ssid"] = run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", "uuid", s["uuid"]])[1]
+    scan = wc.parse_scan(run(wc.cmd_scan(rescan="auto"))[1])
+    t = now()
+    cool = _load(cooldown_path)
+    pick = wc.pick_switch(saved, scan, t, cooldown=cool)
     if not pick:
-        return
+        return None
     cur = next(s for s in saved if s["active"])
-    rc, out = _run(wc.cmd_up(pick["uuid"]))
+    rc, out = run(wc.cmd_up(pick["uuid"]))
     if rc == 0:
-        cartlog.event("wifi", f"按优先级切换 {cur['ssid']} → {pick['ssid']}")
-        return
-    cool[pick["ssid"]] = now + wc.COOLDOWN_S
-    atomicfile.write_json(COOLDOWN, cool)
-    _run(wc.cmd_up(cur["uuid"]))
-    cartlog.event("wifi", f"切到 {pick['ssid']} 失败, 冷却 30 分钟并回到 {cur['ssid']}: {out[-120:]}")
+        log("wifi", f"按优先级切换 {cur['ssid']} -> {pick['ssid']}")
+        return pick
+    cool[pick["ssid"]] = t + wc.COOLDOWN_S
+    atomicfile.write_json(cooldown_path, cool)
+    run(wc.cmd_up(cur["uuid"]))
+    log("wifi", f"切到 {pick['ssid']} 失败, 冷却 30 分钟并回到 {cur['ssid']}: {out[-120:]}")
+    return pick
 
 
 if __name__ == "__main__":

@@ -3,27 +3,18 @@
 
 规则在 netprof_core: 发地址只在 LAN1, 切到发地址前先探测链路上有没有别人的 DHCP;
 LAN1 切到别的配置时先停 PXE 服务. 每次切换记 events.log. nmcli 放后台线程, 同 wifi_panel.
+LAN1 没插线时探测不算数 (收不到 OFFER 不代表对面没有 DHCP), 不启用发地址.
 """
 
-import subprocess
 import tkinter as tk
 from tkinter import messagebox
 
 import cartlog
 import netprof_core as npc
-from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, WifiPanel, _run
+from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, BridgePanel, WifiPanel, _run
 
 
-def _carrier(iface):
-    try:
-        with open(f"/sys/class/net/{iface}/carrier") as f:
-            return f.read().strip() == "1"
-    except OSError:
-        return False
-
-
-class NetProfPanel(tk.Frame):
-    _bg = WifiPanel._bg
+class NetProfPanel(BridgePanel):
     _btn = WifiPanel._btn
     _say = WifiPanel._say
     _sel = WifiPanel._sel
@@ -32,7 +23,6 @@ class NetProfPanel(tk.Frame):
         super().__init__(master, bg=BG)
         self.profs = []
         self.prev = {}                  # 网口 -> 切换前生效的配置, 给「回退」用
-        self._busy = False
         self._build()
         self.reload()
 
@@ -130,9 +120,9 @@ class NetProfPanel(tk.Frame):
 
     def _render(self):
         self.lb.delete(0, "end")
-        link = {i: _carrier(i) for i in npc.IFACES}
+        link = {i: npc.carrier(i) for i in npc.IFACES}
         for p in self.profs:
-            mark = "●" if p["active"] else " "
+            mark = "*" if p["active"] else " "
             tag = " (内置)" if p["builtin"] else ""
             cable = "" if link[p["iface"]] else "  [没插线]"
             self.lb.insert("end", f"{npc.IFACES[p['iface']]} {mark} {p['label']:<12} "
@@ -159,13 +149,15 @@ class NetProfPanel(tk.Frame):
 
         def work():
             if plan["probe"]:
-                subprocess.run(["systemctl", "stop", "pxe-server"], capture_output=True)   # 别听见自己
+                _run(["systemctl", "stop", "pxe-server"])           # 别听见自己
                 offers = npc.dhcp_probe(target["iface"])
+                if offers.unknown:
+                    return False, "LAN1 没插线 (或读不到链路状态), 探测不了对面有没有 DHCP; 插好线再切"
                 if offers:
                     return False, "对面已经有 DHCP 服务器 (" + ", ".join(o["server"] for o in offers) + \
                         "), 你插进别人的网络里了, 不启用发地址"
             if plan["stop_pxe"]:
-                subprocess.run(["systemctl", "stop", *npc.PXE_UNITS], capture_output=True)
+                _run(["systemctl", "stop", *npc.PXE_UNITS])
             rc, out = _run(plan["up"], timeout=45)
             if rc and plan["rollback"]:
                 _run(plan["rollback"], timeout=45)
@@ -174,12 +166,12 @@ class NetProfPanel(tk.Frame):
 
         def done(res):
             ok, out = res if not isinstance(res, Exception) else (False, str(res))
-            name = f"{npc.IFACES[target['iface']]} → {target['label']}"
+            name = f"{npc.IFACES[target['iface']]} -> {target['label']}"
             cartlog.event("netprof", f"{name} {'成功' if ok else '失败: ' + out}")
             if ok:
                 if cur:
                     self.prev[target["iface"]] = cur
-                hint = " · PXE 服务没自动开, 要用去「装机 ▸」打开" if target["kind"] == "serve" else ""
+                hint = " · PXE 服务没自动开, 要用去「装机」页打开" if target["kind"] == "serve" else ""
                 self._say(f"已切换 {name}{hint}")
             else:
                 self._say(out, ok=False)

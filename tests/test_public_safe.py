@@ -82,6 +82,34 @@ def test_local_list_parsing(tmp_path):
     assert cps.load_local(str(tmp_path / "missing")) == []
 
 
+def test_scan_text_reports_line_numbers_and_every_hit():
+    text = "ok 192.0.2.1\nbad 8.8.4.4 and 00:1b:21:aa:bb:cc\n/home/alice/x"
+    assert cps.scan_text(text) == [(2, "ipv4", "8.8.4.4"), (2, "mac", "00:1b:21:aa:bb:cc"),
+                                   (3, "path", "/home/alice")]
+
+
+def test_inline_ignore_only_covers_its_own_line():
+    text = "a 8.8.4.4  # public-safe-ignore\nb 8.8.4.4"
+    assert cps.scan_text(text) == [(2, "ipv4", "8.8.4.4")]
+
+
+def test_deny_words_from_local_file_drive_scan(tmp_path):
+    p = tmp_path / ".public-safe.local"
+    p.write_text("# 现场 SSID 和私网段\nSomeNet\nre:\\b192\\.168\\.77\\.\n")
+    words = cps.load_local(str(p))
+    assert kinds("ssid somenet / gw 192.168.200.1 / 192.168.7.1", deny_words=words) == ["word", "word"]
+
+
+def test_scan_repo_checks_file_names_and_skips_vendor(tmp_path):
+    (tmp_path / "grub.cfg-01-00-1b-21-aa-bb-cc").write_text("menuentry")
+    (tmp_path / "web").mkdir()
+    (tmp_path / "web" / "vendor").mkdir()
+    (tmp_path / "web" / "vendor" / "lib.js").write_text("8.8.4.4")
+    (tmp_path / "bin").write_bytes(b"\xff\xfe\x00 8.8.4.4")
+    found = cps.scan_repo(str(tmp_path), ["grub.cfg-01-00-1b-21-aa-bb-cc", "web/vendor/lib.js", "bin"])
+    assert found == [("grub.cfg-01-00-1b-21-aa-bb-cc", 0, "mac", "00-1b-21-aa-bb-cc")]
+
+
 # ------------------------------------------------------------ 整个仓库
 
 def _tracked():

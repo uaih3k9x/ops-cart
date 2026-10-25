@@ -195,9 +195,34 @@ def iface_mac(iface):
         return bytes.fromhex(f.read().strip().replace(":", ""))
 
 
-def dhcp_probe(iface, timeout=4.0, ignore=()):
+def carrier(iface, root="/sys/class/net"):
+    """网口有没有插线: True / False / None (读不到, 比如网口不存在)."""
+    try:
+        with open(os.path.join(root, iface, "carrier")) as f:
+            return f.read().strip() == "1"
+    except (OSError, ValueError):
+        return None
+
+
+class ProbeResult(list):
+    """dhcp_probe 的结果: 还是 [{server, yiaddr}] 列表 (老调用方式不变), 另带
+    carrier (探测时有没有插线) 和 unknown (没插线/读不到 = 探测不算数, 不能当成"没有别人的 DHCP")."""
+
+    def __init__(self, offers=(), carrier=True):
+        super().__init__(offers)
+        self.carrier = carrier
+
+    @property
+    def unknown(self):
+        return self.carrier is not True
+
+
+def dhcp_probe(iface, timeout=4.0, ignore=(), carrier=carrier):
     """在 iface 上广播一个 DISCOVER, 收集 timeout 秒内的 OFFER (ignore 里的服务器地址不算, 比如自己).
-    要 root (绑 68 端口 + SO_BINDTODEVICE). 返回 [{server, yiaddr}]."""
+    要 root (绑 68 端口 + SO_BINDTODEVICE). 返回 ProbeResult; 没插线时不发包, 直接返回 unknown."""
+    link = carrier(iface)
+    if link is not True:
+        return ProbeResult(carrier=link)
     xid = struct.unpack("!I", os.urandom(4))[0]
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -214,6 +239,6 @@ def dhcp_probe(iface, timeout=4.0, ignore=()):
             o = parse_offer(s.recv(1500), xid)
             if o and o["server"] not in ignore and o not in found:
                 found.append(o)
-        return found
+        return ProbeResult(found)
     finally:
         s.close()

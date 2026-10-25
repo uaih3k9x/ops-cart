@@ -155,3 +155,85 @@ def test_conf_save_is_root_only_and_roundtrips(tmp_path):
     p.chmod(0o644)
     rp.conf_save({"user": "x", "password": "y"}, path=str(p))    # 覆盖时也收紧权限
     assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+
+
+# ------------------------------------------------------------ portal 主机白名单 (TOFU, 2026-10-25)
+# 第一次登录成功后记住 eportal 主机; 以后跳到别的主机就不发任何请求体, 更不发密码
+
+PORTAL = "http://203.0.113.5/eportal/index.jsp?mac=0200000000aa&wlanuserip=x"
+STRANGER = "http://198.51.100.9/eportal/index.jsp?mac=0200000000aa&wlanuserip=x"
+
+
+def _fake_curl(monkeypatch, location, login='{"result":"success","message":""}'):
+    calls = []
+
+    def curl(iface, url, data=None, resolve_to=None):
+        calls.append((url, data))
+        if url == rp.PROBE:
+            return 302, location, ""
+        if "method=pageInfo" in url:
+            return 200, "", '{"passwordEncrypt":"false"}'
+        if "method=login" in url:
+            return 200, "", login
+        return 0, "", ""
+    monkeypatch.setattr(rp, "curl", curl)
+    return calls
+
+
+def _posted(calls):
+    return [u for u, d in calls if d is not None]
+
+
+def test_portal_host():
+    assert rp.portal_host("http://203.0.113.5/eportal/") == "203.0.113.5"
+    assert rp.portal_host("http://Auth.Example.COM:8080/eportal/") == "auth.example.com:8080"
+
+
+def test_host_trust():
+    assert rp.host_trust({}, "a") == "tofu"
+    assert rp.host_trust({"portal_hosts": []}, "a") == "tofu"
+    assert rp.host_trust({"portal_hosts": ["a"]}, "a") == "ok"
+    assert rp.host_trust({"portal_hosts": ["a"]}, "b") == "stranger"
+
+
+def test_first_login_remembers_host(monkeypatch):
+    calls = _fake_curl(monkeypatch, PORTAL)
+    conf = {"iface": "wlp4s0", "user": "u", "password": "p"}
+    assert rp.run_once(conf) == "login ok"
+    assert conf["portal_hosts"] == ["203.0.113.5"]
+    assert any("method=login" in u for u in _posted(calls))
+
+
+def test_known_host_logs_in(monkeypatch):
+    _fake_curl(monkeypatch, PORTAL)
+    conf = {"iface": "wlp4s0", "user": "u", "password": "p", "portal_hosts": ["203.0.113.5"]}
+    assert rp.run_once(conf) == "login ok" and conf["portal_hosts"] == ["203.0.113.5"]
+
+
+def test_stranger_host_gets_no_credentials(monkeypatch):
+    calls = _fake_curl(monkeypatch, STRANGER)
+    conf = {"iface": "wlp4s0", "user": "u", "password": "p", "portal_hosts": ["203.0.113.5"]}
+    assert rp.run_once(conf) == "untrusted: 198.51.100.9"
+    assert _posted(calls) == []                                          # 一个请求体都没发
+    assert conf["portal_hosts"] == ["203.0.113.5"]
+
+
+def test_failed_first_login_does_not_remember(monkeypatch):
+    _fake_curl(monkeypatch, PORTAL, login='{"result":"fail","message":"密码错误"}')
+    conf = {"iface": "wlp4s0", "user": "u", "password": "p"}
+    assert rp.run_once(conf) == "login fail: 密码错误" and "portal_hosts" not in conf
+
+
+def test_attempt_reports_untrusted_as_not_ok(monkeypatch):
+    monkeypatch.setattr(rp, "run_once", lambda conf: "untrusted: 198.51.100.9")
+    r = rp.attempt({"iface": "wlp4s0", "ssid": "CAMPUS-NET"}, "CAMPUS-NET", now=5)
+    assert (r["state"], r["message"], r["ok"]) == ("untrusted", "198.51.100.9", False)
+
+
+def test_persist_hosts_only_when_changed(tmp_path):
+    p = str(tmp_path / "c.json")
+    conf = {"user": "u", "password": "p", "portal_hosts": ["203.0.113.5"]}
+    assert rp.persist_hosts(conf, before=["203.0.113.5"], path=p) is False
+    assert rp._read_json(p) is None
+    assert rp.persist_hosts(conf, before=None, path=p) is True
+    assert rp._read_json(p)["portal_hosts"] == ["203.0.113.5"]

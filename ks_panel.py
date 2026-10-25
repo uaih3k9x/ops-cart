@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Kiosk Kickstart 面板: 表单改常用字段 + 全文编辑 + 备份轮换 + 保存前校验."""
+"""Kiosk Kickstart 面板: 表单改常用字段 + 全文编辑 + 备份轮换 + 保存前校验.
+校验不通过要二次确认才写盘; 写盘/读备份出错弹提示; 算密码 hash (openssl) 放后台."""
 
+import glob
 import os
 import tkinter as tk
 from tkinter import messagebox
 
 import kiosk_core as kc
+import kiosk_ui_core as kui
+from kiosk_ui_core import UiBridge
 
 FONT = ("Noto Sans CJK SC", 12)
 FONT_MONO = ("Noto Sans Mono CJK SC", 13)
@@ -16,8 +20,14 @@ class KsPanel(tk.Frame):
 
     def __init__(self, master):
         super().__init__(master, bg="#161b26")
+        self.ui = UiBridge(self)
+        self.ui.start()
         self._build()
         self.reload()
+
+    def destroy(self):
+        self.ui.stop()
+        super().destroy()
 
     # ------------------------------------------------------------ UI
 
@@ -106,35 +116,52 @@ class KsPanel(tk.Frame):
         if not pw or len(pw) < 8:
             messagebox.showerror("密码", "密码至少 8 位")
             return
-        try:
-            hashed = kc.ks_hash_password(pw)
-            new = kc.ks_set_rootpw(self._content(), hashed)
+
+        def done(hashed):                   # 回到主线程时再取正文, 期间的编辑不会被覆盖
+            if isinstance(hashed, Exception):
+                messagebox.showerror("密码", str(hashed))
+                return
+            try:
+                new = kc.ks_set_rootpw(self._content(), hashed)
+            except ValueError as e:
+                messagebox.showerror("密码", str(e))
+                return
             self.text.delete("1.0", "end")
             self.text.insert("1.0", new)
             self.pw_var.set("")
             self._refresh_warn()
-        except ValueError as e:
-            messagebox.showerror("密码", str(e))
+        if not self.ui.run_bg(lambda: kc.ks_hash_password(pw), done, key="hash"):
+            return
+        self.warn.config(text="处理中…")
 
     def save(self):
-        kc.ks_write(self._content())
+        def confirm(warns):
+            return messagebox.askyesno("校验没通过", "警告:\n" + "\n".join(warns) + "\n\n仍然保存?",
+                                       icon="warning")
+        ok, msg = kui.ks_save(self._content(), confirm)
         self._refresh_warn()
-        import glob
+        if not ok:
+            if msg != "已取消":
+                messagebox.showerror("保存", msg)
+            return
         baks = sorted(glob.glob(kc.KS_PATH + ".bak-*"))
         messagebox.showinfo("保存",
                             f"已写入 {kc.KS_PATH}\n备份: {os.path.basename(baks[-1]) if baks else '无'}")
 
     def restore_backup(self):
-        import glob
-        import shutil
         baks = sorted(glob.glob(kc.KS_PATH + ".bak-*"))
         if not baks:
             messagebox.showinfo("恢复", "没有备份")
             return
-        if messagebox.askyesno("恢复", f"用 {os.path.basename(baks[-1])} 覆盖当前内容?"):
-            kc.ks_write(open(baks[-1]).read())
-            self.reload()
+        if not messagebox.askyesno("恢复", f"用 {os.path.basename(baks[-1])} 覆盖当前内容?"):
+            return
+        try:
+            kc.ks_write(kui.read_text(baks[-1]))
+        except (OSError, UnicodeDecodeError) as ex:
+            messagebox.showerror("恢复", f"恢复失败: {ex}")
+            return
+        self.reload()
 
     def _refresh_warn(self):
         warns = kc.ks_validate(self._content())
-        self.warn.config(text="⚠ " + "  |  ".join(warns) if warns else "✓ 校验通过")
+        self.warn.config(text="警告: " + "  |  ".join(warns) if warns else "校验通过")
