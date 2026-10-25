@@ -2,17 +2,19 @@
 """Kiosk 无线管理面板: 扫描/连接/输密码(可显示)/已保存网络按优先级排序/忘记;
 底部是校园网认证: 改账号密码、立即认证、看最近一次结果.
 
-nmcli 调用放后台线程, 结果用 after() 回到 Tk 线程. 规则见 wifi_core.
+nmcli 调用放后台线程, 结果经 UiBridge 回到 Tk 线程. 规则见 wifi_core.
+推车眼下靠无线上网时 (网线拔了), 忘记 / 改密码 / 重输密码都先弹确认; 重输密码先建后删, 连不上就回滚.
 """
 
 import subprocess
-import threading
 import time
 import tkinter as tk
+import uuid
 from tkinter import messagebox
 
 import ruijie_portal as rp
 import wifi_core as wc
+from kiosk_ui_core import UiBridge
 
 FONT = ("Noto Sans CJK SC", 13)
 FONT_MONO = ("Noto Sans Mono CJK SC", 14)
@@ -27,15 +29,39 @@ def _run(cmd, timeout=30):
         return 1, str(ex)
 
 
-def _bars(sig):
-    return "▂▄▆█"[: max(1, min(4, sig // 25 + 1))].ljust(4)
+AUTH_STATES = {"online": "已在线", "login ok": "登录成功", "skip": "跳过", "login fail": "登录失败",
+               "error": "出错", "down": "连不上网", "portal?": "认证页没认出来",
+               "untrusted": "认证页主机不在白名单, 没发密码"}
+EGRESS_WARN = "{name} 是推车眼下的上网出口 (网线没插), {what}后远程 (SSH / tailscale) 可能会断.\n要继续吗?"
 
 
-class WifiPanel(tk.Frame):
+class BridgePanel(tk.Frame):
+    """面板基类: 自带一个 UiBridge, 后台命令只经它回到 Tk 线程; 面板销毁时停掉轮询."""
+
+    def __init__(self, master, **kw):
+        super().__init__(master, **kw)
+        self.ui = UiBridge(self)
+        self.ui.start()
+
+    def destroy(self):
+        self.ui.stop()
+        super().destroy()
+
+    def _bg(self, work, done, note="处理中…"):
+        """work() 在线程里跑, done(result) 回 Tk 线程 (异常对象也当结果传). 同一面板同时只跑一件事."""
+        def back(res):
+            if self.winfo_exists():
+                done(res)
+        if self.ui.run_bg(work, back, key="panel"):
+            self._say(note)
+        else:
+            self._say("上一步还在处理中…", ok=False)
+
+
+class WifiPanel(BridgePanel):
     def __init__(self, master):
         super().__init__(master, bg=BG)
-        self.nets, self.saved = [], []
-        self._busy = False
+        self.nets, self.saved, self.routes = [], [], ""
         self._build()
         self.reload(rescan=True)        # 缓存里往往只有当前连着的那个
 
@@ -69,9 +95,9 @@ class WifiPanel(tk.Frame):
         self._btn(bar, "连接", self.connect_selected, bg="#26577c")
         self.scan_lb.bind("<Double-Button-1>", lambda _e: self.connect_selected())
 
-        self.saved_lb, bar = self._list(cols, "已保存 · 优先级 高 → 低 (自动连接时从上往下试)")
-        self._btn(bar, "↑ 上移", lambda: self.move(-1))
-        self._btn(bar, "↓ 下移", lambda: self.move(+1))
+        self.saved_lb, bar = self._list(cols, "已保存 · 优先级从高到低 (自动连接时从上往下试)")
+        self._btn(bar, "上移", lambda: self.move(-1))
+        self._btn(bar, "下移", lambda: self.move(+1))
         self._btn(bar, "连接", self.up_saved, bg="#26577c")
         self._btn(bar, "显示已存密码", self.load_psk)
         self._btn(bar, "忘记", self.forget, bg="#47202a")
@@ -85,7 +111,7 @@ class WifiPanel(tk.Frame):
                  insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
         tk.Label(form, text="密码:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(10, 0))
         self.pw_var = tk.StringVar()
-        self.pw_entry = tk.Entry(form, textvariable=self.pw_var, width=24, show="•", font=FONT_MONO,
+        self.pw_entry = tk.Entry(form, textvariable=self.pw_var, width=24, show="*", font=FONT_MONO,
                                  bg="#10141c", fg=FG, insertbackground=FG, relief="flat")
         self.pw_entry.pack(side="left", padx=6, ipady=3)
         self.pw_entry.bind("<Return>", lambda _e: self.connect_form())
@@ -113,14 +139,14 @@ class WifiPanel(tk.Frame):
         tk.Entry(row, textvariable=self.auth_user, width=16, font=FONT_MONO, bg="#10141c", fg=FG,
                  insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
         tk.Label(row, text="密码:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(10, 0))
-        self.auth_pw_entry = tk.Entry(row, textvariable=self.auth_pw, width=20, show="•", font=FONT_MONO,
+        self.auth_pw_entry = tk.Entry(row, textvariable=self.auth_pw, width=20, show="*", font=FONT_MONO,
                                       bg="#10141c", fg=FG, insertbackground=FG, relief="flat")
         self.auth_pw_entry.pack(side="left", padx=6, ipady=3)
         self.auth_pw_entry.bind("<Return>", lambda _e: self.auth_save())
         self.auth_show = tk.BooleanVar(value=False)
         tk.Checkbutton(row, text="显示", variable=self.auth_show, font=FONT, bg=BG, fg="#c8cede",
                        selectcolor=BOX, activebackground=BG, activeforeground=FG,
-                       command=lambda: self.auth_pw_entry.config(show="" if self.auth_show.get() else "•")
+                       command=lambda: self.auth_pw_entry.config(show="" if self.auth_show.get() else "*")
                        ).pack(side="left", padx=4)
         self._btn(row, "保存", self.auth_save)
         self._btn(row, "立即认证", self.auth_now, bg="#26577c")
@@ -134,20 +160,25 @@ class WifiPanel(tk.Frame):
             self.auth_lbl.config(text="最近一次: 还没跑过", fg="#8b93a7")
             return
         when = time.strftime("%H:%M:%S", time.localtime(st.get("time", 0)))
-        text = {"online": "已在线", "login ok": "登录成功", "skip": "跳过", "login fail": "登录失败",
-                "error": "出错", "down": "连不上网", "portal?": "认证页没认出来"}.get(st["state"], st["state"])
+        text = AUTH_STATES.get(st["state"], st["state"])
         self.auth_lbl.config(text=f"最近一次 {when}: {text} {st.get('message', '')}".rstrip(),
                              fg="#7ee787" if st.get("ok") else "#ff7b72")
 
     def auth_save(self):
-        try:
+        user, pw = self.auth_user.get(), self.auth_pw.get()
+
+        def work():                         # 配置里没写 ssid 时要跑 iw 看当前连着哪个, 放后台
             old = rp._read_json(rp.CONF) or {}
             ssid = None if old.get("ssid") else rp.current_ssid(old.get("iface", "wlp4s0"))
-            conf = rp.conf_update(old, self.auth_user.get(), self.auth_pw.get(), ssid=ssid)
-            rp.conf_save(conf)
-        except (ValueError, OSError) as ex:
-            return self._say(f"保存失败: {ex}", ok=False)
-        self._say("认证账号已保存, 下次自动认证用新的; 要马上试点「立即认证」")
+            rp.conf_save(rp.conf_update(old, user, pw, ssid=ssid))
+
+        def done(res):
+            if isinstance(res, (ValueError, OSError)):
+                return self._say(f"保存失败: {res}", ok=False)
+            if isinstance(res, Exception):
+                return self._say(f"保存失败: {type(res).__name__}: {res}", ok=False)
+            self._say("认证账号已保存, 下次自动认证用新的; 要马上试点「立即认证」")
+        self._bg(work, done, "保存中…")
 
     def auth_now(self):
         def done(res):
@@ -157,32 +188,12 @@ class WifiPanel(tk.Frame):
         self._bg(lambda: _run(["systemctl", "start", "campus-auth.service"], timeout=60), done, "认证中…")
 
     def _toggle_show(self):
-        self.pw_entry.config(show="" if self.show_var.get() else "•")
+        self.pw_entry.config(show="" if self.show_var.get() else "*")
 
     def _say(self, text, ok=True):
         self.msg.config(text=text, fg="#7ee787" if ok else "#ff7b72")
 
     # ------------------------------------------------------------ 后台
-
-    def _bg(self, work, done, note="处理中…"):
-        """work() 在线程里跑, done(result) 回 Tk 线程."""
-        if self._busy:
-            return
-        self._busy = True
-        self._say(note)
-
-        def wrap():
-            try:
-                res = work()
-            except Exception as ex:          # noqa: BLE001  面板别因为一条命令挂掉
-                res = ex
-
-            def back():
-                self._busy = False
-                if self.winfo_exists():
-                    done(res)
-            self.after(0, back)
-        threading.Thread(target=wrap, daemon=True).start()
 
     def reload(self, rescan=True):
         def work():
@@ -191,13 +202,14 @@ class WifiPanel(tk.Frame):
             saved = wc.parse_saved(saved)
             for s in saved:                 # 连接名和 SSID 可能不同 (大小写、改过名)
                 s["ssid"] = _run(["nmcli", "-g", "802-11-wireless.ssid", "con", "show", "uuid", s["uuid"]])[1]
-            return wc.parse_scan(scan), saved
+            routes = _run(["ip", "route", "show", "default"])[1]
+            return wc.parse_scan(scan), saved, routes
 
         def done(res):
             if isinstance(res, Exception):
                 self._say(f"读取失败: {res}", ok=False)
                 return
-            self.nets, self.saved = res
+            self.nets, self.saved, self.routes = res
             self._render()
             self._say(f"附近 {len(self.nets)} 个网络, 已保存 {len(self.saved)} 个")
         self._bg(work, done, "扫描中…" if rescan else "读取中…")
@@ -206,12 +218,12 @@ class WifiPanel(tk.Frame):
         known = {s["ssid"] for s in self.saved}
         self.scan_lb.delete(0, "end")
         for n in self.nets:
-            lock = "🔒" if wc.key_mgmt(n["security"]) else "  "
-            tag = " ● 在用" if n["in_use"] else (" 已保存" if n["ssid"] in known else "")
-            self.scan_lb.insert("end", f"{_bars(n['signal'])} {n['signal']:>3} {lock} {n['ssid']}{tag}")
+            lock = "[加密]" if wc.key_mgmt(n["security"]) else "[开放]"
+            tag = " [在用]" if n["in_use"] else (" [已保存]" if n["ssid"] in known else "")
+            self.scan_lb.insert("end", f"{n['signal']:>3}% {lock} {n['ssid']}{tag}")
         self.saved_lb.delete(0, "end")
         for i, s in enumerate(self.saved, 1):
-            flag = " ● 在用" if s["active"] else ("" if s["autoconnect"] else " (不自动连)")
+            flag = " [在用]" if s["active"] else ("" if s["autoconnect"] else " (不自动连)")
             self.saved_lb.insert("end", f"{i:>2}. {s['ssid'] or s['name']}{flag}")
 
     def _sel(self, lb, items):
@@ -219,18 +231,29 @@ class WifiPanel(tk.Frame):
         return (cur[0], items[cur[0]]) if cur and cur[0] < len(items) else (None, None)
 
     def _after_cmd(self, cmds, ok_text, rescan=False):
+        self._after_plan({"do": cmds, "rollback": []}, ok_text, rescan)
+
+    def _after_plan(self, plan, ok_text, rescan=False, prepare=None):
+        """按 wifi_core 的计划执行 (失败自动回滚). prepare() 在后台先跑, 返回计划或错误字符串."""
         def work():
-            for c in cmds:
-                rc, out = _run(c, timeout=45)
-                if rc:
-                    return False, out
-            return True, ""
+            p = prepare() if prepare else plan
+            if isinstance(p, str):
+                return False, p, False
+            return wc.run_plan(p, lambda c: _run(c, timeout=45))
 
         def done(res):
-            ok, out = res if not isinstance(res, Exception) else (False, str(res))
-            self._say(ok_text if ok else f"失败: {out[-160:]}", ok)
+            ok, out, rolled = res if not isinstance(res, Exception) else (False, str(res), False)
+            tail = ", 已回到原来的设置" if rolled else ""
+            self._say(ok_text if ok else f"失败{tail}: {out[-160:]}", ok)
             self.after(300, lambda: self.reload(rescan=rescan))
         self._bg(work, done)
+
+    def _egress_ok(self, s, what):
+        """对当前出口连接动手前确认; 不是出口直接放行."""
+        if not s or not wc.is_egress(s, self.routes):
+            return True
+        return messagebox.askyesno("远程会断", EGRESS_WARN.format(name=s["ssid"] or s["name"], what=what),
+                                   icon="warning")
 
     # ------------------------------------------------------------ 动作
 
@@ -256,9 +279,12 @@ class WifiPanel(tk.Frame):
         sec = next((n["security"] for n in self.nets if n["ssid"] == ssid), "WPA2" if pw else "")
         if wc.key_mgmt(sec) and len(pw) < 8:
             return self._say("WPA 密码至少 8 位", ok=False)
-        old = [wc.cmd_delete(s["uuid"]) for s in self.saved if s["ssid"] == ssid]   # 重输密码 = 重建
-        add = wc.cmd_add(ssid, pw, sec, wc.next_priority(self.saved))
-        self._after_cmd(old + [add, ["nmcli", "con", "up", "id", ssid]], f"已连接并保存 {ssid} (排在最上面)")
+        cur = next((s for s in self.saved if s["ssid"] == ssid and s["active"]), None)
+        if not self._egress_ok(cur, "重建这个连接"):
+            return
+        # 重输密码 = 重建: 先建新的并连上, 成功了才删旧的; 连不上就删掉新的、回到旧的
+        plan = wc.plan_replace(self.saved, ssid, pw, sec, wc.next_priority(self.saved), str(uuid.uuid4()))
+        self._after_plan(plan, f"已连接并保存 {ssid} (排在最上面)")
 
     def _pick_saved(self):
         _, s = self._sel(self.saved_lb, self.saved)
@@ -286,22 +312,35 @@ class WifiPanel(tk.Frame):
         _, s = self._sel(self.saved_lb, self.saved)
         if not s:
             return self._say("先在右边选一个已保存的网络", ok=False)
-        rc, out = _run(wc.cmd_show_psk(s["uuid"]))
-        self.ssid_var.set(s["ssid"] or s["name"])
-        self.pw_var.set(out if rc == 0 else "")
-        self._say("开放网络, 没有密码" if rc == 0 and not out else
-                  "已填入密码框 (勾「显示密码」查看)" if rc == 0 else f"读取失败: {out}", ok=rc == 0)
+
+        def done(res):
+            rc, out = res if not isinstance(res, Exception) else (1, str(res))
+            self.ssid_var.set(s["ssid"] or s["name"])
+            self.pw_var.set(out if rc == 0 else "")
+            self._say("开放网络, 没有密码" if rc == 0 and not out else
+                      "已填入密码框 (勾「显示密码」查看)" if rc == 0 else f"读取失败: {out}", ok=rc == 0)
+        self._bg(lambda: _run(wc.cmd_show_psk(s["uuid"])), done, "读取中…")
 
     def change_psk(self):
         _, s = self._sel(self.saved_lb, self.saved)
         if not s:
             return self._say("先在右边选要改密码的网络", ok=False)
-        if len(self.pw_var.get()) < 8:
+        new = self.pw_var.get()
+        if len(new) < 8:
             return self._say("WPA 密码至少 8 位", ok=False)
-        self._after_cmd([wc.cmd_set_psk(s["uuid"], self.pw_var.get()), wc.cmd_up(s["uuid"])],
-                        f"{s['ssid'] or s['name']} 密码已更新")
+        if not self._egress_ok(s, "改密码"):
+            return
+
+        def prepare():                      # 先记下旧密码, 新密码连不上就写回去
+            rc, old = _run(wc.cmd_show_psk(s["uuid"]))
+            if rc:
+                return f"读不到旧密码, 没改: {old[-120:]}"
+            return wc.plan_change_psk(s["uuid"], old, new)
+        self._after_plan(None, f"{s['ssid'] or s['name']} 密码已更新", prepare=prepare)
 
     def forget(self):
         _, s = self._sel(self.saved_lb, self.saved)
-        if s and messagebox.askyesno("忘记网络", f"删除已保存的 {s['ssid'] or s['name']}?"):
+        if not s or not self._egress_ok(s, "忘记它"):
+            return
+        if messagebox.askyesno("忘记网络", f"删除已保存的 {s['ssid'] or s['name']}?"):
             self._after_cmd([wc.cmd_delete(s["uuid"])], "已删除")

@@ -12,7 +12,7 @@ import wol_core as wol
 from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, WifiPanel
 
 
-class WolPanel(tk.Frame):
+class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命令, 不需要后台线程
     _btn = WifiPanel._btn
     _say = WifiPanel._say
     _sel = WifiPanel._sel
@@ -78,7 +78,7 @@ class WolPanel(tk.Frame):
         except (ValueError, OSError) as ex:
             return self._say(f"没发出去: {ex}", ok=False)
         cartlog.event("wol", f"{name or '(临时)'} {mac} 经 {wol.IFACES.get(iface, iface)}")
-        self._say(f"已从 {wol.IFACES.get(iface, iface)} 发出魔术包 → {name or mac}; 一般 10-60 秒开机")
+        self._say(f"已从 {wol.IFACES.get(iface, iface)} 发出魔术包给 {name or mac}; 一般 10-60 秒开机")
 
     def wake_selected(self):
         _, t = self._sel(self.lb, self.targets)

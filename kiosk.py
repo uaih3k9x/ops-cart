@@ -3,17 +3,21 @@
 
 v2: overrideredirect 全屏铺满; UVC 预览(mpv 嵌入); CH9329 键鼠透传
 (点击画面捕获, Ctrl+Alt 释放, VMware 风格). 终端 root 敲 `kiosk` 启动.
+
+线程纪律: 外部命令 (systemctl/nmcli/v4l2-ctl/smartctl...) 一律经 self.ui (UiBridge) 放到后台,
+结果回主线程才碰界面; CH9329 发送走 ChWorker 自己的线程. 主线程只起 mpv (Popen 不等它).
 """
 
 import os
-import subprocess
-import threading
+import sys
 import time
 import tkinter as tk
+from subprocess import DEVNULL, Popen       # 只给 mpv 用
 from tkinter import messagebox, simpledialog
 
 import cartlog
 import kiosk_core as kc
+import kiosk_ui_core as kui
 import kvm_core as kvm
 from ch9329 import Ch9329
 from serial_panel import SerialPanel
@@ -28,6 +32,9 @@ FONT_MONO = ("Noto Sans Mono CJK SC", 13)
 BOOT_BG = "#ffffff"     # 开机自检页白底, 接 Plymouth 的白底
 VIDEO_DEV = "/dev/video0"
 IDLE_SECONDS = 180
+BOOT_WATCHDOG_MS = 30000    # 自检 30 秒还没完就强制进主界面 (锁屏)
+PANE_CLASSES = {"serial": SerialPanel, "ks": KsPanel, "wifi": WifiPanel,
+                "netprof": NetProfPanel, "wol": WolPanel}
 
 
 class Kiosk(tk.Tk):
@@ -38,6 +45,10 @@ class Kiosk(tk.Tk):
         self.overrideredirect(True)
         self._fill_screen()
         self.configure(bg="#10141c", cursor="arrow")
+        self.ui = kui.UiBridge(self)
+        self.ui.start()
+        self.pane = kui.LeftPane(kui.PANES)
+        self.panels = {}                    # 面板名 -> 正开着的面板 (预览除外)
 
         self.mpv = None
         self.video_frame = None
@@ -49,23 +60,25 @@ class Kiosk(tk.Tk):
         self._kb = kc.HidKeyboard()
         self.mouse_abs = True               # 默认绝对鼠标; BIOS 里切相对
         self._video_wh = (1920, 1080)
-        self._last_abs, self._abs_pos, self._sent_abs = None, None, None
+        self._last_abs, self._pending_abs, self._sent_abs = None, None, None
         self._mouse_acc = [0, 0, 0]      # dx, dy, wheel
         self._mouse_btn = 0
-        self._last_pos = None
-        self.ch, self._ch_dev = None, None
+        self._center = None              # 相对模式: 指针每帧 warp 回画面中心
+        self.chw, self._ch_dev = None, None
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
 
         kc.kp_enter_as_return(self)
+        kui.kp_digits_as_digits(self)
+        self._menu_btns = {}
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read())
         self._lock_win = None
         self._boot_win = None
+        self._arm_win = None
         self._code = None
-        try:
-            kc.pxe_disarm()             # 开机即复位: PXE 默认只给救援菜单
-        except OSError:
-            pass
+        self._boot_once = kui.Once(self._boot_finish)
+        self._exit_once = kui.Once(self._disarm_quietly)
+        self._disarm_quietly()          # 开机即复位: PXE 默认只给救援菜单
         self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
         self.after(50, self._boot_selftest)
         self._last_input = time.time()
@@ -102,7 +115,7 @@ class Kiosk(tk.Tk):
         self.net_label = tk.Label(top, text="检查中", font=FONT, bg="#10141c", fg="#6b7489",
                                   compound="left", padx=6, cursor="hand2")
         self.net_label.pack(side="right", padx=(12, 0))
-        self.net_label.bind("<Button-1>", lambda _e: self.toggle_wifi())
+        self.net_label.bind("<Button-1>", lambda _e: self.toggle_pane("wifi"))
         self.clock = tk.Label(top, font=FONT, bg="#10141c", fg="#8b93a7")
         self.clock.pack(side="right")
         tk.Label(top, text=kc.version_string(), font=FONT, bg="#10141c",
@@ -116,10 +129,9 @@ class Kiosk(tk.Tk):
         body.pack(fill="both", expand=True, padx=12, pady=6)
         self.body = body
 
-        # 左: 状态板 (预览/串口模式下换成对应面板)
+        # 左: 状态板 (开了面板/预览就换成它, 同时只有一个, 见 kui.LeftPane)
         self.status_wrap = tk.Frame(body, bg="#161b26")
         self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        self.serial_panel = None
         tk.Label(self.status_wrap, text="状态", font=FONT_BIG, bg="#161b26",
                  fg="#8b93a7", anchor="w").pack(fill="x", padx=12, pady=(10, 2))
         self.status_text = tk.Text(self.status_wrap, font=FONT_MONO, bg="#161b26",
@@ -130,12 +142,13 @@ class Kiosk(tk.Tk):
         btns = tk.Frame(body, bg="#10141c")
         btns.pack(side="right", fill="y")
         self._build_menu(btns)
-        self.video_dev = kc.default_video(kc.video_nodes()) or VIDEO_DEV
+        nodes = kc.video_nodes()            # 只读 sysfs; 挑有信号的那路要跑 v4l2-ctl, 推迟到自检线程
+        self.video_dev = nodes[0]["dev"] if nodes else VIDEO_DEV
         self.btn_src.config(text=f"画面源:  {kc.video_friendly(self.video_dev)}")
         self._show_kvm()
 
     def _build_menu(self, btns):
-        """右侧按钮按 kc.MENU 分页: 每页一个 Frame, 全部先建好, 切页只换显示哪一个."""
+        """右侧按钮按 kui.MENU 分页: 每页一个 Frame, 全部先建好, 切页只换显示哪一个."""
         colors = {"warn": ("#4a3320", "#e8eaf0"), "danger": ("#47202a", "#ffb3bd")}
         self.btns_wrap, self.pages = btns, {}
 
@@ -146,19 +159,23 @@ class Kiosk(tk.Tk):
             b.pack(fill="x", pady=6)
             return b
 
-        for name, items in kc.MENU.items():
+        for name, items in kui.MENU.items():
             page = tk.Frame(btns, bg="#10141c")
             self.pages[name] = page
             if name != "main":
-                big(page, "←  返回", lambda: self.show_page("main"), bg="#2a3347", fg="#8b93a7")
+                big(page, "返回主页", lambda: self.show_page("main"), bg="#2a3347", fg="#8b93a7")
             for it in items:
                 if "page" in it:
                     cmd = lambda p=it["page"]: self.show_page(p)
+                elif "arg" in it:
+                    cmd = lambda f=getattr(self, it["do"]), a=it["arg"]: f(a)
                 else:
                     cmd = getattr(self, it["do"])
                 b = big(page, it["text"], cmd, *colors.get(it.get("style"), ()))
                 if "attr" in it:
                     setattr(self, it["attr"], b)
+                if "do" in it and "arg" not in it:
+                    self._menu_btns[it["do"]] = b
         self.show_page("main")
 
     def show_page(self, name):
@@ -177,28 +194,31 @@ class Kiosk(tk.Tk):
     CHECK_EVERY = 10        # 自检项 (ping/PCI/nmcli...) 慢一点, 10 s 一轮; 温度风扇照旧 2 s
 
     def refresh(self):
-        """状态板 = 实时自检: 跟开机自检同一张计划表 (selftest.json), 再加温度/风扇."""
+        """状态板 = 实时自检: 跟开机自检同一张计划表 (selftest.json), 再加温度/风扇.
+        采集都在后台 (UiBridge), 上一轮没回来就不再起新的, 线程不会越攒越多."""
         def checks():
-            try:
-                net = kc.net_probe()
-                self.after(0, lambda: self._render_net(*net))
-                self._check_rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
-            finally:
-                self._checking = False
+            return kc.net_probe(), kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
 
-        def work():
+        def checks_done(res):
+            self._checking = False
+            if not isinstance(res, Exception):
+                self._render_net(*res[0])
+                self._check_rows = res[1]
+
+        rows = self._check_rows
+
+        def board():
             now = time.time()
-            if now - self._ssd_ts > 60:          # smartctl 一分钟读一次就够
+            if now - self._ssd_ts > 60:          # smartctl 一分钟读一次就够 (只在这个线程里读写)
                 self._ssd, self._ssd_ts = kc.smart_temp(), now
             temps = kc.temps_status(smart=lambda: self._ssd)
             fans = kc.fans_to_show(kc.fans_status(), self._fans_seen)
-            lines = kc.status_board_lines(self._check_rows, temps, fans, kc.misc_status()["uptime"])
-            self.after(0, lambda: self._render(lines))
+            return kc.status_board_lines(rows, temps, fans, kc.misc_status()["uptime"])
 
         if not self._checking and time.time() - self._check_ts > self.CHECK_EVERY:
             self._checking, self._check_ts = True, time.time()
-            threading.Thread(target=checks, daemon=True).start()
-        threading.Thread(target=work, daemon=True).start()
+            self.ui.run_bg(checks, checks_done)
+        self.ui.run_bg(board, self._render, key="board")
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
 
@@ -209,6 +229,8 @@ class Kiosk(tk.Tk):
                               fg=self.NET_COLORS[state])
 
     def _render(self, lines):
+        if isinstance(lines, Exception):
+            return
         if self.status_text.winfo_ismapped():
             self.status_text.config(state="normal")
             self.status_text.delete("1.0", "end")
@@ -222,93 +244,45 @@ class Kiosk(tk.Tk):
             self.status_text.tag_config("t_hot", foreground="#ff7b72")
             self.status_text.tag_config("dim", foreground="#6b7489")
 
-    def toggle_serial(self):
-        if self.serial_panel:
-            self._stop_preview()          # 互斥: 预览与串口不同时占左侧
-            self.serial_panel.destroy()
-            self.serial_panel = None
-            self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
-            self.banner.config(text="")
+    # ------------------------------------------------------------ 左侧面板
+
+    def toggle_pane(self, name):
+        """左侧面板 (预览/串口/ks/无线/网口配置/WOL) 同时只开一个; 再点一次回状态板."""
+        if name == "preview" and self.pane.current != "preview" and not os.path.exists(self.video_dev):
+            messagebox.showwarning("UVC 预览", f"未检测到采集设备 {self.video_dev}")
+            return
+        close, opening = self.pane.toggle(name)
+        self._pane_close(close)
+        if opening:
+            self._pane_open(opening)
         else:
+            self._show_status()
+
+    def _close_pane(self):
+        self._pane_close(self.pane.close())
+        self._show_status()
+
+    def _pane_close(self, name):
+        if name == "preview":
             self._stop_preview()
-            self._close_net_panels()
-            self.status_wrap.pack_forget()
-            self.serial_panel = SerialPanel(self.body)
-            self.serial_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-            self.banner.config(text="串口会话 · conbroker (display 类只读命令可直接发, 改配置先问管理员)")
+        elif name:
+            w = self.panels.pop(name, None)
+            if w is not None:
+                w.destroy()
 
-    def toggle_ks(self):
-        if getattr(self, "ks_panel", None):
-            self._stop_preview()
-            if self.serial_panel:
-                self.toggle_serial()
-            self.ks_panel.destroy()
-            self.ks_panel = None
-            self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
-            self.banner.config(text="")
-        else:
-            self._stop_preview()
-            if self.serial_panel:
-                self.toggle_serial()
-            self._close_net_panels()
-            self.status_wrap.pack_forget()
-            self.ks_panel = KsPanel(self.body)
-            self.ks_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-            self.banner.config(text="Kickstart 编辑 · 保存自动备份, 修改立即对下次装机生效")
-
-    def _close_net_panels(self):
-        """无线 / 网口配置文件 / 网络唤醒几个网络面板, 开着哪个关哪个."""
-        for attr in ("wifi_panel", "netprof_panel", "wol_panel"):
-            if getattr(self, attr, None):
-                getattr(self, attr).destroy()
-                setattr(self, attr, None)
-                self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
-                self.banner.config(text="")
-
-    def toggle_wifi(self):
-        if getattr(self, "wifi_panel", None):
-            self._close_net_panels()
-            return
-        self._close_net_panels()
-        self._stop_preview()
-        if self.serial_panel:
-            self.toggle_serial()
-        if getattr(self, "ks_panel", None):
-            self.toggle_ks()
+    def _pane_open(self, name):
         self.status_wrap.pack_forget()
-        self.wifi_panel = WifiPanel(self.body)
-        self.wifi_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        self.banner.config(text="无线网络 · 优先级从上往下自动连, 再点一次按钮返回")
-
-    def toggle_netprof(self):
-        if getattr(self, "netprof_panel", None):
-            self._close_net_panels()
+        if name == "preview":
+            self._start_preview()
             return
-        self._close_net_panels()
-        self._stop_preview()
-        if self.serial_panel:
-            self.toggle_serial()
-        if getattr(self, "ks_panel", None):
-            self.toggle_ks()
-        self.status_wrap.pack_forget()
-        self.netprof_panel = NetProfPanel(self.body)
-        self.netprof_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        self.banner.config(text="网口配置文件 · 切换 / 回退 / 新建, 再点一次按钮返回")
+        w = PANE_CLASSES[name](self.body)
+        w.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.panels[name] = w
+        self.banner.config(text=kui.PANES[name])
 
-    def toggle_wol(self):
-        if getattr(self, "wol_panel", None):
-            self._close_net_panels()
-            return
-        self._close_net_panels()
-        self._stop_preview()
-        if self.serial_panel:
-            self.toggle_serial()
-        if getattr(self, "ks_panel", None):
-            self.toggle_ks()
-        self.status_wrap.pack_forget()
-        self.wol_panel = WolPanel(self.body)
-        self.wol_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        self.banner.config(text="网络唤醒 · 双击清单里的机器直接唤醒, 再点一次按钮返回")
+    def _show_status(self):
+        self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self.banner.config(text="")
 
     # ------------------------------------------------------------ UVC 预览
 
@@ -322,28 +296,33 @@ class Kiosk(tk.Tk):
             self._stop_preview()
             self._start_preview()
 
-    def toggle_preview(self):
-        if self.video_frame:
-            self._stop_preview()
-        else:
-            self._start_preview()
+    def _set_video_dev(self, dev):
+        """自检线程挑出的默认画面源 (有信号的优先); 用户已经在看预览就不动."""
+        if dev and dev != self.video_dev and not self.video_frame:
+            self.video_dev = dev
+            self.btn_src.config(text=f"画面源:  {kc.video_friendly(dev)}")
+            self._show_kvm()
 
     def _start_preview(self):
-        if not os.path.exists(self.video_dev):
-            messagebox.showwarning("UVC 预览", f"未检测到采集设备 {self.video_dev}")
-            return
-        self._close_net_panels()
-        self.status_wrap.pack_forget()
+        """只由 toggle_pane / switch_source 调. 分辨率 (v4l2-ctl) 后台读, 回来之前按 16:9 算."""
         self.video_frame = tk.Frame(self.body, container=True, bg="#000000")
         self.video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.video_frame.bind("<Button-1>", lambda e: self._engage_passthrough())
         self.update_idletasks()
         wid = self.video_frame.winfo_id()
-        self._video_wh = kc.video_size(self.video_dev)     # 绝对鼠标按真实画面比例扣黑边
-        os.makedirs("/run/ops-cart", exist_ok=True)        # mpv 的 IPC socket 放这 (cart_snap.py 用)
-        self.mpv = subprocess.Popen(
-            kc.mpv_cmd(wid, self.video_dev),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        dev = self.video_dev
+        self._video_wh = (1920, 1080)
+
+        def got_size(wh):
+            if not isinstance(wh, Exception) and self.video_dev == dev:
+                self._video_wh = wh                         # 绝对鼠标按真实画面比例扣黑边
+        self.ui.run_bg(lambda: kc.video_size(dev), got_size)
+        try:
+            os.makedirs("/run/ops-cart", exist_ok=True)    # mpv 的 IPC socket 放这 (cart_snap.py 用)
+            self.mpv = Popen(kc.mpv_cmd(wid, dev), stdout=DEVNULL, stderr=DEVNULL)
+        except OSError as ex:
+            self.banner.config(text=f"mpv 起不来: {ex}")
+            return
         self._banner_idle()
 
     def _stop_preview(self):
@@ -354,8 +333,6 @@ class Kiosk(tk.Tk):
         if self.video_frame:
             self.video_frame.destroy()
             self.video_frame = None
-        self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        self.banner.config(text="")
 
     # ------------------------------------------------------------ 键鼠透传
 
@@ -364,12 +341,9 @@ class Kiosk(tk.Tk):
         return kvm.resolve(self.kvm, kc.video_key(self.video_dev), kvm.ports())
 
     def _close_ch(self):
-        if self.ch:
-            try:
-                self.ch.close()
-            except OSError:
-                pass
-        self.ch, self._ch_dev = None, None
+        if self.chw:
+            self.chw.close()
+        self.chw, self._ch_dev = None, None
 
     def _ensure_ch(self):
         """连当前画面源绑定的那块 CH9329 (按 CH343 序列号, 重插后 ttyACMn 变了也认得).
@@ -379,13 +353,15 @@ class Kiosk(tk.Tk):
             self._close_ch()
             return state
         dev = os.path.realpath(path)
-        if self.ch and dev == self._ch_dev:
+        if self.chw and not self.chw.dead and dev == self._ch_dev:
             return "ok"
         self._close_ch()
         try:
-            self.ch, self._ch_dev = Ch9329(dev, log=lambda *a: None), dev
+            ch = Ch9329(dev, log=lambda *a: None)
         except OSError:
             return "error"
+        self.chw = kui.ChWorker(ch, on_gone=lambda ex: self.ui.post(self._ch_gone, ex))
+        self._ch_dev = dev
         return "ok"
 
     def _show_kvm(self):
@@ -406,28 +382,28 @@ class Kiosk(tk.Tk):
         except OSError as ex:
             return messagebox.showerror("键鼠绑定", f"保存失败: {ex}")
         src = kc.video_friendly(self.video_dev)
-        cartlog.event("kvm", f"{src} ({key}) → {kvm.label(self.kvm, new)} {new or ''}".strip())
+        cartlog.event("kvm", f"{src} ({key}) -> {kvm.label(self.kvm, new)} {new or ''}".strip())
         self._show_kvm()
         others = kvm.shared_with(self.kvm, new, key) if new else []
         note = f" · 注意: 这块也绑在 {len(others)} 个别的画面源上" if others else ""
         self.banner.config(text=f"{src} 的键鼠: {kvm.label(self.kvm, new)}{note}")
 
-    def _ch_send(self, fn, *args, **kw):
-        """发送失败(线被拔)就丢掉句柄, 下次进透传再重连; 不让异常打断 Tk 的定时循环."""
-        if not self.ch:
-            return
-        try:
-            getattr(self.ch, fn)(*args, **kw)
-        except OSError:
-            self.ch, self._ch_dev = None, None
-            self.banner.config(text="CH9329 断开 · 重新单击画面重连")
+    def _ch_send(self, fn, *args, droppable=False):
+        """只入队, 真正的发送在 ChWorker 线程; 返回是否入队 (满了/断了 = False)."""
+        return bool(self.chw) and self.chw.send(fn, *args, droppable=droppable)
+
+    def _ch_gone(self, _ex):
+        """工作线程报拔线 (句柄已关): 退出透传, 下次单击画面重连."""
+        self._close_ch()
+        self._release_passthrough()
+        self.banner.config(text="CH9329 断开 · 重新单击画面重连")
 
     def _banner_idle(self):
         _path, serial, state = self._kvm_state()
         src = kc.video_friendly(self.video_dev)
         if state != "ok":
             why = "绑定的键鼠不在线" if state == "offline" else "没绑定键鼠"
-            self.banner.config(text=f"预览 {src} · {why}, 只看不操作 · 画面设置 ▸ 键鼠绑定")
+            self.banner.config(text=f"预览 {src} · {why}, 只看不操作 · 去「画面设置」里绑定键鼠")
             return
         mode = "绝对" if self.mouse_abs else "相对"
         self.banner.config(text=f"预览 {src} · 键鼠 {kvm.label(self.kvm, serial)} · 鼠标{mode} · 单击画面进入透传")
@@ -446,20 +422,22 @@ class Kiosk(tk.Tk):
         self._combo = kc.ReleaseCombo()
         self._kb = kc.HidKeyboard()
         self._mute_tk_keys()
-        self._last_pos, self._abs_pos, self._last_abs = None, None, None
+        self._pending_abs, self._last_abs, self._sent_abs = None, None, None
         self._mouse_acc, self._mouse_btn = [0, 0, 0], 0
         if self.mouse_abs:                  # 绝对: 不锁鼠标不藏光标, 指哪打哪
             self.video_frame.config(cursor="tcross")
-        else:                               # 相对 (BIOS 用): 锁住鼠标, 藏本地光标
+        else:                               # 相对 (BIOS 用): 锁住鼠标, 藏本地光标, 指针钉在中心
             self.video_frame.grab_set_global()
             self.video_frame.config(cursor="none")
+            self._center = (self.video_frame.winfo_width() // 2, self.video_frame.winfo_height() // 2)
+            self._warp_center()
         for seq in ("<Motion>", "<Button-1>", "<Button-2>", "<Button-3>",
                     "<ButtonRelease-1>", "<ButtonRelease-2>", "<ButtonRelease-3>",
                     "<Button-4>", "<Button-5>", "<MouseWheel>"):    # X11 滚轮 = 4/5 号键
             self.video_frame.bind(seq, self._on_passthrough_event)
         self.focus_force()
         mode = "绝对" if self.mouse_abs else "相对"
-        self.banner.config(text=f"🔒 透传中 · 鼠标{mode} · 按一下 Ctrl+Alt 再松开 = 释放")
+        self.banner.config(text=f"[透传中] 鼠标{mode} · 按一下 Ctrl+Alt 再松开 = 释放")
         self.after(16, self._flush_mouse)
 
     def _release_passthrough(self):
@@ -473,7 +451,7 @@ class Kiosk(tk.Tk):
         except tk.TclError:
             pass
         self._banner_idle()
-        self._mouse_acc, self._mouse_btn = [0, 0, 0], 0
+        self._mouse_acc, self._mouse_btn, self._center = [0, 0, 0], 0, None
         if self.mouse_abs and self._last_abs:
             self._ch_send("send_mouse_abs", 0, *self._last_abs, 0)   # 松开鼠标键, 光标留原地
         else:
@@ -487,6 +465,14 @@ class Kiosk(tk.Tk):
         if self.video_frame:
             self._banner_idle()
 
+    def _warp_center(self):
+        if self._center and self.video_frame:
+            self.video_frame.event_generate("<Motion>", warp=True, x=self._center[0], y=self._center[1])
+
+    def _abs_at(self, ev):
+        fw, fh = self.video_frame.winfo_width(), self.video_frame.winfo_height()
+        return kc.abs_point(ev.x, ev.y, fw, fh, *self._video_wh)
+
     def _on_passthrough_event(self, ev):
         # 透传时这些事件绑定会一直留在 Frame 上: 释放后左键单击 = 重新进透传, 其余忽略
         # (否则第二次点不进去, 且释放期间的移动会攒成一大步甩给目标机)
@@ -496,39 +482,50 @@ class Kiosk(tk.Tk):
             return
         if ev.type == "6":            # Motion
             if self.mouse_abs:
-                self._abs_pos = (ev.x, ev.y)
+                self._pending_abs = self._abs_at(ev) or self._pending_abs
             else:
-                pos = (ev.x_root, ev.y_root)
-                if self._last_pos:
-                    self._mouse_acc[0] += pos[0] - self._last_pos[0]
-                    self._mouse_acc[1] += pos[1] - self._last_pos[1]
-                self._last_pos = pos
-        elif step := kc.wheel_step(ev.type, ev.num, getattr(ev, "delta", 0)):
-            self._mouse_acc[2] += step
-            if self.mouse_abs:
-                self._send_abs(force=True)          # 滚一格立刻发, 不等下一帧
-        elif ev.type in ("4", "5") and kc.mouse_bit(ev.num):   # ButtonPress / Release
-            bit = kc.mouse_bit(ev.num)
-            if ev.type == "4":
-                self._mouse_btn |= bit
+                d = kui.rel_motion((ev.x, ev.y), self._center)
+                if d:
+                    self._mouse_acc[0] += d[0]
+                    self._mouse_acc[1] += d[1]
+                    self._warp_center()
+            return
+        step = kc.wheel_step(ev.type, ev.num, getattr(ev, "delta", 0))
+        bit = kc.mouse_bit(ev.num) if ev.type in ("4", "5") else None
+        if not step and not bit:
+            return
+        if not self.mouse_abs:
+            if step:
+                self._mouse_acc[2] += step
             else:
-                self._mouse_btn &= ~bit & 0xFF
-            if self.mouse_abs:
-                self._abs_pos = (ev.x, ev.y)
-                self._send_abs(force=True)          # 点击立刻发, 不等下一帧
+                self._mouse_btn = self._mouse_btn | bit if ev.type == "4" else self._mouse_btn & ~bit & 0xFF
+            self._flush_rel(force=True)                 # 点击/滚轮立刻发, 不等下一帧
+            return
+        kind = "wheel" if step else ("press" if ev.type == "4" else "release")
+        pt = self._abs_at(ev)
+        if not kui.abs_should_send(kind, pt, self._last_abs is not None):
+            return                                      # 黑边上按下/滚轮: 不发, 免得点到上一个位置
+        if kind == "press":
+            self._mouse_btn |= bit
+        elif kind == "release":
+            self._mouse_btn &= ~bit & 0xFF
+        self._last_abs = pt or self._last_abs
+        self._send_abs(wheel=step)
 
-    def _send_abs(self, force=False):
-        wheel = self._mouse_acc[2]
-        if self._abs_pos:
-            fw, fh = self.video_frame.winfo_width(), self.video_frame.winfo_height()
-            pt = kc.abs_point(*self._abs_pos, fw, fh, *self._video_wh)
-            if pt:
-                self._last_abs = pt
-            self._abs_pos = None
-        if self._last_abs and (force or wheel or self._last_abs != self._sent_abs):
-            self._ch_send("send_mouse_abs", self._mouse_btn, *self._last_abs, wheel)
+    def _send_abs(self, wheel=0, droppable=False):
+        if self._ch_send("send_mouse_abs", self._mouse_btn, *self._last_abs, wheel, droppable=droppable):
             self._sent_abs = self._last_abs
-            self._mouse_acc[2] = 0
+
+    def _flush_rel(self, force=False):
+        """相对位移每帧最多 ±127, 多的留到下一帧; 位移帧只在工作线程空闲时发 (攒着不丢)."""
+        dx, dy, wheel = self._mouse_acc
+        if not (dx or dy or wheel or self._mouse_btn or force):
+            return
+        if not force and not (self.chw and self.chw.idle()):
+            return
+        send, rest = kui.rel_split(dx, dy, wheel)
+        if self._ch_send("send_mouse", self._mouse_btn, *send, droppable=not force):
+            self._mouse_acc = list(rest)
 
     def _on_key(self, ev, down):
         """物理键码同步按住/松开 (X 键码 = evdev + 8), 不看 keysym, 不受 Shift/输入法影响."""
@@ -558,51 +555,86 @@ class Kiosk(tk.Tk):
         if not self.passthrough:
             return
         if self.mouse_abs:
-            self._send_abs()
+            pt, self._pending_abs = self._pending_abs, None
+            if pt and pt != self._sent_abs:
+                self._last_abs = pt
+                self._send_abs(droppable=True)      # 移动帧可丢: 下一帧会带上最新位置
         else:
-            dx, dy, wheel = self._mouse_acc
-            if dx or dy or wheel or self._mouse_btn:
-                self._ch_send("send_mouse", self._mouse_btn, dx, dy, wheel)
-                self._mouse_acc = [0, 0, 0]
+            self._flush_rel()
         self.after(16, self._flush_mouse)
 
     # ------------------------------------------------------------ 原有动作
 
-    def toggle_pxe(self):
-        _, active = kc.services_status(("pxe-server",))["pxe-server"]
-        verb = "停止" if active else "启动"
-        if not messagebox.askyesno("确认", f"确定要{verb} PXE 装机服务?"):
+    def _bg_action(self, key, work, done, note="处理中…"):
+        """菜单动作的外部命令放后台: 横幅显示 note, 对应按钮置灰; 上一次没回来就不重复起."""
+        btn = self._menu_btns.get(key)
+
+        def finish(res):
+            if btn is not None:
+                btn.config(state="normal")
+            done(res)
+        if not self.ui.run_bg(work, finish, key=key):
+            self.banner.config(text="上一次还在处理中…")
             return
-        subprocess.run(["systemctl", "stop" if active else "start",
-                        "pxe-server", "pxe-http-repo", "pxe-http-boot"],
-                       capture_output=True)
+        self.banner.config(text=note)
+        if btn is not None:
+            btn.config(state="disabled")
+
+    def toggle_pxe(self):
+        units = ("pxe-server", "pxe-http-repo", "pxe-http-boot")
+
+        def asked(res):
+            if isinstance(res, Exception):
+                return self.banner.config(text=f"读不到 PXE 服务状态: {res}")
+            active = res["pxe-server"][1]
+            verb = "停止" if active else "启动"
+            self.banner.config(text="")
+            if not messagebox.askyesno("确认", f"确定要{verb} PXE 装机服务?"):
+                return
+            cmd = ["systemctl", "stop" if active else "start", *units]
+            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30), lambda r: self.banner.config(
+                text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
+                else f"PXE 装机服务{verb}失败, 详见 journalctl"), f"正在{verb} PXE 装机服务…")
+        self._bg_action("toggle_pxe", lambda: kc.services_status(("pxe-server",)), asked, "读取服务状态…")
 
     def cfg_lan2(self):
         warn = ("注意: LAN2 是管理口(远程/SSH/tailscale 走这里)!\n"
                 "修改后当前远程连接会断, 请确保你人在车边操作.\n\n要继续吗?")
         if not messagebox.askyesno("LAN2 管理口", warn, icon="warning"):
             return
-        nics = {n["name"]: n for n in kc.nics_status()}
-        nic = nics["enp3s0"]
-        if messagebox.askyesno("LAN2", f"当前: {nic['ip']} ({nic['method']})\n\n改为 DHCP(自动获取)?"):
-            cmds = kc.nmcli_set_dhcp(kc.LAN2_CON)
-        else:
-            ip = simpledialog.askstring("静态 IP", "IP/前缀:", initialvalue=nic["ip"])
-            gw = simpledialog.askstring("网关", "网关(可空):")
-            dns = simpledialog.askstring("DNS", "DNS(可空):")
-            if not ip:
-                return
-            cmds = kc.nmcli_set_static(kc.LAN2_CON, ip, gw or "", dns or "")
-        for cmd in cmds:
-            subprocess.run(cmd, capture_output=True)
-        messagebox.showinfo("LAN2", "已下发, 状态见左侧(远程会断属正常)")
+
+        def apply(cmds):
+            for cmd in cmds:
+                rc, _ = kc.run(cmd, timeout=30)
+                if rc:
+                    return f"失败: {' '.join(cmd[:4])} 返回 {rc}"
+            return "已下发, 状态见左侧(远程会断属正常)"
+
+        def got(res):
+            self.banner.config(text="")
+            nic = None if isinstance(res, Exception) else next((n for n in res if n["name"] == "enp3s0"), None)
+            if nic is None:
+                return messagebox.showerror("LAN2", "读不到 enp3s0 的状态")
+            if messagebox.askyesno("LAN2", f"当前: {nic['ip']} ({nic['method']})\n\n改为 DHCP(自动获取)?"):
+                cmds = kc.nmcli_set_dhcp(kc.LAN2_CON)
+            else:
+                ip = simpledialog.askstring("静态 IP", "IP/前缀:", initialvalue=nic["ip"])
+                if not ip:
+                    return
+                gw = simpledialog.askstring("网关", "网关(可空):")
+                dns = simpledialog.askstring("DNS", "DNS(可空):")
+                cmds = kc.nmcli_set_static(kc.LAN2_CON, ip, gw or "", dns or "")
+            self._bg_action("cfg_lan2", lambda: apply(cmds), lambda r: messagebox.showinfo(
+                "LAN2", str(r)), "正在下发 LAN2 配置…")
+        self._bg_action("cfg_lan2", kc.nics_status, got, "读取网口状态…")
 
     def confirm_power(self, off):
         verb = "关机" if off else "重启"
         if not self._confirm_pin(verb):
             return
         if messagebox.askyesno("确认", f"确定要{verb}推车?", icon="warning"):
-            kc.power(off)
+            self._disarm_quietly()
+            self.ui.run_bg(lambda: kc.power(off))
 
     # ------------------------------------------------------------ 开机自检(街机风)
 
@@ -634,12 +666,24 @@ class Kiosk(tk.Tk):
                  fg="#2a2e36", anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
 
         def work():
-            rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
-            self.after(0, lambda: self._boot_show(box, rows, 0))
+            rows = kui.boot_rows_safe(lambda: kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context()))
+            try:
+                video = kc.default_video(kc.video_nodes())
+            except Exception:                   # noqa: BLE001  挑不出就用 _build 时的第一路
+                video = None
+            return rows, video
 
-        threading.Thread(target=work, daemon=True).start()
+        def done(res):
+            rows, video = (kui.fail_rows(res), None) if isinstance(res, Exception) else res
+            self._set_video_dev(video)
+            self._boot_show(box, rows, 0)
+
+        self.after(BOOT_WATCHDOG_MS, self._boot_done)   # 看门狗: 自检卡住也要能进锁屏
+        self.ui.run_bg(work, done)
 
     def _boot_show(self, box, rows, i):
+        if self._boot_once.done:                # 看门狗已经放行, 自检页没了
+            return
         if i < len(rows):
             r = rows[i]
             color = {"OK": "#15803d", "WARN": "#b45309", "FAIL": "#dc2626"}.get(r["state"], "#9ca3af")
@@ -653,6 +697,10 @@ class Kiosk(tk.Tk):
         self.after(6000 if failed else 2000, self._boot_done)
 
     def _boot_done(self):
+        """幂等: 正常结束和看门狗谁先到算谁."""
+        self._boot_once()
+
+    def _boot_finish(self):
         """先盖锁屏, 再撤自检页, 最后在锁屏底下放出主界面 -- 中间不留空档."""
         self._last_input = time.time()
         if self.gate.required:
@@ -739,7 +787,7 @@ class Kiosk(tk.Tk):
     def _confirm_pin(self, what):
         if not self.gate.required:
             return True
-        pin = simpledialog.askstring("验证 PIN", f"{what}前请输入 PIN:", show="•", parent=self)
+        pin = simpledialog.askstring("验证 PIN", f"{what}前请输入 PIN:", show="*", parent=self)
         if pin is None:
             return False
         r = self.gate.attempt(pin)
@@ -765,15 +813,22 @@ class Kiosk(tk.Tk):
         st = kc.pxe_mode_read()
         if st["mode"] == "install":
             if messagebox.askyesno("装机模式", f"提前上锁? (当前只对 {st['mac']} 开放装机)"):
-                kc.pxe_disarm()
+                if not self._disarm_quietly():
+                    messagebox.showerror("装机模式", "上锁失败 (写不了 tftp 目录?), 请在终端检查")
                 self._pxe_tick(reschedule=False)
             return
         self._arm_dialog()
 
     def _arm_dialog(self):
-        """解锁: 选一台机器 + 照抄屏幕上的随机码. 码只显示在推车屏幕上, 远程开不了."""
+        """解锁: 选一台机器 + 照抄屏幕上的随机码. 码只显示在推车屏幕上, 远程开不了.
+        同时只有一个对话框 (再点只提到最前); 抢键盘焦点; 输错原地换码, 提示保留."""
+        if self._arm_win is not None and self._arm_win.winfo_exists():
+            self._arm_win.lift()
+            self._arm_win.focus_force()
+            return
         self._code = kc.new_code()
         w = tk.Toplevel(self, bg="#161b26", highlightthickness=3, highlightbackground="#7a1f2b")
+        self._arm_win = w
         w.overrideredirect(True)
         W, H = 780, 760
         w.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
@@ -795,8 +850,9 @@ class Kiosk(tk.Tk):
         tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg="#1f2a3d", fg="#e8eaf0",
                  insertbackground="#e8eaf0", relief="flat").pack(fill="x", padx=24, pady=(6, 12), ipady=4)
         tk.Label(w, text="照抄验证码:", font=FONT, bg="#161b26", fg="#8b93a7").pack()
-        tk.Label(w, text=" ".join(self._code), font=("Noto Sans Mono CJK SC", 40, "bold"),
-                 bg="#161b26", fg="#f0b429").pack()
+        code_lbl = tk.Label(w, text=" ".join(self._code), font=("Noto Sans Mono CJK SC", 40, "bold"),
+                            bg="#161b26", fg="#f0b429")
+        code_lbl.pack()
         code_var = tk.StringVar()
         e = tk.Entry(w, textvariable=code_var, font=("Noto Sans Mono CJK SC", 22), width=10,
                      justify="center", bg="#1f2a3d", fg="#e8eaf0", insertbackground="#e8eaf0", relief="flat")
@@ -804,36 +860,41 @@ class Kiosk(tk.Tk):
         msg = tk.Label(w, text="", font=FONT, bg="#161b26", fg="#ff7b72")
         msg.pack()
 
+        def close():
+            self._code = None
+            self._arm_win = None
+            w.destroy()
+
         def ok(_e=None):
             sel = lb.curselection()
             mac = mac_var.get().strip() or (lb.get(sel[0]) if sel else "")
             if not kc.code_matches(code_var.get(), self._code or ""):
                 self._code = kc.new_code()          # 输错就换码, 不给试
-                msg.config(text="验证码不对, 已换新码")
-                w.destroy()
-                self._arm_dialog()
+                code_lbl.config(text=" ".join(self._code))
+                code_var.set("")
+                msg.config(text="验证码不对, 已换新码, 请照抄上面的新码")
+                e.focus_set()
                 return
             try:
                 kc.pxe_arm(mac)
-            except ValueError as ex:
+            except (ValueError, OSError) as ex:
                 msg.config(text=str(ex))
                 return
-            self._code = None
-            w.destroy()
+            close()
             self._pxe_tick(reschedule=False)
-
-        def cancel():
-            self._code = None
-            w.destroy()
 
         row = tk.Frame(w, bg="#161b26")
         row.pack(pady=10)
         tk.Button(row, text="解锁", font=FONT_BIG, command=ok, bg="#47202a", fg="#ffb3bd",
                   relief="flat", padx=24).pack(side="left", padx=8)
-        tk.Button(row, text="取消", font=FONT_BIG, command=cancel, bg="#2a3347", fg="#e8eaf0",
+        tk.Button(row, text="取消", font=FONT_BIG, command=close, bg="#2a3347", fg="#e8eaf0",
                   relief="flat", padx=24).pack(side="left", padx=8)
         e.bind("<Return>", ok)
         w.after(100, lambda: (w.focus_force(), e.focus_set()))
+        try:
+            w.grab_set()                            # 对话框开着时主界面点不动
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _pxe_log_tail(n=256 * 1024):
@@ -846,34 +907,47 @@ class Kiosk(tk.Tk):
             return ""
 
     def _pxe_tick(self, reschedule=True):
-        """到期 / 选定机器取走了装机菜单 -> 自动上锁; 按钮显示当前状态."""
-        st = kc.pxe_mode_read()
-        if st["mode"] == "install" and kc.pxe_consumed(self._pxe_log_tail(), st["mac"], st["since"]):
+        """到期 / 选定机器取走了装机菜单 -> 自动上锁; 按钮显示当前状态. 出什么错都要排下一轮."""
+        try:
+            st = kc.pxe_mode_read()
+            log = self._pxe_log_tail() if st["mode"] == "install" else ""
+            d = kui.pxe_tick_decide(st, log, time.time())
+            if d["disarm"]:
+                kc.pxe_disarm()
+            if d["banner"]:
+                self.banner.config(text=d["banner"])
+            sub, main = kui.pxe_button_texts(d["view"])
+            danger = d["view"]["mode"] == "install"     # 解锁是危险状态, 主页也得看得见
+            colors = {"bg": "#7a1f2b", "fg": "#ffffff"} if danger else {"bg": "#1f2a3d", "fg": "#e8eaf0"}
+            self.btn_install.config(text=sub, **colors)
+            self.btn_install_page.config(text=main, **colors)
+        except Exception as ex:                         # noqa: BLE001
+            print(f"_pxe_tick: {ex!r}", file=sys.stderr)
+        finally:
+            if reschedule:
+                self.after(2000, self._pxe_tick)
+
+    def _disarm_quietly(self):
+        """装机模式上锁; 失败只记 stderr (开机/退出路径上不能因为它卡住). -> 是否成功."""
+        try:
             kc.pxe_disarm()
-            self.banner.config(text=f"{st['mac']} 已取走装机菜单, 装机模式已自动上锁")
-            st = {"mode": "rescue"}
-        elif st["mode"] == "expired":
-            kc.pxe_disarm()
-            self.banner.config(text="装机模式 30 分钟到期, 已自动上锁")
-            st = {"mode": "rescue"}
-        if st["mode"] == "install":
-            left = int(st["until"] - time.time())
-            self.btn_install.config(text=f"⚠ 装机已解锁 {st['mac'][-8:]}  {left // 60:02d}:{left % 60:02d}",
-                                    bg="#7a1f2b", fg="#ffffff")
-            # 解锁是危险状态, 主页也得看得见
-            self.btn_install_page.config(text=f"⚠ 装机已解锁  {left // 60:02d}:{left % 60:02d}  ▸",
-                                         bg="#7a1f2b", fg="#ffffff")
-        else:
-            self.btn_install.config(text="装机模式:  救援 (安全)", bg="#1f2a3d", fg="#e8eaf0")
-            self.btn_install_page.config(text="装机  ▸", bg="#1f2a3d", fg="#e8eaf0")
-        if reschedule:
-            self.after(2000, self._pxe_tick)
+            return True
+        except OSError as ex:
+            print(f"pxe_disarm: {ex!r}", file=sys.stderr)
+            return False
 
     def quit_kiosk(self):
         if not self._confirm_pin("退出到终端"):
             return
-        self._stop_preview()
         self.destroy()
+
+    def destroy(self):
+        """不管怎么退 (按钮/窗口被关), 先上锁装机模式, 再停预览和键鼠线程."""
+        self._exit_once()
+        self._pane_close(self.pane.close())
+        self._close_ch()
+        self.ui.stop()
+        super().destroy()
 
 
 if __name__ == "__main__":
