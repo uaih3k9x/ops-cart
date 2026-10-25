@@ -209,7 +209,8 @@ class PxeGuard:
         link = self.carrier()
         if link and not self._link:
             self._set("probing", f"{self.iface} 刚接上, 探测有没有别的 DHCP")
-            self._run_probe()
+            if not self._run_probe():
+                return                  # 探测不算数: 不记"已接上", 下一轮重探, 这期间不回包
         self._link = link
         if self.tripped:
             return
@@ -221,20 +222,23 @@ class PxeGuard:
             self._set("serving", "")
 
     def _run_probe(self):
+        """-> 探测算不算数. 结果未知 (None, 或 netprof_core.ProbeResult.unknown: 探测那一刻读不到插线)
+        返回 False 让下一轮重探; 没有探测函数或探测本身报错返回 True, 交给被动监听兜底."""
         if self.probe is None:
             self.log.warning("没有 dhcp_probe, 跳过主动探测 (被动监听照常)")
-            return
+            return True
         try:
             found = self.probe(self.iface, timeout=4.0, ignore=(self.ip,))
         except Exception as e:      # noqa: BLE001  探测坏了不拖垮服务, 被动监听兜底
             self.log.warning("主动探测失败: %s (被动监听照常)", e)
-            return
-        if found is None:
-            self.log.warning("主动探测结果未知 (被动监听照常)")
-            return
+            return True
+        if found is None or getattr(found, "unknown", False):
+            self.log.warning("主动探测结果未知, 下一轮重探")
+            return False
         others = [o for o in found if o.get("server") != self.ip]
         if others:
             self.foreign(others[0].get("server"), "主动探测")
+        return True
 
     def _set(self, state, detail):
         if self.tripped and state != "foreign":     # 别的线程刚判了 foreign, 不许被 tick 改回去

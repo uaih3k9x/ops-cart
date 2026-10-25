@@ -447,6 +447,16 @@ def test_kiosk_runs_no_external_command_on_main_thread():
     assert bad == []
 
 
+def test_kiosk_pin_gate_persists_failures():
+    """车机 PIN 输错计数落 /run: 重启 kiosk 不清零 (只有车机这一个闸门用这个文件)."""
+    calls = [n for n in ast.walk(ast.parse(_src("kiosk.py")))
+             if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "PinGate"]
+    assert calls
+    for c in calls:
+        kw = {k.arg: k.value for k in c.keywords}
+        assert "state_path" in kw and ast.unparse(kw["state_path"]) == "kc.PIN_STATE"
+
+
 def test_kiosk_has_no_lan1_config_and_no_cross_thread_after():
     src = _src("kiosk.py")
     assert "cfg_lan1" not in src and "pxe_conf_read" not in src and "apply_pxe_conf" not in src

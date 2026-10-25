@@ -175,7 +175,7 @@ async function refresh() {
   const cards = [
     card("服务", s.services.map((x) => [x.name, (x.active ? "正常" : "停止") + (x.enabled ? "" : " (未自启)"), x.active ? "ok" : "bad"])),
     card("网卡", s.nics.flatMap((n) => [[`${n.role} ${n.name}`, n.link ? "已插线" : "未插线", n.link ? "ok" : "dim"], ["", `${n.ip} ${n.method}`, "dim"]])),
-    card("连接", [["tailscale", m.tailscale_ip || "-"], ["CH9329 键鼠线", m.ch9329 ? "已连接" : "未连接", m.ch9329 ? "ok" : "bad"], ["", m.uptime || "", "dim"]]),
+    card("连接", [["tailscale", m.tailscale_ip || "-"], ["CH9329 键鼠", (m.kvm && m.kvm.online) ? `${m.kvm.online} 块在线 / ${m.kvm.bound} 个画面源已绑定` : "未连接", (m.kvm && m.kvm.online) ? "ok" : "bad"], ["", m.uptime || "", "dim"]]),
     card("温度 / 风扇", s.temps.map((t) => [t.name, `${t.c.toFixed(0)}°C`, t.level]).concat(
       s.fans.map((f) => [f.name, `${f.rpm} RPM`, f.rpm ? "ok" : "hot"]))),
   ];

@@ -87,7 +87,7 @@ def test_status_payload_shape():
         "services": lambda: {"pxe-server": (True, False)},
         "nics": lambda: [{"role": "LAN2", "name": "enp3s0", "ip": "192.0.2.228/24",
                           "method": "dhcp", "link": True}],
-        "misc": lambda: {"tailscale_ip": "192.0.2.10", "ch9329": True, "uptime": "up 3 days"},
+        "misc": lambda: {"tailscale_ip": "192.0.2.10", "kvm": {"online": 1, "bound": 1}, "uptime": "up 3 days"},
         "temps": lambda: [("CPU", 61.0)],
         "fans": lambda: [("FAN1", 1200)],
         "version": lambda: "1.00.00 (17 bfc0651)",

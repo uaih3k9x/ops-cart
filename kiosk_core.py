@@ -104,15 +104,6 @@ def kp_enter_as_return(root):
     root.bind_class("Entry", "<KP_Enter>", lambda e: e.widget.event_generate("<Return>"))
 
 
-CH9329_BY_ID ="/dev/serial/by-id/usb-1a86_*-if00"   # CH343 串口; 重插后 ttyACMn 会变, by-id 不变
-
-
-def ch9329_port(pattern=CH9329_BY_ID, fallback="/dev/ttyACM0"):
-    import glob
-    hits = sorted(glob.glob(pattern))
-    return hits[0] if hits else fallback
-
-
 PROC_UPTIME = "/proc/uptime"
 
 
@@ -127,14 +118,20 @@ def uptime_text(seconds):
     return "up " + ", ".join(parts)
 
 
-def misc_status():
+def kvm_summary(online, conf):
+    """键鼠概况: online = 在线的 CH9329 块数 (kvm_core.ports), bound = 绑了键鼠的画面源个数."""
+    return {"online": len(online), "bound": len((conf or {}).get("bind") or {})}
+
+
+def misc_status(kvm_ports=None, kvm_conf=None):
+    import kvm_core
     _, ts_ip = run(["tailscale", "ip", "-4"])
-    ch = os.path.exists(ch9329_port())
+    kvm = kvm_summary((kvm_ports or kvm_core.ports)(), (kvm_conf or kvm_core.load)())
     try:
         up = uptime_text(float((_read(PROC_UPTIME) or "").split()[0]))
     except (ValueError, IndexError):
         up = "-"
-    return {"tailscale_ip": ts_ip or "-", "ch9329": ch, "uptime": up}
+    return {"tailscale_ip": ts_ip or "-", "kvm": kvm, "uptime": up}
 
 
 # ---------------------------------------------------------------- 顶栏网络标
@@ -308,8 +305,10 @@ def check_serial(ctx, dev="/dev/ttyUSB0"):
 
 
 def check_ch9329(ctx):
-    return ("OK", os.path.basename(os.path.realpath(ch9329_port()))) if ctx["misc"].get("ch9329") \
-        else ("--", "NOT CONNECTED")
+    k = ctx["misc"].get("kvm") or {}
+    if not k.get("online"):
+        return "--", "NOT CONNECTED"
+    return "OK", f"{k['online']} ONLINE / {k.get('bound', 0)} BOUND"
 
 
 def check_pxe(ctx, iface="eno1"):
@@ -1170,43 +1169,6 @@ def video_size(dev):
     """采集设备当前分辨率; 读不到按 1920x1080 (16:9) 算."""
     rc, out = run(["v4l2-ctl", "-d", dev, "--get-fmt-video"], timeout=3)
     return parse_v4l2_size(out) or (1920, 1080)
-
-
-# ---------------------------------------------------------------- 右侧按钮菜单
-# do = Kiosk 方法名; page = 进二级页; attr = 存成 self.<attr> 以便改文字; style = warn / danger
-# 子页由 kiosk 自动加「← 返回」. 常用的 (预览/串口/锁屏) 留在主页一键直达.
-
-MENU = {
-    "main": [
-        {"text": "UVC 预览:  开 / 关", "do": "toggle_preview", "attr": "btn_video"},
-        {"text": "画面设置  ▸", "page": "video"},
-        {"text": "串口会话:  开 / 关", "do": "toggle_serial", "attr": "btn_serial"},
-        {"text": "装机  ▸", "page": "install", "attr": "btn_install_page"},
-        {"text": "网络  ▸", "page": "net"},
-        {"text": "锁屏", "do": "lock_now"},
-        {"text": "电源  ▸", "page": "power"},
-    ],
-    "video": [
-        {"text": "画面源", "do": "switch_source", "attr": "btn_src"},
-        {"text": "鼠标:  绝对 (点哪是哪)", "do": "toggle_mouse_mode", "attr": "btn_mouse"},
-        {"text": "键鼠绑定:  不绑定", "do": "cycle_kvm", "attr": "btn_kvm"},
-    ],
-    "install": [
-        {"text": "PXE 装机服务:  开 / 关", "do": "toggle_pxe"},
-        {"text": "装机模式:  救援 (安全)", "do": "toggle_install_mode", "attr": "btn_install"},
-        {"text": "Kickstart 编辑", "do": "toggle_ks", "attr": "btn_ks"},
-    ],
-    "net": [
-        {"text": "无线网络", "do": "toggle_wifi", "attr": "btn_wifi"},
-        {"text": "网口配置文件", "do": "toggle_netprof"},
-        {"text": "网络唤醒 (WOL)", "do": "toggle_wol"},
-        {"text": "LAN2 管理口配置", "do": "cfg_lan2"},
-    ],
-    "power": [
-        {"text": "重启推车", "do": "reboot", "style": "warn"},
-        {"text": "关机", "do": "poweroff", "style": "danger"},
-    ],
-}
 
 
 # ---------------------------------------------------------------- 命令行 (部署脚本用)

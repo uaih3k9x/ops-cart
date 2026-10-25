@@ -71,7 +71,7 @@ class Kiosk(tk.Tk):
         kui.kp_digits_as_digits(self)
         self._menu_btns = {}
         self._build()
-        self.gate = kc.PinGate(kc.pin_conf_read())
+        self.gate = kc.PinGate(kc.pin_conf_read(), state_path=kc.PIN_STATE)
         self._lock_win = None
         self._boot_win = None
         self._arm_win = None

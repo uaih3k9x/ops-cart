@@ -708,6 +708,22 @@ def test_guard_unknown_probe_result_does_not_trip(tmp_path):
     assert not g.tripped
 
 
+def test_guard_probe_result_unknown_holds_and_retries(tmp_path):
+    """netprof_core.dhcp_probe 读不到 carrier 时给空的 ProbeResult(unknown): 不能当"没有别人"放行."""
+    from netprof_core import ProbeResult
+    box, results = Box(), [ProbeResult(carrier=None), ProbeResult()]
+
+    def probe(iface, timeout=4.0, ignore=()):
+        box.probes.append((iface, ignore))
+        return results.pop(0)
+    box.probe = probe
+    g = guard_for(tmp_path, box)
+    g.tick()
+    assert not g.tripped and not g.may_reply() and guard_state(tmp_path)["state"] == "probing"
+    g.tick()                                      # 下一轮重探, 这次算数
+    assert len(box.probes) == 2 and g.may_reply()
+
+
 def test_guard_probe_error_does_not_crash(tmp_path):
     box = Box()
 

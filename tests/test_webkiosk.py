@@ -865,3 +865,8 @@ def test_audit_written_to_file_or_stderr(tmp_path, capsys):
     app.audit_log = str(tmp_path / "file" / "audit.log")          # 写不进去: 退到 stderr (journald)
     call(app, "POST", "/api/login", TAIL, {"pin": "0000"})
     assert "act=login" in capsys.readouterr().err
+
+
+def test_web_page_status_uses_kvm_counts():
+    html = _page()
+    assert "m.ch9329" not in html and "m.kvm" in html

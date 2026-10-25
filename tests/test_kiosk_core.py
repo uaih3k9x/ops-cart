@@ -41,7 +41,6 @@ def test_lan1_unit_rewrite_path_is_gone():
     """LAN1 地址改为部署配置, 车机不再重写 systemd 单元."""
     for name in ("apply_pxe_conf", "render_pxe_service", "pxe_conf_read", "pxe_conf_write"):
         assert not hasattr(kc, name)
-    assert all(it.get("do") != "cfg_lan1" for items in kc.MENU.values() for it in items)
 
 
 def test_nmcli_set_static_builds_correct_cmd():
@@ -361,7 +360,7 @@ def test_notice_read_limits_chars(tmp_path):
 
 NICS_OK = [{"name": "eno1", "role": "PXE 装机口", "ip": "-", "link": False},
            {"name": "enp3s0", "role": "管理口", "ip": "192.0.2.228/24", "link": True}]
-MISC_OK = {"tailscale_ip": "192.0.2.10", "ch9329": False, "uptime": "up 1 min"}
+MISC_OK = {"tailscale_ip": "192.0.2.10", "kvm": {"online": 0, "bound": 0}, "uptime": "up 1 min"}
 
 
 def _rows(**kw):
@@ -545,19 +544,30 @@ def test_next_video_device_cycles():
     assert kc.next_video_device([], "/dev/video0") == "/dev/video0"
 
 
-# ---------------------------------------------------------------- CH9329 串口定位
+# ---------------------------------------------------------------- CH9329: 状态只报在线数和绑定数
+# 键鼠按 kvm_core 的序列号绑定认人, 不再有"那一块 CH9329"; ch9329_port 已删
 
-def test_ch9329_port_prefers_stable_by_id(tmp_path):
-    byid = tmp_path / "by-id"
-    byid.mkdir()
-    (byid / "usb-1a86_USB_Single_Serial_0000000001-if00").touch()
-    (byid / "usb-0403_FT232R_XYZ-if00-port0").touch()          # FTDI console 线不算
-    got = kc.ch9329_port(str(byid / "usb-1a86_*-if00"), fallback="/dev/ttyACM0")
-    assert got == str(byid / "usb-1a86_USB_Single_Serial_0000000001-if00")
+def test_ch9329_port_is_gone():
+    assert not hasattr(kc, "ch9329_port") and not hasattr(kc, "CH9329_BY_ID")
 
 
-def test_ch9329_port_fallback_when_absent(tmp_path):
-    assert kc.ch9329_port(str(tmp_path / "none-*"), fallback="/dev/ttyACM0") == "/dev/ttyACM0"
+def test_kvm_summary_counts_online_and_bound():
+    conf = {"names": {}, "bind": {"pci:01:00.0": "SN1", "usb:534d:2109": "SN9"}}
+    assert kc.kvm_summary({"SN1": "/dev/x", "SN2": "/dev/y"}, conf) == {"online": 2, "bound": 2}
+    assert kc.kvm_summary({}, {"names": {}, "bind": {}}) == {"online": 0, "bound": 0}
+
+
+def test_misc_status_reports_kvm_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (0, "192.0.2.10"))
+    monkeypatch.setattr(kc, "PROC_UPTIME", str(tmp_path / "none"))
+    m = kc.misc_status(kvm_ports=lambda: {"SN1": "/dev/x"}, kvm_conf=lambda: {"bind": {"a": "SN1"}})
+    assert m["kvm"] == {"online": 1, "bound": 1} and "ch9329" not in m
+
+
+def test_check_ch9329_shows_counts():
+    assert kc.check_ch9329({"misc": {"kvm": {"online": 2, "bound": 1}}}) == ("OK", "2 ONLINE / 1 BOUND")
+    assert kc.check_ch9329({"misc": {"kvm": {"online": 0, "bound": 1}}}) == ("--", "NOT CONNECTED")
+    assert kc.check_ch9329({"misc": {}}) == ("--", "NOT CONNECTED")
 
 
 # ------------------------------------------------------------ 装机模式 (2026-10-21)
@@ -831,26 +841,10 @@ def test_check_video_by_match():
 
 
 # ------------------------------------------------------------ 右侧二级菜单 (2026-10-21)
+# 菜单搬到 kiosk_ui_core.MENU (测试在 test_kiosk_ui_core), 这里只守着别留两份
 
-def test_menu_pages_reachable_and_actions_unique():
-    pages = kc.MENU
-    links = {it["page"] for items in pages.values() for it in items if "page" in it}
-    assert links == set(pages) - {"main"}                     # 每个子页都从主页进得去, 没有死链
-    actions = [it["do"] for items in pages.values() for it in items if "do" in it]
-    assert len(actions) == len(set(actions))                  # 同一个动作只放一处
-    assert all(pages.values())
-
-
-def test_menu_keeps_every_existing_action():
-    actions = {it["do"] for items in kc.MENU.values() for it in items if "do" in it}
-    assert actions == {"toggle_preview", "switch_source", "toggle_mouse_mode", "cycle_kvm", "toggle_serial",
-                       "toggle_ks", "toggle_pxe", "toggle_install_mode", "cfg_lan2",
-                       "toggle_wifi", "toggle_netprof", "toggle_wol", "lock_now", "reboot", "poweroff"}
-
-
-def test_menu_main_keeps_hot_buttons():
-    main = [it.get("do") for it in kc.MENU["main"]]
-    assert "toggle_preview" in main and "toggle_serial" in main and "lock_now" in main
+def test_menu_lives_only_in_ui_core():
+    assert not hasattr(kc, "MENU")
 
 
 # ------------------------------------------------------------ 状态板 = 实时自检 (2026-10-21)
