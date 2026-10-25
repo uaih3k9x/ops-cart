@@ -1,6 +1,7 @@
 """pxeserver 协议层测试: 红绿循环的绿侧. 全部本机回环高位端口, 不碰真接口."""
 
 import errno
+import io
 import socket
 import struct
 import threading
@@ -11,8 +12,6 @@ from pxeserver import (
     DhcpServer, TftpServer, arch_bootfile, build_dhcp_reply, encode_opt,
     parse_dhcp, tftp_safe_name,
 )
-
-TFTP_PORTS = iter(range(11069, 11100))
 
 
 def make_discover(mac=b"\xaa\xbb\xcc\xdd\xee\x01", arch=7, with_arch=True):
@@ -33,6 +32,7 @@ class FakeLog:
     def info(self, *a, **k): pass
     def warning(self, *a, **k): pass
     def exception(self, *a, **k): pass
+    def error(self, *a, **k): pass
 
 
 def dhcp_for_test():
@@ -191,12 +191,14 @@ def test_tftp_safe_name_accepts_plain(tmp_path):
 # ---- TFTP 传输 (真实回环 UDP)
 
 def start_tftp(tmp_path, **kw):
-    port = next(TFTP_PORTS)
-    srv = TftpServer("127.0.0.1", str(tmp_path), FakeLog(), port=port, **kw)
+    """临时端口: 别和并行跑的其他测试抢固定端口."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    srv = TftpServer("127.0.0.1", str(tmp_path), FakeLog(), port=sock.getsockname()[1], **kw)
     ev = threading.Event()
-    threading.Thread(target=srv.serve, args=(ev,), daemon=True).start()
+    threading.Thread(target=srv.serve, args=(ev, sock), daemon=True).start()
     assert ev.wait(3)
-    return srv, port
+    return srv, srv.port
 
 
 def test_tftp_transfer_with_options(tmp_path):
@@ -457,3 +459,161 @@ def test_decline_quarantines_address():
     assert _yiaddr(d.handle(make_discover(mac=M1), None, now=2)) == "192.0.2.11"     # 换一个
     assert d.handle(make_discover(mac=M2), None, now=3) is None                       # .10 隔离中
     assert _yiaddr(d.handle(make_discover(mac=M2), None, now=d.DECLINE_HOLD_S + 2)) == "192.0.2.10"
+
+
+# ---- A6: TFTP 块号回绕 / 流式读 / blksize 校验
+
+class AckingSock:
+    """假 TFTP 会话套接字: 发 DATA 就排一个对应 ACK, 发 OACK 就排 ACK0; 全程记账."""
+
+    def __init__(self, client=("192.0.2.10", 2000), refuse_oack=False):
+        self.client, self.refuse_oack = client, refuse_oack
+        self.sent, self.inbox, self.closed = [], [], False
+
+    def settimeout(self, t):
+        pass
+
+    def sendto(self, pkt, addr):
+        assert addr == self.client
+        self.sent.append(pkt)
+        if pkt[:2] == b"\x00\x03":
+            self.inbox.append(b"\x00\x04" + pkt[2:4])
+        elif pkt[:2] == b"\x00\x06":
+            self.inbox.append(b"\x00\x05\x00\x08nope\x00" if self.refuse_oack else b"\x00\x04\x00\x00")
+
+    def recvfrom(self, n):
+        if not self.inbox:
+            raise socket.timeout()
+        return self.inbox.pop(0), self.client
+
+    def close(self):
+        self.closed = True
+
+
+class ReadSpy(io.BytesIO):
+    def __init__(self, data, limit):
+        super().__init__(data)
+        self.limit, self.biggest = limit, 0
+
+    def read(self, n=-1):
+        assert 0 <= n <= self.limit, n          # 只按块读, 不整文件读进内存
+        self.biggest = max(self.biggest, n)
+        return super().read(n)
+
+
+def _tftp(tmp_path, sock):
+    return TftpServer("192.0.2.1", str(tmp_path), FakeLog(), sock_factory=lambda: sock)
+
+
+def test_tftp_block_number_wraps_past_65535(tmp_path):
+    blk = 8
+    payload = bytes(i % 251 for i in range(65537 * blk + 3))       # 65538 块: 超过 16 位
+    (tmp_path / "big.img").write_bytes(payload)
+    sock = AckingSock()
+    _tftp(tmp_path, sock)._rrq(b"\x00\x01big.img\x00octet\x00blksize\x008\x00", sock.client)
+    data = [p for p in sock.sent if p[:2] == b"\x00\x03"]
+    assert b"".join(p[4:] for p in data) == payload
+    wire = [struct.unpack("!H", p[2:4])[0] for p in data]
+    assert len(wire) == 65538 and wire[65534:65538] == [65535, 0, 1, 2]
+    assert sock.closed
+
+
+def test_tftp_transfer_reads_block_by_block():
+    from pxeserver import tftp_send_file
+    spy = ReadSpy(b"z" * 5000, 512)
+    sock = AckingSock()
+    assert tftp_send_file(sock, sock.client, spy, 5000, 512, retries=2)
+    assert spy.biggest == 512
+
+
+def test_tftp_empty_file_sends_one_empty_block(tmp_path):
+    (tmp_path / "empty").write_bytes(b"")
+    sock = AckingSock()
+    _tftp(tmp_path, sock)._rrq(b"\x00\x01empty\x00octet\x00", sock.client)
+    assert [p for p in sock.sent if p[:2] == b"\x00\x03"] == [b"\x00\x03\x00\x01"]
+
+
+@pytest.mark.parametrize("bad", [b"7", b"65465", b"abc", b""])
+def test_tftp_bad_blksize_gets_error(tmp_path, bad):
+    (tmp_path / "f").write_bytes(b"x" * 100)
+    sock = AckingSock()
+    _tftp(tmp_path, sock)._rrq(b"\x00\x01f\x00octet\x00blksize\x00" + bad + b"\x00", sock.client)
+    assert len(sock.sent) == 1 and sock.sent[0][:2] == b"\x00\x05"
+
+
+@pytest.mark.parametrize("msg", [b"\x00\x01", b"\x00\x01noterminator", b"\x00\x01f\x00octet\x00tsize\x00"])
+def test_tftp_malformed_rrq_gets_error(tmp_path, msg):
+    (tmp_path / "f").write_bytes(b"x")
+    sock = AckingSock()
+    _tftp(tmp_path, sock)._rrq(msg, sock.client)
+    assert len(sock.sent) == 1 and sock.sent[0][:2] == b"\x00\x05"
+
+
+def test_tftp_blksize_limits_accepted(tmp_path):
+    from pxeserver import parse_rrq
+    assert parse_rrq(b"\x00\x01f\x00octet\x00blksize\x008\x00")[2]["blksize"] == 8
+    assert parse_rrq(b"\x00\x01f\x00octet\x00BLKSIZE\x0065464\x00")[2]["blksize"] == 65464
+
+
+def test_tftp_client_refusing_oack_aborts(tmp_path):
+    (tmp_path / "f").write_bytes(b"x" * 100)
+    sock = AckingSock(refuse_oack=True)
+    _tftp(tmp_path, sock)._rrq(b"\x00\x01f\x00octet\x00tsize\x000\x00", sock.client)
+    assert not [p for p in sock.sent if p[:2] == b"\x00\x03"]       # 客户端回 ERROR 就别再发数据
+
+
+# ---- A7: serve 循环不静默死, 主线程盯着工作线程
+
+class StopLoop(BaseException):
+    pass
+
+
+class ScriptedSock:
+    def __init__(self, script):
+        self.script, self.sent = list(script), []
+
+    def recvfrom(self, n):
+        step = self.script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def sendto(self, pkt, addr):
+        self.sent.append((pkt, addr))
+
+
+def test_serve_loop_survives_recv_and_handler_errors():
+    from pxeserver import serve_loop
+    seen = []
+
+    def handler(sock, msg, addr):
+        if msg == b"boom":
+            raise ValueError("bad packet")
+        seen.append(msg)
+
+    sock = ScriptedSock([OSError("ENETDOWN"), (b"boom", ("192.0.2.9", 68)),
+                         (b"ok", ("192.0.2.9", 68)), StopLoop()])
+    with pytest.raises(StopLoop):
+        serve_loop(sock, handler, FakeLog(), "测试", sleep=lambda s: None)
+    assert seen == [b"ok"]
+
+
+class FakeThread:
+    def __init__(self, name, alive=True):
+        self.name, self.alive = name, alive
+
+    def is_alive(self):
+        return self.alive
+
+
+def test_supervise_exits_1_when_worker_dies():
+    from pxeserver import EXIT_THREAD_DIED, supervise
+    ts = [FakeThread("dhcp"), FakeThread("tftp")]
+    ticks = []
+
+    def sleep(s):
+        ticks.append(s)
+        if len(ticks) == 3:
+            ts[1].alive = False
+    assert supervise(ts, FakeLog(), sleep=sleep) == EXIT_THREAD_DIED == 1
+    assert len(ticks) == 3
