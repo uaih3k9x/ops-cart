@@ -617,3 +617,168 @@ def test_supervise_exits_1_when_worker_dies():
             ts[1].alive = False
     assert supervise(ts, FakeLog(), sleep=sleep) == EXIT_THREAD_DIED == 1
     assert len(ticks) == 3
+
+
+# ---- A2: 别在别人的网段上发 DHCP
+
+import json  # noqa: E402
+
+from pxeserver import EXIT_FOREIGN_DHCP, PxeGuard, supervise  # noqa: E402
+
+
+class Box:
+    """可变的假环境: carrier / 网口地址 / 探测结果, 测试里随时改."""
+
+    def __init__(self, link=True, addr="192.0.2.1", found=()):
+        self.link, self.addr, self.found, self.probes = link, addr, list(found), []
+
+    def probe(self, iface, timeout=4.0, ignore=()):
+        self.probes.append((iface, ignore))
+        return [o for o in self.found if o["server"] not in ignore]
+
+
+def guard_for(tmp_path, box, events=None):
+    return PxeGuard("192.0.2.1", "eno1", FakeLog(), probe=box.probe, carrier=lambda: box.link,
+                    addr=lambda: box.addr, state_path=str(tmp_path / "pxe-guard.json"),
+                    event=(events.append if events is not None else lambda m: None))
+
+
+def guard_state(tmp_path):
+    return json.loads((tmp_path / "pxe-guard.json").read_text())
+
+
+def test_guard_probes_at_start_and_serves_when_alone(tmp_path):
+    box = Box()
+    g = guard_for(tmp_path, box)
+    assert not g.may_reply()                      # 没探测过之前不回包
+    g.tick()
+    assert box.probes == [("eno1", ("192.0.2.1",))]
+    assert g.may_reply() and guard_state(tmp_path)["state"] == "serving"
+
+
+def test_guard_trips_on_foreign_offer_at_start(tmp_path):
+    box, events = Box(found=[{"server": "198.51.100.1", "yiaddr": "198.51.100.50"}]), []
+    g = guard_for(tmp_path, box, events)
+    g.tick()
+    assert g.tripped and not g.may_reply()
+    st = guard_state(tmp_path)
+    assert st["state"] == "foreign" and st["server"] == "198.51.100.1"
+    assert events and "198.51.100.1" in events[0]
+
+
+def test_guard_ignores_own_offer_in_probe(tmp_path):
+    box = Box(found=[{"server": "192.0.2.1", "yiaddr": "192.0.2.10"}])
+    g = guard_for(tmp_path, box)
+    g.tick()
+    assert not g.tripped and g.may_reply()
+
+
+def test_guard_reprobes_on_carrier_up(tmp_path):
+    box = Box(link=False)
+    g = guard_for(tmp_path, box)
+    g.tick()
+    assert box.probes == [] and not g.may_reply() and guard_state(tmp_path)["state"] == "no-link"
+    box.link = True
+    g.tick()
+    assert len(box.probes) == 1 and g.may_reply()
+    g.tick()
+    assert len(box.probes) == 1                   # 一直插着不重复探测
+    box.link = False
+    g.tick()
+    box.link, box.found = True, [{"server": "203.0.113.1", "yiaddr": "203.0.113.9"}]
+    g.tick()                                      # 拔了插到别处: 0 -> 1 再探测一次
+    assert len(box.probes) == 2 and g.tripped
+
+
+def test_guard_silent_when_iface_lacks_our_ip(tmp_path):
+    box = Box(addr="198.51.100.7")
+    g = guard_for(tmp_path, box)
+    g.tick()
+    assert not g.may_reply() and guard_state(tmp_path)["state"] == "no-ip"
+    box.addr = "192.0.2.1"
+    g.tick()
+    assert g.may_reply()
+
+
+def test_guard_unknown_probe_result_does_not_trip(tmp_path):
+    box = Box()
+    box.probe = lambda iface, timeout=4.0, ignore=(): None          # 探测说不准 (如没插线)
+    g = guard_for(tmp_path, box)
+    g.tick()
+    assert not g.tripped
+
+
+def test_guard_probe_error_does_not_crash(tmp_path):
+    box = Box()
+
+    def boom(*a, **k):
+        raise PermissionError("need root")
+    box.probe = boom
+    g = guard_for(tmp_path, box)
+    g.tick()
+    assert not g.tripped and g.may_reply()
+
+
+def test_guard_state_write_failure_is_swallowed(tmp_path):
+    box = Box()
+    g = PxeGuard("192.0.2.1", "eno1", FakeLog(), probe=box.probe, carrier=lambda: True,
+                 addr=lambda: "192.0.2.1", state_path=str(tmp_path / "file" / "x.json"),
+                 event=lambda m: None)
+    (tmp_path / "file").write_text("not a dir")
+    g.tick()
+    assert g.may_reply()
+
+
+def _reply_from(server, kind=b"\x02", mac=M1):
+    head = bytearray(make_discover(mac=mac))[:240]
+    head[0] = 2                                   # BOOTREPLY
+    return bytes(head + encode_opt(53, kind) + encode_opt(54, (server,)) + b"\xff")
+
+
+def test_passive_foreign_offer_stops_replies(tmp_path):
+    box = Box()
+    g = guard_for(tmp_path, box)
+    g.tick()
+    d = dhcp_for_test()
+    d.guard = g
+    d.watch_reply(_reply_from("192.0.2.1"))       # 自己的回包: 不算
+    assert g.may_reply()
+    d.watch_reply(_reply_from("198.51.100.1", b"\x05"))
+    assert g.tripped and guard_state(tmp_path)["server"] == "198.51.100.1"
+    assert d.handle(make_discover(mac=M2), None) is None
+    assert d.handle_proxy(make_discover(mac=M2), ("192.0.2.10", 4011)) is None
+
+
+def test_request_selecting_foreign_server_trips_guard(tmp_path):
+    g = guard_for(tmp_path, Box())
+    g.tick()
+    d = dhcp_for_test()
+    d.guard = g
+    assert d.handle(_msg(M1, b"\x03", "198.51.100.50", "198.51.100.1"), None) is None
+    assert g.tripped
+
+
+def test_dhcp_does_not_answer_before_guard_ready(tmp_path):
+    d = dhcp_for_test()
+    d.guard = guard_for(tmp_path, Box())
+    assert d.handle(make_discover(mac=M1), None) is None     # 还没 tick: 没探测过
+    assert d.leases == {}                                    # 也不占地址
+
+
+def test_supervise_exits_foreign_code_when_guard_trips(tmp_path):
+    box = Box()
+    g = guard_for(tmp_path, box)
+
+    def sleep(s):
+        box.link = False if box.link else True
+        box.found = [{"server": "198.51.100.1", "yiaddr": "198.51.100.2"}]
+    assert supervise([FakeThread("dhcp")], FakeLog(), guard=g, sleep=sleep) == EXIT_FOREIGN_DHCP == 3
+
+
+def test_pxe_unit_prevents_restart_on_foreign_dhcp():
+    import pathlib
+    u = (pathlib.Path(__file__).resolve().parent.parent / "deploy" / "systemd" /
+         "pxe-server.service").read_text()
+    line = next(l for l in u.splitlines() if l.startswith("RestartPreventExitStatus="))
+    assert "3" in line.split("=", 1)[1].split()
+    assert "--iface eno1" in u

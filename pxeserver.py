@@ -13,6 +13,7 @@ TFTP: 支持 blksize / tsize 协商, octet 模式, 拒绝根目录穿越.
 import argparse
 import errno
 import ipaddress
+import json
 import logging
 import os
 import socket
@@ -22,6 +23,17 @@ import threading
 import time
 
 MAGIC = b"\x63\x82\x53\x63"
+
+try:                    # 推车上和 cartlog.py 放在一起; Windows 单文件用时没有, 就不记
+    import cartlog
+except ImportError:     # pragma: no cover
+    cartlog = None
+
+
+def cart_event(msg):
+    """装机相关事件进推车的 events.log ([pxe]); 写不了就算了."""
+    if cartlog is not None:
+        cartlog.event("pxe", msg)
 
 
 # ---------------------------------------------------------------- DHCP
@@ -118,6 +130,145 @@ def open_dhcp_socket(sock, ip, port, iface=None, platform=sys.platform, sleep=ti
     return sock
 
 
+# ---------------------------------------------------------------- 守卫: 别在别人的网段上发 DHCP
+
+GUARD_STATE = "/run/ops-cart/pxe-guard.json"
+
+
+def read_carrier(iface):
+    """/sys/class/net/<iface>/carrier: 1 插着; 读不到 (网口 down 时内核回 EINVAL) 当没插."""
+    try:
+        with open(f"/sys/class/net/{iface}/carrier") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def iface_ipv4(iface):
+    """网口的主 IPv4 地址 (SIOCGIFADDR, 不起子进程); 没有/不是 Linux 返回 None.
+    只看主地址: 装机口按约定只配 PXE_IP 一个地址, 配成次地址时这里会当成没有, 宁可不回包."""
+    try:
+        import fcntl
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            res = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", iface.encode()[:15]))
+        finally:
+            s.close()
+        return socket.inet_ntoa(res[20:24])
+    except (OSError, ImportError):
+        return None
+
+
+def default_probe():
+    """netprof_core.dhcp_probe (推车上有); 拿不到就不做主动探测."""
+    try:
+        from netprof_core import dhcp_probe
+        return dhcp_probe
+    except ImportError:
+        return None
+
+
+class PxeGuard:
+    """装机口守卫. 只有 state == "serving" 才回 DHCP/proxyDHCP:
+    - 启动时和 carrier 从 0 变 1 时主动探测一次 (probe 广播 DISCOVER, 收别人的 OFFER)
+    - 被动看到 server-id 不是自己的 OFFER/ACK, 或客户端 REQUEST 选了别的服务器
+    - 网口上得真有 --ip
+    发现别人的 DHCP 就 tripped, 进程以 EXIT_FOREIGN_DHCP 退出, 单元里 RestartPreventExitStatus 不再拉起.
+    状态写 state_path (JSON), 车机和排障时看."""
+
+    def __init__(self, ip, iface, log, probe=None, carrier=None, addr=None, state_path=GUARD_STATE,
+                 event=cart_event, now=time.time):
+        self.ip, self.iface, self.log = ip, iface, log
+        self.probe = probe
+        self.carrier = carrier or (lambda: read_carrier(iface))
+        self.addr = addr or (lambda: iface_ipv4(iface))
+        self.state_path, self.event, self.now = state_path, event, now
+        self.state, self.detail, self.server = "starting", "", None
+        self.tripped, self._link = False, False
+        self._lock = threading.Lock()
+
+    def may_reply(self):
+        return self.state == "serving"
+
+    def foreign(self, server, how):
+        with self._lock:
+            if self.tripped:
+                return
+            self.tripped, self.server = True, server
+        self._set("foreign", f"{how}发现别的 DHCP 服务器 {server}")
+        self.log.error("装机口 %s 上有别的 DHCP 服务器 %s (%s), 停止应答", self.iface, server, how)
+        self.event(f"装机口 {self.iface} 上发现别的 DHCP 服务器 {server} ({how}), PXE 服务停止")
+
+    def tick(self):
+        if self.tripped:
+            return
+        if not self.iface:
+            self._set("serving", "没指定网卡, 不做探测")
+            return
+        link = self.carrier()
+        if link and not self._link:
+            self._set("probing", f"{self.iface} 刚接上, 探测有没有别的 DHCP")
+            self._run_probe()
+        self._link = link
+        if self.tripped:
+            return
+        if not link:
+            self._set("no-link", f"{self.iface} 没插线")
+        elif self.addr() != self.ip:
+            self._set("no-ip", f"{self.iface} 上没有 {self.ip}")
+        else:
+            self._set("serving", "")
+
+    def _run_probe(self):
+        if self.probe is None:
+            self.log.warning("没有 dhcp_probe, 跳过主动探测 (被动监听照常)")
+            return
+        try:
+            found = self.probe(self.iface, timeout=4.0, ignore=(self.ip,))
+        except Exception as e:      # noqa: BLE001  探测坏了不拖垮服务, 被动监听兜底
+            self.log.warning("主动探测失败: %s (被动监听照常)", e)
+            return
+        if found is None:
+            self.log.warning("主动探测结果未知 (被动监听照常)")
+            return
+        others = [o for o in found if o.get("server") != self.ip]
+        if others:
+            self.foreign(others[0].get("server"), "主动探测")
+
+    def _set(self, state, detail):
+        if (state, detail) == (self.state, self.detail):
+            return
+        self.state, self.detail = state, detail
+        self.log.info("守卫状态 %s %s", state, detail)
+        self._write()
+
+    def _write(self):
+        doc = {"state": self.state, "detail": self.detail, "server": self.server,
+               "iface": self.iface, "ip": self.ip, "since": self.now(), "pid": os.getpid()}
+        tmp = f"{self.state_path}.tmp"
+        try:
+            os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(doc, f)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            self.log.warning("守卫状态写不了 %s: %s", self.state_path, e)
+
+
+def foreign_server(msg, my_ip):
+    """别人的 OFFER/ACK (BOOTREPLY, server-id 不是 my_ip) -> 它的地址; 否则 None."""
+    parsed = parse_dhcp(msg)
+    if not parsed or msg[0] != 2:
+        return None
+    opts = parsed[2]
+    sid = opts.get(54, b"")
+    if opts.get(53, b"")[0:1] not in (b"\x02", b"\x05") or len(sid) != 4:
+        return None
+    sid = socket.inet_ntoa(sid)
+    return None if sid == my_ip else sid
+
+
+
 EXIT_THREAD_DIED = 1        # 工作线程死了: 交给 systemd 重启
 EXIT_FOREIGN_DHCP = 3       # 装机口上有别人的 DHCP: 不许重启 (RestartPreventExitStatus)
 EXIT_CONFIG = 4             # 参数不对: 重启也没用
@@ -172,6 +323,16 @@ class DhcpServer:
         self.leases = {}        # mac(bytes) -> [ip, 到期时间]
         self.declined = {}      # ip -> 隔离到什么时候
         self._lock = threading.Lock()
+        self.guard = None       # PxeGuard; None = 不设防 (测试/Windows)
+
+    def _quiet(self):
+        return self.guard is not None and not self.guard.may_reply()
+
+    def watch_reply(self, msg):
+        """收到的 BOOTREPLY: 别人的 OFFER/ACK 就报给守卫."""
+        sid = foreign_server(msg, self.ip)
+        if sid and self.guard is not None:
+            self.guard.foreign(sid, "被动监听")
 
     # ---- 租约表
 
@@ -214,7 +375,19 @@ class DhcpServer:
 
     def handle(self, msg, addr, now=None):
         parsed = parse_dhcp(msg)
-        if not parsed or msg[0] != 1:       # 只管 BOOTREQUEST
+        if not parsed:
+            return None
+        if msg[0] == 2:                     # 67 口上看到别人的回包 (中继之类)
+            self.watch_reply(msg)
+            return None
+        if msg[0] != 1:
+            return None
+        sid = parsed[2].get(54, b"")
+        if self.guard is not None and parsed[2].get(53, b"")[0:1] == b"\x03" and len(sid) == 4 \
+                and sid != socket.inet_aton(self.ip):
+            # SELECTING 时才带 server-id: 客户端在这个网段上收到过别人的 OFFER
+            self.guard.foreign(socket.inet_ntoa(sid), "客户端选了")
+        if self._quiet():
             return None
         now = time.time() if now is None else now
         with self._lock:
@@ -271,7 +444,7 @@ class DhcpServer:
     def handle_proxy(self, msg, addr):
         """proxyDHCP (UDP 4011): PXE 二阶段, 只回引导信息不租 IP (yiaddr=0)."""
         parsed = parse_dhcp(msg)
-        if not parsed:
+        if not parsed or msg[0] != 1 or self._quiet():
             return None
         xid, mac, opts = parsed
         msg_type = opts.get(53, b"")[0:1]
@@ -302,6 +475,23 @@ class DhcpServer:
         reply = self.handle_proxy(msg, addr)
         if reply:
             sock.sendto(reply, addr)  # 单播回源
+
+    def serve_watch(self, sock=None, sleep=time.sleep):
+        """被动监听 UDP/68 (锁在装机口): 看别人的 OFFER/ACK. 和 dhcp_probe 一样带 SO_REUSEADDR 共用端口;
+        绑不上 (端口被别的程序独占) 就每 30 秒再试, 不让线程死掉."""
+        while sock is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, self.iface.encode())
+                s.bind(("", 68))
+                sock = s
+            except OSError as e:
+                s.close()
+                self.log.warning("被动监听 UDP/68 绑不上: %s, 30 秒后重试", e)
+                sleep(30)
+        serve_loop(sock, lambda _s, msg, _a: self.watch_reply(msg), self.log, "DHCP 被动监听")
 
     def serve(self, ready_event=None, sock=None):
         if sock is None:
@@ -483,6 +673,7 @@ def main():
     p.add_argument("--bios-file", default="pxelinux.0")
     p.add_argument("--log", default=None)
     p.add_argument("--iface", default=None, help="装机口网卡名 (Linux 必填, 否则收不到 DHCP 广播)")
+    p.add_argument("--guard-state", default=GUARD_STATE, help="守卫状态文件 (JSON)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -495,23 +686,37 @@ def main():
     log.info("PXE 服务启动 ip=%s/%d pool=%s tftp-root=%s", args.ip, args.prefix, args.pool,
              args.tftp_root)
 
-    dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log,
-                      iface=args.iface, prefix=args.prefix)
-    if sys.platform.startswith("linux") and not args.iface:
+    try:
+        dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log,
+                          iface=args.iface, prefix=args.prefix)
+    except (ValueError, TypeError) as e:
+        log.error("参数不对: %s", e)
+        sys.exit(EXIT_CONFIG)
+    linux = sys.platform.startswith("linux")
+    if linux and not args.iface:
         log.warning("Linux 上没给 --iface: DHCP 只绑 %s, 收不到客户端的广播 DISCOVER", args.ip)
+    guard = PxeGuard(args.ip, args.iface if linux else None, log, probe=default_probe(),
+                     state_path=args.guard_state)
+    dhcp.guard = guard
+    guard.tick()                    # 先探测: 装机口接在别人的网段上就一个包都不发
+    if guard.tripped:
+        sys.exit(EXIT_FOREIGN_DHCP)
     tftp = TftpServer(args.ip, args.tftp_root, log)
     ev1, ev2, ev3 = threading.Event(), threading.Event(), threading.Event()
     threads = [threading.Thread(target=dhcp.serve, args=(ev1,), name="dhcp", daemon=True),
                threading.Thread(target=tftp.serve, args=(ev2,), name="tftp", daemon=True),
                threading.Thread(target=dhcp.serve_proxy, args=(ev3,), name="proxydhcp", daemon=True)]
+    if linux and args.iface:
+        threads.append(threading.Thread(target=dhcp.serve_watch, name="watch", daemon=True))
     for t in threads:
         t.start()
     for ev in (ev1, ev2, ev3):     # 真绑上了才报就绪; 地址没出现就一直等 (bind_retry 里会提示)
         while not ev.wait(2):
-            if not all(t.is_alive() for t in threads):
+            guard.tick()
+            if guard.tripped or not all(t.is_alive() for t in threads):
                 break
-    log.info("DHCP UDP/67 + proxyDHCP UDP/4011 + TFTP UDP/69 就绪")
-    sys.exit(supervise(threads, log))
+    log.info("DHCP UDP/67 + proxyDHCP UDP/4011 + TFTP UDP/69 就绪, 守卫 %s", guard.state)
+    sys.exit(supervise(threads, log, guard=guard))
 
 
 if __name__ == "__main__":
