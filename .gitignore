@@ -11,3 +11,19 @@ BUILD
 # 脱敏词表与本机验收产物
 .public-safe.local
 test-results/
+
+# 推车运行时文件 (在 /opt/pxe 里直接跑时会生成, 不进仓库)
+CART-LOG.md
+*.bak
+*.bak-*
+*.bak.*
+kiosk.conf
+selftest.json
+kvm.json
+serial.conf
+notice.txt
+wol.json
+pxe.conf
+pxe-mode.json
+pxeserver.log
+video-names.json
