@@ -275,7 +275,13 @@ class Kiosk(tk.Tk):
         if name == "preview":
             self._start_preview()
             return
-        w = PANE_CLASSES[name](self.body)
+        try:
+            w = PANE_CLASSES[name](self.body)
+        except Exception as ex:                 # noqa: BLE001  面板起不来就回状态板, 不留半截状态
+            self.pane.close()
+            self._show_status()
+            self.banner.config(text=f"面板打不开: {type(ex).__name__}: {ex}")
+            return
         w.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.panels[name] = w
         self.banner.config(text=kui.PANES[name])
