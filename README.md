@@ -17,14 +17,20 @@
 ## 能干什么
 
 - **装机**:自研 PXE 服务端(DHCP + proxyDHCP + TFTP),目标机器网线直插即全自动装 Rocky 9;
-  按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器只能进救援
+  按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器只能进救援。
+  服务端自己也守规矩:租约到期回收、池满不发、不是自己的租约不吭声;装机口上看见别人的 DHCP 就停,
+  网口上没有自己的地址就不回包;TFTP / HTTP 发装机菜单和 ks 前再核一遍装机模式和 MAC
 - **KVM**:HDMI 采集低延迟预览,CH9329 透传键鼠(绝对鼠标,VMware 式 Ctrl+Alt 释放);
   开机自动选有信号的画面源
 - **串口**:串口 console 面板,交换机/防火墙/服务器在网络炸了的时候也够得着
 - **车机界面**:无 WM 直跑的全屏 Kiosk —— 街机风开机自检、实时状态板、右侧二级菜单、PIN 锁屏
-- **网页版 Kiosk**:同一套状态与串口经浏览器远程访问,tailnet 永远放行,局域网需开关 + PIN
+  (输错冷却逐次翻倍、封顶 15 分钟,计数落 `/run`,重启 kiosk 不清零);外部命令和串口收发都在后台线程,
+  结果经队列回主线程
+- **网页版 Kiosk**:同一套状态、画面、键鼠与串口经浏览器远程访问,tailnet 永远放行,局域网需开关 + PIN;
+  只认白名单里的 Host、POST 必须同源,输错冷却按来源 IP 分开;以专用用户跑,操作写审计日志(PIN、打字内容不记)
 - **联网**:有线优先、无线兜底(拔网线约 17 秒切换);内置无线管理面板,
-  校园网锐捷 ePortal 无浏览器自动认证
+  校园网锐捷 ePortal 无浏览器自动认证(认证页主机首次记住,之后跳到陌生主机不发账号);
+  改当前出口那条无线前先确认,换连接先建后删、新密码连不上自动回退
 - **OCR**:截图识字带坐标,给"看屏幕 → 找按钮 → 点"的自动化留接口
 
 ## 代码地图
@@ -33,24 +39,25 @@
 
 | 文件 | 职责 |
 |---|---|
-| [`pxeserver.py`](pxeserver.py) | PXE 服务端,单文件,Linux / Windows 通用 |
-| [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);LAN1 没插线就等地址出现,不退出 |
+| [`pxeserver.py`](pxeserver.py) | PXE 服务端:DHCP 租约表、TFTP(块号回绕、流式读)、装机口守卫 `PxeGuard`(状态写 `/run/ops-cart/pxe-guard.json`)、grub 菜单模板(全仓库只此一处);Linux / Windows 通用 |
+| [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);ks 和装机菜单只给装机模式里解锁的那个 MAC,`.bak` 一律 404;LAN1 没插线就等地址出现,不退出 |
 | [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter) |
-| [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、nmcli 命令、装机菜单与装机网段(读 `pxe.env`)、菜单定义 |
-| [`serial_panel.py`](serial_panel.py) | 串口会话面板 |
+| [`kiosk_ui_core.py`](kiosk_ui_core.py) | GUI 的界面逻辑:`UiBridge`(后台结果回主线程)、左侧面板状态机、右侧菜单定义、装机定时器判定、CH9329 发送线程与鼠标位移拆分 |
+| [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、状态采集、nmcli 命令、装机模式与装机网段(读 `pxe.env`)、PIN 闸门;`python3 kiosk_core.py --write-rescue` 给部署脚本写救援菜单 |
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
 | [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序;面板底部改校园网认证账号、立即认证、看最近结果 |
 | [`wifi_prefer.py`](wifi_prefer.py) | 定时让优先级真正生效:看得见更高优先级的已保存网络就切过去,失败冷却 30 分钟 |
-| [`netprof_panel.py`](netprof_panel.py) · [`netprof_core.py`](netprof_core.py) | 网口配置文件:LAN1/LAN2 切换、一键回退、静态地址模板;发地址只在 LAN1,启用前探测对面有没有 DHCP |
+| [`netprof_panel.py`](netprof_panel.py) · [`netprof_core.py`](netprof_core.py) | 网口配置文件:LAN1/LAN2 切换、一键回退、静态地址模板;发地址只在 LAN1,启用前探测对面有没有 DHCP(没插线不探测,结果算"未知",不许启用) |
 | [`wol_panel.py`](wol_panel.py) · [`wol_core.py`](wol_core.py) | 网络唤醒:常用目标清单 + 临时输 MAC,从选定网口广播魔术包 |
 | [`atomicfile.py`](atomicfile.py) | 防断电写文件:临时文件 → fsync → 改名,配置要么旧要么新 |
 | [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
-| [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版远程管理口(标准库 http.server + xterm.js);单独的 `webkiosk.service`,默认不开机自启 |
-| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着配置里写的那个 SSID 时跑(配置没写 SSID 就不跑);结果写 `/run/ops-cart/campus-auth-status.json` 给面板和状态板 |
+| [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版远程管理口(标准库 http.server + xterm.js);单独的 `webkiosk.service`,专用用户 `ops-web`,默认不开机自启 |
+| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着配置里写的那个 SSID 时跑(配置没写 SSID 就不跑);认证页主机白名单 `portal_hosts`(空时首次成功自动记住);结果写 `/run/ops-cart/campus-auth-status.json` 给面板和状态板 |
 | [`kvm_core.py`](kvm_core.py) | 画面源 ↔ 键鼠绑定:CH9329 按 CH343 序列号认身份;没绑或不在线 = 只看不操作,绝不退回随便一块 |
-| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈,也可当命令行工具用 |
-| [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿) |
-| [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract) |
+| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈(独占打开,被占用报 `Ch9329Busy`、拔线报 `Ch9329Gone`),也可当命令行工具用 |
+| [`serial_panel.py`](serial_panel.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务 |
+| [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
+| [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
 
 | 目录 | 内容 |
 |---|---|
@@ -58,7 +65,7 @@
 | [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查 |
-| [`docs/`](docs/) | 优化方案、版本部署清单 |
+| [`docs/`](docs/) | 优化方案、版本部署清单、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例 |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
@@ -66,7 +73,7 @@
 ## 快速开始
 
 ```bash
-# 离线全测
+# 离线全测(本机什么版本都行,但代码要能在推车的 Python 3.9 上跑,tests/test_py39_compat.py 守着语法)
 python3 -m pytest -q
 
 # CH9329 注入
@@ -101,8 +108,20 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
 sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk
 sudo cp deploy/bin/kiosk-setpin /usr/local/bin/ && sudo kiosk-setpin
 sudo systemctl enable --now kiosk.service cart-boot-success.timer campus-auth.timer wifi-prefer.timer
-# 网页管理口按需: sudo systemctl enable --now webkiosk.service
+# 网页管理口按需 (专用用户 + 预建 web.conf, 见单元注释):
+#   sudo useradd -r -s /sbin/nologin ops-web
+#   sudo install -o ops-web -g ops-web -m 0600 /dev/null /opt/pxe/web.conf
+#   sudo systemctl enable --now webkiosk.service
 ```
+
+tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py --write-rescue`)。
+装机菜单只在车机上解锁装机模式时按 MAC 生成,TFTP / HTTP 两头都会核对装机模式;
+所以 Windows 脚本和手工放进 tftp 的自动装机菜单都装不了机,这是故意的。
+
+运行时状态都在 `/run/ops-cart/`(tmpfiles 建,重启推车清空):`pxe-guard.json` 是装机口守卫状态,
+`pin-gate.json` 是车机 PIN 输错计数,`mpv.sock` 给 `cart_snap.py` 用。
+`pxe-server` 发现装机口上有别的 DHCP 会以退出码 3 停下且不再自动拉起:拔掉那根线、确认 LAN1 只接被测机,
+再 `systemctl restart pxe-server`。
 
 装机网段只在 `/etc/ops-cart/pxe.env` 里定(`pxe-*` 三个单元和车机生成的 grub 菜单共用),车机界面不再改 LAN1 地址;
 `pxe-server` 的 `--iface eno1` 写死在单元里。校园网认证配置在 `/etc/ops-cart/campus-auth.json`(要写 `ssid`)。
@@ -129,7 +148,7 @@ datasheet 不写"校验含帧头"—— 真机的应答帧会。
 - **车是外设,脑在远端**:采集和注入在车上,OCR 与决策可以放在 tailnet 任意一端
 - **物理层优先**:键鼠走 USB、画面走 HDMI、console 走串口,机房网络怎么炸都不断
 - **单测覆盖协议,实机验证行为**:GUI 层的 bug 几乎都是实机暴露的,单测绿不代表能跑
-- **危险动作前置**:装机口永不进交换机(rogue DHCP)、改管理口必弹警告、
+- **危险动作前置**:装机口永不进交换机(rogue DHCP,服务端自己也会盯着,看见别人就停)、改管理口必弹警告、
   `clearpart --all` 必亮校验条、备份永远先于写入
 
 ## 已实测
