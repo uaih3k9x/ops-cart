@@ -176,7 +176,7 @@ def serve_error(rc, stderr):
 
 
 _KEY_SEQ = {
-    "Return": b"\r", "KP_Enter": b"\r", "BackSpace": b"\x7f", "Tab": b"\t",
+    "Return": b"\r", "KP_Enter": b"\r", "BackSpace": b"\x08", "Tab": b"\t",
     "Escape": b"\x1b", "Up": b"\x1b[A", "Down": b"\x1b[B", "Right": b"\x1b[C",
     "Left": b"\x1b[D", "Home": b"\x1b[H", "End": b"\x1b[F", "Delete": b"\x1b[3~",
     "Prior": b"\x1b[5~", "Next": b"\x1b[6~",

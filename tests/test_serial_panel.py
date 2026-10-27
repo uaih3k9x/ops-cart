@@ -93,7 +93,8 @@ def test_broker_port_reads_state_file(tmp_path):
 def test_key_bytes_printable_and_specials():
     assert sp.key_bytes("a", "a", 0) == b"a"
     assert sp.key_bytes("Return", "\r", 0) == b"\r"
-    assert sp.key_bytes("BackSpace", "\x08", 0) == b"\x7f"
+    # 华为 VRP 只认 ^H 退格, DEL(0x7f) 响铃不删 (10/27 AR651C 实测); Cisco/Linux readline 也认 ^H
+    assert sp.key_bytes("BackSpace", "\x08", 0) == b"\x08"
     assert sp.key_bytes("Tab", "\t", 0) == b"\t"
     assert sp.key_bytes("Up", "", 0) == b"\x1b[A"
     assert sp.key_bytes("question", "?", 1) == b"?"
