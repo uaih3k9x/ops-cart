@@ -652,6 +652,18 @@ def notice_read(path=NOTICE_PATH, max_lines=12, max_chars=400):
     return "\n".join(lines).strip()[:max_chars]
 
 
+DREAM_LATEST = "/opt/pxe/dreams/latest.json"
+
+
+def dream_line(path=DREAM_LATEST):
+    """锁屏底部一行: cart_dream.py 昨夜整理的标题. 没有/坏了返回 ""."""
+    try:
+        d = json.loads(_read(path) or "")
+        return f"昨夜整理 {d['date'][5:]} · {d['headline']}" if d.get("headline") else ""
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return ""
+
+
 def notice_font_px(text, width, height, lo=24, hi=220):
     """公告字号(像素): 塞满 width x height 的最大值. 中文 1 字宽, ASCII 0.6, 行高 1.3."""
     lines = text.splitlines()

@@ -1,0 +1,10 @@
+[Unit]
+Description=Ops cart nightly CART-LOG digest via Claude Code (read-only, no tools)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pxe
+ExecStart=/usr/bin/python3 /opt/pxe/cart_dream.py
+TimeoutStartSec=15min
+Nice=10

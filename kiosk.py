@@ -832,6 +832,9 @@ class Kiosk(tk.Tk):
         self._lock_net = tk.Label(w, text="检查中", font=FONT, bg="#10141c", fg="#6b7489",
                                   compound="left", padx=6)
         self._lock_net.place(relx=0.985, rely=0.02, anchor="ne")
+        # 底部一行: 昨夜整理 (cart_dream.py) 的标题
+        self._lock_dream = tk.Label(w, text="", font=FONT, bg="#10141c", fg="#6b7489")
+        self._lock_dream.place(relx=0.5, rely=0.97, anchor="s")
         if self._net_view:
             self._paint_net(self._lock_net)
         box = tk.Frame(w, bg="#10141c")
@@ -870,6 +873,9 @@ class Kiosk(tk.Tk):
         if text != self._lock_notice.cget("text"):     # 字号自适应: 时钟和 PIN 之间那块塞满
             px = kc.notice_font_px(text, self.winfo_screenwidth() * 0.9, self.winfo_screenheight() * 0.36)
             self._lock_notice.config(text=text, font=("Noto Sans CJK SC", -px, "bold"))
+        dream = kc.dream_line()
+        if dream != self._lock_dream.cget("text"):
+            self._lock_dream.config(text=dream)
         self._lock_win.after(1000, self._lock_tick)
 
     def _try_unlock(self):
