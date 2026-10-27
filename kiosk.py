@@ -70,6 +70,7 @@ class Kiosk(tk.Tk):
         kc.kp_enter_as_return(self)
         kui.kp_digits_as_digits(self)
         self._menu_btns = {}
+        self._net_view, self._lock_net = None, None     # 最近一次网络探测; 锁屏上的网络标
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read(), state_path=kc.PIN_STATE)
         self._lock_win = None
@@ -222,11 +223,16 @@ class Kiosk(tk.Tk):
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
 
-    NET_COLORS = {"on": "#7ee787", "warn": "#f0b429", "off": "#ff7b72"}
-
     def _render_net(self, state, text):
-        self.net_label.config(image=self._net_imgs.get(state, ""), text=text,
-                              fg=self.NET_COLORS[state])
+        """顶栏和锁屏的网络标用同一份探测结果, 锁着屏也照常刷新."""
+        self._net_view = kui.net_view(state, text)
+        for label in (self.net_label, self._lock_net):
+            if label is not None:
+                self._paint_net(label)
+
+    def _paint_net(self, label):
+        v = self._net_view
+        label.config(image=self._net_imgs.get(v["image"], ""), text=v["text"], fg=v["fg"])
 
     def _render(self, lines):
         if isinstance(lines, Exception):
@@ -738,6 +744,12 @@ class Kiosk(tk.Tk):
         self._lock_notice = tk.Label(w, font=("Noto Sans CJK SC", 28, "bold"), bg="#10141c", fg="#ffb86c",
                                      justify="center", wraplength=int(self.winfo_screenwidth() * 0.92))
         self._lock_notice.place(relx=0.5, rely=0.48, anchor="center")
+        # 右上角网络标 (#1): 只看不点, 锁着屏不开无线面板
+        self._lock_net = tk.Label(w, text="检查中", font=FONT, bg="#10141c", fg="#6b7489",
+                                  compound="left", padx=6)
+        self._lock_net.place(relx=0.985, rely=0.02, anchor="ne")
+        if self._net_view:
+            self._paint_net(self._lock_net)
         box = tk.Frame(w, bg="#10141c")
         box.place(relx=0.5, rely=0.8, anchor="center")
         tk.Label(box, text="运维推车已锁定", font=FONT_BIG, bg="#10141c",
@@ -782,7 +794,7 @@ class Kiosk(tk.Tk):
         r = self.gate.attempt(pin)
         if r == "ok":
             self._lock_win.destroy()
-            self._lock_win = None
+            self._lock_win, self._lock_net = None, None
             self._last_input = time.time()
         elif r == "locked":
             left = max(1, int(self.gate.locked_until - time.time()))

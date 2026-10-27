@@ -7,6 +7,7 @@
 - rel_split / rel_motion / abs_should_send / ChWorker: 键鼠透传
 - kp_digits_as_digits: 小键盘数字不看 NumLock
 - ks_save / read_text: Kickstart 保存与恢复
+- net_view: 顶栏和锁屏网络标怎么画
 """
 
 import queue
@@ -104,6 +105,18 @@ class UiBridge:
 
 
 # ---------------------------------------------------------------- 装机模式定时器
+
+# ---------------------------------------------------------------- 网络标
+
+NET_COLORS = {"on": "#7ee787", "warn": "#f0b429", "off": "#ff7b72"}
+
+
+def net_view(state, text):
+    """网络探测结果 -> 网络标的图标 key / 文字 / 颜色. 认不出的状态按离线画, 不抛."""
+    if state not in NET_COLORS:
+        state = "off"
+    return {"image": state, "text": text, "fg": NET_COLORS[state]}
+
 
 def pxe_tick_decide(st, log_text, now, consumed=kc.pxe_consumed):
     """st = kc.pxe_mode_read(). -> {disarm, banner, view}; view 给按钮显示:

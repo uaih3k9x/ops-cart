@@ -480,3 +480,19 @@ def test_panels_use_bridge_not_after0():
     for name in ("wifi_panel.py", "netprof_panel.py", "ks_panel.py", "wol_panel.py"):
         src = _src(name)
         assert "after(0" not in src and "threading.Thread" not in src, name
+
+
+def test_net_view_colors_and_unknown_state():
+    assert ui.net_view("on", "在线") == {"image": "on", "text": "在线", "fg": "#7ee787"}
+    assert ui.net_view("warn", "出不去")["fg"] == "#f0b429"
+    assert ui.net_view("off", "无路由")["fg"] == "#ff7b72"
+    assert ui.net_view("???", "x")["image"] == "off"         # 认不出的状态按离线画, 不抛
+
+
+def test_lock_screen_shows_net_indicator():
+    """#1: 锁屏右上角也有网络标, 和顶栏用同一份状态刷新."""
+    src = open(os.path.join(ROOT, "kiosk.py"), encoding="utf-8").read()
+    lock = src[src.index("    def lock(self):"):src.index("    def lock_now(self):")]
+    assert "_lock_net" in lock
+    render = src[src.index("    def _render_net(self"):src.index("    def _render(self, lines)")]
+    assert "_lock_net" in render and "kui.net_view" in render
