@@ -48,6 +48,7 @@ class Kiosk(tk.Tk):
         self._fill_screen()
         self.configure(bg="#10141c", cursor="arrow")
         self.ui = kui.UiBridge(self)
+        kui.main_thread_gc(self)            # 后台线程里不许触发 GC (会析构 Tk 对象等主线程 -> 死锁)
         self.ui.start()
         self.pane = kui.LeftPane(kui.PANES)
         self.panels = {}                    # 面板名 -> 正开着的面板 (预览除外)
@@ -95,7 +96,8 @@ class Kiosk(tk.Tk):
         self.after(5000, self._idle_tick)
         self.after(2000, self._pxe_tick)
         self.after(100, self.refresh)
-        self.after(lc.SAMPLE_MS, self._lamp_tick)
+        self.ui.repeat_bg(self._lamp_sample, self._lamp_sampled, every=lc.SAMPLE_MS / 1000)
+        self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
 
     def _fill_screen(self):
         self.update_idletasks()
@@ -264,11 +266,12 @@ class Kiosk(tk.Tk):
         if self.pane.current != name:
             self.toggle_pane(name)
 
+    def _lamp_sample(self):
+        """常驻采样线程里跑: 只读文件和 /proc, 不碰 Tk (_kvm_count 是 int, 读一下是原子的)."""
+        return lc.sample(sp.data_dir(sp.serial_conf_read()), self._kvm_count)
+
     def _lamp_tick(self):
-        """采样在后台 (上一次没回来就跳过), 画在这里; 每半个采样周期重画一次, 闪烁才跟得上."""
-        kvm_count = self._kvm_count
-        self.ui.run_bg(lambda: lc.sample(sp.data_dir(sp.serial_conf_read()), kvm_count),
-                       self._lamp_sampled, key="lamps")
+        """采样在常驻线程里 (见 __init__), 这里只画; 每半个采样周期重画一次, 闪烁才跟得上."""
         self._lamp_paint()
         self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
 

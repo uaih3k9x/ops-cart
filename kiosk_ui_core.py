@@ -10,11 +10,27 @@
 - net_view: 顶栏和锁屏网络标怎么画
 """
 
+import gc
 import queue
 import sys
 import threading
+import time
 
 import kiosk_core as kc
+
+
+# ---------------------------------------------------------------- 垃圾回收只在主线程
+
+def main_thread_gc(root, every_ms=2000, gc_mod=gc):
+    """关掉自动回收, 改由主线程定时 collect.
+    自动回收可能在后台线程里触发, 析构 Tk 对象 (StringVar/PhotoImage) 要等主线程;
+    主线程若正好在 Thread.start() 里等这个线程起来, 两边互等 -> 界面冻死 (10/27 1.07.00)."""
+    gc_mod.disable()
+
+    def tick():
+        gc_mod.collect()
+        root.after(every_ms, tick)
+    root.after(every_ms, tick)
 
 
 # ---------------------------------------------------------------- UiBridge
@@ -65,6 +81,19 @@ class UiBridge:
             self.post(finish, res)
         self._spawn(wrap)
         return True
+
+    def repeat_bg(self, work, done, every, sleep=time.sleep):
+        """常驻一个线程, 每 every 秒跑一次 work, 结果 (或异常对象) 交给 done 在主线程执行.
+        高频采样 (灯条) 用它, 别每次 run_bg 新起线程: 线程起得越多, 碰上 GC 死锁的机会越大."""
+        def loop():
+            while not self.stopped:
+                try:
+                    res = work()
+                except Exception as ex:      # noqa: BLE001
+                    res = ex
+                self.post(done, res)
+                sleep(every)
+        self._spawn(loop)
 
     def drain(self, limit=200):
         for _ in range(limit):

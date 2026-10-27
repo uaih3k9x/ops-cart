@@ -496,3 +496,51 @@ def test_lock_screen_shows_net_indicator():
     assert "_lock_net" in lock
     render = src[src.index("    def _render_net(self"):src.index("    def _render(self, lines)")]
     assert "_lock_net" in render and "kui.net_view" in render
+
+
+# ------------------------------------------------------------ 1.07.01 死锁修复: 垃圾回收只在主线程, 灯条采样用常驻线程
+
+class FakeGc:
+    def __init__(self):
+        self.calls = []
+
+    def disable(self):
+        self.calls.append("disable")
+
+    def collect(self):
+        self.calls.append("collect")
+
+
+def test_main_thread_gc_disables_auto_and_collects_on_after():
+    """自动回收会在任意线程触发, 析构 Tk 对象时等主线程 -> 主线程又在等这个线程启动 = 死锁 (10/27 冻屏)."""
+    root, g = FakeRoot(), FakeGc()
+    ui.main_thread_gc(root, every_ms=3000, gc_mod=g)
+    assert g.calls == ["disable"] and root.jobs[0][1] == 3000
+    root.tick()
+    assert g.calls == ["disable", "collect"] and len(root.jobs) == 1     # 收完再排下一轮
+
+
+def test_repeat_bg_posts_each_result_until_stopped():
+    b = ui.UiBridge(FakeRoot(), spawn=_sync_spawn)
+    n, got, slept = [0], [], []
+
+    def work():
+        n[0] += 1
+        if n[0] == 2:
+            raise ValueError("boom")
+        return n[0]
+
+    def sleep(s):
+        slept.append(s)
+        if len(slept) == 3:
+            b.stopped = True
+    b.repeat_bg(work, got.append, every=0.2, sleep=sleep)
+    assert got == [] and slept == [0.2, 0.2, 0.2]
+    b.drain()
+    assert got[0] == 1 and isinstance(got[1], ValueError) and got[2] == 3
+
+
+def test_kiosk_uses_main_thread_gc_and_no_per_tick_threads():
+    src = _src("kiosk.py")
+    assert "main_thread_gc(" in src
+    assert "repeat_bg(" in src
