@@ -78,3 +78,52 @@ def test_slot_view_text_and_health():
     assert lc.slot_view(1, {"present": False, "baud": None}) == ("1\n未插", None)
     assert lc.slot_view(2, {"present": True, "baud": None}) == ("2\n空闲", "OK")
     assert lc.slot_view(3, {"present": True, "baud": 9600}) == ("3\n9600", "OK")
+
+
+# ------------------------------------------------------------ 响铃: 设备回 ^G -> 操作头亮红 (可选主板蜂鸣)
+
+def test_bell_tail_counts_new_bel_bytes_only(tmp_path):
+    log = tmp_path / "c.log"
+    log.write_bytes(b"old\x07\x07")                 # 第一次见: 只记位置, 不数旧的
+    t = lc.BellTail()
+    assert t.read("con-1", str(log)) == 0
+    with open(log, "ab") as f:
+        f.write(b"Username:abc\x07\x1b[1D \x07")
+    assert t.read("con-1", str(log)) == 2
+    assert t.read("con-1", str(log)) == 2          # 没新内容
+    log.write_bytes(b"\x07")                        # 被截断/轮转: 重新从末尾记
+    assert t.read("con-1", str(log)) == 2
+    assert t.read("con-1", str(tmp_path / "none")) == 2
+
+
+def test_lamp_view_bell_is_solid_red():
+    v = lc.lamp_view("OK", active=True, on=False, bell=True)
+    assert v["bg"] == lc.HEALTH_COLOR["FAIL"] and v["fg"] == lc.LIT_FG
+
+
+def test_tone_events_on_then_off():
+    on, off = lc.tone_events(1000, now=12.5)
+    assert len(on) == len(off) == 24                 # x86_64 struct input_event
+    import struct
+    assert struct.unpack("llHHi", on)[2:] == (0x12, 0x02, 1000)
+    assert struct.unpack("llHHi", off)[2:] == (0x12, 0x02, 0)
+
+
+def test_beeper_rate_limited():
+    played = []
+    b = lc.Beeper(play=played.append, gap=0.3)
+    b.ring(now=1.0); b.ring(now=1.1); b.ring(now=1.35)
+    assert played == [1.0, 1.35]
+
+
+def test_sample_reports_bell_counters(tmp_path, monkeypatch):
+    monkeypatch.setattr(lc, "net_bytes", lambda: {})
+    monkeypatch.setattr(lc, "SLOTS", ["/dev/con-1"])
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "_dev_con-1.log").write_bytes(b"x")
+    bells, rung = lc.BellTail(), []
+    lc.sample(str(tmp_path), 0, bells=bells, on_bell=lambda: rung.append(1))
+    with open(tmp_path / "logs" / "_dev_con-1.log", "ab") as f:
+        f.write(b"\x07")
+    _slots, counters = lc.sample(str(tmp_path), 0, bells=bells, on_bell=lambda: rung.append(1))
+    assert counters["bell:con-1"] == 1 and rung == [1]

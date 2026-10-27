@@ -1,0 +1,15 @@
+#!/bin/bash
+# 推车风扇曲线 (IT8625, 芯片自动模式, 跟 temp1): 60°C 起转、52°C 停、起转 PWM 60 (~24%, 实测 50 就能从静止起)、
+# 70°C 起加速、90°C 满速. BIOS 每次开机会写回自己的曲线 (10°C 就半速常转), 所以开机跑一次.
+# 只改曲线不切手动: kiosk 挂了温度上来照样加速.
+set -eu
+H=$(grep -lx it8625 /sys/class/hwmon/hwmon*/name | head -1 | xargs -r dirname)
+[ -n "$H" ] || { echo "找不到 it8625"; exit 1; }
+for n in 2 3; do
+    echo 2 > "$H/pwm${n}_enable"
+    echo 70000 > "$H/pwm${n}_auto_point2_temp"
+    echo 60000 > "$H/pwm${n}_auto_point1_temp"
+    echo 52000 > "$H/pwm${n}_auto_point1_temp_hyst"
+    echo 60 > "$H/pwm${n}_auto_start"
+    echo "pwm$n: start=$(cat $H/pwm${n}_auto_start) on=$(cat $H/pwm${n}_auto_point1_temp) off=$(cat $H/pwm${n}_auto_point1_temp_hyst)"
+done

@@ -70,6 +70,8 @@ class Kiosk(tk.Tk):
         self.chw, self._ch_dev = None, None
         self._kvm_count = 0                 # 键鼠灯的活动计数: 入队成功一次加一
         self._activity, self._lamp_slots, self._active = lc.Activity(), None, set()
+        self._bell_activity, self._bell_active = lc.Activity(hold=lc.BELL_HOLD_S), set()
+        self._bells, self._beeper = lc.BellTail(), lc.Beeper()   # 只在采样线程里用
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
 
         kc.kp_enter_as_return(self)
@@ -268,7 +270,9 @@ class Kiosk(tk.Tk):
 
     def _lamp_sample(self):
         """常驻采样线程里跑: 只读文件和 /proc, 不碰 Tk (_kvm_count 是 int, 读一下是原子的)."""
-        return lc.sample(sp.data_dir(sp.serial_conf_read()), self._kvm_count)
+        conf = sp.serial_conf_read()
+        on_bell = self._beeper.ring if conf.get("bell_beep") else None   # serial.conf 开了才响主板蜂鸣
+        return lc.sample(sp.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
 
     def _lamp_tick(self):
         """采样在常驻线程里 (见 __init__), 这里只画; 每半个采样周期重画一次, 闪烁才跟得上."""
@@ -279,7 +283,11 @@ class Kiosk(tk.Tk):
         if isinstance(res, Exception):
             return
         self._lamp_slots, counters = res
-        self._active = self._activity.update(counters, time.time())
+        now = time.time()
+        bells = {k[5:]: v for k, v in counters.items() if k.startswith("bell:")}
+        self._bell_active = self._bell_activity.update(bells, now)
+        self._active = self._activity.update(
+            {k: v for k, v in counters.items() if not k.startswith("bell:")}, now)
 
     def _lamp_paint(self):
         on = lc.blink_on(time.time())
@@ -288,7 +296,7 @@ class Kiosk(tk.Tk):
             views[key] = (name, lc.health_of(self._check_rows, label))
         for key, (text, health) in views.items():
             f, stripe, lab, last = self._lamps[key]
-            v = lc.lamp_view(health, key in self._active, on)
+            v = lc.lamp_view(health, key in self._active, on, bell=key in self._bell_active)
             state = (text, v["bg"], v["fg"], v["bar"])
             if state == last[0]:
                 continue
