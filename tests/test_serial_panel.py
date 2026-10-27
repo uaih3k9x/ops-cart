@@ -234,3 +234,32 @@ def test_async_result_runs_only_in_drain():
     assert done == [] and panel.after_calls == []
     sp.SerialPanel._run_ui(panel)
     assert done == [42]
+
+
+# ============================================================ 推车 hub 口别名 /dev/con-N (仿片序列号全一样, by-id 认不出)
+
+CON = {"/dev/con-1": "/dev/ttyUSB0", "/dev/con-2": "/dev/ttyUSB1",
+       "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A5069RR4-if00-port0": "/dev/ttyUSB1"}
+
+
+def con_real(p):
+    return CON.get(p, p)
+
+
+def test_console_ports_use_alias_and_hide_onboard():
+    ports = ["/dev/ttyS1", "/dev/ttyS0", "/dev/ttyUSB1", "/dev/ttyUSB0", "/dev/ttyUSB7", "/dev/ttyACM0"]
+    aliases = ["/dev/con-1", "/dev/con-2"]
+    assert sp.console_ports(ports, aliases, con_real) == [
+        "/dev/con-1", "/dev/con-2", "/dev/ttyACM0", "/dev/ttyUSB7"]
+
+
+def test_serve_target_keeps_alias_over_byid():
+    byid = ["/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A5069RR4-if00-port0"]
+    assert sp.serve_target("/dev/con-2", ["/dev/con-1", "/dev/con-2"], byid, con_real) == "/dev/con-2"
+    assert sp.serve_target("/dev/ttyUSB1", [], byid, con_real) == byid[0]
+
+
+def test_alias_paths(tmp_path):
+    for n in ("con-2", "con-1", "ttyUSB0"):
+        (tmp_path / n).write_text("")
+    assert sp.alias_paths(str(tmp_path / "con-*")) == [str(tmp_path / "con-1"), str(tmp_path / "con-2")]

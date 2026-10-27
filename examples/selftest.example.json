@@ -6,7 +6,7 @@
   {"check": "pxe",       "label": "LAN1 / PXE",    "iface": "eno1"},
   {"check": "wifi",      "label": "WIFI"},
   {"check": "tailscale"},
-  {"check": "serial",    "label": "CONSOLE",       "dev": "/dev/ttyUSB0"},
+  {"check": "serial",    "label": "CONSOLE",       "devs": ["/dev/con-1", "/dev/con-2", "/dev/con-3", "/dev/con-4"]},
   {"check": "ch9329",    "label": "CH9329"},
   {"check": "pci",       "label": "SC0710",        "id": "12ab:0710", "count": 2, "driver": "LINUXV4L2SC0710"},
   {"check": "signal",    "label": "CAPTURE 1",     "match": "卡1"},

@@ -434,6 +434,13 @@ def test_check_serial_uses_dev_param():
     assert seen == ["/dev/ttyS1"]
 
 
+def test_check_serial_devs_counts_present():
+    devs = ["/dev/con-1", "/dev/con-2", "/dev/con-3", "/dev/con-4"]
+    assert kc.check_serial(_ctx(exists=lambda p: True), devs=devs) == ("OK", "4/4")
+    assert kc.check_serial(_ctx(exists=lambda p: p != "/dev/con-2"), devs=devs) == ("WARN", "3/4 NO CON-2")
+    assert kc.check_serial(_ctx(exists=lambda p: False), devs=devs) == ("--", "NOT CONNECTED")
+
+
 def test_check_ping():
     assert kc.check_ping(_ctx(), host="192.0.2.8") == ("OK", "192.0.2.8")
     assert kc.check_ping(_ctx(ping=lambda h: False), host="nas") == ("WARN", "UNREACHABLE")

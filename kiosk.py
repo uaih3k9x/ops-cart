@@ -19,6 +19,8 @@ import cartlog
 import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
+import lamps_core as lc
+import serial_panel as sp
 from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
@@ -65,6 +67,8 @@ class Kiosk(tk.Tk):
         self._mouse_btn = 0
         self._center = None              # 相对模式: 指针每帧 warp 回画面中心
         self.chw, self._ch_dev = None, None
+        self._kvm_count = 0                 # 键鼠灯的活动计数: 入队成功一次加一
+        self._activity, self._lamp_slots, self._active = lc.Activity(), None, set()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
 
         kc.kp_enter_as_return(self)
@@ -91,6 +95,7 @@ class Kiosk(tk.Tk):
         self.after(5000, self._idle_tick)
         self.after(2000, self._pxe_tick)
         self.after(100, self.refresh)
+        self.after(lc.SAMPLE_MS, self._lamp_tick)
 
     def _fill_screen(self):
         self.update_idletasks()
@@ -125,6 +130,8 @@ class Kiosk(tk.Tk):
                   bg="#2a3347", fg="#e8eaf0", activebackground="#3a4560",
                   relief="flat", padx=14, pady=4, cursor="hand2").pack(
                   side="right", padx=10)
+
+        self._build_lamps()
 
         body = tk.Frame(self, bg="#10141c")
         body.pack(fill="both", expand=True, padx=12, pady=6)
@@ -222,6 +229,70 @@ class Kiosk(tk.Tk):
         self.ui.run_bg(board, self._render, key="board")
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
+
+    # ------------------------------------------------------------ 执行器条 (issue #2)
+
+    def _build_lamps(self):
+        """顶栏下一行 grandMA3 执行器风格的方块: 左边 4 个串口操作头, 右边键鼠/PXE/网口.
+        左边色带 = 自检健康, 整块闪 = 计数器在动."""
+        bar = tk.Frame(self, bg="#10141c")
+        bar.pack(fill="x", padx=12, pady=(0, 4))
+        self._lamps = {}
+
+        def block(key, width, pane):
+            f = tk.Frame(bar, bg=lc.EMPTY_BODY)
+            f.pack(side="left", padx=(0, 6))
+            stripe = tk.Frame(f, bg=lc.HEALTH_COLOR[None], width=5)
+            stripe.pack(side="left", fill="y")
+            lab = tk.Label(f, text="", font=FONT, width=width, height=2, justify="left", anchor="w",
+                           bg=lc.EMPTY_BODY, fg=lc.EMPTY_FG, padx=6, cursor="hand2")
+            lab.pack(side="left")
+            for w in (f, lab):
+                w.bind("<Button-1>", lambda _e: self._open_pane(pane))
+            self._lamps[key] = (f, stripe, lab, [None])
+
+        for n in range(1, len(lc.SLOTS) + 1):
+            block(f"con-{n}", 8, "serial")
+        tk.Frame(bar, bg="#2a3347", width=2).pack(side="left", fill="y", padx=(4, 10))
+        pane_of = {"kvm": "preview", "pxe": "ks", "net:eno1": "netprof", "net:enp3s0": "netprof",
+                   "net:wlp4s0": "wifi"}
+        for name, _label, key in lc.LOWER:
+            block(key, 5, pane_of[key])
+            self._lamps[key][2].config(text=name)
+
+    def _open_pane(self, name):
+        if self.pane.current != name:
+            self.toggle_pane(name)
+
+    def _lamp_tick(self):
+        """采样在后台 (上一次没回来就跳过), 画在这里; 每半个采样周期重画一次, 闪烁才跟得上."""
+        kvm_count = self._kvm_count
+        self.ui.run_bg(lambda: lc.sample(sp.data_dir(sp.serial_conf_read()), kvm_count),
+                       self._lamp_sampled, key="lamps")
+        self._lamp_paint()
+        self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
+
+    def _lamp_sampled(self, res):
+        if isinstance(res, Exception):
+            return
+        self._lamp_slots, counters = res
+        self._active = self._activity.update(counters, time.time())
+
+    def _lamp_paint(self):
+        on = lc.blink_on(time.time())
+        views = {f"con-{i + 1}": lc.slot_view(i + 1, slot) for i, slot in enumerate(self._lamp_slots or [])}
+        for name, label, key in lc.LOWER:
+            views[key] = (name, lc.health_of(self._check_rows, label))
+        for key, (text, health) in views.items():
+            f, stripe, lab, last = self._lamps[key]
+            v = lc.lamp_view(health, key in self._active, on)
+            state = (text, v["bg"], v["fg"], v["bar"])
+            if state == last[0]:
+                continue
+            last[0] = state
+            f.config(bg=v["bg"])
+            stripe.config(bg=v["bar"])
+            lab.config(text=text, bg=v["bg"], fg=v["fg"])
 
     def _render_net(self, state, text):
         """顶栏和锁屏的网络标用同一份探测结果, 锁着屏也照常刷新."""
@@ -402,7 +473,9 @@ class Kiosk(tk.Tk):
 
     def _ch_send(self, fn, *args, droppable=False):
         """只入队, 真正的发送在 ChWorker 线程; 返回是否入队 (满了/断了 = False)."""
-        return bool(self.chw) and self.chw.send(fn, *args, droppable=droppable)
+        ok = bool(self.chw) and self.chw.send(fn, *args, droppable=droppable)
+        self._kvm_count += bool(ok)
+        return ok
 
     def _ch_gone(self, _ex):
         """工作线程报拔线 (句柄已关): 退出透传, 下次单击画面重连."""

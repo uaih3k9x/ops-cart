@@ -300,8 +300,15 @@ def check_tailscale(ctx):
     return ("OK", ts) if ts != "-" else ("WARN", "OFFLINE")
 
 
-def check_serial(ctx, dev="/dev/ttyUSB0"):
-    return ("OK", os.path.basename(dev)) if ctx["exists"](dev) else ("--", "NOT CONNECTED")
+def check_serial(ctx, dev="/dev/ttyUSB0", devs=None):
+    """devs: 一组口 (推车 hub 的 /dev/con-N) 合成一行, 显示在线几根、缺哪根."""
+    if not devs:
+        return ("OK", os.path.basename(dev)) if ctx["exists"](dev) else ("--", "NOT CONNECTED")
+    missing = [os.path.basename(d).upper() for d in devs if not ctx["exists"](d)]
+    if len(missing) == len(devs):
+        return "--", "NOT CONNECTED"
+    n = f"{len(devs) - len(missing)}/{len(devs)}"
+    return ("OK", n) if not missing else ("WARN", f"{n} NO {','.join(missing)}")
 
 
 def check_ch9329(ctx):

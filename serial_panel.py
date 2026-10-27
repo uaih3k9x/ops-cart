@@ -6,10 +6,12 @@
 开停服务/留言经 conbroker 命令行; 控制台只连它的本地 socket, 不直接碰串口设备.
 
 线程纪律: 后台线程只往 self.ui / self.rx 两个队列放东西, 界面只在 _drain 里改 (Tk 不是线程安全的).
-开服务优先用 /dev/serial/by-id 路径 (重插后 ttyUSBn 变了也认得); 键鼠 CH9329 的口标出来, 不许当控制台.
+开服务优先用推车 hub 口别名 /dev/con-N (udev 按物理口起名; 那批 FT232R 仿片序列号全一样, by-id 只剩一个),
+其次 /dev/serial/by-id 路径 (重插后 ttyUSBn 变了也认得); 板载 ttyS* 不列; 键鼠 CH9329 的口标出来, 不许当控制台.
 """
 
 import codecs
+import glob
 import json as _json
 import os
 import pwd
@@ -53,6 +55,8 @@ def _conbroker_cmd():
 
 BAUDS = ["9600", "115200", "57600", "38400", "4800"]
 BYID_DIR = "/dev/serial/by-id"
+ALIAS_GLOB = "/dev/con-*"   # /etc/udev/rules.d/99-cart-console.rules
+HIDDEN_PORT = re.compile(r"^/dev/ttyS\d+$")   # 板载 COM 口, 推车上不接线
 RECONNECT_MS = 3000         # 服务断了以后多久看一次它回来没有
 PASTE_LINE_S = 0.05         # 粘贴按行发, 行间停一下, 交换机 CLI 吃得消
 
@@ -120,6 +124,25 @@ def prefer_byid(dev, paths, realpath=os.path.realpath):
     """同一个口有 by-id 路径就用它 (按序列号认口, 重插不变)."""
     r = realpath(dev)
     return next((p for p in sorted(paths) if realpath(p) == r), dev)
+
+
+def alias_paths(pattern=ALIAS_GLOB):
+    return sorted(glob.glob(pattern))
+
+
+def console_ports(ports, aliases, realpath=os.path.realpath):
+    """下拉列表: 有 hub 口别名的换成别名, 板载口去掉; 别名排前面."""
+    out = []
+    for p in ports:
+        if HIDDEN_PORT.match(p):
+            continue
+        out.append(next((a for a in aliases if realpath(a) == realpath(p)), p))
+    return sorted(out, key=lambda p: (p not in aliases, p))
+
+
+def serve_target(port, aliases, byid, realpath=os.path.realpath):
+    """开服务用的路径: hub 口别名原样用, 别的口换成 by-id."""
+    return port if port in aliases else prefer_byid(port, byid, realpath)
 
 
 def match_service(dev, serves, realpath=os.path.realpath):
@@ -259,7 +282,7 @@ class SerialPanel(tk.Frame):
         self.ui = queue.Queue()             # 后台线程 -> 要在主线程里执行的函数
         self.term = TermFeed()
         self.chat_off = None
-        self._serves, self._kvm_devs, self._byid = {}, set(), []
+        self._serves, self._kvm_devs, self._byid, self._aliases = {}, set(), [], []
         self._busy = self._pasting = self._reconnect = False
         self._build()
         self.refresh_ports()
@@ -530,11 +553,12 @@ class SerialPanel(tk.Frame):
 
     def refresh_ports(self, wake=True):
         def fetch():
-            return _run(["list"]), kvm_devices(kvm.ports()), byid_paths()
+            return _run(["list"]), kvm_devices(kvm.ports()), byid_paths(), alias_paths()
 
         def done(res):
-            text, self._kvm_devs, self._byid = res
+            text, self._kvm_devs, self._byid, self._aliases = res
             ports, self._serves = parse_list(text)
+            ports = console_ports(ports, self._aliases)
             menu = self.port_menu["menu"]
             menu.delete(0, "end")
             for p in ports:
@@ -556,7 +580,7 @@ class SerialPanel(tk.Frame):
         if os.path.realpath(port) in self._kvm_devs:
             self._con_write([("text", f"\n[{port} 是键鼠 CH9329 的口, 不能当控制台]\n")], "mark")
             return
-        target = prefer_byid(port, self._byid)
+        target = serve_target(port, self._aliases, self._byid)
         self._busy = True
         self._con_write([("text", f"\n[开服务] {target} @ {self.baud_var.get()}\n")], "mark")
         # serve 是常驻前台设计: nohup+setsid 丢后台, 立刻返回; stderr 落临时文件, 1.5 秒后看它死没死
