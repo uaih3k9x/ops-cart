@@ -94,3 +94,50 @@ def test_sample_attaches_path():
         return r
     u = uc.sample(path="/org/ups", runner=runner)
     assert u["percent"] == 92 and u["path"] == "/org/ups"
+
+
+# ------------------------------------------------------- hidraw 合并 (issue #4)
+
+def test_merge_prefers_hidraw_values():
+    up = {"state": "discharging", "percent": 96, "warning": "none", "path": "/x"}
+    hid = {"load": 18, "voltage": 234, "status": "OB", "runtime": 1802,
+           "charge": 95, "source": "hidraw", "path": "/dev/hidraw7"}
+    m = uc.merge(up, hid)
+    assert m["percent"] == 95              # hidraw 更新的电量优先
+    assert m["load"] == 18 and m["voltage"] == 234
+    assert m["status"] == "OB"
+    assert m["state"] == "discharging"     # state 仍然只有 upower 给
+    assert m["source"] == "upower+hidraw"
+
+
+def test_merge_hidraw_only():
+    m = uc.merge(None, {"charge": 88, "load": 5, "status": "OL",
+                        "voltage": None, "runtime": None, "source": "hidraw"})
+    assert m["percent"] == 88 and m["load"] == 5
+    assert "voltage" not in m              # None 不塞进来
+    assert m["source"] == "hidraw"
+
+
+def test_merge_nothing_is_none():
+    assert uc.merge(None, None) is None
+
+
+def test_sample_all_survives_broken_hidraw(monkeypatch):
+    monkeypatch.setattr(uc, "sample", lambda path=None, runner=None: {"state": "charging", "percent": 100})
+
+    def boom():
+        raise OSError("no permission")
+    got = uc.sample_all(hid_reader=boom)
+    assert got["percent"] == 100 and got["source"] == "upower"
+
+
+def test_label_includes_load_and_voltage():
+    ups = {"state": "fully-charged", "percent": 100, "load": 18, "voltage": 234.0}
+    assert uc.label(ups) == "电池 100% · 18% 负载 · 234V"
+    assert uc.detail({"load": None}) == ""
+    assert uc.detail(None) == ""
+
+
+def test_detail_partial():
+    assert uc.detail({"voltage": 232.0}) == "232V"
+    assert uc.detail({"load": 7}) == "7% 负载"

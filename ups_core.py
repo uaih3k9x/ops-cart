@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""推车 UPS (issue #4): 通过系统自带的 upower 读 APC Back-UPS 的电量与市电状态.
+"""推车 UPS (issue #4): 读 APC Back-UPS 的电量、市电状态、负载和输入电压.
 
-只走 upower 命令行, 不装 NUT, 不引第三方库. 这里的纯逻辑 (解析/配色/阈值) 单独可测,
-实际读在后台线程里每秒一次, 画在 kiosk 顶栏、状态板和锁屏上.
+两条路, 自动挑:
+  1. hidpdc 直读 /dev/hidrawN —— 能拿到 upower 不报的 ups.load / input.voltage / ups.status
+     (需要 udev 规则 70-apc-ups.rules 给普通用户读权限)
+  2. 退回 upower 命令行 —— 只有 state / percentage / warning-level
+
+不装 NUT, 不引第三方库. 纯逻辑 (解析/配色/阈值/合并) 单独可测, 实际读在后台线程每秒一次,
+画在 kiosk 顶栏、状态板和锁屏上.
 
 实测 (2026-10-29, BX1200CI-CN): state 会从 charging 翻到 discharging, 但滞后一两分钟;
 `time to empty` 一直是 28.5 minutes 不变, 不可信 —— 低电量只能按百分比判断.
 """
 
+import os
 import re
 import subprocess
 
@@ -48,16 +54,31 @@ def low(ups, threshold=LOW_PCT):
     return on_battery(ups) and ups.get("percent", 100) <= threshold
 
 
+def detail(ups):
+    """负载/电压这类附加信息, 一行; 没有就空串."""
+    if not ups:
+        return ""
+    bits = []
+    if ups.get("load") is not None:
+        bits.append(f"{ups['load']}% 负载")
+    if ups.get("voltage"):
+        bits.append(f"{int(ups['voltage'])}V")
+    return " · ".join(bits)
+
+
 def label(ups):
     """一行字的电量说明; 没读到就说没读到, 别装作正常."""
     if not ups:
         return "电池 --"
     pct = ups.get("percent", 0)
     if on_battery(ups):
-        return f"电池 {pct}% 放电"
-    if ups.get("state") == "charging":
-        return f"电池 {pct}% 充电"
-    return f"电池 {pct}%"
+        base = f"电池 {pct}% 放电"
+    elif ups.get("state") == "charging":
+        base = f"电池 {pct}% 充电"
+    else:
+        base = f"电池 {pct}%"
+    extra = detail(ups)
+    return f"{base} · {extra}" if extra else base
 
 
 def health(ups):
@@ -101,6 +122,83 @@ def device_path(runner=_run):
                 _CACHE["path"] = line
             return line
     return None
+
+
+HIDRAW_GLOB = "/sys/class/hidraw/hidraw*"
+APC_VENDOR, APC_PRODUCT = "051d", "0002"
+
+
+def hidraw_nodes(root=HIDRAW_GLOB):
+    """/sys/class/hidraw/hidrawN 里属于 APC UPS 的那些设备节点路径."""
+    import glob
+    out = []
+    for d in sorted(glob.glob(root)):
+        uevent = os.path.join(d, "device", "uevent")
+        try:
+            with open(uevent, encoding="utf-8", errors="replace") as f:
+                text = f.read().upper()
+        except OSError:
+            continue
+        if f"HID_ID=0003:{APC_VENDOR.upper()}:{APC_PRODUCT.upper()}" in text:
+            out.append("/dev/" + os.path.basename(d))
+    return out
+
+
+def read_hid(path=None):
+    """直读 hidraw 拿负载/电压/状态. 没有权限或没设备时返回 None, 不抛异常."""
+    import hidpdc
+    for dev in ([path] if path else hidraw_nodes()):
+        try:
+            fields, fd, sizes = hidpdc.open_device(dev)
+        except (OSError, ValueError):
+            continue
+        try:
+            values = hidpdc.read_all(fields, fd, sizes)
+        finally:
+            os.close(fd)
+        return {
+            "load": values.get("ups.load"),
+            "voltage": values.get("input.voltage"),
+            "status": values.get("ups.status", ""),
+            "runtime": values.get("battery.runtime"),
+            "charge": values.get("battery.charge"),
+            "source": "hidraw",
+            "path": dev,
+        }
+    return None
+
+
+def merge(upops, hid):
+    """upower 的结果 + hidraw 的结果 -> 一份状态.
+
+    upower 管 state/percent/warning; hidraw 补 load/voltage/status.
+    两边的电量/状态互相印证: 有 hidraw 的 charge 就用它 (刷新更快).
+    """
+    if not upops and not hid:
+        return None
+    out = dict(upops or {})
+    if hid:
+        if hid.get("charge") is not None:
+            out["percent"] = int(hid["charge"])
+        if hid.get("status"):
+            out["status"] = hid["status"]
+        for key in ("load", "voltage", "runtime"):
+            if hid.get(key) is not None:
+                out[key] = hid[key]
+        out["source"] = "upower+hidraw" if upops else "hidraw"
+    else:
+        out.setdefault("source", "upower")
+    return out
+
+
+def sample_all(path=None, runner=_run, hid_reader=read_hid):
+    """一次采样: upower 与 hidraw 合并. 两条都失败返回 None."""
+    upops = sample(path, runner)
+    try:
+        hid = hid_reader()
+    except Exception:            # noqa: BLE001  直读是加分项, 坏了不能连累 upower
+        hid = None
+    return merge(upops, hid)
 
 
 def sample(path=None, runner=_run):
