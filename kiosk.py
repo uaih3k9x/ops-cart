@@ -20,6 +20,7 @@ import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
 import lamps_core as lc
+import netprof_core as npc
 import ups_core as uc
 import serial_panel as sp
 from ch9329 import Ch9329
@@ -297,7 +298,7 @@ class Kiosk(tk.Tk):
     def _ups_sample(self):
         """后台线程: 每秒读一次 upower (命令行, 只读). 读不到就返回 None."""
         try:
-            return uc.sample(path=self._ups_path)
+            return uc.sample_all(path=self._ups_path)   # upower + hidraw 直读(负载/电压)
         except Exception:          # noqa: BLE001  采样失败不能把线程搞死
             return None
 
@@ -778,10 +779,10 @@ class Kiosk(tk.Tk):
         self._bg_action("toggle_pxe", lambda: kc.services_status(("pxe-server",)), asked, "读取服务状态…")
 
     def cfg_lan2(self):
-        warn = ("注意: LAN2 是管理口(远程/SSH/tailscale 走这里)!\n"
-                "修改后当前远程连接会断, 请确保你人在车边操作.\n\n要继续吗?")
-        if not messagebox.askyesno("LAN2 管理口", warn, icon="warning"):
-            return
+        """#8: 这里改的是内置连接; 「网口配置文件」改的是命名配置, 两个入口都会动 enp3s0.
+        实时状态按 netprof_core.lan2_view 单一口径读, 有冲突就把参与方写进对话框."""
+        def read():
+            return kc.nics_status(), kc.run(npc.CMD_CONS)[1]
 
         def apply(cmds):
             for cmd in cmds:
@@ -790,23 +791,35 @@ class Kiosk(tk.Tk):
                     return f"失败: {' '.join(cmd[:4])} 返回 {rc}"
             return "已下发, 状态见左侧(远程会断属正常)"
 
-        def got(res):
+        def ask(res):
             self.banner.config(text="")
-            nic = None if isinstance(res, Exception) else next((n for n in res if n["name"] == "enp3s0"), None)
-            if nic is None:
+            nics, cons = res if not isinstance(res, Exception) else ([], "")
+            view = npc.lan2_view(kc.LAN2_CON, cons, nics)
+            if view["ip"] == "-" and not view["link"]:
                 return messagebox.showerror("LAN2", "读不到 enp3s0 的状态")
-            if messagebox.askyesno("LAN2", f"当前: {nic['ip']} ({nic['method']})\n\n改为 DHCP(自动获取)?"):
+            warn = ("注意: LAN2 是管理口(远程/SSH/tailscale 走这里)!\n"
+                    "修改后当前远程连接会断, 请确保你人在车边操作.\n\n"
+                    f"当前: {view['ip']} ({view['method']})  生效配置: {view['active'] or '-'}\n"
+                    + (f"\n{view['warning']}\n" if view["conflict"] else "")
+                    + "\n要继续吗?")
+            if not messagebox.askyesno("LAN2 管理口", warn, icon="warning"):
+                return
+            if messagebox.askyesno("LAN2", f"当前: {view['ip']} ({view['method']})\n\n改为 DHCP(自动获取)?"):
                 cmds = kc.nmcli_set_dhcp(kc.LAN2_CON)
             else:
-                ip = simpledialog.askstring("静态 IP", "IP/前缀:", initialvalue=nic["ip"])
+                ip = simpledialog.askstring("静态 IP", "IP/前缀:", initialvalue=view["ip"])
                 if not ip:
                     return
                 gw = simpledialog.askstring("网关", "网关(可空):")
                 dns = simpledialog.askstring("DNS", "DNS(可空):")
                 cmds = kc.nmcli_set_static(kc.LAN2_CON, ip, gw or "", dns or "")
-            self._bg_action("cfg_lan2", lambda: apply(cmds), lambda r: messagebox.showinfo(
-                "LAN2", str(r)), "正在下发 LAN2 配置…")
-        self._bg_action("cfg_lan2", kc.nics_status, got, "读取网口状态…")
+
+            def applied(r):
+                messagebox.showinfo("LAN2", str(r))
+
+            self._bg_action("cfg_lan2_apply", lambda: apply(cmds), applied, "正在下发 LAN2 配置…")
+
+        self._bg_action("cfg_lan2", read, ask, "读取网口状态…")
 
     def confirm_power(self, off):
         verb = "关机" if off else "重启"

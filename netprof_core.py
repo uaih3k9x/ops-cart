@@ -116,10 +116,14 @@ def pick_self(peer):
 
 # ------------------------------------------------------------ nmcli 命令
 
-def cmd_create(iface, kind, label, addr=None):
+def cmd_create(iface, kind, label, addr=None, confirmed=True):
+    """拼 `nmcli con add`. confirmed=False 时静态地址一律拒绝 —— 地址可能只是探测来的建议值,
+    必须由人确认后才允许写进 NetworkManager (issue #8)."""
     why = check(iface, kind) or check_label(label)
     if why:
         raise ValueError(why)
+    if kind != "dhcp" and not confirmed:
+        raise ValueError("静态地址没经确认, 不能直接写")
     cmd = ["nmcli", "con", "add", "type", "ethernet", "ifname", iface, "con-name", con_name(iface, kind, label),
            "connection.autoconnect", "no", "ipv6.method", "disabled"]
     if kind == "dhcp":
@@ -145,6 +149,44 @@ def plan_switch(cur, new):
         "probe": new["kind"] == "serve",
         "stop_pxe": new["iface"] in SERVE_IFACES and new["kind"] != "serve",
         "warn_remote": new["iface"] == "enp3s0",
+    }
+
+
+# ------------------------------------------------------------ LAN2 单一口径 (issue #8)
+
+LAN2 = "enp3s0"
+
+
+def lan2_view(iface=LAN2, cons_text="", nics=()):
+    """LAN2 管理口的唯一口径: 两个入口都读它, 不再各自判断.
+
+    kiosk 的「LAN2 管理口配置」改的是内置连接 (名字就是网口名),
+    「网口配置文件」面板改的是 cart-<网口>-<种类>-<标签>. 两个入口都会动这个口,
+    所以只要命名配置出现, 就标冲突 (entries 列出参与方), 由界面明确提示.
+    """
+    nic = next((n for n in nics if n.get("name") == iface), None) or {}
+    builtin = iface if parse_name(iface) else None
+    profs = parse_cons(cons_text)
+    named = [p["name"] for p in profs if p["iface"] == iface and not p["builtin"]]
+    active = next((p["name"] for p in profs if p["iface"] == iface and p["active"]), None)
+    entries = (["LAN2 管理口配置"] if builtin else []) + (["网口配置文件"] if named else [])
+    conflict = builtin is not None and bool(named)
+    warning = ""
+    if conflict:
+        warning = ("两个入口都能改这个口：「LAN2 管理口配置」改内置连接，"
+                   "「网口配置文件」改命名配置；切换后以实际状态为准")
+    return {
+        "iface": iface,
+        "ip": nic.get("ip") or "-",
+        "method": nic.get("method") or "-",
+        "link": bool(nic.get("link")),
+        "con": nic.get("con") or "",
+        "builtin": builtin,
+        "named": named,
+        "active": active,
+        "entries": entries,
+        "conflict": conflict,
+        "warning": warning,
     }
 
 

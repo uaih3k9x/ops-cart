@@ -22,6 +22,7 @@ class NetProfPanel(BridgePanel):
     def __init__(self, master):
         super().__init__(master, bg=BG)
         self.profs = []
+        self._cons_text = ""
         self.prev = {}                  # 网口 -> 切换前生效的配置, 给「回退」用
         self._build()
         self.reload()
@@ -87,6 +88,11 @@ class NetProfPanel(BridgePanel):
         self.msg.pack(fill="x", padx=16, pady=(2, 10))
         self._form_changed()
 
+    def _lan2_note(self):
+        """#8: LAN2 有两个入口能改, 直接标出来, 别让同一接口出现两份说法."""
+        v = npc.lan2_view("enp3s0", getattr(self, "_cons_text", ""), ())
+        return v["warning"] if v["conflict"] else ""
+
     def _use_template(self):
         hit = dict(npc.STATIC_TEMPLATES).get(self.tpl_var.get())
         if hit:
@@ -110,13 +116,18 @@ class NetProfPanel(BridgePanel):
     # ------------------------------------------------------------ 列表
 
     def reload(self):
+        def work():
+            text = _run(npc.CMD_CONS)[1]
+            return npc.parse_cons(text), text
+
         def done(res):
             if isinstance(res, Exception):
                 return self._say(f"读取失败: {res}", ok=False)
-            self.profs = res
+            self.profs, self._cons_text = res
             self._render()
-            self._say(f"{len(self.profs)} 个配置文件")
-        self._bg(lambda: npc.parse_cons(_run(npc.CMD_CONS)[1]), done, "读取中…")
+            note = self._lan2_note()
+            self._say(note if note else f"{len(self.profs)} 个配置文件")
+        self._bg(work, done, "读取中…")
 
     def _render(self):
         self.lb.delete(0, "end")
@@ -189,8 +200,16 @@ class NetProfPanel(BridgePanel):
     def create(self):
         iface, kind, label = self.iface_var.get(), self.kind_var.get(), self.label_var.get().strip()
         try:
+            # 静态地址只是建议值: 先算出来给人看, 确认后才允许写 NetworkManager (issue #8)
             addr = npc.pick_self(self.peer_var.get().strip()) if kind == "static" else None
-            cmd = npc.cmd_create(iface, kind, label, addr=addr)
+            if kind == "static" and not messagebox.askyesno(
+                    "新建静态地址",
+                    f"将在 {iface} 上新建配置「{label}」\n"
+                    f"地址: {addr}（同网段挑的空地址，不抢默认路由）\n\n"
+                    f"确认写入 NetworkManager 并切换过去吗？",
+                    icon="question"):
+                return self._say("没确认, 未写入", ok=False)
+            cmd = npc.cmd_create(iface, kind, label, addr=addr, confirmed=True)
         except ValueError as ex:
             return self._say(str(ex), ok=False)
         name = npc.con_name(iface, kind, label)

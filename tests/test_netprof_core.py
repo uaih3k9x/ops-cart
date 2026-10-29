@@ -218,3 +218,55 @@ def test_dhcp_probe_with_carrier_collects_offers(monkeypatch):
     res = np_.dhcp_probe("eno1", timeout=1, carrier=lambda iface: True)
     assert res == [{"server": "192.0.2.1", "yiaddr": "192.0.2.99"}]
     assert not res.unknown and res.carrier is True and fake["s"].closed
+
+
+# ------------------------------------------------------- LAN2 单一口径 (#8)
+
+NICS = [{"name": "eno1", "con": "Lan1-pxe", "role": "PXE 装机口", "ip": "-",
+         "method": "auto", "link": False},
+        {"name": "enp3s0", "con": "enp3s0", "role": "管理口", "ip": "192.0.2.5/24",
+         "method": "auto", "link": True}]
+
+# 只有内置 enp3s0 在管这个口
+CONS_BUILTIN_ONLY = "\n".join([
+    "enp3s0:1603-3:802-3-ethernet::yes",
+    "Lan1-pxe:a737-4:802-3-ethernet:eno1:yes",
+])
+
+
+def test_lan2_view_builtin_only_has_no_conflict():
+    v = np_.lan2_view("enp3s0", CONS_BUILTIN_ONLY, NICS)
+    assert v["ip"] == "192.0.2.5/24" and v["method"] == "auto"
+    assert v["builtin"] == "enp3s0"
+    assert v["named"] == []
+    assert v["active"] == "enp3s0"
+    assert v["entries"] == ["LAN2 管理口配置"]
+    assert v["conflict"] is False
+    assert v["warning"] == ""
+
+
+def test_lan2_view_flags_two_entries_on_same_iface():
+    """命名配置一出现, 两个入口就能同时改这个口了 —— kiosk 改内置, 网口面板改命名."""
+    v = np_.lan2_view("enp3s0", CONS, NICS)
+    assert v["named"] == ["cart-enp3s0-static-华为交换机"]
+    assert v["entries"] == ["LAN2 管理口配置", "网口配置文件"]
+    assert v["conflict"] is True
+    assert "两个入口" in v["warning"]
+
+
+def test_lan2_view_missing_nic_is_unknown():
+    v = np_.lan2_view("enp3s0", CONS, [])
+    assert v["ip"] == "-" and v["method"] == "-"
+    assert v["conflict"] is True          # 读不到实时状态不影响"有两个入口"这个事实
+
+
+def test_cmd_create_static_requires_confirmation():
+    """#8: 静态地址只是建议值, 没人确认前不许写 NetworkManager."""
+    with pytest.raises(ValueError):
+        np_.cmd_create("enp3s0", "static", "x", addr="192.168.1.250/24", confirmed=False)
+    cmd = np_.cmd_create("enp3s0", "static", "x", addr="192.168.1.250/24", confirmed=True)
+    assert "ipv4.addresses" in cmd
+
+
+def test_cmd_create_dhcp_ignores_confirmation():
+    assert np_.cmd_create("enp3s0", "dhcp", "x", confirmed=False)[-2:] == ["ipv4.method", "auto"]
