@@ -20,6 +20,7 @@ import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
 import lamps_core as lc
+import ups_core as uc
 import serial_panel as sp
 from ch9329 import Ch9329
 from serial_panel import SerialPanel
@@ -78,6 +79,8 @@ class Kiosk(tk.Tk):
         kui.kp_digits_as_digits(self)
         self._menu_btns = {}
         self._net_view, self._lock_net = None, None     # 最近一次网络探测; 锁屏上的网络标
+        self._ups, self._lock_ups, self._ups_path = None, None, None   # issue #4: UPS 状态
+        self._ups_shutdown = False                     # 低电量关机只触发一次
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read(), state_path=kc.PIN_STATE)
         self._lock_win = None
@@ -99,6 +102,7 @@ class Kiosk(tk.Tk):
         self.after(2000, self._pxe_tick)
         self.after(100, self.refresh)
         self.ui.repeat_bg(self._lamp_sample, self._lamp_sampled, every=lc.SAMPLE_MS / 1000)
+        self.ui.repeat_bg(self._ups_sample, self._ups_sampled, every=1.0)
         self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
 
     def _fill_screen(self):
@@ -225,7 +229,11 @@ class Kiosk(tk.Tk):
                 self._ssd, self._ssd_ts = kc.smart_temp(), now
             temps = kc.temps_status(smart=lambda: self._ssd)
             fans = kc.fans_to_show(kc.fans_status(), self._fans_seen)
-            return kc.status_board_lines(rows, temps, fans, kc.misc_status()["uptime"])
+            lines = kc.status_board_lines(rows, temps, fans, kc.misc_status()["uptime"])
+            ups = self._ups
+            if ups:
+                lines += [("", "dim"), ("电池  " + uc.label(ups)[3:], self._ups_tag(ups))]
+            return lines
 
         if not self._checking and time.time() - self._check_ts > self.CHECK_EVERY:
             self._checking, self._check_ts = True, time.time()
@@ -251,6 +259,9 @@ class Kiosk(tk.Tk):
             lab = tk.Label(f, text="", font=FONT, width=width, height=2, justify="left", anchor="w",
                            bg=lc.EMPTY_BODY, fg=lc.EMPTY_FG, padx=6, cursor="hand2")
             lab.pack(side="left")
+            if pane is None:                    # 电池这类只看不点的, 不做鼠标绑定
+                self._lamps[key] = (f, stripe, lab, [None])
+                return
             for w in (f, lab):
                 # 操作头带上自己那一路 (issue #5); 其余面板不带
                 slot = key if key.startswith("con-") else None
@@ -265,6 +276,8 @@ class Kiosk(tk.Tk):
         for name, _label, key in lc.LOWER:
             block(key, 5, pane_of[key])
             self._lamps[key][2].config(text=name)
+        block(uc.UPS_KEY, 9, None)              # issue #4: 电池, 只看不点
+        self._lamps[uc.UPS_KEY][2].config(text="电池")
 
     def _open_pane(self, name, select=None):
         """select: 串口面板要选中的那一路 (issue #5 执行器条点操作头)."""
@@ -280,6 +293,66 @@ class Kiosk(tk.Tk):
         conf = sp.serial_conf_read()
         on_bell = self._beeper.ring if conf.get("bell_beep") else None   # serial.conf 开了才响主板蜂鸣
         return lc.sample(sp.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
+
+    def _ups_sample(self):
+        """后台线程: 每秒读一次 upower (命令行, 只读). 读不到就返回 None."""
+        try:
+            return uc.sample(path=self._ups_path)
+        except Exception:          # noqa: BLE001  采样失败不能把线程搞死
+            return None
+
+    def _ups_sampled(self, res):
+        """主线程: 收到 UPS 状态; 画顶栏灯、锁屏, 到阈值就正常关机一次."""
+        if isinstance(res, Exception):
+            return
+        if isinstance(res, dict):
+            self._ups_path = res.get("path") or self._ups_path
+        prev, self._ups = self._ups, res
+        if self._ups or prev:
+            self._paint_ups()
+        if uc.low(res) and not self._ups_shutdown:
+            self._ups_shutdown = True
+            self._on_ups_low(res)
+
+    def _on_ups_low(self, ups):
+        """低电量: 记日志 + 顶栏提示, 然后正常关机 (由确认流程决定是否真关)."""
+        msg = f"UPS 电量 {ups.get('percent')}% (阈值 {uc.LOW_PCT}%), 正常关机"
+        try:
+            with open("/var/log/ops-cart-ups.log", "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+        except OSError:
+            pass
+        self.banner.config(text=msg)
+        if self._lock_win is not None:
+            self._lock_notice.config(text=msg, fg="#ff7b72")
+        self._disarm_quietly()
+        self.after(3000, lambda: self.ui.run_bg(lambda: kc.power(True)))
+
+    def _paint_ups(self):
+        """顶栏电池块和锁屏右上角那一行, 用同一份状态."""
+        ups = self._ups
+        text, health = uc.label(ups), uc.health(ups)
+        lamp = self._lamps.get(uc.UPS_KEY)
+        if lamp is not None:
+            f, stripe, lab, last = lamp
+            v = lc.lamp_view(health, uc.on_battery(ups), True)
+            state = (text, v["bg"], v["fg"], v["bar"])
+            if state != last[0]:
+                last[0] = state
+                f.config(bg=v["bg"])
+                stripe.config(bg=v["bar"])
+                lab.config(text=text, bg=v["bg"], fg=v["fg"])
+        label = self._lock_ups
+        if label is not None:
+            label.config(text=text, fg=self._ups_fg(health))
+
+    @staticmethod
+    def _ups_tag(ups):
+        return {"OK": "t_ok", "WARN": "t_hot", "FAIL": "bad"}.get(uc.health(ups), "dim")
+
+    @staticmethod
+    def _ups_fg(health):
+        return {"OK": "#7ee787", "WARN": "#f0b429", "FAIL": "#ff7b72"}.get(health, "#6b7489")
 
     def _lamp_tick(self):
         """采样在常驻线程里 (见 __init__), 这里只画; 每半个采样周期重画一次, 闪烁才跟得上."""
@@ -843,6 +916,10 @@ class Kiosk(tk.Tk):
         self._lock_net = tk.Label(w, text="检查中", font=FONT, bg="#10141c", fg="#6b7489",
                                   compound="left", padx=6)
         self._lock_net.place(relx=0.985, rely=0.02, anchor="ne")
+        # 右上角第二行: 电池 (#4) —— 断电时锁屏上也要看得见
+        self._lock_ups = tk.Label(w, text=uc.label(self._ups), font=FONT, bg="#10141c",
+                                  fg=self._ups_fg(uc.health(self._ups)))
+        self._lock_ups.place(relx=0.985, rely=0.065, anchor="ne")
         # 底部一行: 昨夜整理 (cart_dream.py) 的标题
         self._lock_dream = tk.Label(w, text="", font=FONT, bg="#10141c", fg="#6b7489")
         self._lock_dream.place(relx=0.5, rely=0.97, anchor="s")
@@ -895,7 +972,7 @@ class Kiosk(tk.Tk):
         r = self.gate.attempt(pin)
         if r == "ok":
             self._lock_win.destroy()
-            self._lock_win, self._lock_net = None, None
+            self._lock_win, self._lock_net, self._lock_ups = None, None, None
             self._last_input = time.time()
         elif r == "locked":
             left = max(1, int(self.gate.locked_until - time.time()))
