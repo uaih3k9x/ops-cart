@@ -264,7 +264,7 @@ class Kiosk(tk.Tk):
                 return
             for w in (f, lab):
                 # 操作头带上自己那一路 (issue #5); 其余面板不带
-                slot = key if key.startswith("con-") else None
+                slot = lc.slot_for_lamp(key) if key.startswith("con-") else None
                 w.bind("<Button-1>", lambda _e, p=pane, s=slot: self._open_pane(p, s))
             self._lamps[key] = (f, stripe, lab, [None])
 

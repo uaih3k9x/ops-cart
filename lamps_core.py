@@ -26,6 +26,15 @@ LOWER = [("键鼠", "CH9329", "kvm"), ("PXE", "PXE SERVER", "pxe"),
          ("LAN1", "LAN1 / PXE", "net:eno1"), ("LAN2", "LAN2", "net:enp3s0"),
          ("Wi-Fi", "WIFI", "net:wlp4s0")]
 SLOTS = [f"/dev/con-{n}" for n in range(1, 5)]   # /etc/udev/rules.d/99-cart-console.rules
+
+
+def slot_for_lamp(key):
+    """执行器条上的键 (con-3) -> 设备路径 (/dev/con-3).
+
+    issue #5 的坑: 键是 "con-N", 面板要的是 "/dev/con-N"; 直接把键传下去会被当成
+    不存在的口, 面板显示"未插", 再点开服务 conbroker 就报"无 conN 这个设备"。
+    """
+    return f"/dev/{key}"
 PXE_LOG = "/opt/pxe/pxeserver.log"
 SPKR = "/dev/input/by-path/platform-pcspkr-event-spkr"
 EV_SND, SND_TONE = 0x12, 0x02

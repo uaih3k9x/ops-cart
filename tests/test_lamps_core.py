@@ -127,3 +127,12 @@ def test_sample_reports_bell_counters(tmp_path, monkeypatch):
         f.write(b"\x07")
     _slots, counters = lc.sample(str(tmp_path), 0, bells=bells, on_bell=lambda: rung.append(1))
     assert counters["bell:con-1"] == 1 and rung == [1]
+
+
+def test_slot_for_lamp_gives_device_path():
+    """执行器条的键是 con-3, 面板要的是 /dev/con-3 (issue #5 的回归)."""
+    assert lc.slot_for_lamp("con-1") == "/dev/con-1"
+    assert lc.slot_for_lamp("con-4") == "/dev/con-4"
+    # 面板真正能用它选中
+    import serial_panel as sp
+    assert sp.select_port(["/dev/con-1", "/dev/con-3"], lc.slot_for_lamp("con-3")) == ("/dev/con-3", True)
