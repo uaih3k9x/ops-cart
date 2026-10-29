@@ -153,6 +153,19 @@ def match_service(dev, serves, realpath=os.path.realpath):
     return next((n for n in serves if realpath(n) == r), None)
 
 
+def select_port(ports, want, realpath=os.path.realpath):
+    """issue #5: 把点中那一路口对齐到下拉列表里的条目.
+
+    返回 (要显示的路径, 是否在列表里). 不在列表里说明这一路没插线,
+    仍然返回 want, 由面板提示"未插"; 指向同一设备时优先用列表里的写法.
+    """
+    if want in ports:
+        return want, True
+    r = realpath(want)
+    hit = next((p for p in ports if realpath(p) == r), None)
+    return (hit, True) if hit else (want, False)
+
+
 def kvm_devices(kvm_ports, realpath=os.path.realpath):
     """键鼠 CH9329 占着的真实设备 (kvm_core.ports() 的 by-id 路径解析出来)."""
     return {realpath(p) for p in kvm_ports.values()}
@@ -273,7 +286,7 @@ def _btn(parent, text, cmd, bg="#1f2a3d"):
 class SerialPanel(tk.Frame):
     """kiosk 里的 '串口会话' 页. 左控制台 (宽) | 右聊天 (窄), F2 切换焦点."""
 
-    def __init__(self, master):
+    def __init__(self, master, want=None):
         super().__init__(master, bg=BG)
         self.cfg = serial_conf_read()
         self.ddir = data_dir(self.cfg)
@@ -284,6 +297,8 @@ class SerialPanel(tk.Frame):
         self.chat_off = None
         self._serves, self._kvm_devs, self._byid, self._aliases = {}, set(), [], []
         self._busy = self._pasting = self._reconnect = False
+        self._want = want                    # issue #5: 打开面板时点中的那一路, 列表回来后落位
+        self._menu_ports = []                # 下拉列表当前列出的口
         self._build()
         self.refresh_ports()
         self.after(30, self._drain)
@@ -551,6 +566,21 @@ class SerialPanel(tk.Frame):
         self.port_var.set(dev)
         self._connect()
 
+    def select_slot(self, dev):
+        """issue #5: 执行器条点第 N 路时切到 /dev/con-N.
+
+        列表里没有这个口 (没插线) 也要停在这上面, 并在控制台提示未插;
+        有在跑的服务就顺手连上, 没有就只选中, 不自动开服务 (开服务会占串口).
+        """
+        shown_path, present = select_port(list(self._menu_ports), dev)
+        self.port_var.set(shown_path)
+        self._reconnect = False
+        self._disconnect()
+        if present:
+            self._connect()
+        else:
+            self.con_title.config(text=f"控制台 · {dev} 未插 (这一路没有设备)", fg=DIM)
+
     def refresh_ports(self, wake=True):
         def fetch():
             return _run(["list"]), kvm_devices(kvm.ports()), byid_paths(), alias_paths()
@@ -560,10 +590,15 @@ class SerialPanel(tk.Frame):
             ports, self._serves = parse_list(text)
             ports = console_ports(ports, self._aliases)
             menu = self.port_menu["menu"]
+            self._menu_ports = list(ports)
             menu.delete(0, "end")
             for p in ports:
                 menu.add_command(label=port_label(p, self._kvm_devs), command=lambda v=p: self._select(v))
-            if ports and self.port_var.get() not in ports:
+            want, self._want = self._want, None
+            if want:
+                shown_path, _present = select_port(ports, want)
+                self.port_var.set(shown_path)
+            elif ports and self.port_var.get() not in ports:
                 free = [p for p in ports if p not in self._kvm_devs]
                 self.port_var.set((free or ports)[0])
             shown = [f"{os.path.basename(n)} @ {b}" for n, b in self._serves.items()]

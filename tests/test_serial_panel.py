@@ -264,3 +264,21 @@ def test_alias_paths(tmp_path):
     for n in ("con-2", "con-1", "ttyUSB0"):
         (tmp_path / n).write_text("")
     assert sp.alias_paths(str(tmp_path / "con-*")) == [str(tmp_path / "con-1"), str(tmp_path / "con-2")]
+
+
+# ---------------------------------------------------------------- issue #5: 指定操作头
+
+def test_select_port_exact_hit():
+    assert sp.select_port(["/dev/con-1", "/dev/con-2"], "/dev/con-2") == ("/dev/con-2", True)
+
+
+def test_select_port_missing_slot_still_selected():
+    """没插线的那一路照样要选中, 只是标明不在列表里 (面板提示"未插")."""
+    assert sp.select_port(["/dev/con-1"], "/dev/con-3") == ("/dev/con-3", False)
+
+
+def test_select_port_matches_by_realpath():
+    """别名和 by-id 指向同一个设备时, 选别名. 这里用假的 realpath 模拟."""
+    real = {"/dev/con-2": "/dev/ttyUSB1", "/dev/serial/by-id/x": "/dev/ttyUSB1"}
+    got = sp.select_port(["/dev/serial/by-id/x"], "/dev/con-2", realpath=real.get)
+    assert got == ("/dev/serial/by-id/x", True)

@@ -252,7 +252,9 @@ class Kiosk(tk.Tk):
                            bg=lc.EMPTY_BODY, fg=lc.EMPTY_FG, padx=6, cursor="hand2")
             lab.pack(side="left")
             for w in (f, lab):
-                w.bind("<Button-1>", lambda _e: self._open_pane(pane))
+                # 操作头带上自己那一路 (issue #5); 其余面板不带
+                slot = key if key.startswith("con-") else None
+                w.bind("<Button-1>", lambda _e, p=pane, s=slot: self._open_pane(p, s))
             self._lamps[key] = (f, stripe, lab, [None])
 
         for n in range(1, len(lc.SLOTS) + 1):
@@ -264,9 +266,14 @@ class Kiosk(tk.Tk):
             block(key, 5, pane_of[key])
             self._lamps[key][2].config(text=name)
 
-    def _open_pane(self, name):
+    def _open_pane(self, name, select=None):
+        """select: 串口面板要选中的那一路 (issue #5 执行器条点操作头)."""
         if self.pane.current != name:
-            self.toggle_pane(name)
+            self.toggle_pane(name, select=select)
+        elif select:
+            panel = self.panels.get(name)
+            if panel is not None:
+                panel.select_slot(select)
 
     def _lamp_sample(self):
         """常驻采样线程里跑: 只读文件和 /proc, 不碰 Tk (_kvm_count 是 int, 读一下是原子的)."""
@@ -334,7 +341,7 @@ class Kiosk(tk.Tk):
 
     # ------------------------------------------------------------ 左侧面板
 
-    def toggle_pane(self, name):
+    def toggle_pane(self, name, select=None):
         """左侧面板 (预览/串口/ks/无线/网口配置/WOL) 同时只开一个; 再点一次回状态板."""
         if name == "preview" and self.pane.current != "preview" and not os.path.exists(self.video_dev):
             messagebox.showwarning("UVC 预览", f"未检测到采集设备 {self.video_dev}")
@@ -342,7 +349,7 @@ class Kiosk(tk.Tk):
         close, opening = self.pane.toggle(name)
         self._pane_close(close)
         if opening:
-            self._pane_open(opening)
+            self._pane_open(opening, select=select)
         else:
             self._show_status()
 
@@ -358,13 +365,17 @@ class Kiosk(tk.Tk):
             if w is not None:
                 w.destroy()
 
-    def _pane_open(self, name):
+    def _pane_open(self, name, select=None):
         self.status_wrap.pack_forget()
         if name == "preview":
             self._start_preview()
             return
         try:
-            w = PANE_CLASSES[name](self.body)
+            # 串口面板: 打开时就指定要选的那一路, 列表回来后落位 (issue #5)
+            if select and name == "serial":
+                w = PANE_CLASSES[name](self.body, want=select)
+            else:
+                w = PANE_CLASSES[name](self.body)
         except Exception as ex:                 # noqa: BLE001  面板起不来就回状态板, 不留半截状态
             self.pane.close()
             self._show_status()
