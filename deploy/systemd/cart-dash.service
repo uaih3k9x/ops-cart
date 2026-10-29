@@ -5,8 +5,9 @@ After=multi-user.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/pxe
-# 推车的 Python 是 3.9, Pillow/pyusb 在 ~/cartdash-venv (root 装 unit 时改成实际路径)
-ExecStart=/home/uaih3k9x/cartdash-venv/bin/python /opt/pxe/dash_service.py
+# 推车 Python 3.9 没装 Pillow/pyusb, 部署时建 venv: python3 -m venv /opt/pxe/venv
+# 再 /opt/pxe/venv/bin/pip install pillow pyusb
+ExecStart=/opt/pxe/venv/bin/python /opt/pxe/dash_service.py
 # 屏幕拔了照常写快照, 所以不因为 USB 出错就重启; 真崩了才拉起
 Restart=on-failure
 RestartSec=5
