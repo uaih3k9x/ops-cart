@@ -1,0 +1,19 @@
+[Unit]
+Description=Ops cart side display: sample state.json + draw the udisp panel
+After=multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pxe
+# 推车的 Python 是 3.9, Pillow/pyusb 在 ~/cartdash-venv (root 装 unit 时改成实际路径)
+ExecStart=/home/uaih3k9x/cartdash-venv/bin/python /opt/pxe/dash_service.py
+# 屏幕拔了照常写快照, 所以不因为 USB 出错就重启; 真崩了才拉起
+Restart=on-failure
+RestartSec=5
+Nice=10
+# 副屏由 udev 规则 (60-xfz1986-udisp.rules) 给组属主, 不依赖 root
+StateDirectory=ops-cart
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
