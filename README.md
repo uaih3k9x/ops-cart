@@ -34,7 +34,8 @@
   改当前出口那条无线前先确认,换连接先建后删、新密码连不上自动回退
 - **副屏与 UPS**:USB 副屏常驻状态板(`cart-dash` 统一采集,车机和副屏读同一份快照);
   APC UPS 直读 hidraw 拿电量、负载、市电状态,放电到 15% 正常关机;顶栏一排虚拟指示灯,颜色看自检、闪烁看活动
-- **OCR**:截图识字带坐标,给"看屏幕 → 找按钮 → 点"的自动化留接口
+- **OCR 与屏幕配方**:截图识字带坐标;`recipe.py boot-pxe` 自动进启动菜单选网络启动
+- **机房辅助**:LLDP 显示网线对面的交换机和口;串口一键只读巡检并比对配置漂移;TSC 线缆/资产标签;关键事件推到手机;Clonezilla 整盘克隆(解锁 MAC + 目标盘显式匹配)
 
 ## 代码地图
 
@@ -62,6 +63,12 @@
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
 | [`cart_label.py`](cart_label.py) | TSC 标签机 TSPL 生成器(只出字节流,打印由调用方 `cat > /dev/usb/lp0`):旗形线缆标签(上下对折、下半份旋转 180°)、推车线标、刻度尺、资产标签(PDF → pdftoppm → BITMAP);校准常量集中在文件头;缩写对照表校验见 [`examples/label_abbrev.json`](examples/label_abbrev.json) |
+| [`tspl_preview.py`](tspl_preview.py) | 不在打印机边上时把 TSPL 画成 HTML/SVG:旗面轮廓、折痕、对折后正反面;查出界和对折对称。开发机工具 |
+| [`lldp_core.py`](lldp_core.py) | LLDP/CDP 被动监听(只收不发):LAN1/LAN2 对面是哪台交换机的哪个口,经 cart-dash 进快照,副屏和状态板显示;给线缆标签对端出建议值 |
+| [`survey_core.py`](survey_core.py) | 串口一键只读巡检:命令白名单 fail-closed(只认全称 `display`/`show`),走 conbroker 发、存档、和上一份比对配置漂移;串口面板「巡检」按钮 |
+| [`notify_core.py`](notify_core.py) | 关键事件推到手机(UPS、守卫、校园网认证、服务挂了、非正常重启):只读状态文件、只在变化时推、防抖冷却;渠道 ntfy 或飞书群机器人,默认不外发 |
+| [`recipe_core.py`](recipe_core.py) · [`recipe.py`](recipe.py) | 屏幕自动化配方:截图 + OCR + CH9329,第一个配方 `boot-pxe` 自动进启动菜单选网络启动;配方里不许出现保存类按键 |
+| [`clone_core.py`](clone_core.py) | 整盘克隆(Clonezilla over PXE):解锁用途 clone-save / clone-restore、启动参数生成、目标盘按型号/序列号显式匹配(绝不默认 sda)、批量清单确认;见 [`docs/CLONE.md`](docs/CLONE.md) |
 | [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
 | [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;`--once --preview` 导出画面不推屏 |
 | [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
@@ -75,7 +82,7 @@
 | [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查;`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
-| [`docs/`](docs/) | 优化方案、版本部署清单、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md) |
+| [`docs/`](docs/) | 优化方案、版本部署清单、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
