@@ -1,6 +1,9 @@
 """notify_core: 当前状态 → 和上次比 → 只在变化时出事件; 防抖、冷却合并、持久化."""
 
 import json
+import pathlib
+
+import pytest
 
 import notify_core as nc
 
@@ -276,3 +279,212 @@ def test_state_roundtrip_and_bad_file(tmp_path):
     assert nc.load_state(str(p)) == st
     p.write_text("{半个")
     assert nc.load_state(str(p)) is None
+
+
+# ---------------------------------------------------------------- 配置 / 发送器
+
+EXAMPLE = pathlib.Path(__file__).resolve().parent.parent / "examples" / "notify.example.json"
+
+
+class FakeResp:
+    def __init__(self, status=200):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return b"{}"
+
+
+class FakeOpener:
+    """假 urlopen: 记下请求, 按 fail 决定抛错或返回状态码. 测试里不发真请求."""
+
+    def __init__(self, fail=None, status=200):
+        self.reqs, self.fail, self.status = [], fail, status
+
+    def __call__(self, req, timeout=None):
+        self.reqs.append((req, timeout))
+        if self.fail:
+            raise self.fail
+        return FakeResp(self.status)
+
+
+def test_example_conf_is_valid_and_placeholder():
+    conf = nc.load_conf(str(EXAMPLE))
+    assert conf["kind"] == "ntfy"
+    assert conf["url"].startswith("https://push.example.invalid/")
+
+
+def test_load_conf_missing_is_none_and_bad_raises(tmp_path):
+    assert nc.load_conf(str(tmp_path / "nope.json")) is None
+    p = tmp_path / "n.json"
+    for bad in ('{"kind": "slack", "url": "https://push.example.invalid/x"}',
+                '{"kind": "ntfy", "url": "ftp://x"}', "[1]", "{半"):
+        p.write_text(bad)
+        with pytest.raises(ValueError):
+            nc.load_conf(str(p))
+
+
+def test_load_conf_disabled_is_none(tmp_path):
+    p = tmp_path / "n.json"
+    p.write_text('{"kind": "ntfy", "url": "https://push.example.invalid/x", "enabled": false}')
+    assert nc.load_conf(str(p)) is None
+
+
+def test_ntfy_sender_posts_body_and_headers():
+    op = FakeOpener()
+    send = nc.ntfy_sender({"kind": "ntfy", "url": "https://push.example.invalid/cart", "title": "推车",
+                           "token": "tk_secret", "timeout": 7}, opener=op)
+    send({"key": "ups.power", "text": "推车转电池供电 92%，市电断了", "prio": 4, "ts": T0})
+    req, timeout = op.reqs[0]
+    assert req.get_method() == "POST" and req.full_url == "https://push.example.invalid/cart"
+    assert req.data == "推车转电池供电 92%，市电断了".encode()
+    h = {k.lower(): v for k, v in req.header_items()}
+    assert h["priority"] == "4" and h["authorization"] == "Bearer tk_secret"
+    h["title"].encode("ascii")                          # 中文标题按 RFC 2047 编码, 头里只有 ASCII
+    assert h["title"].lower().startswith("=?utf-8?")
+    assert timeout == 7
+
+
+def test_ntfy_sender_optional_headers():
+    op = FakeOpener()
+    nc.ntfy_sender({"kind": "ntfy", "url": "https://push.example.invalid/c", "priority": False},
+                   opener=op)({"key": "k", "text": "x", "prio": 4, "ts": T0})
+    h = {k.lower() for k, _ in op.reqs[0][0].header_items()}
+    assert "priority" not in h and "title" not in h and "authorization" not in h
+
+
+def test_ntfy_sender_raises_on_http_error_status():
+    send = nc.ntfy_sender({"kind": "ntfy", "url": "https://push.example.invalid/c"},
+                          opener=FakeOpener(status=500))
+    with pytest.raises(OSError):
+        send({"key": "k", "text": "x", "prio": 3, "ts": T0})
+
+
+# ---------------------------------------------------------------- 发件箱
+
+def ev(key, text, ts=T0):
+    return {"key": key, "text": text, "prio": 3, "ts": ts}
+
+
+def test_queue_keeps_last_per_key_and_caps():
+    box = nc.queue([ev("a", "1"), ev("b", "1")], [ev("a", "2")])
+    assert [(e["key"], e["text"]) for e in box] == [("b", "1"), ("a", "2")]
+    box = nc.queue([], [ev(f"k{i}", "x") for i in range(nc.MAX_OUTBOX + 5)])
+    assert len(box) == nc.MAX_OUTBOX and box[-1]["key"] == f"k{nc.MAX_OUTBOX + 4}"
+
+
+def test_deliver_stops_at_first_failure_and_marks_late_messages():
+    sent = []
+
+    def send(e):
+        if e["key"] == "b":
+            raise OSError("网断了")
+        sent.append(e["text"])
+    left, err = nc.deliver([ev("a", "早的"), ev("b", "x"), ev("c", "y")], send, now=T0 + 600)
+    assert [e["key"] for e in left] == ["b", "c"] and "网断了" in err
+    assert sent[0].startswith("[补发 ") and sent[0].endswith("早的")
+    sent.clear()
+    assert nc.deliver([ev("a", "新的")], send, now=T0 + 5) == ([], None)
+    assert sent == ["新的"]
+
+
+# ---------------------------------------------------------------- 跑一轮
+
+def readers(ups=OL, ts=T0):
+    return {"state": lambda: {"ts": ts, "ups": ups},
+            "guard": lambda: {"state": "serving"},
+            "auth": lambda: {"state": "online", "ok": True, "message": ""},
+            "services": lambda: {"pxe-server": "active", "kiosk": "active", "cart-dash": "active"},
+            "boot": lambda: {"id": "b1", "ok": True},
+            "now": lambda: ts}
+
+
+def test_run_once_without_conf_logs_only(tmp_path):
+    st, conf, logs = str(tmp_path / "notify.json"), str(tmp_path / "none.json"), []
+    op = FakeOpener()
+    nc.run_once(readers(), st, conf, now=T0, opener=op, log=lambda k, m: logs.append((k, m)))
+    r = nc.run_once(readers(ups=OB, ts=T0 + 30), st, conf, now=T0 + 30, opener=op,
+                    log=lambda k, m: logs.append((k, m)))
+    assert op.reqs == []                                # 没配置: 零外发
+    assert ("notify", "推车转电池供电 92%，市电断了") in logs
+    assert nc.load_state(st)["outbox"] == [] and r["sent"] == 0
+
+
+def test_run_once_sends_and_retries_last_state_after_failure(tmp_path):
+    st, conf = str(tmp_path / "notify.json"), tmp_path / "conf.json"
+    conf.write_text('{"kind": "ntfy", "url": "https://push.example.invalid/cart"}')
+    logs = []
+
+    def log(_k, m):
+        logs.append(m)
+    nc.run_once(readers(), st, str(conf), now=T0, opener=FakeOpener(), log=log)
+    down = FakeOpener(fail=OSError("网断了"))
+    nc.run_once(readers(ups=OB, ts=T0 + 30), st, str(conf), now=T0 + 30, opener=down, log=log)
+    assert len(down.reqs) == 1
+    assert [e["key"] for e in nc.load_state(st)["outbox"]] == ["ups.power"]    # 发送失败不丢
+    assert sum("推送失败" in m for m in logs) == 1
+    nc.run_once(readers(ups=OB, ts=T0 + 60), st, str(conf), now=T0 + 60, opener=down, log=log)
+    assert sum("推送失败" in m for m in logs) == 1      # 一直失败不刷日志
+    up = FakeOpener()
+    r = nc.run_once(readers(ups=OB, ts=T0 + 400), st, str(conf), now=T0 + 400, opener=up, log=log)
+    assert r["sent"] == 1 and up.reqs[0][0].data.decode().endswith("推车转电池供电 92%，市电断了")
+    assert nc.load_state(st)["outbox"] == []
+    assert any("推送恢复" in m for m in logs)
+
+
+def test_run_once_bad_conf_sends_nothing_and_logs(tmp_path):
+    st, conf = str(tmp_path / "notify.json"), tmp_path / "conf.json"
+    conf.write_text('{"kind": "ntfy"}')
+    op, logs = FakeOpener(), []
+    nc.run_once(readers(ups=OB), st, str(conf), now=T0, opener=op, log=lambda k, m: logs.append(m))
+    assert op.reqs == [] and any("notify.json" in m for m in logs)
+
+
+def test_main_test_push_needs_conf_and_uses_sender(tmp_path, capsys):
+    assert nc.main(["--test", "--conf", str(tmp_path / "none.json")]) == 1
+    conf = tmp_path / "conf.json"
+    conf.write_text('{"kind": "ntfy", "url": "https://push.example.invalid/cart"}')
+    op = FakeOpener()
+    assert nc.main(["--test", "--conf", str(conf)], opener=op) == 0
+    assert "测试" in op.reqs[0][0].data.decode()
+    assert nc.main(["--test", "--conf", str(conf)], opener=FakeOpener(fail=OSError("断"))) == 1
+
+
+# ---------------------------------------------------------------- 真读取的解析部分
+
+def test_parse_is_active():
+    out = "active\nfailed\ninactive\n"
+    assert nc.parse_is_active(["a", "b", "c"], out) == {"a": "active", "b": "failed", "c": "inactive"}
+    assert nc.parse_is_active(["a", "b"], "active\n") == {"a": "active", "b": None}
+
+
+def test_parse_boot_success():
+    assert nc.parse_boot_success("Result=success\nExecMainExitTimestampMonotonic=61234567\n") is True
+    assert nc.parse_boot_success("Result=success\nExecMainExitTimestampMonotonic=0\n") is False
+    assert nc.parse_boot_success("Result=exit-code\nExecMainExitTimestampMonotonic=61234567\n") is False
+    assert nc.parse_boot_success("") is None
+
+
+def test_default_read_uses_injected_runner_and_paths(tmp_path):
+    g = tmp_path / "guard.json"
+    g.write_text('{"state": "proxy"}')
+    bid = tmp_path / "boot_id"
+    bid.write_text("abc\n")
+    calls = []
+
+    def runner(cmd):
+        calls.append(cmd)
+        if "is-active" in cmd:
+            return "active\nactive\nfailed\n"
+        return "Result=success\nExecMainExitTimestampMonotonic=5\n"
+    read = nc.default_read(runner=runner, dash=str(tmp_path / "no.json"), guard=str(g),
+                           auth=str(tmp_path / "no2.json"), boot_id=str(bid))
+    cur = nc.collect(read)
+    assert cur["values"]["guard"] == "proxy" and cur["values"]["svc.cart-dash"] == "down"
+    assert cur["values"]["auth"] is None and cur["boot"] == {"id": "abc", "ok": True}
+    assert all(c[0] == "systemctl" for c in calls)

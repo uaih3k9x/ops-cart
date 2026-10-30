@@ -1,0 +1,8 @@
+{
+  "kind": "ntfy",
+  "url": "https://push.example.invalid/ops-cart",
+  "token": "",
+  "title": "推车",
+  "priority": true,
+  "timeout": 10
+}

@@ -244,3 +244,219 @@ def load_state(path=STATE_PATH):
 
 def save_state(path, st):
     atomicfile.write_json(path, st)
+
+
+# ---------------------------------------------------------------- 配置 / 发送器
+# /etc/ops-cart/notify.json (root 0600, 里面可能有令牌), 示例 examples/notify.example.json:
+#   {"kind": "ntfy", "url": "https://push.example.invalid/<topic>", "token": "", "title": "推车",
+#    "priority": true, "timeout": 10}
+# 没有这个文件 / enabled=false = 只写 events.log, 一个包都不往外发.
+
+CONF_PATH = "/etc/ops-cart/notify.json"
+KINDS = ("ntfy",)
+MAX_OUTBOX = 20             # 网断太久时最多攒这么多条 (同一监视项只留最后一条)
+LATE_S = 60                 # 比事件晚这么久才发出去的, 前面标 [补发 时:分]
+
+
+def load_conf(path=CONF_PATH):
+    """-> 配置 dict; 没文件或 enabled=false 返回 None; 写错了抛 ValueError (不猜, 不发)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return None
+    try:
+        conf = json.loads(text)
+    except ValueError:
+        raise ValueError(f"{path} 不是合法 JSON") from None
+    if not isinstance(conf, dict):
+        raise ValueError(f"{path} 应该是一个对象")
+    if conf.get("enabled") is False:
+        return None
+    if conf.get("kind") not in KINDS:
+        raise ValueError(f"{path}: kind 只支持 {', '.join(KINDS)}")
+    if not str(conf.get("url") or "").startswith(("https://", "http://")):
+        raise ValueError(f"{path}: url 要是 http(s) 地址")
+    return conf
+
+
+def ntfy_sender(conf, opener=None):
+    """ntfy 兼容的 HTTP POST: 正文 = 消息, Title / Priority / Authorization 头可选. 失败抛 OSError."""
+    import urllib.request
+    from email.header import Header
+    opener = opener or urllib.request.urlopen
+    timeout = float(conf.get("timeout") or 10)
+
+    def send(ev):
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+        if conf.get("title"):
+            headers["Title"] = Header(str(conf["title"]), "utf-8").encode()    # 中文按 RFC 2047
+        if conf.get("priority", True):
+            headers["Priority"] = str(int(ev.get("prio") or 3))
+        if conf.get("token"):
+            headers["Authorization"] = f"Bearer {conf['token']}"
+        req = urllib.request.Request(conf["url"], data=ev["text"].encode("utf-8"), headers=headers,
+                                     method="POST")
+        with opener(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            if not 200 <= status < 300:
+                raise OSError(f"推送服务回 HTTP {status}")
+    return send
+
+
+def queue(outbox, events):
+    """新事件进发件箱: 同一监视项只留最后一条 (补推最后状态), 超过上限丢最老的."""
+    box = [e for e in (outbox or []) if e.get("key") not in {n["key"] for n in events}]
+    return (box + list(events))[-MAX_OUTBOX:]
+
+
+def deliver(outbox, send, now):
+    """按顺序发, 碰到第一条失败就停 (网断了后面的也发不出去, 别每条都等超时).
+    -> (没发出去的, 失败原因或 None)."""
+    import time
+    for i, e in enumerate(outbox):
+        text = e["text"]
+        if now - e.get("ts", now) > LATE_S:
+            text = f"[补发 {time.strftime('%H:%M', time.localtime(e['ts']))}] {text}"
+        try:
+            send(dict(e, text=text))
+        except Exception as ex:          # noqa: BLE001  urllib 各种错, 一律留着下次重试
+            return list(outbox[i:]), _one_line(f"{type(ex).__name__}: {ex}")[:120]
+    return [], None
+
+
+# ---------------------------------------------------------------- 跑一轮 (timer 每 30 s 一次)
+
+def _cart_event(kind, msg):
+    import cartlog
+    return cartlog.event(kind, msg)
+
+
+def run_once(read, state_path=STATE_PATH, conf_path=CONF_PATH, now=None, opener=None, log=_cart_event):
+    """采集 -> diff -> 记 events.log -> (配置了才) 发. 先落盘再发: 发到一半断电也不丢事件."""
+    import time
+    now = time.time() if now is None else now
+    prev = load_state(state_path)
+    events, st = diff(prev, collect(read), now)
+    for e in events:
+        log("notify", e["text"])
+
+    try:
+        conf, err = load_conf(conf_path), None
+    except ValueError as ex:
+        conf, err = None, str(ex)
+    if err != st.get("conf_err"):
+        if err:
+            log("notify", f"推送配置 notify.json 有问题, 只记日志不外发: {err}")
+        st["conf_err"] = err
+    if conf is None:
+        st["outbox"], st["failing"] = [], None
+        save_state(state_path, st)
+        return {"events": len(events), "sent": 0, "left": 0}
+
+    box = queue(st.get("outbox"), events)
+    st["outbox"] = box
+    save_state(state_path, st)
+    left, why = deliver(box, ntfy_sender(conf, opener), now) if box else ([], None)
+    if why and not st.get("failing"):
+        log("notify", f"推送失败, 留着下次重试 ({len(left)} 条): {why}")
+    elif not why and st.get("failing"):
+        log("notify", f"推送恢复, 补发了 {len(box)} 条")
+    st["outbox"], st["failing"] = left, (why or None)
+    save_state(state_path, st)
+    return {"events": len(events), "sent": len(box) - len(left), "left": len(left)}
+
+
+# ---------------------------------------------------------------- 真读取 (推车上)
+
+BOOT_ID = "/proc/sys/kernel/random/boot_id"
+BOOT_UNIT = "cart-boot-success.service"
+
+
+def parse_is_active(names, out):
+    """`systemctl is-active a b c` 每个单元一行, 按顺序对上."""
+    lines = [ln.strip() for ln in (out or "").splitlines()]
+    return {n: (lines[i] or None) if i < len(lines) else None for i, n in enumerate(names)}
+
+
+def parse_boot_success(out):
+    """`systemctl show -p Result -p ExecMainExitTimestampMonotonic cart-boot-success.service`
+    -> 这次开机它跑成功过没有; 读不到 None. 它是 oneshot, 跑完就 inactive, 只能看退出时间戳.
+    kiosk 没起来时 Requisite 让它根本不启动, 时间戳是 0."""
+    kv = dict(ln.split("=", 1) for ln in (out or "").splitlines() if "=" in ln)
+    if "Result" not in kv or "ExecMainExitTimestampMonotonic" not in kv:
+        return None
+    try:
+        ran = int(kv["ExecMainExitTimestampMonotonic"]) > 0
+    except ValueError:
+        return None
+    return ran and kv["Result"] == "success"
+
+
+def _run(cmd):
+    import subprocess
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def default_read(runner=_run, dash=DASH_STATE, guard=GUARD_STATE, auth=AUTH_STATUS, boot_id=BOOT_ID):
+    import time
+
+    def boot():
+        with open(boot_id) as f:
+            bid = f.read().strip() or None
+        try:
+            ok = parse_boot_success(runner(["systemctl", "show", "-p", "Result",
+                                            "-p", "ExecMainExitTimestampMonotonic", BOOT_UNIT]))
+        except Exception:        # noqa: BLE001  systemctl 不在/超时: 判断不了
+            ok = None
+        return {"id": bid, "ok": ok}
+
+    return {
+        "now": time.time,
+        "state": lambda: _read_json(dash),
+        "guard": lambda: _read_json(guard),
+        "auth": lambda: _read_json(auth),
+        "services": lambda: parse_is_active(SERVICES, runner(["systemctl", "is-active", *SERVICES])),
+        "boot": boot,
+    }
+
+
+def main(argv=None, opener=None):
+    """cart-notify.service 每次跑一轮; --test 发一条测试消息, 部署时确认手机收得到."""
+    import argparse
+    import time
+    ap = argparse.ArgumentParser(description="推车关键事件推送 (#16)")
+    ap.add_argument("--state", default=STATE_PATH)
+    ap.add_argument("--conf", default=CONF_PATH)
+    ap.add_argument("--test", action="store_true", help="按配置发一条测试消息")
+    a = ap.parse_args(argv)
+    if a.test:
+        try:
+            conf = load_conf(a.conf)
+        except ValueError as ex:
+            print(ex)
+            return 1
+        if conf is None:
+            print(f"{a.conf} 没有或 enabled=false: 不外发")
+            return 1
+        now = time.time()
+        _left, why = deliver([_event("test", "推车推送测试：收到这条就说明渠道通了", 3, now)],
+                             ntfy_sender(conf, opener), now)
+        print(why or "已发出")
+        return 1 if why else 0
+    r = run_once(default_read(), a.state, a.conf, opener=opener)
+    print(f"事件 {r['events']} 条, 发出 {r['sent']} 条, 积压 {r['left']} 条")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
