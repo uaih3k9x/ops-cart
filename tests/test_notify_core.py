@@ -287,8 +287,8 @@ EXAMPLE = pathlib.Path(__file__).resolve().parent.parent / "examples" / "notify.
 
 
 class FakeResp:
-    def __init__(self, status=200):
-        self.status = status
+    def __init__(self, status=200, body=b"{}"):
+        self.status, self.body = status, body
 
     def __enter__(self):
         return self
@@ -297,20 +297,20 @@ class FakeResp:
         return False
 
     def read(self):
-        return b"{}"
+        return self.body
 
 
 class FakeOpener:
     """假 urlopen: 记下请求, 按 fail 决定抛错或返回状态码. 测试里不发真请求."""
 
-    def __init__(self, fail=None, status=200):
-        self.reqs, self.fail, self.status = [], fail, status
+    def __init__(self, fail=None, status=200, body=b"{}"):
+        self.reqs, self.fail, self.status, self.body = [], fail, status, body
 
     def __call__(self, req, timeout=None):
         self.reqs.append((req, timeout))
         if self.fail:
             raise self.fail
-        return FakeResp(self.status)
+        return FakeResp(self.status, self.body)
 
 
 def test_example_conf_is_valid_and_placeholder():
@@ -488,3 +488,70 @@ def test_default_read_uses_injected_runner_and_paths(tmp_path):
     assert cur["values"]["guard"] == "proxy" and cur["values"]["svc.cart-dash"] == "down"
     assert cur["values"]["auth"] is None and cur["boot"] == {"id": "abc", "ok": True}
     assert all(c[0] == "systemctl" for c in calls)
+
+
+# ---- 飞书群自定义机器人 (webhook + 签名校验) ----
+
+FEISHU = {"kind": "feishu-webhook", "url": "https://open.feishu.cn/open-apis/bot/v2/hook/EXAMPLE",
+          "secret": "s3cr3t-example"}
+
+
+def test_feishu_sign_uses_ts_newline_secret_as_hmac_key():
+    import base64
+    import hashlib
+    import hmac
+    want = base64.b64encode(hmac.new(b"1700000000\ns3cr3t-example", b"", hashlib.sha256).digest()).decode()
+    assert nc.feishu_sign("s3cr3t-example", 1700000000) == want
+    wrong = base64.b64encode(hmac.new(b"s3cr3t-example", b"1700000000\ns3cr3t-example",
+                                      hashlib.sha256).digest()).decode()
+    assert nc.feishu_sign("s3cr3t-example", 1700000000) != wrong       # 密钥和消息别放反
+
+
+def test_feishu_sender_posts_signed_text():
+    import json
+    op = FakeOpener(body=b'{"code":0,"msg":"success"}')
+    send = nc.make_sender(FEISHU, opener=op, clock=lambda: 1700000000.7)
+    send({"key": "ups.power", "text": "推车转电池供电 92%，市电断了", "prio": 4, "ts": T0})
+    req, timeout = op.reqs[0]
+    assert req.get_method() == "POST" and req.full_url == FEISHU["url"]
+    body = json.loads(req.data.decode("utf-8"))
+    assert body["msg_type"] == "text" and body["content"]["text"] == "推车转电池供电 92%，市电断了"
+    assert body["timestamp"] == "1700000000" and body["sign"] == nc.feishu_sign(FEISHU["secret"], 1700000000)
+    assert {k.lower(): v for k, v in req.header_items()}["content-type"].startswith("application/json")
+
+
+def test_feishu_sender_title_prefix_and_no_secret():
+    import json
+    op = FakeOpener(body=b'{"code":0}')
+    conf = {"kind": "feishu-webhook", "url": FEISHU["url"], "title": "推车"}
+    nc.make_sender(conf, opener=op)({"key": "k", "text": "x", "prio": 3, "ts": T0})
+    body = json.loads(op.reqs[0][0].data.decode("utf-8"))
+    assert body["content"]["text"] == "【推车】x" and "sign" not in body and "timestamp" not in body
+
+
+@pytest.mark.parametrize("resp", [b'{"code":19021,"msg":"sign match fail"}', b'{"StatusCode":1}', b"not json"])
+def test_feishu_sender_raises_on_api_error_even_http_200(resp):
+    send = nc.make_sender(FEISHU, opener=FakeOpener(body=resp))
+    with pytest.raises(OSError):
+        send({"key": "k", "text": "x", "prio": 3, "ts": T0})
+
+
+def test_load_conf_feishu_needs_https(tmp_path):
+    p = tmp_path / "n.json"
+    p.write_text('{"kind": "feishu-webhook", "url": "https://open.feishu.cn/open-apis/bot/v2/hook/x"}')
+    assert nc.load_conf(str(p))["kind"] == "feishu-webhook"
+    p.write_text('{"kind": "feishu-webhook", "url": "http://open.feishu.cn/open-apis/bot/v2/hook/x"}')
+    with pytest.raises(ValueError):
+        nc.load_conf(str(p))
+
+
+def test_make_sender_ntfy_unchanged():
+    op = FakeOpener()
+    nc.make_sender({"kind": "ntfy", "url": "https://push.example.invalid/c"}, opener=op)(
+        {"key": "k", "text": "x", "prio": 3, "ts": T0})
+    assert op.reqs[0][0].data == b"x"
+
+
+def test_feishu_example_conf_is_valid_and_placeholder():
+    conf = nc.load_conf(str(EXAMPLE.parent / "notify.feishu.example.json"))
+    assert conf["kind"] == "feishu-webhook" and conf["url"].endswith("/00000000-0000-0000-0000-000000000000")

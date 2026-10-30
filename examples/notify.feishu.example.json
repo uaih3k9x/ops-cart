@@ -1,0 +1,7 @@
+{
+  "kind": "feishu-webhook",
+  "url": "https://open.feishu.cn/open-apis/bot/v2/hook/00000000-0000-0000-0000-000000000000",
+  "secret": "群机器人设置里开「签名校验」后给的密钥",
+  "title": "推车",
+  "timeout": 10
+}

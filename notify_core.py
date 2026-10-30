@@ -253,7 +253,7 @@ def save_state(path, st):
 # 没有这个文件 / enabled=false = 只写 events.log, 一个包都不往外发.
 
 CONF_PATH = "/etc/ops-cart/notify.json"
-KINDS = ("ntfy",)
+KINDS = ("ntfy", "feishu-webhook")
 MAX_OUTBOX = 20             # 网断太久时最多攒这么多条 (同一监视项只留最后一条)
 LATE_S = 60                 # 比事件晚这么久才发出去的, 前面标 [补发 时:分]
 
@@ -277,6 +277,8 @@ def load_conf(path=CONF_PATH):
         raise ValueError(f"{path}: kind 只支持 {', '.join(KINDS)}")
     if not str(conf.get("url") or "").startswith(("https://", "http://")):
         raise ValueError(f"{path}: url 要是 http(s) 地址")
+    if conf["kind"] == "feishu-webhook" and not conf["url"].startswith("https://"):
+        raise ValueError(f"{path}: 飞书 webhook 只走 https")
     return conf
 
 
@@ -302,6 +304,56 @@ def ntfy_sender(conf, opener=None):
             if not 200 <= status < 300:
                 raise OSError(f"推送服务回 HTTP {status}")
     return send
+
+
+def feishu_sign(secret, ts):
+    """飞书群自定义机器人的签名: "时间戳\n密钥" 当 HMAC-SHA256 的密钥, 消息为空, 再 Base64."""
+    import base64
+    import hashlib
+    import hmac
+    key = f"{int(ts)}\n{secret}".encode("utf-8")
+    return base64.b64encode(hmac.new(key, b"", hashlib.sha256).digest()).decode("ascii")
+
+
+def feishu_sender(conf, opener=None, clock=None):
+    """飞书群自定义机器人 webhook: 只能往那一个群发, 不需要应用凭据. 配了 secret 就带签名.
+    飞书出错也回 HTTP 200, 要看正文里的 code (StatusCode 是旧格式). 失败抛 OSError."""
+    import time
+    import urllib.request
+    opener = opener or urllib.request.urlopen
+    clock = clock or time.time
+    timeout = float(conf.get("timeout") or 10)
+
+    def send(ev):
+        text = ev["text"]
+        if conf.get("title"):
+            text = f"【{conf['title']}】{text}"
+        body = {"msg_type": "text", "content": {"text": text}}
+        if conf.get("secret"):
+            ts = int(clock())
+            body.update(timestamp=str(ts), sign=feishu_sign(conf["secret"], ts))
+        req = urllib.request.Request(conf["url"], data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                     headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+        with opener(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            raw = resp.read()
+        if not 200 <= status < 300:
+            raise OSError(f"飞书回 HTTP {status}")
+        try:
+            r = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise OSError(f"飞书回的不是 JSON: {raw[:80]!r}") from None
+        code = r.get("code", r.get("StatusCode"))
+        if code != 0:
+            raise OSError(f"飞书回 code={code} {r.get('msg') or r.get('StatusMessage') or ''}".strip())
+    return send
+
+
+def make_sender(conf, opener=None, clock=None):
+    """按 kind 选发送器."""
+    if conf.get("kind") == "feishu-webhook":
+        return feishu_sender(conf, opener, clock)
+    return ntfy_sender(conf, opener)
 
 
 def queue(outbox, events):
@@ -357,7 +409,7 @@ def run_once(read, state_path=STATE_PATH, conf_path=CONF_PATH, now=None, opener=
     box = queue(st.get("outbox"), events)
     st["outbox"] = box
     save_state(state_path, st)
-    left, why = deliver(box, ntfy_sender(conf, opener), now) if box else ([], None)
+    left, why = deliver(box, make_sender(conf, opener), now) if box else ([], None)
     if why and not st.get("failing"):
         log("notify", f"推送失败, 留着下次重试 ({len(left)} 条): {why}")
     elif not why and st.get("failing"):
@@ -449,7 +501,7 @@ def main(argv=None, opener=None):
             return 1
         now = time.time()
         _left, why = deliver([_event("test", "推车推送测试：收到这条就说明渠道通了", 3, now)],
-                             ntfy_sender(conf, opener), now)
+                             make_sender(conf, opener), now)
         print(why or "已发出")
         return 1 if why else 0
     r = run_once(default_read(), a.state, a.conf, opener=opener)
