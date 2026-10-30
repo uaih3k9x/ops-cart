@@ -397,3 +397,53 @@ def test_lan2_confirm_text_shows_change_and_rollback():
     t = np_.lan2_confirm_text("enp3s0", before, after)
     assert "原来: DHCP" in t and "改为: 静态 198.51.100.7/24" in t
     assert "出问题怎么回滚" in t and "nmcli con up enp3s0" in t
+
+
+# ------------------------------------------------- LAN1/LAN2 切换统一确认框 (#8)
+
+L1_SERVE = {"name": "Lan1-pxe", "uuid": "a737-4", "iface": "eno1", "kind": "serve",
+            "label": "装机", "active": True, "builtin": True}
+L1_STATIC = {"name": "cart-eno1-static-临时", "uuid": "cccc-6", "iface": "eno1", "kind": "static",
+             "label": "临时", "active": False, "builtin": False}
+L1_DHCP = {"name": "cart-eno1-dhcp-临时", "uuid": "dddd-7", "iface": "eno1", "kind": "dhcp",
+           "label": "临时", "active": False, "builtin": False}
+
+
+def test_parse_ip_br():
+    text = "eno1             UP             192.0.2.5/24 \nenp3s0           DOWN           \n"
+    assert np_.parse_ip_br(text) == {"eno1": "192.0.2.5/24"}
+    assert np_.parse_ip_br("") == {}
+    assert np_.CMD_IP_BR == ["ip", "-4", "-br", "addr", "show"]
+
+
+def test_switch_confirm_lan1_shows_before_after_and_rollback():
+    plan = np_.plan_switch(L1_SERVE, L1_STATIC)
+    t = np_.switch_confirm_text(L1_SERVE, L1_STATIC, plan, ip="192.0.2.5/24")
+    assert "LAN1 (eno1)" in t
+    assert "原来: 装机 · 发地址 / PXE · 192.0.2.5/24" in t
+    assert "改为: 临时 · 静态地址" in t
+    assert plan["rollback_text"] in t and "nmcli con up id Lan1-pxe" in t
+    assert "先停 PXE" in t                         # LAN1 切离发地址会停服务, 事先说
+    assert "管理口" not in t and "探测" not in t
+    assert t.rstrip().endswith("要继续吗?")
+
+
+def test_switch_confirm_lan1_without_previous_or_ip():
+    t = np_.switch_confirm_text(None, L1_DHCP, np_.plan_switch(None, L1_DHCP))
+    assert "原来: 没有生效配置 · 当前地址 -" in t
+    assert "nmcli dev disconnect eno1" in t
+
+
+def test_switch_confirm_serve_adds_probe_and_proxy_note():
+    plan = np_.plan_switch(L1_DHCP, L1_SERVE)
+    t = np_.switch_confirm_text(L1_DHCP, L1_SERVE, plan, ip="198.51.100.9/24")
+    assert "探测" in t and "DHCP" in t
+    assert "代理" in t and "不发地址" in t
+    assert "先停 PXE" not in t
+
+
+def test_switch_confirm_lan2_keeps_remote_warning():
+    plan = np_.plan_switch(CUR, NEW)
+    t = np_.switch_confirm_text(CUR, NEW, plan, ip="192.0.2.5/24")
+    assert "LAN2 (enp3s0)" in t and "远程连接会断" in t
+    assert plan["rollback_text"] in t

@@ -4,7 +4,7 @@
 规则在 netprof_core: 发地址只在 LAN1, 切到发地址前先探测链路上有没有别人的 DHCP;
 LAN1 切到别的配置时先停 PXE 服务. 每次切换记 events.log. nmcli 放后台线程, 同 wifi_panel.
 LAN1 没插线时探测不算数 (收不到 OFFER 不代表对面没有 DHCP), 不启用发地址.
-静态地址由人填 (建议值只做预填), 确认框写明回滚方式 (#8).
+静态地址由人填 (建议值只做预填); LAN1/LAN2 切换前都弹确认框, 写明原来/改为/回滚方式 (#8).
 """
 
 import tkinter as tk
@@ -37,6 +37,7 @@ class NetProfPanel(BridgePanel):
         super().__init__(master, bg=BG)
         self.profs = []
         self._cons_text = ""
+        self._ips = {}                  # 网口 -> 当前地址, 给切换确认框用 (reload 后台读)
         self.prev = {}                  # 网口 -> 切换前生效的配置, 给「回退」用
         self._build()
         self.reload()
@@ -132,12 +133,12 @@ class NetProfPanel(BridgePanel):
     def reload(self):
         def work():
             text = _run(npc.CMD_CONS)[1]
-            return npc.parse_cons(text), text
+            return npc.parse_cons(text), text, npc.parse_ip_br(_run(npc.CMD_IP_BR)[1])
 
         def done(res):
             if isinstance(res, Exception):
                 return self._say(f"读取失败: {res}", ok=False)
-            self.profs, self._cons_text = res
+            self.profs, self._cons_text, self._ips = res
             self._render()
             note = self._lan2_note()
             self._say(note if note else f"{len(self.profs)} 个配置文件")
@@ -167,10 +168,11 @@ class NetProfPanel(BridgePanel):
         if cur and cur["uuid"] == target["uuid"]:
             return self._say("已经是这个了")
         plan = npc.plan_switch(cur, target)
-        if plan["warn_remote"] and not messagebox.askyesno(
-                "LAN2 管理口", "LAN2 是管理口, 切换后经它的远程连接会断 (无线和 tailscale 还在).\n\n"
-                f"{plan['rollback_text']}\n\n要继续吗?", icon="warning", parent=self):
-            return
+        # #8: LAN1/LAN2 都先确认 (原来/改为/回滚); 点否什么都不动. 自动回滚、探测这些保护照旧
+        if not messagebox.askyesno(
+                "切换网口配置", npc.switch_confirm_text(cur, target, plan, self._ips.get(target["iface"], "")),
+                icon="warning", parent=self):
+            return self._say("没确认, 未切换", ok=False)
 
         def work():
             if plan["probe"]:
@@ -232,8 +234,8 @@ class NetProfPanel(BridgePanel):
                 if not messagebox.askyesno(
                         "新建静态地址",
                         f"将在 {iface} 上新建配置「{label}」\n地址: {addr}（不抢默认路由）\n\n"
-                        f"{npc.rollback_text(self._active(iface), iface)}\n\n"
-                        f"确认写入 NetworkManager 并切换过去吗？", icon="question", parent=self):
+                        f"确认写入 NetworkManager 吗？（切换前还会再确认一次，带回滚方式）",
+                        icon="question", parent=self):
                     return self._say("没确认, 未写入", ok=False)
             cmd = npc.cmd_create(iface, kind, label, addr=addr, confirmed=True)
         except ValueError as ex:

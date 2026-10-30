@@ -216,6 +216,38 @@ def plan_switch(cur, new):
     }
 
 
+CMD_IP_BR = ["ip", "-4", "-br", "addr", "show"]
+
+
+def parse_ip_br(text):
+    """CMD_IP_BR 输出 -> {网口: 第一个地址}; 没地址的口不出现."""
+    out = {}
+    for line in (text or "").splitlines():
+        f = line.split()
+        if len(f) >= 3:
+            out[f[0]] = f[2]
+    return out
+
+
+def switch_confirm_text(cur, new, plan, ip=""):
+    """切网口配置前的确认框 (#8): LAN1/LAN2 都弹, 写明原来/改为/要注意的/怎么回滚.
+    ip = 该网口当前地址 (读不到给空). 这是额外一层, 不替代切换失败自动回滚和发地址前的探测."""
+    iface, ip = new["iface"], ip or "-"
+    before = f"{cur['label']} · {KINDS[cur['kind']]} · {ip}" if cur else f"没有生效配置 · 当前地址 {ip}"
+    lines = [f"{IFACES.get(iface, iface)} ({iface}) 切换网口配置", "",
+             f"原来: {before}", f"改为: {new['label']} · {KINDS[new['kind']]}", ""]
+    if plan["warn_remote"]:
+        lines.append("LAN2 是管理口, 切换后经它的远程连接会断 (无线和 tailscale 还在).")
+    if plan["stop_pxe"]:
+        lines.append("会先停 PXE 装机服务, 再切换.")
+    if plan["probe"]:
+        lines.append("发地址前会先探测链路上有没有别的 DHCP 服务器, 有 (或没插线探测不了) 就不启用.")
+        lines.append("如果接在交换机/已有网络上, 推车可能进代理模式, 只补 PXE 引导、不发地址.")
+    if lines[-1]:
+        lines.append("")
+    return "\n".join(lines + [plan["rollback_text"], "", "要继续吗?"])
+
+
 # ------------------------------------------------------------ LAN2 单一口径 (issue #8)
 
 LAN2 = "enp3s0"
