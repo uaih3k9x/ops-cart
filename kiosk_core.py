@@ -15,6 +15,7 @@ import time
 
 import atomicfile
 import cartlog
+import clone_core
 import pxeserver
 
 LAN1_CON = "Lan1-pxe"   # eno1, 装机口
@@ -1002,17 +1003,83 @@ def pxe_mode_read(path=PXE_MODE, now=None):
     return pxeserver.pxe_mode(path, now)
 
 
-# 解锁用途: rocky = 自动装 Rocky (默认, 菜单默认项就是装机); winpe = 进 WinPE (菜单里没有自动装机项)
-ARM_PURPOSES = ("rocky", "winpe")
+# 整盘克隆 (#18): 部署配置 (镜像仓库) 和这一批的清单, 都不进仓库; 样例见 examples/clone*.example.json
+CLONE_CONF = "/opt/pxe/clone.json"
+CLONE_BATCH = "/opt/pxe/clone-batch.json"
 
 
-def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, purpose="rocky"):
+def clone_missing(root=None):
+    """tftp 根目录 clonezilla/ 下缺的 Clonezilla 文件; 空列表 = 齐了, 才能按克隆用途解锁."""
+    return pxeserver.clone_missing(str(root or TFTP_ROOT))
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f), None
+    except OSError as e:
+        return None, f"读不了 {path}: {e.strerror or e}"
+    except ValueError as e:
+        return None, f"{path} 不是合法 JSON: {e}"
+
+
+def clone_plan(purpose, mac=None, root=None, conf_path=None, batch_path=None, env_path=None):
+    """读克隆配置和清单, 算出这一批每台放不放行 (clone_core.plan). 车机确认框和 pxe_arm 都用它."""
+    root = str(root or TFTP_ROOT)
+    out = {"purpose": purpose, "error": None, "rows": [], "digest": None}
+    missing = clone_missing(root)
+    conf, err = _read_json(str(conf_path or CLONE_CONF))
+    batch, err2 = _read_json(str(batch_path or CLONE_BATCH))
+    if not missing and (err or err2):
+        out["error"] = err or err2
+        return out
+    local = conf.get("local_dir") if isinstance(conf, dict) else None
+    exists = (lambda name: isinstance(local, str) and os.path.isdir(os.path.join(local, name)))
+    return clone_core.plan(purpose, conf, batch, pxe_env_read(env_path or PXE_ENV)["PXE_IP"], mac=mac,
+                           missing=missing, image_exists=exists)
+
+
+# 解锁用途: rocky = 自动装 Rocky (默认, 菜单默认项就是装机); winpe = 进 WinPE (菜单里没有自动装机项);
+# clone-save = Clonezilla 抓镜像 (选定一台); clone-restore = Clonezilla 恢复镜像 (清单里一批)
+ARM_PURPOSES = ("rocky", "winpe") + clone_core.CLONE_PURPOSES
+
+
+def _arm_clone(mac, now, root, path, seconds, purpose, confirm, conf_path, batch_path, env_path):
+    """克隆用途: 重新算一遍清单, 和车机上人确认的 (confirm = 当时的 digest) 一致才写; 只给放行的 MAC 写菜单."""
+    p = clone_plan(purpose, mac=mac, root=root, conf_path=conf_path, batch_path=batch_path, env_path=env_path)
+    if p["error"]:
+        raise ValueError(p["error"])
+    if not confirm or confirm != p["digest"]:
+        raise ValueError("克隆清单和确认时的不一样 (清单或配置被改过?), 请重新打开对话框确认")
+    ok = [r for r in p["rows"] if r["params"]]
+    ip = pxe_env_read(env_path or PXE_ENV)["PXE_IP"]
+    head = f"# 推车生成: Clonezilla {purpose}, 只下发给解锁时确认过的机器\n"
+    _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue(env_path))
+    for r in ok:
+        _write_atomic(os.path.join(root, mac_cfg_name(r["mac"])),
+                      head + pxeserver.grub_menu_clone(ip, purpose, r["params"]))
+    state = {"mac": ok[0]["mac"], "since": now, "until": now + seconds}
+    if purpose == "clone-restore":
+        state["macs"] = [r["mac"] for r in ok]
+    _write_atomic(path, json.dumps(state))
+    skipped = [f"{r['mac']} ({r['reason']})" for r in p["rows"] if not r["params"]]
+    _pxe_event(f"装机模式解锁 {len(ok)} 台 {seconds // 60} 分钟; 用途 {purpose}: " +
+               ", ".join(f"{r['mac']} {r['image']} -> {r['device']}" for r in ok) +
+               (f"; 不放行 {', '.join(skipped)}" if skipped else ""))
+
+
+def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, purpose="rocky",
+            confirm=None, conf_path=None, batch_path=None, env_path=None):
     """只给 mac 写解锁菜单. purpose 不认识、winpe 但 win/ 不齐都抛 ValueError (车机原样显示),
-    什么都不写: 不齐时不退化成 rocky 菜单 (iPXE 一失败网卡就废了, 只能整机重启)."""
+    什么都不写: 不齐时不退化成 rocky 菜单 (iPXE 一失败网卡就废了, 只能整机重启).
+    克隆用途见 _arm_clone: clone-restore 不看 mac, 按清单来; confirm 是车机确认时 clone_plan 的 digest."""
     now = time.time() if now is None else now
-    mac = _norm_mac(mac)
     if purpose not in ARM_PURPOSES:
         raise ValueError(f"解锁用途不对: {purpose!r}")
+    if purpose in clone_core.CLONE_PURPOSES:
+        root = str(root)
+        return _arm_clone(mac, now, root, path, seconds, purpose, confirm, conf_path, batch_path, env_path)
+    mac = _norm_mac(mac)
     if purpose == "winpe":
         missing = winpe_missing(root)
         if missing:
@@ -1030,7 +1097,7 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, p
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
-    只要带 inst.ks= 或 WinPE 项 (pxeserver.unlock_only_menu) 也一并删掉. grub.cfg.bak-* 这类
+    只要带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu) 也一并删掉. clonezilla/ 和 win/ 一样不删. grub.cfg.bak-* 这类
     手工备份 GRUB 不会去取, 不动. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
     再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
@@ -1056,6 +1123,20 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     except FileNotFoundError:
         pass
     _pxe_event("装机模式上锁, 只剩救援菜单" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else ""))
+
+
+def pxe_retire(macs, root=TFTP_ROOT):
+    """一批里已经取走菜单的那几台: 先删它们的 MAC 菜单 (别的还在等, 不整体上锁).
+    做完关机后再 PXE 就只拿得到救援菜单, 不会再写一遍盘."""
+    gone = []
+    for mac in macs:
+        try:
+            os.remove(os.path.join(str(root), mac_cfg_name(mac)))
+            gone.append(mac)
+        except FileNotFoundError:
+            pass
+    if gone:
+        _pxe_event(f"已取走菜单, 先删掉它们的菜单: {', '.join(gone)}")
 
 
 def _log_ts(line):

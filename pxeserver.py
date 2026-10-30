@@ -644,22 +644,65 @@ def ipxe_script():
     return "\n".join(lines + ["boot"]) + "\n"
 
 
-def winpe_missing(root):
-    """tftp 根目录下 win/ 缺的 (或空的, 拷到一半) 文件, 按 WINPE_FILES 顺序. 空列表 = 齐了."""
+def _missing(root, sub, names):
     missing = []
-    for n in WINPE_FILES:
+    for n in names:
         try:
-            ok = os.path.getsize(os.path.join(root, WINPE_DIR, n)) > 0
+            ok = os.path.getsize(os.path.join(root, sub, n)) > 0
         except OSError:
             ok = False
         if not ok:
-            missing.append(f"{WINPE_DIR}/{n}")
+            missing.append(f"{sub}/{n}")
     return missing
 
 
+def winpe_missing(root):
+    """tftp 根目录下 win/ 缺的 (或空的, 拷到一半) 文件, 按 WINPE_FILES 顺序. 空列表 = 齐了."""
+    return _missing(root, WINPE_DIR, WINPE_FILES)
+
+
+# 整盘克隆 (#18): Clonezilla Live 的 live/ 三个文件放 tftp 根目录下 clonezilla/, 80 口 HTTP 出.
+# GRUB 经 HTTP 取 kernel/initrd, live-boot 再按 fetch= 经 HTTP 取 squashfs (几百 MB, 不走 TFTP).
+# 启动参数 (ocs-sr 命令、镜像仓库、目标盘) 由 clone_core 生成, 这里只管模板和 GRUB 转义.
+CLONE_DIR = "clonezilla"
+CLONE_FILES = ("vmlinuz", "initrd.img", "filesystem.squashfs")
+CLONE_KERNEL = f"{CLONE_DIR}/vmlinuz"
+CLONE_TITLES = {"clone-save": "Clonezilla save disk image to cart (reads this disk)",
+                "clone-restore": "Clonezilla RESTORE image (overwrites this disk)"}
+# GRUB 里会展开/截断/转义的字符, 以及 shell 元字符: 参数里一概不许 (clone_core 已经收紧, 这里再拦一道)
+_GRUB_BAD = set("$\\'`;{}#|&<>\n\t\r")
+
+
+def clone_missing(root):
+    """tftp 根目录下 clonezilla/ 缺的 (或空的) 文件. 空列表 = 齐了, 才能按克隆用途解锁."""
+    return _missing(root, CLONE_DIR, CLONE_FILES)
+
+
+def _grub_arg(token):
+    """一个内核参数 -> GRUB linux 行里的写法: 双引号转义成 \\" (Clonezilla 自己的 grub.cfg 也这么写),
+    GRUB 不去引号, 原样交给内核, ocs_live_run="ocs-sr ..." 才是一个参数."""
+    if not isinstance(token, str) or not token.strip() or any(c in _GRUB_BAD for c in token) \
+            or token.count('"') not in (0, 2) or (token.count('"') == 2 and not token.endswith('"')):
+        raise ValueError(f"启动参数不能进 GRUB 菜单: {token!r}")
+    return token.replace('"', '\\"')
+
+
+def grub_menu_clone(ip, purpose, params):
+    """解锁用途 clone-save / clone-restore 的 MAC 菜单: 第 0 项 (默认) Clonezilla, 后面救援, timeout 15,
+    不带任何自动装机项. params 是 clone_core.boot_params 的 token 列表; 只走 HTTP."""
+    if purpose not in CLONE_TITLES:
+        raise ValueError(f"克隆用途不对: {purpose!r}")
+    args = " ".join(_grub_arg(t) for t in params)
+    return (f"set default=0\nset timeout=15\n\n"
+            f"menuentry '{CLONE_TITLES[purpose]}' {{\n"
+            f"    linux (http,{ip})/{CLONE_KERNEL} {args} fetch=http://{ip}/{CLONE_DIR}/filesystem.squashfs\n"
+            f"    initrd (http,{ip})/{CLONE_DIR}/initrd.img\n}}\n\n" +
+            _linux_entries(ip, "Rescue shell", _rescue_args(f"http://{ip}:8000")))
+
+
 def unlock_only_menu(text):
-    """只能给解锁那台机器的菜单: 带自动装机 (inst.ks=) 或 WinPE 链式加载项."""
-    return "inst.ks=" in text or WINPE_CHAIN in text
+    """只能给解锁那台机器的菜单: 带自动装机 (inst.ks=)、WinPE 链式加载项或 Clonezilla 克隆项."""
+    return "inst.ks=" in text or WINPE_CHAIN in text or CLONE_KERNEL in text or "ocs_live_run" in text
 
 
 def norm_mac(mac):
@@ -672,16 +715,25 @@ def norm_mac(mac):
 
 def pxe_mode(path=PXE_MODE, now=None):
     """{"mode": "rescue"} / {"mode": "install", mac, since, until} / 过期则 mode="expired".
-    文件没有、坏了、字段不对一律当救援."""
+    恢复一批 (#18) 时文件里多一个 macs 名单, 结果里也带 macs. 文件没有、坏了、字段不对
+    (含 macs 不是非空 MAC 列表) 一律当救援."""
     now = time.time() if now is None else now
     try:
         with open(path) as f:
             st = json.load(f)
         mac, since, until = norm_mac(st["mac"]), st["since"], st["until"]
         armed = now <= until
+        macs = None
+        if "macs" in st:
+            if not isinstance(st["macs"], list) or not st["macs"]:
+                raise ValueError("macs")
+            macs = [norm_mac(m) for m in st["macs"]]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return {"mode": "rescue"}
-    return {"mode": "install" if armed else "expired", "mac": mac, "since": since, "until": until}
+    out = {"mode": "install" if armed else "expired", "mac": mac, "since": since, "until": until}
+    if macs is not None:
+        out["macs"] = macs
+    return out
 
 
 def menu_mac(name):
@@ -696,7 +748,8 @@ def menu_mac(name):
 
 
 def install_allowed(mac, mode):
-    return bool(mac) and mode.get("mode") == "install" and mode.get("mac") == mac
+    """mac 现在能不能拿解锁菜单: 没过期, 且是解锁的那台 (一批时在 macs 名单里)."""
+    return bool(mac) and mode.get("mode") == "install" and mac in mode.get("macs", [mode.get("mac")])
 
 
 # ---------------------------------------------------------------- TFTP

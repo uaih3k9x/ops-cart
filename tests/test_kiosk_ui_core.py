@@ -151,6 +151,26 @@ def test_pxe_tick_decide_consumed_disarms():
     assert d["disarm"] is True and MAC in d["banner"] and d["view"] == {"mode": "rescue"}
 
 
+MAC2 = "02:00:00:00:00:0b"
+
+
+def test_pxe_tick_decide_batch_waits_for_everyone_and_retires_consumed():
+    """恢复一批 (#18): 名单里全都取走菜单才上锁; 取走的那几台先把菜单删掉 (关机后再 PXE 不会再来一遍)."""
+    st = {"mode": "install", "mac": MAC, "macs": [MAC, MAC2], "since": 10, "until": 9999}
+    took = {MAC}
+    d = ui.pxe_tick_decide(st, "log", 20, consumed=lambda log, mac, since: mac in took)
+    assert d["disarm"] is False and d["retire"] == [MAC]
+    assert d["view"] == {"mode": "install", "mac": MAC, "left": 9979, "count": 2}
+    took.add(MAC2)
+    d = ui.pxe_tick_decide(st, "log", 20, consumed=lambda log, mac, since: mac in took)
+    assert d["disarm"] is True and "2 台" in d["banner"] and d["view"] == {"mode": "rescue"}
+
+
+def test_pxe_button_texts_batch():
+    a, b = ui.pxe_button_texts({"mode": "install", "mac": MAC, "left": 125, "count": 3})
+    assert "3 台" in a and "02:05" in a and "02:05" in b
+
+
 def test_pxe_tick_decide_left_never_negative():
     st = {"mode": "install", "mac": MAC, "since": 0, "until": 10}
     assert ui.pxe_tick_decide(st, "", 10.5)["view"]["left"] == 0
@@ -584,3 +604,16 @@ def test_kiosk_opens_ch9329_only_inside_idle_ch_opener():
     assert all(ast.unparse(c.args[0]) == "path" for c in opens)      # by-id 路径, 不是 realpath 后的 ttyACMn
     src = _src("kiosk.py")
     assert '"reap"' in src and "on_busy=" in src and '_ch_send("release"' in src
+
+
+def test_kiosk_arm_dialog_offers_clone_and_confirms_the_list():
+    """#18: 解锁对话框能选抓镜像/恢复镜像; 克隆用途把确认时清单的 digest 交给 pxe_arm;
+    一批里先取走菜单的那几台要 retire."""
+    tree = ast.parse(_src("kiosk.py"))
+    arms = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "pxe_arm"]
+    assert arms and all("confirm" in {k.arg for k in c.keywords} for c in arms)
+    src = _src("kiosk.py")
+    for purpose in ("rocky", "winpe", "clone-save", "clone-restore"):
+        assert f'"{purpose}"' in src, purpose
+    assert "kc.clone_plan(" in src and "cc.plan_lines(" in src
+    assert "kc.pxe_retire(" in src and 'd.get("retire")' in src

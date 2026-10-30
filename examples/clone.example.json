@@ -1,0 +1,11 @@
+{
+  "proto": "smb",
+  "smb_version": "smb3",
+  "save_share": "clone-rw",
+  "user": "clonesave",
+  "password": "change-me-example",
+  "restore_share": "clone-ro",
+  "restore_user": "",
+  "restore_password": "",
+  "local_dir": "/srv/data/clone"
+}

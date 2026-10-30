@@ -1,0 +1,26 @@
+{
+  "image": "lab-image-example",
+  "rule": {
+    "model": "EXAMPLE NVME 512GB",
+    "size_min": 500000000000,
+    "size_max": 520000000000
+  },
+  "machines": [
+    {
+      "mac": "02:00:00:00:00:01",
+      "disks": {"blockdevices": [
+        {"name": "nvme0n1", "model": "EXAMPLE NVME 512GB", "serial": "SN-EXAMPLE-1", "size": 512110190592,
+         "type": "disk", "tran": "nvme", "rm": false},
+        {"name": "sda", "model": "EXAMPLE SATA 1TB", "serial": "SN-EXAMPLE-2", "size": 1000204886016,
+         "type": "disk", "tran": "sata", "rm": false}
+      ]}
+    },
+    {
+      "mac": "02:00:00:00:00:02",
+      "disks": {"blockdevices": [
+        {"name": "nvme0n1", "model": "EXAMPLE NVME 512GB", "serial": "SN-EXAMPLE-3", "size": 512110190592,
+         "type": "disk", "tran": "nvme", "rm": false}
+      ]}
+    }
+  ]
+}
