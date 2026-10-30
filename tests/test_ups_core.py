@@ -51,6 +51,23 @@ def test_on_battery_only_whole_word_ob():
     assert not uc.on_battery({"state": "charging", "percent": 85, "status": None})
 
 
+def test_hid_ol_wins_over_lagging_upower_discharging():
+    # 来电后 upower 还报 discharging, hidraw 已经 OL: 不能当成走电池去关机
+    back = {"state": "discharging", "percent": 10, "status": "OL CHRG"}
+    assert not uc.on_battery(back)
+    assert not uc.low(back)
+    assert uc.health(dict(back, warning="none")) == "OK"
+
+
+def test_no_hid_status_falls_back_to_upower():
+    for status in (None, "", "CHRG"):
+        u = {"state": "discharging", "percent": 10, "status": status}
+        assert uc.on_battery(u)
+        assert uc.low(u)
+    assert uc.low({"state": "discharging", "percent": 10})
+    assert not uc.on_battery({"state": "charging", "percent": 10, "status": ""})
+
+
 def test_low_and_health_follow_hid_ob():
     ob = {"state": "charging", "percent": 12, "status": "OB DISCHRG"}
     assert uc.low(ob)

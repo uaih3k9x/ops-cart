@@ -274,6 +274,11 @@ def test_ups_line_on_battery_uses_hid_status_before_upower_catches_up():
     assert u == {"text": "市电断开 · 电池 85% · 剩 27 分", "level": "warn"}
 
 
+def test_ups_line_back_on_mains_trusts_hid_ol_over_lagging_upower():
+    u = dc.layout_view(_snap(ups={"state": "discharging", "percent": 10, "status": "OL CHRG"}))["ups"]
+    assert u == {"text": "电池 10%", "level": "ok"}
+
+
 def test_ups_line_low_battery_is_bad_and_missing_ups_is_dim():
     u = dc.layout_view(_snap(ups={"state": "discharging", "percent": 12}))["ups"]
     assert u["level"] == "bad" and u["text"].startswith("市电断开 · 电池 12%")
