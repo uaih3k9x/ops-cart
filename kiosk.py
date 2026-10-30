@@ -17,6 +17,7 @@ from subprocess import DEVNULL, Popen       # 只给 mpv 用
 from tkinter import messagebox, simpledialog
 
 import cartlog
+import clone_core as cc
 import dash_core as dc
 import kiosk_core as kc
 import kiosk_ui_core as kui
@@ -1065,7 +1066,8 @@ class Kiosk(tk.Tk):
     def toggle_install_mode(self):
         st = kc.pxe_mode_read()
         if st["mode"] == "install":
-            if messagebox.askyesno("装机模式", f"提前上锁? (当前只对 {st['mac']} 开放装机)"):
+            who = f"{len(st['macs'])} 台 (一批)" if "macs" in st else st["mac"]
+            if messagebox.askyesno("装机模式", f"提前上锁? (当前只对 {who} 开放装机)"):
                 if not self._disarm_quietly():
                     messagebox.showerror("装机模式", "上锁失败 (写不了 tftp 目录?), 请在终端检查")
                 self._pxe_tick(reschedule=False)
@@ -1089,16 +1091,18 @@ class Kiosk(tk.Tk):
         tk.Label(w, text="解锁装机模式", font=FONT_BIG, bg="#161b26", fg="#e8eaf0").pack(pady=(18, 4))
         tk.Label(w, text="装 Rocky: 选定的机器下次 PXE 会自动安装并清空整块硬盘 (clearpart --all)。\n"
                          "进 WinPE: 菜单默认进 PE, 不自动装机 (被测机要关 Secure Boot)。\n"
-                         "只对这一台开放, 30 分钟或它取走菜单后自动上锁。",
+                         "抓镜像: 选定的机器整盘存到推车; 恢复镜像: 下面清单里的一批整盘覆盖。\n"
+                         "30 分钟或取走菜单后自动上锁。",
                  font=FONT, bg="#161b26", fg="#ff7b72", justify="center").pack(pady=(0, 10))
         purpose_var = tk.StringVar(value="rocky")
         prow = tk.Frame(w, bg="#161b26")
         prow.pack(pady=(0, 10))
-        for val, text in (("rocky", "装 Rocky"), ("winpe", "进 WinPE")):
+        for val, text in (("rocky", "装 Rocky"), ("winpe", "进 WinPE"),
+                          ("clone-save", "抓镜像"), ("clone-restore", "恢复镜像")):
             tk.Radiobutton(prow, text=text, value=val, variable=purpose_var, indicatoron=False,
-                           font=FONT_BIG, width=10, bg="#2a3347", fg="#e8eaf0", selectcolor="#47202a",
-                           activebackground="#3a4560", activeforeground="#e8eaf0",
-                           relief="flat").pack(side="left", padx=8)
+                           font=FONT_BIG, width=8, bg="#2a3347", fg="#e8eaf0", selectcolor="#47202a",
+                           activebackground="#3a4560", activeforeground="#e8eaf0", command=lambda: refresh_plan(),
+                           relief="flat").pack(side="left", padx=6)
         tk.Label(w, text="最近来要过地址的机器 (或在下面手填 MAC):", font=FONT, bg="#161b26",
                  fg="#8b93a7").pack(anchor="w", padx=24)
         lb = tk.Listbox(w, font=FONT_MONO, height=5, bg="#1f2a3d", fg="#e8eaf0", relief="flat",
@@ -1110,7 +1114,30 @@ class Kiosk(tk.Tk):
         lb.pack(fill="x", padx=24)
         mac_var = tk.StringVar()
         tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg="#1f2a3d", fg="#e8eaf0",
-                 insertbackground="#e8eaf0", relief="flat").pack(fill="x", padx=24, pady=(6, 12), ipady=4)
+                 insertbackground="#e8eaf0", relief="flat").pack(fill="x", padx=24, pady=(6, 6), ipady=4)
+        # 克隆用途: 这一批放不放行的清单 (#18). 人看的就是要写的: 解锁时 pxe_arm 重算, digest 不同就拒绝
+        plan_lb = tk.Listbox(w, font=FONT_MONO, height=4, bg="#1f2a3d", fg="#f0b429", relief="flat",
+                             exportselection=False)
+        plan_lb.pack(fill="x", padx=24, pady=(0, 8))
+        plan = {"digest": None}
+
+        def picked_mac():
+            sel = lb.curselection()
+            return mac_var.get().strip() or (lb.get(sel[0]) if sel else "")
+
+        def refresh_plan(_e=None):
+            plan_lb.delete(0, "end")
+            plan["digest"] = None
+            purpose = purpose_var.get()
+            if purpose not in ("clone-save", "clone-restore"):
+                return
+            p = kc.clone_plan(purpose, mac=picked_mac() if purpose == "clone-save" else None)
+            for line in cc.plan_lines(p) or [f"不能解锁: {p['error']}"]:
+                plan_lb.insert("end", line)
+            plan["digest"] = p["digest"]
+
+        lb.bind("<<ListboxSelect>>", refresh_plan)
+        mac_var.trace_add("write", lambda *_a: refresh_plan())
         tk.Label(w, text="照抄验证码:", font=FONT, bg="#161b26", fg="#8b93a7").pack()
         code_lbl = tk.Label(w, text=" ".join(self._code), font=("Noto Sans Mono CJK SC", 40, "bold"),
                             bg="#161b26", fg="#f0b429")
@@ -1128,8 +1155,7 @@ class Kiosk(tk.Tk):
             w.destroy()
 
         def ok(_e=None):
-            sel = lb.curselection()
-            mac = mac_var.get().strip() or (lb.get(sel[0]) if sel else "")
+            mac = picked_mac()
             if not kc.code_matches(code_var.get(), self._code or ""):
                 self._code = kc.new_code()          # 输错就换码, 不给试
                 code_lbl.config(text=" ".join(self._code))
@@ -1138,7 +1164,8 @@ class Kiosk(tk.Tk):
                 e.focus_set()
                 return
             try:
-                kc.pxe_arm(mac, purpose=purpose_var.get())     # WinPE 文件不齐也走 ValueError 显示
+                # WinPE/Clonezilla 文件不齐、克隆清单和上面显示的不一样, 都走 ValueError 显示
+                kc.pxe_arm(mac, purpose=purpose_var.get(), confirm=plan["digest"])
             except (ValueError, OSError) as ex:
                 msg.config(text=str(ex))
                 return
@@ -1176,6 +1203,8 @@ class Kiosk(tk.Tk):
             d = kui.pxe_tick_decide(st, log, time.time())
             if d["disarm"]:
                 kc.pxe_disarm()
+            elif d.get("retire"):
+                kc.pxe_retire(d["retire"])
             if d["banner"]:
                 self.banner.config(text=d["banner"])
             sub, main = kui.pxe_button_texts(d["view"])
