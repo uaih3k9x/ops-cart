@@ -1043,13 +1043,22 @@ class Kiosk(tk.Tk):
         w = tk.Toplevel(self, bg="#161b26", highlightthickness=3, highlightbackground="#7a1f2b")
         self._arm_win = w
         w.overrideredirect(True)
-        W, H = 780, 760
+        W, H = 780, min(850, self.winfo_screenheight() - 20)
         w.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
         w.attributes("-topmost", True)
         tk.Label(w, text="解锁装机模式", font=FONT_BIG, bg="#161b26", fg="#e8eaf0").pack(pady=(18, 4))
-        tk.Label(w, text="选定的机器下次 PXE 会自动安装 Rocky 并清空整块硬盘 (clearpart --all)。\n"
-                         "只对这一台开放, 30 分钟或它取走装机菜单后自动上锁。",
+        tk.Label(w, text="装 Rocky: 选定的机器下次 PXE 会自动安装并清空整块硬盘 (clearpart --all)。\n"
+                         "进 WinPE: 菜单默认进 PE, 不自动装机 (被测机要关 Secure Boot)。\n"
+                         "只对这一台开放, 30 分钟或它取走菜单后自动上锁。",
                  font=FONT, bg="#161b26", fg="#ff7b72", justify="center").pack(pady=(0, 10))
+        purpose_var = tk.StringVar(value="rocky")
+        prow = tk.Frame(w, bg="#161b26")
+        prow.pack(pady=(0, 10))
+        for val, text in (("rocky", "装 Rocky"), ("winpe", "进 WinPE")):
+            tk.Radiobutton(prow, text=text, value=val, variable=purpose_var, indicatoron=False,
+                           font=FONT_BIG, width=10, bg="#2a3347", fg="#e8eaf0", selectcolor="#47202a",
+                           activebackground="#3a4560", activeforeground="#e8eaf0",
+                           relief="flat").pack(side="left", padx=8)
         tk.Label(w, text="最近来要过地址的机器 (或在下面手填 MAC):", font=FONT, bg="#161b26",
                  fg="#8b93a7").pack(anchor="w", padx=24)
         lb = tk.Listbox(w, font=FONT_MONO, height=5, bg="#1f2a3d", fg="#e8eaf0", relief="flat",
@@ -1089,7 +1098,7 @@ class Kiosk(tk.Tk):
                 e.focus_set()
                 return
             try:
-                kc.pxe_arm(mac)
+                kc.pxe_arm(mac, purpose=purpose_var.get())     # WinPE 文件不齐也走 ValueError 显示
             except (ValueError, OSError) as ex:
                 msg.config(text=str(ex))
                 return
