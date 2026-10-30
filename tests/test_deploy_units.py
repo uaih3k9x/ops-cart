@@ -51,3 +51,13 @@ def test_webkiosk_unit_hardened_and_independent():
 def test_campus_auth_units_renamed():
     assert (UNITS / "campus-auth.service").exists() and (UNITS / "campus-auth.timer").exists()
     assert "/etc/ops-cart/campus-auth.json" in unit("campus-auth.service")
+
+
+def test_cart_notify_units_read_only_oneshot_timer():
+    s, t = unit("cart-notify.service"), unit("cart-notify.timer")
+    assert "Type=oneshot" in s and "ExecStart=/usr/bin/python3 /opt/pxe/notify_core.py" in s
+    assert "NoNewPrivileges=yes" in s
+    body = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#"))
+    assert "cart-dash.service" not in body                 # 只读状态文件, 不依赖也不拉起 cart-dash
+    assert "StateDirectory" not in body                    # /var/lib/ops-cart 的权限做梦在用, 别改
+    assert "OnUnitActiveSec=30" in t and "WantedBy=timers.target" in t

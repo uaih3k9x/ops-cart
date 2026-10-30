@@ -1,0 +1,13 @@
+[Unit]
+Description=Ops cart key events to phone (UPS/guard/campus auth/services/boot), log-only when unconfigured
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pxe
+# 只读 /run/ops-cart 下的状态文件和 systemctl, 不采集; 状态和发件箱在 /var/lib/ops-cart/notify.json
+# 推送配置 /etc/ops-cart/notify.json (0600), 没有就只写 events.log, 零外发
+ExecStart=/usr/bin/python3 /opt/pxe/notify_core.py
+TimeoutStartSec=2min
+NoNewPrivileges=yes
+Nice=10

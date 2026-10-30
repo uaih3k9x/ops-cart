@@ -1,0 +1,11 @@
+[Unit]
+Description=Every 30 s: check cart state and push key events
+
+[Timer]
+# 开机早点跑一次, 把这次 boot id 记成"还没成功"; 撑不到 boot-success 就死了, 下次开机才认得出来
+OnBootSec=15
+OnUnitActiveSec=30
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
