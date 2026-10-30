@@ -544,3 +544,29 @@ def test_kiosk_uses_main_thread_gc_and_no_per_tick_threads():
     src = _src("kiosk.py")
     assert "main_thread_gc(" in src
     assert "repeat_bg(" in src
+
+
+def test_chworker_with_idle_ch_busy_is_not_gone_and_reap_runs_in_worker():
+    """#9: 被占用只丢这次输入, 不标 dead; 'reap' 跟发送排同一个队, 在工作线程里放锁."""
+    import kvm_core as kvm
+    from ch9329 import Ch9329Busy
+    plan, devs, busy, gone = [Ch9329Busy("占用")], [], [], []
+
+    def opener():
+        if plan:
+            raise plan.pop(0)
+        devs.append(FakeCh())
+        return devs[-1]
+    t = [0.0]
+    ich = kvm.IdleCh(opener, on_busy=lambda: busy.append(1), clock=lambda: t[0])
+    w = ui.ChWorker(ich, on_gone=gone.append)
+    w.send("send_report", bytes(8))
+    w.join(1)
+    assert busy == [1] and not w.dead and gone == []
+    w.send("send_report", bytes(8))
+    w.join(1)
+    t[0] = 10.0
+    w.send("reap", droppable=True)
+    w.join(1)
+    assert devs[0].closed and not ich.is_open
+    w.close(wait=True)
