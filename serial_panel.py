@@ -22,6 +22,7 @@ import time
 import tkinter as tk
 
 import kvm_core as kvm
+import survey_core
 from serial_core import (  # noqa: F401  界面要用的 + 给老调用方的兼容名
     ALIAS_GLOB, BAUDS, BYID_DIR, HIDDEN_PORT, SERIAL_CONF, TermFeed, _CTRL, _conbroker_cmd, _run,
     alias_paths, broker_port, byid_paths, console_ports, data_dir, key_bytes, kvm_devices, match_service,
@@ -58,7 +59,7 @@ class SerialPanel(tk.Frame):
         self.term = TermFeed()
         self.chat_off = None
         self._serves, self._kvm_devs, self._byid, self._aliases = {}, set(), [], []
-        self._busy = self._pasting = self._reconnect = False
+        self._busy = self._pasting = self._reconnect = self._surveying = False
         self._want = want                    # issue #5: 打开面板时点中的那一路, 列表回来后落位
         self._menu_ports = []                # 下拉列表当前列出的口
         self._build()
@@ -84,7 +85,7 @@ class SerialPanel(tk.Frame):
         self.baud_menu.pack(side="left", padx=6)
         for text, cmd in (("刷新", self.refresh_ports), ("开服务", self.start_serve),
                           ("停服务", self.stop_serve), ("唤醒(回车)", lambda: self._tx(b"\r")),
-                          ("Ctrl+C", lambda: self._tx(b"\x03"))):
+                          ("Ctrl+C", lambda: self._tx(b"\x03")), ("巡检", self.survey)):
             _btn(bar, text, cmd).pack(side="left", padx=4)
         self.serve_label = tk.Label(bar, text="服务: 未知", font=FONT, bg=BG, fg=DIM)
         self.serve_label.pack(side="right")
@@ -409,6 +410,36 @@ class SerialPanel(tk.Frame):
         self._disconnect()
         self._con_write([("text", f"\n[停服务] {name}\n")], "mark")
         self._async(lambda: _run(["stop", name], timeout=30), lambda t: self.refresh_ports())
+
+    def survey(self):
+        """#15 一键只读巡检: 后台跑 survey_core (走 conbroker send), 摘要经 self.ui 回主线程写进控制台.
+
+        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor, 默认 huawei.
+        """
+        if self._surveying:
+            return
+        dev = self.port_var.get()
+        name = match_service(dev, self._serves)
+        if not name:
+            self._con_write([("text", f"\n[巡检] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
+            return
+        self._surveying = True
+        vendor = self.cfg.get("survey_vendor", "huawei")
+        head = survey_core.safe_name(os.path.basename(dev))
+        self._con_write([("text", f"\n[巡检] {dev} ({vendor}): 逐条发只读命令, 跑完前先别敲键\n")], "mark")
+
+        def work():
+            try:
+                r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head)
+            except Exception as e:                 # run_survey 本不抛; 兜住, 免得按钮一直锁着
+                r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
+            survey_core.record(r)
+            return r
+
+        def done(r):
+            self._surveying = False
+            self._con_write([("text", "\n[巡检] " + r["summary"].replace("\n", "\n       ") + "\n")], "mark")
+        self._async(work, done)
 
     def destroy(self):
         self._disconnect()
