@@ -72,6 +72,33 @@ def test_offer_has_bootfile_and_next_server():
     assert socket.inet_ntoa(reply[20:24]) == "192.0.2.1"  # siaddr = TFTP
 
 
+def make_ipxe_discover():
+    """iPXE 自己发的 DHCP: option 77 (user class) = "iPXE"."""
+    return make_discover()[:-1] + encode_opt(77, b"iPXE") + b"\xff"
+
+
+def test_ipxe_client_gets_script_url():
+    # GRUB 链式加载 iPXE 后, iPXE 再要一次地址: 给脚本 URL, 不然又拿 shim 绕回 GRUB
+    d = dhcp_for_test()
+    reply = d.handle(make_ipxe_discover(), ("127.0.0.1", 68))
+    _, _, opts = parse_dhcp(reply)
+    assert opts[67] == b"http://192.0.2.1/boot.ipxe"
+    assert reply[108:236].split(b"\x00")[0] == b"http://192.0.2.1/boot.ipxe"
+
+
+def test_ipxe_client_via_proxy_gets_script_url():
+    d = dhcp_for_test()
+    reply = d.handle_proxy(make_ipxe_discover(), ("192.0.2.10", 4011))
+    _, _, opts = parse_dhcp(reply)
+    assert opts[67] == b"http://192.0.2.1/boot.ipxe"
+
+
+def test_firmware_pxe_still_gets_shim():
+    d = dhcp_for_test()
+    _, _, opts = parse_dhcp(d.handle(make_discover(), ("127.0.0.1", 68)))
+    assert opts[67] == b"shimx64.efi"
+
+
 def test_offer_has_option_60_pxeclient():
     d = dhcp_for_test()
     reply = d.handle(make_discover(), None)

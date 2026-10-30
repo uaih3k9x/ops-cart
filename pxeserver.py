@@ -7,6 +7,7 @@
 
 DHCP: 按 option 93 (client system architecture) 分发 bootloader:
   0007/0009 -> shimx64.efi (UEFI x86-64),  0000 -> pxelinux.0 (BIOS)
+  option 77 带 iPXE (GRUB 链式加载的 iPXE) -> http://<ip>/boot.ipxe
 TFTP: 支持 blksize / tsize 协商, octet 模式, 拒绝根目录穿越.
 """
 
@@ -95,6 +96,11 @@ def arch_bootfile(opts, uefi_file, bios_file):
     if kind == 0:  # 0000: BIOS x86
         return bios_file
     return uefi_file  # 0007/0009: EFI x86-64
+
+
+def is_ipxe(opts):
+    """option 77 (user class) 带 iPXE: 是被 GRUB 链式加载起来的 iPXE 在要地址."""
+    return b"iPXE" in opts.get(77, b"")
 
 
 SO_BINDTODEVICE = 25   # Linux; Python 的 socket 模块不一定导出这个常量
@@ -326,6 +332,7 @@ class DhcpServer:
         self.netmask, self.broadcast = str(net.netmask), str(net.broadcast_address)
         self.port = port
         self.uefi_file, self.bios_file = uefi_file, bios_file
+        self.ipxe_script = f"http://{ip}/boot.ipxe"
         self.log = log
         self.leases = {}        # mac(bytes) -> [ip, 到期时间]
         self.declined = {}      # ip -> 隔离到什么时候
@@ -367,8 +374,14 @@ class DhcpServer:
                 return ip
         return None             # 池子用完: 宁可不回, 也不把同一个地址发给两台机器
 
+    def _bootfile(self, opts):
+        # iPXE 再要地址时给脚本, 不然又拿到 shim 绕回 GRUB (Windows PE 走 GRUB -> iPXE -> wimboot)
+        if is_ipxe(opts):
+            return self.ipxe_script
+        return arch_bootfile(opts, self.uefi_file, self.bios_file)
+
     def _reply(self, msg, kind, ip, opts):
-        bootfile = arch_bootfile(opts, self.uefi_file, self.bios_file)
+        bootfile = self._bootfile(opts)
         return build_dhcp_reply(msg, 2, ip, self.ip, [
             encode_opt(53, kind),
             encode_opt(60, "PXEClient"),
@@ -420,7 +433,7 @@ class DhcpServer:
                 self.log.warning("DHCP DISCOVER %s: 地址池已用完, 不回 OFFER", mac_hex)
                 return None
             self.log.info("DHCP DISCOVER %s -> OFFER %s bootfile=%s", mac_hex, ip,
-                          arch_bootfile(opts, self.uefi_file, self.bios_file))
+                          self._bootfile(opts))
             return self._reply(msg, b"\x02", ip, opts)
         if msg_type == b"\x03":  # REQUEST
             if server_id and not ours:
@@ -459,7 +472,7 @@ class DhcpServer:
             return None
         reply_type = b"\x02" if msg_type == b"\x01" else b"\x05"
         kind = "OFFER" if msg_type == b"\x01" else "ACK"
-        bootfile = arch_bootfile(opts, self.uefi_file, self.bios_file)
+        bootfile = self._bootfile(opts)
         self.log.info("proxyDHCP %s %s -> %s:%s bootfile=%s", kind, mac.hex(":", 1),
                       addr[0], addr[1], bootfile)
         return build_dhcp_reply(msg, 2, "0.0.0.0", self.ip, [
