@@ -166,8 +166,9 @@ class Runner:
             key = self.ctx.get("key")
             if not key:
                 raise StepFailed("前面没认出开机提示, 不知道该按哪个键")
+        burst = 1 if key == "esc" else max(1, int(step.get("burst", 1)))    # ESC 连按会把菜单又关掉
         while True:
-            for _ in range(max(1, int(step.get("burst", 1)))):
+            for _ in range(burst):
                 self._press(key)
                 self.sleep(step.get("interval", POLL_S))
             shot, lines = self._look()
@@ -222,7 +223,8 @@ class Runner:
              "select_menu": _select_menu}
 
     def run(self, recipe):
-        """-> {ok, step (失败在第几步, 从 0 数), reason}."""
+        """-> {ok, step (失败在第几步, 从 0 数), reason}. 配方不合规直接抛 RecipeError, 一个键都不发."""
+        validate(recipe)
         start = self.clock()
         total = float(recipe["timeout"])
         self._ev("start", name=recipe.get("name"), timeout=total, dry_run=self.dry_run)
@@ -280,3 +282,176 @@ def marker_index(items):
     """恰好一项行首带高亮标记 -> 它的序号; 没有或不止一项 -> None (读不出来)."""
     marked = [i for i, l in enumerate(items) if _MARKER.match(l.get("text", ""))]
     return marked[0] if len(marked) == 1 else None
+
+
+# ---------------------------------------------------------------- 配方校验
+# 第一版只进启动菜单, 不改 BIOS 设置: 配方里任何地方出现保存类字眼一律拒绝 (看的也不行),
+# 键只收白名单 (导航 + 各厂商的启动菜单键). F10 是保存键, Intel NUC 的启动菜单恰好也是 F10, 不支持.
+
+ALLOWED_KEYS = frozenset({"enter", "esc", "up", "down", "home", "end", "pgup", "pgdn",
+                          "f8", "f9", "f11", "f12"})
+FORBIDDEN = ["save", "f10", "保存", "load default", "恢复默认"]
+MAX_TOTAL_S = 900
+MAX_STEPS = 30
+_FIELDS = {
+    "wait_text": {"patterns", "prompts", "avoid", "timeout", "poll"},
+    "press": {"key", "timeout"},
+    "press_until": {"key", "patterns", "avoid", "interval", "burst", "timeout"},
+    "select_menu": {"patterns", "avoid", "skip_if", "interval", "poll", "timeout"},
+}
+_REQUIRED = {"press": {"key"}, "press_until": {"key", "patterns"}, "select_menu": {"patterns"}}
+
+
+class RecipeError(ValueError):
+    pass
+
+
+def _flat(s):
+    return norm(s).replace(" ", "")
+
+
+_FORBIDDEN_FLAT = [_flat(w) for w in FORBIDDEN]
+
+
+def _strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _strings(k)
+            yield from _strings(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _strings(v)
+
+
+def _num(v, lo, hi, what):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+        raise RecipeError(f"{what} 要在 {lo}~{hi} 之间, 现在是 {v!r}")
+
+
+def _patterns(v, what):
+    if not isinstance(v, list) or not v:
+        raise RecipeError(f"{what} 要是非空列表")
+    for p in v:
+        if not isinstance(p, str) or not pattern_ok(p):
+            raise RecipeError(f"{what} 里的 {p!r} 太短或不是文字, 会什么都撞上")
+
+
+def _key(k, what):
+    if not isinstance(k, str) or k not in ALLOWED_KEYS:
+        raise RecipeError(f"{what}: 不认识/不许发的键 {k!r} (只许 {', '.join(sorted(ALLOWED_KEYS))})")
+
+
+def validate(recipe):
+    """不合规抛 RecipeError, 合规原样返回. 宁可错拒, 不可放过."""
+    if not isinstance(recipe, dict):
+        raise RecipeError("配方要是一个对象")
+    for s in _strings(recipe):
+        f = _flat(s)
+        for w, fw in zip(FORBIDDEN, _FORBIDDEN_FLAT):
+            if fw in f:
+                raise RecipeError(f"配方里出现保存类字眼 {w!r} ({s!r}), 第一版不做改设置的配方")
+    extra = set(recipe) - {"name", "timeout", "steps"}
+    if extra:
+        raise RecipeError(f"配方里有不认识的字段 {sorted(extra)}")
+    if not isinstance(recipe.get("name", ""), str):
+        raise RecipeError("name 要是文字")
+    _num(recipe.get("timeout"), 1, MAX_TOTAL_S, "总超时 timeout")
+    steps = recipe.get("steps")
+    if not isinstance(steps, list) or not 0 < len(steps) <= MAX_STEPS:
+        raise RecipeError(f"steps 要是 1~{MAX_STEPS} 步的列表")
+    have_prompt = False
+    for i, st in enumerate(steps, 1):
+        where = f"第 {i} 步"
+        if not isinstance(st, dict) or st.get("do") not in _FIELDS:
+            raise RecipeError(f"{where}: 不认识的步骤 {st!r}")
+        do = st["do"]
+        extra = set(st) - _FIELDS[do] - {"do"}
+        missing = _REQUIRED.get(do, set()) - set(st)
+        if extra or missing:
+            raise RecipeError(f"{where} {do}: 多了字段 {sorted(extra)} / 缺字段 {sorted(missing)}")
+        if "timeout" in st:
+            _num(st["timeout"], 0.1, MAX_TOTAL_S, f"{where} timeout")
+        for f in ("interval", "poll"):
+            if f in st:
+                _num(st[f], 0.1, 10, f"{where} {f}")
+        if "burst" in st:
+            _num(st["burst"], 1, 10, f"{where} burst")
+        for f in ("patterns", "avoid", "skip_if"):
+            if f in st:
+                _patterns(st[f], f"{where} {f}")
+        if do == "wait_text":
+            if ("patterns" in st) == ("prompts" in st):
+                raise RecipeError(f"{where} wait_text: patterns 和 prompts 二选一")
+            if "prompts" in st:
+                pr = st["prompts"]
+                if not isinstance(pr, list) or not pr or not all(
+                        isinstance(x, (list, tuple)) and len(x) == 2 for x in pr):
+                    raise RecipeError(f"{where} prompts 要是 [[提示, 键], ...]")
+                _patterns([p for p, _k in pr], f"{where} prompts")
+                for _p, k in pr:
+                    _key(k, f"{where} prompts")
+                have_prompt = True
+        if "key" in st:
+            if st["key"] == PROMPT_KEY and do == "press_until":
+                if not have_prompt:
+                    raise RecipeError(f"{where}: 用 $prompt 之前要有带 prompts 的 wait_text")
+            else:
+                _key(st["key"], where)
+    return recipe
+
+
+def load_json(text):
+    import json
+    try:
+        obj = json.loads(text)
+    except ValueError as e:
+        raise RecipeError(f"配方不是合法 JSON: {e}") from None
+    return validate(obj)
+
+
+# ---------------------------------------------------------------- 内置配方
+# 开机提示 -> 启动菜单键, 按优先级 (一屏里 F12 / F11 都有时先认 F12). 都是网上和手册里的常见说法,
+# 推车实拍校准过的再在这里注明.
+BOOT_PROMPTS = [
+    ("F12", "f12", "Dell / Lenovo / Acer / Gigabyte / VMware; Supermicro 的 F12 直接网络启动"),
+    ("F11", "f11", "MSI / ASRock / Supermicro, AMI 的 BBS Popup"),
+    ("F8", "f8", "ASUS 台式主板"),
+    ("F9", "f9", "HP Boot Device Options"),
+    ("ESC", "esc", "HP Startup Menu / ASUS 笔记本; 有的 AMI 是 DEL/ESC 进 Setup, 所以排最后"),
+]
+# 启动菜单的标题; 带 Press / 键名的行 (开机提示本身, 如 "ESC for Boot Menu") 不算
+MENU_TITLES = ["Please select boot device", "Select boot device", "Boot Menu", "Boot Option Menu",
+               "Boot Options", "Boot Device Options", "Boot Manager", "UEFI BOOT", "启动菜单"]
+PROMPT_LINE = ["Press", "F12", "F11", "F8", "F9", "ESC", "DEL"]
+# 已经在走网络启动的迹象 (有的机器按 F12 直接网络启动, 不出菜单)
+PXE_PROGRESS = ["Start PXE over", "PXE-E", "DHCP", "Checking Media", "NBP", "Station IP", "CLIENT MAC",
+                "iPXE", "GNU GRUB"]
+NET_ITEMS = ["IPv4", "PXE", "Network", "NIC"]       # 菜单里找网络启动项, 按优先级
+NET_AVOID = ["IPv6", "HTTP"]
+
+
+def boot_pxe(timeout=120, key=None):
+    """盯开机提示 -> 狂按对应的启动菜单键 -> 菜单里选网络启动 -> 等 PXE 动起来.
+    key 给了就不认提示, 上电就按这个键 (提示太快、OCR 来不及看时用)."""
+    steps = []
+    if key is None:
+        steps.append({"do": "wait_text", "prompts": [[p, k] for p, k, _who in BOOT_PROMPTS], "timeout": 90})
+    steps += [
+        {"do": "press_until", "key": key or PROMPT_KEY, "patterns": MENU_TITLES + PXE_PROGRESS,
+         "avoid": PROMPT_LINE, "interval": 0.3, "burst": 3, "timeout": 45},
+        {"do": "select_menu", "patterns": NET_ITEMS, "avoid": NET_AVOID, "skip_if": PXE_PROGRESS,
+         "timeout": 20},
+        {"do": "wait_text", "patterns": PXE_PROGRESS, "timeout": 60},
+    ]
+    return validate({"name": "boot-pxe", "timeout": timeout, "steps": steps})
+
+
+BUILTIN = {"boot-pxe": boot_pxe}
+
+
+def builtin(name, **kw):
+    if name not in BUILTIN:
+        raise RecipeError(f"没有内置配方 {name!r} (有: {', '.join(BUILTIN)})")
+    return BUILTIN[name](**kw)

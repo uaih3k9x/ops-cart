@@ -262,10 +262,191 @@ def test_prompt_picks_key_from_table():
     assert any(e["ev"] == "prompt" and e["key"] == "f11" for e in events)
 
 
-def test_prompt_key_without_prompt_step_fails():
+def test_prompt_key_without_prompt_step_rejected():
     r, keys, events, clock = runner([BLANK])
-    res = r.run(rec({"do": "press_until", "key": "$prompt", "patterns": ["Boot Menu"], "timeout": 5}))
-    assert not res["ok"] and keys.sent == []
+    with pytest.raises(rc.RecipeError):
+        r.run(rec({"do": "press_until", "key": "$prompt", "patterns": ["Boot Menu"], "timeout": 5}))
+    assert keys.sent == []
+
+
+def test_esc_is_never_burst():
+    # ESC 是开关键: 连按两下会把刚打开的菜单又关掉, 所以每看一眼只按一下
+    r, keys, events, clock = runner([BLANK, BLANK, MENU])
+    res = r.run(rec({"do": "press_until", "key": "esc", "patterns": ["select boot device"], "burst": 3,
+                     "interval": 0.3, "timeout": 30}))
+    assert res["ok"] and keys.sent == ["esc"] * 3
+
+
+# ------------------------------------------------------------ 配方校验
+
+def ok_recipe(**kw):
+    r = rec({"do": "wait_text", "patterns": ["Boot Menu"], "timeout": 10})
+    r.update(kw)
+    return r
+
+
+@pytest.mark.parametrize("bad", [
+    {"do": "wait_text", "patterns": ["Save & Exit"]},
+    {"do": "wait_text", "patterns": ["SAVE CHANGES"]},
+    {"do": "wait_text", "patterns": ["F10"]},
+    {"do": "wait_text", "patterns": ["f 10 Save"]},
+    {"do": "wait_text", "patterns": ["F1O"]},                  # 拼成 F1O 也躲不过
+    {"do": "wait_text", "patterns": ["保存并退出"]},
+    {"do": "wait_text", "patterns": ["Load Defaults"]},
+    {"do": "press", "key": "f10"},
+    {"do": "select_menu", "patterns": ["PXE"], "avoid": ["Save"]},
+])
+def test_validate_rejects_save_keywords(bad):
+    with pytest.raises(rc.RecipeError):
+        rc.validate(rec(bad))
+
+
+def test_validate_rejects_save_in_name():
+    with pytest.raises(rc.RecipeError):
+        rc.validate(ok_recipe(name="save-and-boot"))
+
+
+@pytest.mark.parametrize("key", ["f2", "del", "delete", "a", "y", "ctrl", "F12 ", "f13", "", None, 12])
+def test_validate_rejects_unknown_keys(key):
+    with pytest.raises(rc.RecipeError):
+        rc.validate(rec({"do": "press", "key": key}))
+
+
+def test_validate_rejects_unknown_prompt_key():
+    with pytest.raises(rc.RecipeError):
+        rc.validate(rec({"do": "wait_text", "prompts": [["F2", "f2"]]}))
+
+
+@pytest.mark.parametrize("bad", [
+    {"do": "type", "text": "hello"},                             # 不认识的原语
+    {"do": "wait_text", "pattern": ["PXE"]},                     # 字段拼错
+    {"do": "wait_text", "patterns": []},
+    {"do": "wait_text", "patterns": "PXE"},                      # 不是列表
+    {"do": "wait_text", "patterns": ["F"]},                      # 太短
+    {"do": "wait_text", "patterns": ["PXE"], "timeout": 0},
+    {"do": "wait_text", "patterns": ["PXE"], "timeout": 10000},
+    {"do": "press_until", "key": "f12", "patterns": ["Boot Menu"], "interval": 0.01},
+    {"do": "press_until", "key": "f12", "patterns": ["Boot Menu"], "burst": 50},
+    {"do": "press_until", "key": "f12"},                         # 没写等什么
+    "wait_text",
+])
+def test_validate_rejects_bad_steps(bad):
+    with pytest.raises(rc.RecipeError):
+        rc.validate(rec(bad))
+
+
+@pytest.mark.parametrize("bad", [
+    {"name": "x", "steps": []},
+    {"name": "x", "timeout": 60, "steps": []},
+    {"name": "x", "timeout": 0, "steps": [{"do": "press", "key": "enter"}]},
+    {"name": "x", "timeout": 100000, "steps": [{"do": "press", "key": "enter"}]},
+    {"name": "x", "timeout": 60, "steps": [{"do": "press", "key": "enter"}], "extra": 1},
+    [],
+    None,
+])
+def test_validate_rejects_bad_recipe(bad):
+    with pytest.raises(rc.RecipeError):
+        rc.validate(bad)
+
+
+def test_load_json_validates():
+    with pytest.raises(rc.RecipeError):
+        rc.load_json('{"name": "x", "timeout": 60, "steps": [{"do": "press", "key": "F10"}]}')
+    with pytest.raises(rc.RecipeError):
+        rc.load_json("{not json")
+    r = rc.load_json('{"name": "x", "timeout": 60, "steps": [{"do": "press", "key": "enter"}]}')
+    assert r["steps"][0]["key"] == "enter"
+
+
+def test_runner_refuses_invalid_recipe_before_any_key():
+    r, keys, events, clock = runner([MENU])
+    with pytest.raises(rc.RecipeError):
+        r.run(rec({"do": "press", "key": "enter"}, {"do": "press", "key": "f10"}))
+    assert keys.sent == [] and clock.t == 0
+
+
+# ------------------------------------------------------------ 内置配方 boot-pxe
+
+def test_boot_prompt_table_keys_allowed_and_no_save():
+    assert {k for _p, k, _who in rc.BOOT_PROMPTS} <= rc.ALLOWED_KEYS
+    assert "f10" not in rc.ALLOWED_KEYS
+    for p, _k, _who in rc.BOOT_PROMPTS:
+        assert rc.pattern_ok(p)
+
+
+def test_builtin_boot_pxe_is_valid():
+    r = rc.builtin("boot-pxe", timeout=120)
+    assert rc.validate(r) is r
+    assert r["timeout"] == 120
+    assert [s["do"] for s in r["steps"]] == ["wait_text", "press_until", "select_menu", "wait_text"]
+
+
+def test_builtin_boot_pxe_fixed_key_skips_prompt():
+    r = rc.builtin("boot-pxe", timeout=60, key="f12")
+    assert [s["do"] for s in r["steps"]] == ["press_until", "select_menu", "wait_text"]
+    assert r["steps"][0]["key"] == "f12"
+    with pytest.raises(rc.RecipeError):
+        rc.builtin("boot-pxe", key="f10")
+    with pytest.raises(rc.RecipeError):
+        rc.builtin("boot-pxe", key="f2")
+
+
+def test_builtin_unknown_name():
+    with pytest.raises(rc.RecipeError):
+        rc.builtin("bios-reset")
+
+
+def test_boot_pxe_end_to_end_ami_menu():
+    frames = [BLANK, POST, BLANK, MENU, MENU, MENU, PXE_PROGRESS]
+    r, keys, events, clock = runner(frames)
+    res = r.run(rc.builtin("boot-pxe", timeout=120))
+    assert res["ok"], res
+    f11 = [k for k in keys.sent if k == "f11"]
+    assert f11 and keys.sent[len(f11):] == ["home", "down", "down", "down", "enter"]
+    assert all(e.get("shot") for e in events if e["ev"] in ("look", "hit", "menu"))
+
+
+def test_boot_pxe_fi2_noise_and_direct_network_boot():
+    # 提示里 F12 被识成 FI2; 这台按 F12 直接网络启动, 不出菜单
+    post = [L("Press <DEL> to run Setup", 400), L("Press <FI2> to boot from network", 420)]
+    frames = [BLANK, post, BLANK, PXE_PROGRESS]
+    r, keys, events, clock = runner(frames)
+    res = r.run(rc.builtin("boot-pxe", timeout=120))
+    assert res["ok"], res
+    assert set(keys.sent) == {"f12"}
+    assert any(e["ev"] == "skip" for e in events)
+
+
+def test_boot_pxe_prompt_line_is_not_mistaken_for_menu():
+    # 提示 "ESC for Boot Menu" 还挂在屏上时, 不能当成菜单已经出来
+    post = [L("Press ESC for Boot Menu", 400)]
+    frames = [post, post, post, post, MENU, MENU, MENU, PXE_PROGRESS]
+    r, keys, events, clock = runner(frames)
+    res = r.run(rc.builtin("boot-pxe", timeout=120))
+    assert res["ok"], res
+    assert keys.sent == ["esc"] * 4 + ["home", "down", "down", "down", "enter"]
+
+
+def test_boot_pxe_menu_without_network_entry_stops():
+    menu = [L("Please select boot device:", 100, x=200),
+            L("Windows Boot Manager", 140, x=200), L("UEFI: USB", 160, x=200)]
+    r, keys, events, clock = runner([POST, menu])
+    res = r.run(rc.builtin("boot-pxe", timeout=120))
+    assert not res["ok"] and "enter" not in keys.sent
+    assert res["step"] == 2
+
+
+def test_boot_pxe_prompt_never_appears():
+    r, keys, events, clock = runner([BLANK])
+    res = r.run(rc.builtin("boot-pxe", timeout=120))
+    assert not res["ok"] and res["step"] == 0 and keys.sent == []
+
+
+def test_boot_pxe_total_timeout_respected():
+    r, keys, events, clock = runner([BLANK])
+    res = r.run(rc.builtin("boot-pxe", timeout=20))
+    assert not res["ok"] and "总超时" in res["reason"]
+    assert clock.t < 25
 
 
 def test_select_menu_moves_to_nth_item():
