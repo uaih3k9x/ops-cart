@@ -50,3 +50,101 @@ def summary(msg, who="kiosk", path=CART_LOG, now=None):
     t = time.localtime(now if now is not None else time.time())
     text = _one_line(msg).replace("|", "\\|")
     return _append(path, f"| {time.strftime('%Y-%m-%d', t)} | {who} | {time.strftime('%H:%M', t)} {text} |")
+
+
+# ---------------------------------------------------------------- CART-LOG 滚动
+# 手册部分 (待办、铁律…) 不动, 只把 "## 日志" 表里的老条目按月挪进 /opt/pxe/cart-log/.
+# cart_dream 按字节位置记"读到哪了": 只挪它已经读过的行, 再把位置换算到新文件, 没读过的原样留着.
+# 和 summary() 的追加不加锁: 滚动是人手动跑的, 别挑 kiosk 正在写的时候.
+
+import json
+import re
+
+ARCHIVE_DIR = "/opt/pxe/cart-log"
+DREAM_STATE = "/var/lib/ops-cart/dream.json"
+ARCHIVE_NOTE = "> 更早的条目按月归档在 `/opt/pxe/cart-log/`。"
+_ROW = re.compile(r"^\| (\d{4}-\d{2}-\d{2}) \|")
+_TABLE_HEAD = "| 日期 | 谁 | 做了什么 | 回滚 |\n| --- | --- | --- | --- |\n"
+
+
+def roll(data, keep_since, offset):
+    """CART-LOG 字节 -> (新字节, 挪走的行, 新的读取位置). keep_since 之前且已被读过的行才挪."""
+    lines = data.splitlines(keepends=True)
+    pos, starts = 0, []
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln)
+    try:
+        sec = next(i for i, ln in enumerate(lines) if ln.rstrip() == "## 日志".encode())
+        sep = next(i for i in range(sec, len(lines)) if lines[i].startswith(b"| ---"))
+    except StopIteration:
+        raise ValueError("CART-LOG 里没找到 '## 日志' 表") from None
+    keep, moved = [], []
+    for i in range(sep + 1, len(lines)):
+        m = _ROW.match(lines[i].decode("utf-8", "replace"))
+        if m and m.group(1) < keep_since and starts[i] + len(lines[i]) <= offset:
+            moved.append(lines[i].decode("utf-8").rstrip("\n"))
+        else:
+            keep.append(lines[i])
+    if not moved:
+        return data, [], offset
+    head = lines[:sep + 1]
+    if not any(ln.decode("utf-8", "replace").strip() == ARCHIVE_NOTE for ln in head):
+        head = head[:sec + 1] + [b"\n", ARCHIVE_NOTE.encode() + b"\n"] + head[sec + 1:]
+    new = b"".join(head + keep)
+    tail = data[offset:]
+    assert new.endswith(tail), "没读过的部分被改动了"
+    return new, moved, len(new) - len(tail)
+
+
+def archive_text(old, rows):
+    """往一个月的归档里追加行; 新文件先写标题和表头."""
+    if not old:
+        month = rows[0][2:9] if rows else ""
+        old = f"# CART-LOG 归档 {month}\n\n从 /opt/pxe/CART-LOG.md 的日志表滚动出来, 只追加不改.\n\n{_TABLE_HEAD}"
+    return old + "".join(r + "\n" for r in rows)
+
+
+def roll_files(keep_since, log=CART_LOG, state=DREAM_STATE, archive_dir=ARCHIVE_DIR):
+    """真滚: 先写归档, 再换 CART-LOG, 最后改做梦的读取位置. 做梦还没读过的一行都不挪."""
+    import atomicfile
+    with open(log, "rb") as f:
+        data = f.read()
+    try:
+        with open(state) as f:
+            st = json.load(f)
+        offset = int(st["offset"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return "做梦的读取位置读不到, 不滚 (没整理过的条目不能挪走)"
+    new, moved, off = roll(data, keep_since, offset)
+    if not moved:
+        return f"{keep_since} 之前没有已整理过的条目, 不用滚"
+    by_month = {}
+    for r in moved:
+        by_month.setdefault(_ROW.match(r).group(1)[:7], []).append(r)
+    names = []
+    for month, rows in sorted(by_month.items()):
+        path = os.path.join(archive_dir, f"CART-LOG-{month}.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = f.read()
+        except OSError:
+            old = ""
+        atomicfile.write_text(path, archive_text(old, rows))
+        names.append(path)
+    atomicfile.write_text(log, new.decode("utf-8"))
+    st["offset"] = off
+    atomicfile.write_json(state, st)
+    return f"归档 {len(moved)} 条 → {', '.join(names)}; 做梦读取位置 {offset} → {off}"
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    ap = argparse.ArgumentParser(description="CART-LOG 滚动: 老条目按月归档")
+    ap.add_argument("cmd", choices=["roll"])
+    ap.add_argument("--keep-days", type=int, default=7, help="保留最近几天 (默认 7)")
+    a = ap.parse_args()
+    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - a.keep_days * 86400))
+    print(roll_files(since))
+    sys.exit(0)
