@@ -1097,3 +1097,74 @@ def test_guard_state_sticks_at_proxy(tmp_path):
     assert g.state == "proxy" and not g.may_reply()
     g.tick()
     assert g.state == "proxy"
+
+
+# ---- #11: Windows PE (GRUB -> iPXE -> wimboot), 只进解锁后的 MAC 菜单
+
+import pxeserver as _px  # noqa: E402
+
+
+def _winpe_entry(cfg):
+    return [b for b in cfg.split("menuentry ")[1:] if "WinPE" in b]
+
+
+def test_grub_menu_rocky_and_rescue_have_no_winpe():
+    for cfg in (grub_menu("192.0.2.1"), grub_menu("192.0.2.1", install=True)):
+        assert not _winpe_entry(cfg) and _px.WINPE_CHAIN not in cfg
+
+
+def test_grub_menu_winpe_default_winpe_then_rescue_no_ks():
+    """解锁用途 winpe: 第 0 项 (默认) WinPE, 后面救援, 不带任何自动装机项, timeout 15."""
+    cfg = _px.grub_menu_winpe("192.0.2.1")
+    entries = cfg.split("menuentry ")[1:]
+    assert "set default=0" in cfg and "set timeout=15" in cfg
+    assert entries[0].startswith("'WinPE (GRUB -> iPXE -> wimboot)'")
+    assert "chainloader (http,192.0.2.1)/win/ipxe.efi" in entries[0]
+    assert "inst.rescue" in entries[1] and len(entries) == 3            # 救援 HTTP + TFTP
+    assert "inst.ks" not in cfg and "inst.repo" not in cfg
+
+
+def test_ipxe_script_template():
+    s = _px.ipxe_script()
+    assert s.startswith("#!ipxe\n") and s.rstrip().endswith("boot")
+    assert "kernel win/wimboot" in s
+    for name in ("bootmgfw.efi", "bcd", "boot.sdi", "boot.wim"):
+        assert f"initrd -n {name} win/{name}" in s
+    assert set(_px.WINPE_FILES) >= {"ipxe.efi", "wimboot", "bootmgfw.efi", "bcd", "boot.sdi", "boot.wim"}
+
+
+def test_dhcp_ipxe_url_uses_script_constant():
+    d = DhcpServer("192.0.2.1", "192.0.2.10", "192.0.2.20", "shimx64.efi", "pxelinux.0", FakeLog())
+    assert d.ipxe_script == f"http://192.0.2.1/{_px.IPXE_SCRIPT}" and _px.IPXE_SCRIPT == "boot.ipxe"
+
+
+def test_winpe_missing_lists_absent_or_empty_files(tmp_path):
+    assert _px.winpe_missing(str(tmp_path)) == [f"win/{n}" for n in _px.WINPE_FILES]
+    (tmp_path / "win").mkdir()
+    for n in _px.WINPE_FILES:
+        (tmp_path / "win" / n).write_bytes(b"x")
+    assert _px.winpe_missing(str(tmp_path)) == []
+    (tmp_path / "win" / "boot.wim").write_bytes(b"")                    # 空文件 (拷到一半) 也算缺
+    assert _px.winpe_missing(str(tmp_path)) == ["win/boot.wim"]
+
+
+@pytest.mark.parametrize("text,want", [
+    ("linux /vmlinuz inst.ks=http://192.0.2.1:8000/ks.cfg", True),
+    ("chainloader (http,192.0.2.1)/win/ipxe.efi", True),
+    ("chainloader /win/ipxe.efi", True),
+    ("linux /vmlinuz inst.rescue", False),
+])
+def test_unlock_only_menu(text, want):
+    assert _px.unlock_only_menu(text) is want
+
+
+def test_tftp_winpe_menu_only_for_armed_mac(tmp_path):
+    """带 WinPE 项、不带 ks 的 MAC 菜单 (10/30 手写的那种) 也只给解锁的那台."""
+    root, mode = _tree(tmp_path, armed_until=1000)
+    winpe = "set default=0\nmenuentry 'WinPE' {\n    chainloader (http,192.0.2.1)/win/ipxe.efi\n}\n"
+    (root / ARMED_CFG).write_text(winpe)
+    (root / "grub.cfg-01-02-00-00-00-00-02").write_text(winpe)
+    assert "ipxe.efi" in _fetch(root, mode, "/" + ARMED_CFG)
+    got = _fetch(root, mode, "/grub.cfg-01-02-00-00-00-00-02")
+    assert "ipxe.efi" not in got and "inst.rescue" in got
+    assert "ipxe.efi" not in _fetch(root, mode, "/" + ARMED_CFG, now=1001)   # 过期

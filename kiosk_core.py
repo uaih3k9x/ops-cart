@@ -969,6 +969,16 @@ def grub_cfg_install(env_path=None):
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True))
 
 
+def grub_cfg_winpe(env_path=None):
+    return ("# 推车生成: 进 WinPE (不自动装机), 只下发给解锁时选定的那台机器\n" +
+            pxeserver.grub_menu_winpe(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
+
+
+def winpe_missing(root=None):
+    """tftp 根目录 win/ 下缺的 WinPE 文件; 空列表 = 齐了, 才能按 winpe 用途解锁."""
+    return pxeserver.winpe_missing(str(root or TFTP_ROOT))
+
+
 _norm_mac = pxeserver.norm_mac
 
 
@@ -989,19 +999,37 @@ def pxe_mode_read(path=PXE_MODE, now=None):
     return pxeserver.pxe_mode(path, now)
 
 
-def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
+# 解锁用途: rocky = 自动装 Rocky (默认, 菜单默认项就是装机); winpe = 进 WinPE (菜单里没有自动装机项)
+ARM_PURPOSES = ("rocky", "winpe")
+
+
+def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, purpose="rocky"):
+    """只给 mac 写解锁菜单. purpose 不认识、winpe 但 win/ 不齐都抛 ValueError (车机原样显示),
+    什么都不写: 不齐时不退化成 rocky 菜单 (iPXE 一失败网卡就废了, 只能整机重启)."""
     now = time.time() if now is None else now
     mac = _norm_mac(mac)
+    if purpose not in ARM_PURPOSES:
+        raise ValueError(f"解锁用途不对: {purpose!r}")
+    if purpose == "winpe":
+        missing = winpe_missing(root)
+        if missing:
+            raise ValueError(f"WinPE 文件不齐, 缺 {', '.join(missing)}")
+        _write_atomic(os.path.join(root, pxeserver.IPXE_SCRIPT), pxeserver.ipxe_script())
+        menu, what = grub_cfg_winpe(), "winpe (进 WinPE, 不装机)"
+    else:
+        menu, what = grub_cfg_install(), "rocky (自动装机)"
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
-    _write_atomic(os.path.join(root, mac_cfg_name(mac)), grub_cfg_install())
+    _write_atomic(os.path.join(root, mac_cfg_name(mac)), menu)
     _write_atomic(path, json.dumps({"mac": mac, "since": now, "until": now + seconds}))
-    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟")
+    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟; 用途 {what}")
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
-    只要带 inst.ks= 也一并删掉. grub.cfg.bak-* 这类手工备份 GRUB 不会去取, 不动."""
+    只要带 inst.ks= 或 WinPE 项 (pxeserver.unlock_only_menu) 也一并删掉. grub.cfg.bak-* 这类
+    手工备份 GRUB 不会去取, 不动. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
+    再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
     removed = []
     for d, _dirs, files in os.walk(root):
@@ -1013,7 +1041,7 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
             if not (name.startswith("grub.cfg-01-") and d == root):
                 try:
                     with open(full, errors="replace") as f:
-                        if "inst.ks=" not in f.read():
+                        if not pxeserver.unlock_only_menu(f.read()):
                             continue
                 except OSError:
                     continue

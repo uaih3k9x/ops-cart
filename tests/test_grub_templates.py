@@ -92,3 +92,18 @@ def test_setup_script_does_not_write_menus_itself():
             continue
         assert not re.search(r"(>>?|\btee\b|\bcp\b|\binstall\b)[^#]*grub\.cfg", code), line
     assert "menuentry" not in sh
+
+
+@pytest.mark.parametrize("name,cfg", grub_texts())
+def test_template_has_no_winpe_entry(name, cfg):
+    """#11: WinPE 项和自动装机一样只进解锁后的 MAC 菜单, 仓库模板/脚本里一项都不许写."""
+    import pxeserver
+    assert pxeserver.WINPE_CHAIN not in cfg, name
+
+
+def test_generated_rocky_menu_has_no_winpe_and_winpe_menu_has_no_ks():
+    """两种解锁用途分开: rocky 菜单不带 WinPE (免得 5 秒倒计时误装), winpe 菜单不带自动装机."""
+    import pxeserver
+    assert pxeserver.WINPE_CHAIN not in kc.grub_cfg_install()
+    cfg = kc.grub_cfg_winpe()
+    assert "inst.ks" not in cfg and pxeserver.WINPE_CHAIN in default_entry(cfg)
