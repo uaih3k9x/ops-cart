@@ -85,6 +85,43 @@ def test_preview_writes_file_not_usb(tmp_path):
     assert n == 0 and factory.calls == 0
 
 
+class FakeWatcher:
+    def __init__(self, ifaces):
+        self.ifaces, self.started, self.closed = ifaces, False, False
+
+    def start(self):
+        self.started = True
+        return self
+
+    def snapshot(self):
+        return {"LAN1": {"iface": "x", "state": "none", "age": None, "neighbor": None, "error": ""}}
+
+    def close(self):
+        self.closed = True
+
+
+def test_run_owns_lldp_watcher_lifecycle(tmp_path, monkeypatch):
+    """真机路径 (ctx 不注入): dash_service 起监听线程, 把快照接进采集, 退出时关掉."""
+    made = []
+    monkeypatch.setattr(dc, "default_ctx", lambda lldp=None: _ctx(lldp=lldp))
+    st = tmp_path / "s.json"
+    ds.run(once=True, state_path=str(st), out=io.StringIO(), preview=str(tmp_path / "p"),
+           render=lambda v: b"x", lldp_factory=lambda ifaces: made.append(FakeWatcher(ifaces)) or made[-1])
+    w = made[0]
+    assert w.ifaces == dc.LLDP_IFACES and w.started and w.closed
+    assert json.loads(st.read_text())["lldp"]["LAN1"]["state"] == "none"
+
+
+def test_run_survives_lldp_watcher_failure(tmp_path, monkeypatch):
+    def broken(ifaces):
+        raise OSError("no AF_PACKET")
+    monkeypatch.setattr(dc, "default_ctx", lambda lldp=None: _ctx(lldp=lldp))
+    st, out = tmp_path / "s.json", io.StringIO()
+    ds.run(once=True, state_path=str(st), out=out, preview=str(tmp_path / "p"),
+           render=lambda v: b"x", lldp_factory=broken)
+    assert json.loads(st.read_text())["lldp"] == {} and "LLDP" in out.getvalue()
+
+
 def test_view_key_ignores_clock_and_stale():
     a = {"net": "on", "clock": "10:01", "stale": False}
     b = {"net": "on", "clock": "10:02", "stale": False}

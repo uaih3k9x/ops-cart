@@ -5,6 +5,7 @@
   - 每 200 ms 采集一次, 原子写 /run/ops-cart/state.json (带 ts/seq)
   - 版面有变化 / 时钟跳分钟 才重画, 画完推一帧到 USB 副屏
   - 屏幕拔掉不退出: 继续写快照, 每 3 s 试着重连
+  - LAN1 / LAN2 的 LLDP 监听线程归这里管 (#14): 起不来/没 root/网口没了都只是"不可用", 不退出
 
 用法:
   python3 dash_service.py                                  # 常驻
@@ -19,6 +20,7 @@ import time
 
 import dash_core as dc
 import lamps_core
+import lldp_core
 
 SAMPLE_S = 0.2          # 快照节奏
 RECONNECT_S = 3.0       # 拔线后重连间隔
@@ -41,11 +43,33 @@ def _connect(factory, out):
         return None
 
 
+def _start_lldp(factory, out):
+    """起 LLDP 监听线程; 起不来就算了 (快照里 lldp 为空), 不影响别的采集."""
+    try:
+        return factory(dc.LLDP_IFACES).start()
+    except Exception as e:
+        print("LLDP 监听起不来: %s: %s" % (type(e).__name__, e), file=out)
+        return None
+
+
 def run(once=False, preview=None, fps=DEFAULT_FPS, state_path=dc.STATE_PATH,
         sample_s=SAMPLE_S, out=sys.stdout, ctx=None, display_factory=None,
-        render=None):
-    """主循环. 依赖都可注入, 测试里用假的. 返回推了几帧."""
-    ctx = ctx or dc.default_ctx()
+        render=None, lldp_factory=None):
+    """主循环. 依赖都可注入, 测试里用假的. 返回推了几帧.
+    ctx 不注入时 (真机) 才起 LLDP 监听, 退出时关掉."""
+    watcher = None
+    if ctx is None:
+        watcher = _start_lldp(lldp_factory or lldp_core.Watcher, out)
+        ctx = dc.default_ctx(lldp=watcher.snapshot if watcher else None)
+    try:
+        return _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, render)
+    finally:
+        if watcher is not None:
+            watcher.close()
+
+
+def _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, render):
+    """采集 → 落盘 → 版面变了才推屏. 拔屏重连."""
     render = render or (lambda v: __import__("dash_render").make_frame(v))
     factory = display_factory or (lambda: __import__("udisp_usb"))
 

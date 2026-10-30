@@ -542,11 +542,14 @@ STATE_TAG = {"OK": "ok", "WARN": "t_warn", "FAIL": "bad"}
 ON_TEMPS_BLOCK = {"cpu", "fan"}      # 状态板下面有温度/风扇明细, 自检行就不重复
 
 
-def status_board_lines(rows, temps, fans, uptime):
-    """状态板 = 自检结果 (rows 为 None 表示第一轮还没跑完) + 温度/风扇 + 开机时长. -> [(文本, tag)]"""
+def status_board_lines(rows, temps, fans, uptime, peers=None):
+    """状态板 = 自检结果 (rows 为 None 表示第一轮还没跑完) + LLDP 对端 + 温度/风扇 + 开机时长.
+    peers: dash_core.peers(state.json) 给的 [{name, text, level}] (#14). -> [(文本, tag)]"""
     lines = [("检查中…", "dim")] if rows is None else \
         [(selftest_line(r, width=22), STATE_TAG.get(r["state"], "dim")) for r in rows
          if r.get("check") not in ON_TEMPS_BLOCK]
+    lines += [(f"{p['name']:<6}{p['text']}", "ok" if p.get("level") == "ok" else "dim")
+              for p in peers or []]
     lines += [("", "dim"), (uptime, "dim")]
     if temps:
         lines.append(("", "dim"))

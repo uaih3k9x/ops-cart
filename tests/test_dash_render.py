@@ -56,6 +56,16 @@ def test_render_v2_both_modes(locked):
     assert r.render(v).size == (r.PANEL_W, r.PANEL_H)
 
 
+def test_render_lldp_peer_lines():
+    nb = {"sys_name": "SW-A-VERY-LONG-NAME-" * 4, "port_id": "GigabitEthernet0/0/1", "port_subtype": 5,
+          "vlan": 10, "ttl": 120}
+    lldp = {"LAN1": {"state": "fresh", "age": 3, "neighbor": nb, "error": ""},
+            "LAN2": {"state": "stale", "age": 900, "neighbor": nb, "error": ""}}
+    v = dc.layout_view(_full_snap(lldp=lldp))
+    assert len(v["peers"]) == 2
+    assert r.render(v).size == (r.PANEL_W, r.PANEL_H)
+
+
 def test_render_v2_stale_and_empty_snapshot():
     assert r.render(dc.layout_view({}, locked=False)).size == (r.PANEL_W, r.PANEL_H)
     old = _full_snap(ts=1.0)

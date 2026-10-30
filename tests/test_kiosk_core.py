@@ -961,6 +961,16 @@ def test_status_board_lines_tags_by_state():
     assert any("fan2" in t and "2393" in t for t in texts)
 
 
+def test_status_board_lines_show_lldp_peers_after_checks():
+    rows = [{"label": "LAN2", "state": "OK", "detail": "192.0.2.5"}]
+    peers = [{"name": "LAN1", "text": "对端 SW-A Gi0/1", "level": "ok"},
+             {"name": "LAN2", "text": "没收到 LLDP（交换机可能关了）", "level": "dim"}]
+    lines = kc.status_board_lines(rows, temps=[], fans=[], uptime="up", peers=peers)
+    assert lines[1] == ("LAN1  对端 SW-A Gi0/1", "ok")
+    assert lines[2] == ("LAN2  没收到 LLDP（交换机可能关了）", "dim")
+    assert kc.status_board_lines(rows, [], [], "up") == kc.status_board_lines(rows, [], [], "up", peers=[])
+
+
 def test_status_board_lines_before_first_check():
     lines = kc.status_board_lines(None, temps=[], fans=[], uptime="up 1 min")
     assert lines[0] == ("检查中…", "dim")
