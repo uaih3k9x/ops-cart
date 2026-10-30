@@ -16,6 +16,7 @@ from subprocess import DEVNULL, Popen       # 只给 mpv 用
 from tkinter import messagebox, simpledialog
 
 import cartlog
+import dash_core as dc
 import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
@@ -74,6 +75,7 @@ class Kiosk(tk.Tk):
         self._activity, self._lamp_slots, self._active = lc.Activity(), None, set()
         self._bell_activity, self._bell_active = lc.Activity(hold=lc.BELL_HOLD_S), set()
         self._bells, self._beeper = lc.BellTail(), lc.Beeper()   # 只在采样线程里用
+        self._kiosk_report = dc.KioskReporter()   # 回写锁屏/键鼠计数给副屏 (#10), 采样线程里用
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
 
         kc.kp_enter_as_return(self)
@@ -293,6 +295,8 @@ class Kiosk(tk.Tk):
         """常驻采样线程里跑: 只读文件和 /proc, 不碰 Tk (_kvm_count 是 int, 读一下是原子的)."""
         conf = sp.serial_conf_read()
         on_bell = self._beeper.ring if conf.get("bell_beep") else None   # serial.conf 开了才响主板蜂鸣
+        # 副屏 (cart-dash) 拿不到这两样: 锁屏看锁屏窗口在不在, 键鼠看入队计数. 只在变了时写盘
+        self._kiosk_report.update(self._lock_win is not None, self._kvm_count)
         return lc.sample(sp.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
 
     def _ups_sample(self):
