@@ -126,6 +126,10 @@ def render(view, size=(PANEL_W, PANEL_H)):
     tw = _font(38).getlength(tag)
     d.ellipse([W - M - tw - 34, 124, W - M - tw - 14, 144], fill=color)
     d.text((W - M, 112), tag, font=_font(38), fill=color, anchor="ra")
+    ups = view.get("ups") or {}
+    if ups.get("text"):
+        d.text((W - M, 168), ups["text"], font=_font(28), anchor="ra",
+               fill={"ok": DIM, "warn": WARN, "bad": BAD}.get(ups.get("level"), DIM))
     info = " · ".join(x for x in ("LAN2 " + view["lan2"] if view.get("lan2") else "",
                                   "开机 " + view["uptime"] if view.get("uptime") else "") if x)
     d.text((M, 210), info, font=_font(30), fill=DIM)

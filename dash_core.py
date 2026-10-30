@@ -26,7 +26,8 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 自检要 ping/systemctl/v4l2-ctl, 每 200 ms 跑一遍既浪费又会在断网时拖过 STALE_S.
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
-           "todo": 30, "dream": 60, "notice": 5}
+           "todo": 30, "dream": 60, "notice": 5, "ups": 5}
+UPS_LOW = 20            # 走电池且电量不高于这个: 副屏变红
 
 
 def _pull(ctx, key, default):
@@ -55,6 +56,7 @@ def collect(ctx):
         "lamps": _pull(ctx, "lamps", {}),           # {"con-1": n, ..., "kvm": n, "pxe": bytes}
         "slots": _pull(ctx, "slots", []),           # 操作头 [{dev, present, baud, count}]
         "notice": _pull(ctx, "notice", ""),
+        "ups": _pull(ctx, "ups", None),             # ups_core.sample_all(): upower + hidraw
         "kiosk": _pull(ctx, "kiosk", {}),           # {"locked": bool, "panel": str}
         "todo": _pull(ctx, "todo", []),
         "dream": _pull(ctx, "dream", ""),
@@ -153,6 +155,24 @@ def _checks(rows):
                           "detail": r.get("detail", "")} for r in problems]}
 
 
+def _ups_line(ups):
+    """副屏头部的 UPS 一行. 走电池看 upower 的 discharging 或 hidraw 的 OB:
+    upower 要滞后一两分钟才翻, hidraw 状态是即时的."""
+    if not ups:
+        return {"text": "UPS 未连接", "level": "dim"}
+    pct = ups.get("percent")
+    on_batt = ups.get("state") == "discharging" or "OB" in str(ups.get("status") or "").split()
+    if on_batt:
+        text = "市电断开 · 电池 %s%%" % pct
+        if ups.get("runtime"):
+            text += " · 剩 %d 分" % (int(ups["runtime"]) // 60)
+        return {"text": text, "level": "bad" if (pct or 0) <= UPS_LOW else "warn"}
+    text = "电池 %s%%" % pct
+    if ups.get("load") is not None:
+        text += " · 负载 %s%%" % ups["load"]
+    return {"text": text, "level": "ok"}
+
+
 def _heads(slots, active):
     """上排 4 个操作头: 文字同主屏执行器条 (波特率 / 空闲 / 未插)."""
     out = []
@@ -189,6 +209,7 @@ def layout_view(snap, locked=False, active=(), now=None):
         "date": "%d月%d日 周%s" % (t.tm_mon, t.tm_mday, WEEKDAYS[t.tm_wday]),
         "net": snap.get("net") or "down",
         "lan2": snap.get("lan2") or "",
+        "ups": _ups_line(snap.get("ups")),
         "uptime": short_uptime(snap.get("uptime") or ""),
         "temps": snap.get("temps") or [],
         "fans": snap.get("fans") or [],
@@ -261,11 +282,17 @@ def default_ctx(ddir=None, clock=time.monotonic):
         "kiosk": lambda: read_kiosk(),
         "todo": lambda: read_todo(),
         "dream": lambda: kc.dream_line(),
+        "ups": lambda: _ups_sample(),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)
     ctx.update(safe=safe, now=time.time)
     return ctx
+
+
+def _ups_sample():
+    import ups_core
+    return ups_core.sample_all()
 
 
 def _lan2_addr(kc):

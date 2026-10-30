@@ -257,3 +257,24 @@ def test_kiosk_reporter_swallows_write_errors(tmp_path):
     (tmp_path / "f").write_text("")                         # 父路径是个文件, 怎么都写不进去
     rep = dc.KioskReporter(str(tmp_path / "f" / "kiosk.json"))
     assert rep.update(locked=True, kvm=0) is False         # /run/ops-cart 没建好也不能拖垮 kiosk
+
+
+# ---- 副屏 UPS 一行
+
+def test_ups_line_on_mains():
+    u = dc.layout_view(_snap(ups={"state": "fully-charged", "percent": 100, "load": 18,
+                                  "status": "OL"}))["ups"]
+    assert u == {"text": "电池 100% · 负载 18%", "level": "ok"}
+
+
+def test_ups_line_on_battery_uses_hid_status_before_upower_catches_up():
+    # upower 的 discharging 要滞后一两分钟; hidraw 的 OB 是即时的
+    u = dc.layout_view(_snap(ups={"state": "fully-charged", "percent": 85, "status": "OB DISCHRG",
+                                  "runtime": 1630}))["ups"]
+    assert u == {"text": "市电断开 · 电池 85% · 剩 27 分", "level": "warn"}
+
+
+def test_ups_line_low_battery_is_bad_and_missing_ups_is_dim():
+    u = dc.layout_view(_snap(ups={"state": "discharging", "percent": 12}))["ups"]
+    assert u["level"] == "bad" and u["text"].startswith("市电断开 · 电池 12%")
+    assert dc.layout_view(_snap(ups=None))["ups"] == {"text": "UPS 未连接", "level": "dim"}
