@@ -931,13 +931,18 @@ def grub_cfg_rescue(env_path=None):
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
-def grub_cfg_install(env_path=None, winpe=False):
+def grub_cfg_install(env_path=None):
     return ("# 推车生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
-            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True, winpe=winpe))
+            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True))
+
+
+def grub_cfg_winpe(env_path=None):
+    return ("# 推车生成: 进 WinPE (不自动装机), 只下发给解锁时选定的那台机器\n" +
+            pxeserver.grub_menu_winpe(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
 def winpe_missing(root=None):
-    """tftp 根目录 win/ 下缺的 WinPE 文件; 空列表 = 齐了, 解锁菜单里才放 WinPE 项."""
+    """tftp 根目录 win/ 下缺的 WinPE 文件; 空列表 = 齐了, 才能按 winpe 用途解锁."""
     return pxeserver.winpe_missing(str(root or TFTP_ROOT))
 
 
@@ -961,18 +966,29 @@ def pxe_mode_read(path=PXE_MODE, now=None):
     return pxeserver.pxe_mode(path, now)
 
 
-def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
+# 解锁用途: rocky = 自动装 Rocky (默认, 菜单默认项就是装机); winpe = 进 WinPE (菜单里没有自动装机项)
+ARM_PURPOSES = ("rocky", "winpe")
+
+
+def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, purpose="rocky"):
+    """只给 mac 写解锁菜单. purpose 不认识、winpe 但 win/ 不齐都抛 ValueError (车机原样显示),
+    什么都不写: 不齐时不退化成 rocky 菜单 (iPXE 一失败网卡就废了, 只能整机重启)."""
     now = time.time() if now is None else now
     mac = _norm_mac(mac)
-    # win/ 不齐就不放 WinPE 项: iPXE 一失败, 回到 GRUB 网卡就废了, 只能整机重启, 不如不给这条路
-    missing = winpe_missing(root)
-    if not missing:
+    if purpose not in ARM_PURPOSES:
+        raise ValueError(f"解锁用途不对: {purpose!r}")
+    if purpose == "winpe":
+        missing = winpe_missing(root)
+        if missing:
+            raise ValueError(f"WinPE 文件不齐, 缺 {', '.join(missing)}")
         _write_atomic(os.path.join(root, pxeserver.IPXE_SCRIPT), pxeserver.ipxe_script())
+        menu, what = grub_cfg_winpe(), "winpe (进 WinPE, 不装机)"
+    else:
+        menu, what = grub_cfg_install(), "rocky (自动装机)"
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
-    _write_atomic(os.path.join(root, mac_cfg_name(mac)), grub_cfg_install(winpe=not missing))
+    _write_atomic(os.path.join(root, mac_cfg_name(mac)), menu)
     _write_atomic(path, json.dumps({"mac": mac, "since": now, "until": now + seconds}))
-    winpe = "WinPE 可选" if not missing else f"WinPE 不放 (缺 {', '.join(missing)})"
-    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟; {winpe}")
+    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟; 用途 {what}")
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):

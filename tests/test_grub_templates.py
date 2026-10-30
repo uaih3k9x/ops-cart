@@ -101,8 +101,9 @@ def test_template_has_no_winpe_entry(name, cfg):
     assert pxeserver.WINPE_CHAIN not in cfg, name
 
 
-def test_generated_install_menu_default_is_not_winpe():
+def test_generated_rocky_menu_has_no_winpe_and_winpe_menu_has_no_ks():
+    """两种解锁用途分开: rocky 菜单不带 WinPE (免得 5 秒倒计时误装), winpe 菜单不带自动装机."""
     import pxeserver
-    cfg = kc.grub_cfg_install(winpe=True)
-    assert pxeserver.WINPE_CHAIN in cfg
-    assert pxeserver.WINPE_CHAIN not in default_entry(cfg)
+    assert pxeserver.WINPE_CHAIN not in kc.grub_cfg_install()
+    cfg = kc.grub_cfg_winpe()
+    assert "inst.ks" not in cfg and pxeserver.WINPE_CHAIN in default_entry(cfg)

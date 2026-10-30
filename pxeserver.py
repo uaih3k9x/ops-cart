@@ -548,26 +548,38 @@ IPXE_SCRIPT = "boot.ipxe"
 WINPE_TITLE = "WinPE (GRUB -> iPXE -> wimboot)"
 
 
-def grub_menu(ip, install=False, winpe=False):
+def grub_menu(ip, install=False):
     """GRUB 菜单: 救援 (默认, 不装系统) / 自动装机. 每项都给 HTTP (快) 和 TFTP (慢) 两条路.
     装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此核对是不是解锁的那台
-    (防误装; MAC 头是客户端自报的, 不当访问控制).
-    winpe=True 在最后加一项 WinPE (不当默认项), 只给解锁时的 MAC 菜单用."""
+    (防误装; MAC 头是客户端自报的, 不当访问控制)."""
     repo = f"http://{ip}:8000"
     if install:
         title, args, timeout = ("Rocky 9.8 auto install",
                                 f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg inst.ks.sendmac", 5)
     else:
-        title, args, timeout = ("Rescue shell", f"inst.stage2={repo}/rocky inst.rescue inst.sshd inst.text", 10)
-    out = [f"set default=0\nset timeout={timeout}\n"]
+        title, args, timeout = ("Rescue shell", _rescue_args(repo), 10)
+    return f"set default=0\nset timeout={timeout}\n\n" + _linux_entries(ip, title, args)
+
+
+def _rescue_args(repo):
+    return f"inst.stage2={repo}/rocky inst.rescue inst.sshd inst.text"
+
+
+def _linux_entries(ip, title, args):
+    out = []
     for src, label in ((f"(http,{ip})", "HTTP fast"), ("", "TFTP slow")):
         out.append(f"menuentry '{title} ({label})' {{\n"
                    f"    linux {src}/vmlinuz ip=dhcp {args}\n"
                    f"    initrd {src}/initrd.img\n}}\n")
-    if winpe:
-        out.append(f"menuentry '{WINPE_TITLE}' {{\n"
-                   f"    chainloader (http,{ip})/{WINPE_CHAIN}\n}}\n")
     return "\n".join(out)
+
+
+def grub_menu_winpe(ip):
+    """解锁用途 winpe 的 MAC 菜单: 默认 WinPE, 后面救援; 不带任何自动装机项 (跟 rocky 用途分开,
+    免得倒计时误装). timeout 放长到 15 秒, 被测机那头有时间看清."""
+    return (f"set default=0\nset timeout=15\n\n"
+            f"menuentry '{WINPE_TITLE}' {{\n    chainloader (http,{ip})/{WINPE_CHAIN}\n}}\n\n" +
+            _linux_entries(ip, "Rescue shell", _rescue_args(f"http://{ip}:8000")))
 
 
 def ipxe_script():

@@ -960,20 +960,20 @@ def _winpe_entry(cfg):
     return [b for b in cfg.split("menuentry ")[1:] if "WinPE" in b]
 
 
-def test_grub_menu_winpe_entry_only_when_asked():
-    assert not _winpe_entry(grub_menu("192.0.2.1"))
-    assert not _winpe_entry(grub_menu("192.0.2.1", install=True))
-    cfg = grub_menu("192.0.2.1", install=True, winpe=True)
-    entry = _winpe_entry(cfg)
-    assert len(entry) == 1 and "WinPE (GRUB -> iPXE -> wimboot)" in entry[0]
-    assert "chainloader (http,192.0.2.1)/win/ipxe.efi" in entry[0]
+def test_grub_menu_rocky_and_rescue_have_no_winpe():
+    for cfg in (grub_menu("192.0.2.1"), grub_menu("192.0.2.1", install=True)):
+        assert not _winpe_entry(cfg) and _px.WINPE_CHAIN not in cfg
 
 
-def test_grub_menu_winpe_is_never_default():
-    cfg = grub_menu("192.0.2.1", install=True, winpe=True)
-    first = cfg.split("menuentry ")[1]
-    assert "set default=0" in cfg and "WinPE" not in first
-    assert cfg.split("menuentry ")[-1].startswith("'WinPE")         # 排最后
+def test_grub_menu_winpe_default_winpe_then_rescue_no_ks():
+    """解锁用途 winpe: 第 0 项 (默认) WinPE, 后面救援, 不带任何自动装机项, timeout 15."""
+    cfg = _px.grub_menu_winpe("192.0.2.1")
+    entries = cfg.split("menuentry ")[1:]
+    assert "set default=0" in cfg and "set timeout=15" in cfg
+    assert entries[0].startswith("'WinPE (GRUB -> iPXE -> wimboot)'")
+    assert "chainloader (http,192.0.2.1)/win/ipxe.efi" in entries[0]
+    assert "inst.rescue" in entries[1] and len(entries) == 3            # 救援 HTTP + TFTP
+    assert "inst.ks" not in cfg and "inst.repo" not in cfg
 
 
 def test_ipxe_script_template():
