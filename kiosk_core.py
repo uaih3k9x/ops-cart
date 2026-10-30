@@ -320,7 +320,8 @@ def check_ch9329(ctx):
 
 def check_pxe(ctx, iface="eno1"):
     if ctx["svcs"].get("pxe-server", (False, False))[1]:
-        return "OK", "RUNNING"
+        guard = ctx.get("pxe_guard", dict)()       # pxeserver 守卫状态; 装机口上有别的 DHCP 时是 proxy
+        return "OK", "代理模式（不发地址）" if guard.get("state") == "proxy" else "RUNNING"
     nic = {n["name"]: n for n in ctx["nics"]}.get(iface, {})
     return "--", "LINK UP / STANDBY" if nic.get("link") else "STANDBY"
 
@@ -473,6 +474,19 @@ def _safe(fn, default):
         return default
 
 
+PXE_GUARD = pxeserver.GUARD_STATE
+
+
+def pxe_guard_read(path=None):
+    """pxe-guard.json (pxeserver 守卫写); 没有/坏了给 {}."""
+    try:
+        with open(path or PXE_GUARD) as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def selftest_context():
     """真机快照. SMART 要 sudo 且慢, 自检不读. 每一样都兜住, 本函数不抛."""
     return {"nics": _safe(nics_status, []), "misc": _safe(misc_status, {}),
@@ -480,7 +494,8 @@ def selftest_context():
             "temps": _safe(lambda: temps_status(smart=lambda: None), []), "fans": _safe(fans_status, []),
             "exists": os.path.exists, "pci": pci_devices,
             "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0,
-            "videos": video_nodes, "signal": lambda dev: video_signal(dev), "wifi": wifi_status}
+            "videos": video_nodes, "signal": lambda dev: video_signal(dev), "wifi": wifi_status,
+            "pxe_guard": pxe_guard_read}
 
 
 def wifi_status():

@@ -407,6 +407,32 @@ def _ctx(**kw):
     return ctx
 
 
+def test_selftest_pxe_proxy_mode_says_no_addresses():
+    """#11: 装机口上有别的 DHCP 时守卫转代理模式, 自检行要看得出"不发地址"."""
+    ctx = dict(_ctx(), svcs={"pxe-server": (True, True)},
+               pxe_guard=lambda: {"state": "proxy", "leases": False, "server": "198.51.100.1"})
+    assert kc.check_pxe(ctx) == ("OK", "代理模式（不发地址）")
+    ctx["pxe_guard"] = lambda: {"state": "serving", "leases": True}
+    assert kc.check_pxe(ctx) == ("OK", "RUNNING")
+    ctx["pxe_guard"] = lambda: {}                  # 状态文件没有/读不了: 照旧
+    assert kc.check_pxe(ctx) == ("OK", "RUNNING")
+    del ctx["pxe_guard"]
+    assert kc.check_pxe(ctx) == ("OK", "RUNNING")
+
+
+def test_selftest_context_reads_guard_state(tmp_path, monkeypatch):
+    p = tmp_path / "pxe-guard.json"
+    monkeypatch.setattr(kc, "PXE_GUARD", str(p))
+    for name in ("nics_status", "misc_status", "services_status", "temps_status", "fans_status"):
+        monkeypatch.setattr(kc, name, lambda *a, **k: {})
+    ctx = kc.selftest_context()
+    assert ctx["pxe_guard"]() == {}
+    p.write_text('{"state": "proxy", "leases": false}')
+    assert ctx["pxe_guard"]()["state"] == "proxy"
+    p.write_text("not json")
+    assert ctx["pxe_guard"]() == {}
+
+
 def test_selftest_run_follows_plan_order_and_labels():
     plan = [{"check": "cpu"}, {"check": "lan", "label": "MGMT", "iface": "enp3s0"}]
     rows = kc.selftest_run(plan, _ctx())
