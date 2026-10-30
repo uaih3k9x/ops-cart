@@ -1,5 +1,7 @@
 """serial_panel 测试: 界面线程纪律 + 旧名字仍能从 serial_panel 导入. 纯逻辑见 test_serial_core.py."""
 
+import pytest
+
 import serial_core as sc
 import serial_panel as sp
 
@@ -32,9 +34,7 @@ def test_async_result_runs_only_in_drain():
     done = []
     ev = threading.Event()
     sp.SerialPanel._async(panel, lambda: 42, lambda r: (done.append(r), ev.set()))
-    for t in list(threading.enumerate()):
-        if t.daemon and t is not threading.current_thread():
-            t.join(timeout=1)
+    _join_bg(timeout=1)
     assert done == [] and panel.after_calls == []
     sp.SerialPanel._run_ui(panel)
     assert done == [42]
@@ -64,11 +64,23 @@ class _SurveyPanel(_NoTk):
         return sp.SerialPanel._async(self, fn, done)
 
 
-def _join_bg():
+_BASE = set()
+
+
+@pytest.fixture(autouse=True)
+def _thread_baseline():
+    """别的测试留下的常驻线程 (TFTP 服务等) 不归这里等, 只等本测试新起的."""
+    import threading
+    _BASE.clear()
+    _BASE.update(t.ident for t in threading.enumerate())
+    yield
+
+
+def _join_bg(timeout=2):
     import threading
     for t in list(threading.enumerate()):
-        if t.daemon and t is not threading.current_thread():
-            t.join(timeout=2)
+        if t.daemon and t.ident not in _BASE and t is not threading.current_thread():
+            t.join(timeout=timeout)
 
 
 def test_survey_without_service_only_prompts(monkeypatch):
