@@ -13,6 +13,7 @@
 import ipaddress
 import os
 import select
+import shlex
 import socket
 import struct
 import time
@@ -114,6 +115,57 @@ def pick_self(peer):
     raise ValueError(f"{peer} 网段里没有空地址")
 
 
+def _v4(text, what):
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError as ex:
+        raise ValueError(f"{what}地址不对: {text}") from ex
+    if ip.version != 4:
+        raise ValueError(f"{what}只支持 IPv4: {text}")
+    return ip
+
+
+def static_form(addr, gateway="", dns="", avoid=""):
+    """人手填的静态地址 (#8): 校验并规整成 {addr, gateway, dns}, 不对就 ValueError(人话).
+    addr 必须写明 地址/前缀 (不替人猜 /24); 网关、DNS 可空; avoid = 对端设备地址, 不许撞."""
+    addr = (addr or "").strip()
+    if not addr:
+        raise ValueError("地址不能为空, 写成 地址/前缀, 比如 192.0.2.5/24")
+    if "/" not in addr:
+        raise ValueError(f"{addr} 没写前缀, 要写成 地址/前缀, 比如 {addr}/24")
+    host, prefix = addr.split("/", 1)
+    ip = _v4(host.strip(), "")
+    prefix = prefix.strip()
+    if not prefix.isdigit() or not 1 <= int(prefix) <= 32:
+        raise ValueError(f"前缀要是 1–32 的数字: /{prefix}")
+    if ip.is_unspecified or ip.is_loopback or ip.is_multicast or ip.is_reserved:
+        raise ValueError(f"{ip} 是保留/回环/组播地址, 不能用")
+    net = ipaddress.ip_interface(f"{ip}/{prefix}").network
+    if net.prefixlen <= 30 and ip == net.network_address:
+        raise ValueError(f"{ip} 是 {net} 的网络号, 不能当地址")
+    if net.prefixlen <= 30 and ip == net.broadcast_address:
+        raise ValueError(f"{ip} 是 {net} 的广播地址, 不能当地址")
+    if avoid and ip == _v4(avoid.split("/")[0].strip(), "对端"):
+        raise ValueError(f"{ip} 就是对端设备的地址, 会撞, 换一个")
+
+    gateway = (gateway or "").strip()
+    if gateway:
+        gw = _v4(gateway, "网关")
+        if gw not in net:
+            raise ValueError(f"网关 {gw} 不在 {net} 网段里")
+        if gw == ip:
+            raise ValueError(f"网关 {gw} 不能是推车自己")
+        if net.prefixlen <= 30 and gw in (net.network_address, net.broadcast_address):
+            raise ValueError(f"网关 {gw} 是网络号或广播地址")
+        gateway = str(gw)
+    servers = [d for d in (dns or "").replace(",", " ").split() if d]
+    try:
+        dns = ",".join(str(_v4(d, "DNS ")) for d in servers)
+    except ValueError as ex:
+        raise ValueError(f"DNS 不对: {ex}") from ex
+    return {"addr": f"{ip}/{prefix}", "gateway": gateway, "dns": dns}
+
+
 # ------------------------------------------------------------ nmcli 命令
 
 def cmd_create(iface, kind, label, addr=None, confirmed=True):
@@ -141,11 +193,23 @@ def cmd_delete(uuid):
     return ["nmcli", "con", "delete", "uuid", uuid]
 
 
+def rollback_text(cur, iface):
+    """确认框里的退路 (#8): 人话 + 车边终端能照抄的命令. cur = 该网口当前生效的配置 (可为 None)."""
+    if cur:
+        name = cur.get("name")
+        cmd = f"nmcli con up id {shlex.quote(name)}" if name else shlex.join(cmd_up(cur["uuid"]))
+        return (f"出问题怎么回滚: 切换失败会自动回到「{cur.get('label') or name or cur['uuid']}」; "
+                f"切过去后不对, 在本面板点「回退上一个」,\n或车边终端执行: {cmd}")
+    return (f"出问题怎么回滚: {IFACES.get(iface, iface)} 原来没有生效配置, 没有可回到的; "
+            f"不对就车边终端执行: nmcli dev disconnect {iface}")
+
+
 def plan_switch(cur, new):
     """cur = 该网口当前生效的配置 (可为 None), new = 要切的. 返回要做的事, 由面板按顺序执行."""
     return {
         "up": cmd_up(new["uuid"]),
         "rollback": cmd_up(cur["uuid"]) if cur else None,
+        "rollback_text": rollback_text(cur, new["iface"]),
         "probe": new["kind"] == "serve",
         "stop_pxe": new["iface"] in SERVE_IFACES and new["kind"] != "serve",
         "warn_remote": new["iface"] == "enp3s0",
@@ -188,6 +252,55 @@ def lan2_view(iface=LAN2, cons_text="", nics=()):
         "conflict": conflict,
         "warning": warning,
     }
+
+
+IPV4_FIELDS = ("method", "addr", "gateway", "dns")
+
+
+def cmd_ipv4(con):
+    return ["nmcli", "-g", "ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.dns", "con", "show", con]
+
+
+def parse_ipv4(text):
+    """cmd_ipv4 输出 (一行一个字段, 末尾空行可能被裁掉) -> {method, addr, gateway, dns}; 读不到返回 None."""
+    lines = (text or "").splitlines()
+    if not lines or not lines[0].strip():
+        return None
+    lines += [""] * len(IPV4_FIELDS)
+    return {k: lines[i].strip() for i, k in enumerate(IPV4_FIELDS)}
+
+
+def describe_ipv4(s):
+    if not s:
+        return "读不到"
+    if s["method"] == "auto":
+        return "DHCP(自动获取)"
+    if s["method"] != "manual":
+        return s["method"]
+    return (f"静态 {s['addr'] or '-'}" + (f" 网关 {s['gateway']}" if s.get("gateway") else "")
+            + (f" DNS {s['dns']}" if s.get("dns") else ""))
+
+
+def lan2_rollback(con, before):
+    """kiosk「LAN2 管理口配置」是原地改内置连接, 回滚 = 把改之前的四个 ipv4 字段写回去再 up.
+    before = parse_ipv4 的结果; 读不到 (None) 就给不出命令, 只给人话."""
+    if not before:
+        return {"cmds": None,
+                "text": (f"出问题怎么回滚: 读不到改之前的设置, 只能手动 —— 车边终端 nmcli con show {con} 看现状, "
+                         f"想改回 DHCP 就再开「LAN2 管理口配置」选 DHCP")}
+    cmds = [["nmcli", "con", "mod", con, "ipv4.method", before["method"],
+             "ipv4.addresses", before["addr"], "ipv4.gateway", before["gateway"], "ipv4.dns", before["dns"]],
+            ["nmcli", "con", "up", con]]
+    text = (f"出问题怎么回滚 (回到原来的 {describe_ipv4(before)}):\n"
+            f"  人在车边: 再开「LAN2 管理口配置」改回去\n"
+            f"  或车边终端执行:\n" + "\n".join("    " + shlex.join(c) for c in cmds))
+    return {"cmds": cmds, "text": text}
+
+
+def lan2_confirm_text(con, before, after):
+    """下发前最后一个确认框: 原来什么、改成什么、怎么回滚."""
+    return (f"原来: {describe_ipv4(before)}\n改为: {describe_ipv4(after)}\n\n"
+            f"{lan2_rollback(con, before)['text']}\n\n确认下发?")
 
 
 # ------------------------------------------------------------ DHCP 探测
