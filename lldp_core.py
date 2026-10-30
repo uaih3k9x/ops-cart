@@ -7,6 +7,9 @@
 
 解析和邻居表是纯函数 (测试用现拼的帧 + 注入时钟); 监听线程由 cart-dash (dash_service) 起.
 畸形帧一律返回 None, 不往上抛.
+
+用法 (上推车实机验证, 要 root; cart-dash 平时已经在听, 这个只是手动看一眼):
+  sudo python3 lldp_core.py eno1 enp3s0 --wait 35      # 听 35 秒 (交换机默认 30 秒发一次)
 """
 
 import errno
@@ -16,6 +19,8 @@ import socket
 import struct
 import threading
 import time
+
+import cart_label
 
 LLDP_MAC = b"\x01\x80\xc2\x00\x00\x0e"    # nearest bridge
 CDP_MAC = b"\x01\x00\x0c\xcc\xcc\xcc"
@@ -259,6 +264,18 @@ class Neighbors:
         return out
 
 
+def label_suggestion(nb, table, max_len):
+    """线缆标签"对端"的建议值: "设备名 端口" 过缩写对照表 → ASCII. 只是建议, 交给人确认.
+    max_len 由调用方给 (标签那边的限长表还在改, 这里不认键名). 剩中文 / 超长 / 空都抛 ValueError."""
+    s = cart_label.abbreviate("%s %s" % (device_name(nb), port_name(nb)), table)
+    if not s:
+        raise ValueError("对端没有设备名和端口")
+    cart_label.ascii_only(s)
+    if len(s) > max_len:
+        raise ValueError("超长: %r %d 字符, 最多 %d" % (s, len(s), max_len))
+    return s
+
+
 NO_LLDP = "没收到 LLDP（交换机可能关了）"
 
 
@@ -437,3 +454,31 @@ class Watcher:
                     s.close()
                 except OSError:
                     pass
+
+
+def main(argv=None):
+    import argparse
+    import json
+    ap = argparse.ArgumentParser(description="听一会儿 LLDP/CDP, 打印对端 (只收不发)")
+    ap.add_argument("ifaces", nargs="+")
+    ap.add_argument("--wait", type=float, default=35)
+    a = ap.parse_args(argv)
+    w = Watcher([(i, i) for i in a.ifaces])
+    end = time.time() + a.wait
+    while True:
+        w.poll(min(1.0, max(0.0, end - time.time())))
+        snap = w.snapshot()
+        if time.time() >= end or all(e["state"] == "fresh" for e in snap.values()):
+            break
+        if all(e["state"] == "off" for e in snap.values()):
+            time.sleep(min(1.0, max(0.0, end - time.time())))
+    w.close()
+    for name, e in snap.items():
+        print("%-8s %s" % (name, peer_line(e)[0]))
+        if e["neighbor"]:
+            print(json.dumps(e["neighbor"], ensure_ascii=False, indent=2))
+    return 0 if any(e["neighbor"] for e in snap.values()) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

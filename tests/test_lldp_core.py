@@ -415,6 +415,40 @@ def test_peer_line_none_off_and_garbage():
     assert lc.peer_line({"state": "fresh"}) == ("没收到 LLDP（交换机可能关了）", "dim")   # 坏快照不炸
 
 
+# ---- 线缆标签"对端"建议值: 交给人确认, 不自动打印
+
+def _abbrev():
+    import os
+    import cart_label
+    return cart_label.load_abbrev(os.path.join(os.path.dirname(lc.__file__), "examples",
+                                               "label_abbrev.json"))
+
+
+def test_label_suggestion_abbreviates_device_and_port():
+    t = _abbrev()
+    assert lc.label_suggestion(lc.parse_frame(huawei()), t, 25) == "SW-A Gi0/0/1"
+    assert lc.label_suggestion(lc.parse_frame(cisco()), t, 25) == "SW-B.example.com Gi1/0/1"
+    nb = dict(lc.parse_frame(huawei()), sys_name="核心-交换机", port_id="XGigabitEthernet0/0/2")
+    assert lc.label_suggestion(nb, t, 25) == "CORE-SW Te0/0/2"
+    assert lc.label_suggestion(lc.parse_frame(h3c()), {}, 40) == "SW-C Ten-GigabitEthernet1/0/49"
+
+
+def test_label_suggestion_rejects_too_long_non_ascii_or_empty():
+    t = _abbrev()
+    with pytest.raises(ValueError):
+        lc.label_suggestion(lc.parse_frame(cisco()), t, 20)                 # 超长, 交给人改
+    with pytest.raises(ValueError):
+        lc.label_suggestion(dict(lc.parse_frame(huawei()), sys_name="教学楼"), t, 25)   # 剩中文
+    with pytest.raises(ValueError):
+        lc.label_suggestion({"sys_name": "", "chassis_id": "", "port_id": ""}, t, 25)
+
+
+def test_cli_reports_unavailable_iface(capsys):
+    # 这台不是推车: 不是 Linux / 没 root / 网口不存在, 都该老实说不可用, 退出码 1
+    assert lc.main(["no-such-if0", "--wait", "0"]) == 1
+    assert "LLDP 不可用" in capsys.readouterr().out
+
+
 def test_module_never_sends():
     import os
     src = open(os.path.join(os.path.dirname(lc.__file__), "lldp_core.py"), encoding="utf-8").read()
