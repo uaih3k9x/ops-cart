@@ -5,7 +5,7 @@ v2: overrideredirect 全屏铺满; UVC 预览(mpv 嵌入); CH9329 键鼠透传
 (点击画面捕获, Ctrl+Alt 释放, VMware 风格). 终端 root 敲 `kiosk` 启动.
 
 线程纪律: 外部命令 (systemctl/nmcli/v4l2-ctl/smartctl...) 一律经 self.ui (UiBridge) 放到后台,
-结果回主线程才碰界面; CH9329 发送走 ChWorker 自己的线程. 主线程只起 mpv (Popen 不等它).
+结果回主线程才碰界面; CH9329 开关口和发送都走 ChWorker 自己的线程. 主线程只起 mpv (Popen 不等它).
 """
 
 import os
@@ -37,6 +37,8 @@ FONT_MONO = ("Noto Sans Mono CJK SC", 13)
 BOOT_BG = "#ffffff"     # 开机自检页白底, 接 Plymouth 的白底
 VIDEO_DEV = "/dev/video0"
 IDLE_SECONDS = 180
+CH_REAP_MS = 1000           # 每秒让 ChWorker 看一次键鼠空不空闲 (空闲 kvm.IDLE_RELEASE_S 秒放锁, #9)
+CH_BUSY_NOTE_MS = 2500      # "键鼠被占用" 横幅留多久
 BOOT_WATCHDOG_MS = 30000    # 自检 30 秒还没完就强制进主界面 (锁屏)
 PANE_CLASSES = {"serial": SerialPanel, "ks": KsPanel, "wifi": WifiPanel,
                 "netprof": NetProfPanel, "wol": WolPanel}
@@ -107,6 +109,7 @@ class Kiosk(tk.Tk):
         self.ui.repeat_bg(self._lamp_sample, self._lamp_sampled, every=lc.SAMPLE_MS / 1000)
         self.ui.repeat_bg(self._ups_sample, self._ups_sampled, every=1.0)
         self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
+        self.after(CH_REAP_MS, self._ch_reap_tick)
 
     def _fill_screen(self):
         self.update_idletasks()
@@ -529,8 +532,9 @@ class Kiosk(tk.Tk):
         self.chw, self._ch_dev = None, None
 
     def _ensure_ch(self):
-        """连当前画面源绑定的那块 CH9329 (按 CH343 序列号, 重插后 ttyACMn 变了也认得).
-        没绑 / 不在线就不连 —— 绝不退回随便一块. 返回 ok/unbound/offline/error."""
+        """备好当前画面源绑定的那块 CH9329 (按 CH343 序列号, 重插后 ttyACMn 变了也认得).
+        没绑 / 不在线就不连 —— 绝不退回随便一块. 返回 ok/unbound/offline.
+        这里不开口: IdleCh 在工作线程里有输入才开、空闲就关, 光看画面不占独占锁 (#9)."""
         path, _serial, state = self._kvm_state()
         if state != "ok":
             self._close_ch()
@@ -539,13 +543,33 @@ class Kiosk(tk.Tk):
         if self.chw and not self.chw.dead and dev == self._ch_dev:
             return "ok"
         self._close_ch()
-        try:
-            ch = Ch9329(dev, log=lambda *a: None)
-        except OSError:
-            return "error"
-        self.chw = kui.ChWorker(ch, on_gone=lambda ex: self.ui.post(self._ch_gone, ex))
+        # 按 by-id 路径 (带序列号) 开, 不用 ttyACMn: 放锁期间拔了再插, ttyACMn 可能已经是别的键鼠
+        ich = kvm.IdleCh(lambda: Ch9329(path, log=lambda *a: None),
+                         on_busy=lambda: self.ui.post(self._ch_busy))
+        self.chw = kui.ChWorker(ich, on_gone=lambda ex: self.ui.post(self._ch_gone, ex))
         self._ch_dev = dev
         return "ok"
+
+    def _ch_reap_tick(self):
+        if self.chw:
+            self.chw.send("reap", droppable=True)      # 排在已入队的发送后面, 队满就等下一秒
+        self.after(CH_REAP_MS, self._ch_reap_tick)
+
+    def _ch_busy(self):
+        """工作线程报: 要开口时别人 (命令行 / 网页口) 正占着 -> 这次输入已丢, 横幅提示一会儿."""
+        text = "键鼠被占用 (远程在发键) · 刚才的输入没发出去, 稍后再按"
+        self.banner.config(text=text)
+
+        def restore():
+            if self.banner.cget("text") == text:       # 期间横幅换过别的就不动
+                self._banner_now()
+        self.after(CH_BUSY_NOTE_MS, restore)
+
+    def _banner_now(self):
+        if self.passthrough:
+            self._banner_passthrough()
+        elif self.video_frame:
+            self._banner_idle()
 
     def _show_kvm(self):
         _path, serial, state = self._kvm_state()
@@ -596,12 +620,8 @@ class Kiosk(tk.Tk):
     def _engage_passthrough(self):
         if self.passthrough:
             return
-        state = self._ensure_ch()
-        if state in ("unbound", "offline"):
+        if self._ensure_ch() != "ok":
             self._banner_idle()                     # 只看不操作: 横幅说明原因, 不弹窗打断
-            return
-        if state != "ok":
-            messagebox.showwarning("键鼠透传", "绑定的 CH9329 打不开 (被占用或刚拔掉?)")
             return
         self.passthrough = True
         self._combo = kc.ReleaseCombo()
@@ -621,9 +641,12 @@ class Kiosk(tk.Tk):
                     "<Button-4>", "<Button-5>", "<MouseWheel>"):    # X11 滚轮 = 4/5 号键
             self.video_frame.bind(seq, self._on_passthrough_event)
         self.focus_force()
+        self._banner_passthrough()
+        self.after(16, self._flush_mouse)
+
+    def _banner_passthrough(self):
         mode = "绝对" if self.mouse_abs else "相对"
         self.banner.config(text=f"[透传中] 鼠标{mode} · 按一下 Ctrl+Alt 再松开 = 释放")
-        self.after(16, self._flush_mouse)
 
     def _release_passthrough(self):
         if not self.passthrough:
@@ -637,11 +660,9 @@ class Kiosk(tk.Tk):
             pass
         self._banner_idle()
         self._mouse_acc, self._mouse_btn, self._center = [0, 0, 0], 0, None
-        if self.mouse_abs and self._last_abs:
-            self._ch_send("send_mouse_abs", 0, *self._last_abs, 0)   # 松开鼠标键, 光标留原地
-        else:
-            self._ch_send("send_mouse", 0, 0, 0, 0)
-        self._ch_send("send_report", self._kb.release_all())         # 松开所有键盘键
+        self._kb.release_all()
+        # 松开鼠标键 (绝对模式光标留原地) 和所有键盘键; 已经空闲放锁的话 IdleCh 不为这个重开
+        self._ch_send("release", self._last_abs if self.mouse_abs else None)
 
     def toggle_mouse_mode(self):
         self._release_passthrough()

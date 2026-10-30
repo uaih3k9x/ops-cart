@@ -544,3 +544,43 @@ def test_kiosk_uses_main_thread_gc_and_no_per_tick_threads():
     src = _src("kiosk.py")
     assert "main_thread_gc(" in src
     assert "repeat_bg(" in src
+
+
+def test_chworker_with_idle_ch_busy_is_not_gone_and_reap_runs_in_worker():
+    """#9: 被占用只丢这次输入, 不标 dead; 'reap' 跟发送排同一个队, 在工作线程里放锁."""
+    import kvm_core as kvm
+    from ch9329 import Ch9329Busy
+    plan, devs, busy, gone = [Ch9329Busy("占用")], [], [], []
+
+    def opener():
+        if plan:
+            raise plan.pop(0)
+        devs.append(FakeCh())
+        return devs[-1]
+    t = [0.0]
+    ich = kvm.IdleCh(opener, on_busy=lambda: busy.append(1), clock=lambda: t[0])
+    w = ui.ChWorker(ich, on_gone=gone.append)
+    w.send("send_report", bytes(8))
+    w.join(1)
+    assert busy == [1] and not w.dead and gone == []
+    w.send("send_report", bytes(8))
+    w.join(1)
+    t[0] = 10.0
+    w.send("reap", droppable=True)
+    w.join(1)
+    assert devs[0].closed and not ich.is_open
+    w.close(wait=True)
+
+
+def test_kiosk_opens_ch9329_only_inside_idle_ch_opener():
+    """#9: 车机主线程不直接开 CH9329 (开口 = 拿独占锁), 只把开法交给 IdleCh, 由 ChWorker 线程按需开关;
+    每秒排一次 reap 放空闲的锁; 退出透传走 IdleCh.release (放过锁就不为松开重开)."""
+    tree = ast.parse(_src("kiosk.py"))
+    opens = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "Ch9329"]
+    in_opener = {id(lam.body) for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "IdleCh"
+                 for lam in n.args[:1] if isinstance(lam, ast.Lambda)}
+    assert opens and all(id(c) in in_opener for c in opens)
+    assert all(ast.unparse(c.args[0]) == "path" for c in opens)      # by-id 路径, 不是 realpath 后的 ttyACMn
+    src = _src("kiosk.py")
+    assert '"reap"' in src and "on_busy=" in src and '_ch_send("release"' in src
