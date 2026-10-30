@@ -650,7 +650,7 @@ def test_supervise_exits_1_when_worker_dies():
 
 import json  # noqa: E402
 
-from pxeserver import EXIT_FOREIGN_DHCP, PxeGuard, supervise  # noqa: E402
+from pxeserver import PxeGuard, supervise  # noqa: E402
 
 
 class Box:
@@ -665,7 +665,7 @@ class Box:
 
 
 def guard_for(tmp_path, box, events=None):
-    return PxeGuard("192.0.2.1", "eno1", FakeLog(), probe=box.probe, carrier=lambda: box.link,
+    return PxeGuard("192.0.2.1", "eno1", FakeLog(), prefix=24, probe=box.probe, carrier=lambda: box.link,
                     addr=lambda: box.addr, state_path=str(tmp_path / "pxe-guard.json"),
                     event=(events.append if events is not None else lambda m: None))
 
@@ -683,21 +683,29 @@ def test_guard_probes_at_start_and_serves_when_alone(tmp_path):
     assert g.may_reply() and guard_state(tmp_path)["state"] == "serving"
 
 
-def test_guard_trips_on_foreign_offer_at_start(tmp_path):
+def test_guard_goes_proxy_on_foreign_offer_at_start(tmp_path):
+    """#11: 探到别人的 DHCP 不停服, 转代理模式: 不发地址, 只回引导信息."""
     box, events = Box(found=[{"server": "198.51.100.1", "yiaddr": "198.51.100.50"}]), []
     g = guard_for(tmp_path, box, events)
     g.tick()
-    assert g.tripped and not g.may_reply()
+    assert g.state == "proxy" and not g.may_reply() and g.may_proxy()
     st = guard_state(tmp_path)
-    assert st["state"] == "foreign" and st["server"] == "198.51.100.1"
-    assert events and "198.51.100.1" in events[0]
+    assert st["state"] == "proxy" and st["server"] == "198.51.100.1" and st["leases"] is False
+    assert st["offered"] == "198.51.100.50" and st["prefix"] == 24
+    assert events and "198.51.100.1" in events[0] and "不发地址" in events[0]
+
+
+def test_guard_serving_state_file_says_leases(tmp_path):
+    g = guard_for(tmp_path, Box())
+    g.tick()
+    assert g.may_proxy() and guard_state(tmp_path)["leases"] is True
 
 
 def test_guard_ignores_own_offer_in_probe(tmp_path):
     box = Box(found=[{"server": "192.0.2.1", "yiaddr": "192.0.2.10"}])
     g = guard_for(tmp_path, box)
     g.tick()
-    assert not g.tripped and g.may_reply()
+    assert g.state == "serving" and g.may_reply()
 
 
 def test_guard_reprobes_on_carrier_up(tmp_path):
@@ -714,7 +722,40 @@ def test_guard_reprobes_on_carrier_up(tmp_path):
     g.tick()
     box.link, box.found = True, [{"server": "203.0.113.1", "yiaddr": "203.0.113.9"}]
     g.tick()                                      # 拔了插到别处: 0 -> 1 再探测一次
-    assert len(box.probes) == 2 and g.tripped
+    assert len(box.probes) == 2 and g.state == "proxy"
+    g.tick()
+    assert len(box.probes) == 2 and g.state == "proxy"      # 插着不动: 不重探, 也不自己变回去
+    box.link = False
+    g.tick()
+    assert not g.may_proxy() and guard_state(tmp_path)["state"] == "no-link"
+    box.link, box.found = True, []
+    g.tick()                                      # 又插回直连: 重探没人, 恢复发地址
+    assert len(box.probes) == 3 and g.state == "serving" and g.may_reply()
+    assert guard_state(tmp_path)["server"] is None
+
+
+def test_guard_passive_hit_during_probe_wins_over_empty_probe(tmp_path):
+    """探测那 4 秒里被动监听先看到别人: 探测自己没收到也不能当没有."""
+    box = Box(link=False)
+    g = guard_for(tmp_path, box)
+    g.tick()
+
+    def probe(iface, timeout=4.0, ignore=()):
+        g.foreign("198.51.100.1", "被动监听")     # 模拟另一个线程
+        return []
+    g.probe, box.link = probe, True
+    g.tick()
+    assert g.state == "proxy" and not g.may_reply()
+
+
+def test_guard_no_ip_even_with_foreign_dhcp(tmp_path):
+    box = Box(addr=None, found=[{"server": "198.51.100.1", "yiaddr": "198.51.100.50"}])
+    g = guard_for(tmp_path, box)
+    g.tick()
+    assert not g.may_proxy() and guard_state(tmp_path)["state"] == "no-ip"
+    box.addr = "192.0.2.1"
+    g.tick()
+    assert g.state == "proxy"
 
 
 def test_guard_silent_when_iface_lacks_our_ip(tmp_path):
@@ -732,7 +773,7 @@ def test_guard_unknown_probe_result_does_not_trip(tmp_path):
     box.probe = lambda iface, timeout=4.0, ignore=(): None          # 探测说不准 (如没插线)
     g = guard_for(tmp_path, box)
     g.tick()
-    assert not g.tripped
+    assert g.state == "probing" and not g.may_proxy()
 
 
 def test_guard_probe_result_unknown_holds_and_retries(tmp_path):
@@ -746,12 +787,13 @@ def test_guard_probe_result_unknown_holds_and_retries(tmp_path):
     box.probe = probe
     g = guard_for(tmp_path, box)
     g.tick()
-    assert not g.tripped and not g.may_reply() and guard_state(tmp_path)["state"] == "probing"
+    assert not g.may_proxy() and guard_state(tmp_path)["state"] == "probing"
     g.tick()                                      # 下一轮重探, 这次算数
     assert len(box.probes) == 2 and g.may_reply()
 
 
-def test_guard_probe_error_does_not_crash(tmp_path):
+def test_guard_probe_error_falls_back_to_proxy(tmp_path):
+    """探测坏了 = 不知道有没有别人: 偏向不发地址."""
     box = Box()
 
     def boom(*a, **k):
@@ -759,7 +801,16 @@ def test_guard_probe_error_does_not_crash(tmp_path):
     box.probe = boom
     g = guard_for(tmp_path, box)
     g.tick()
-    assert not g.tripped and g.may_reply()
+    assert g.state == "proxy" and not g.may_reply() and g.may_proxy()
+    assert guard_state(tmp_path)["server"] is None
+
+
+def test_guard_without_probe_function_falls_back_to_proxy(tmp_path):
+    g = PxeGuard("192.0.2.1", "eno1", FakeLog(), probe=None, carrier=lambda: True,
+                 addr=lambda: "192.0.2.1", state_path=str(tmp_path / "pxe-guard.json"),
+                 event=lambda m: None)
+    g.tick()
+    assert g.state == "proxy" and not g.may_reply()
 
 
 def test_guard_state_write_failure_is_swallowed(tmp_path):
@@ -778,7 +829,24 @@ def _reply_from(server, kind=b"\x02", mac=M1):
     return bytes(head + encode_opt(53, kind) + encode_opt(54, (server,)) + b"\xff")
 
 
-def test_passive_foreign_offer_stops_replies(tmp_path):
+PXE_VENDOR = b"PXEClient:Arch:00007:UNDI:003016"
+
+
+def make_pxe_discover(mac=M2, extra=b"", arch=7, with_arch=True):
+    """固件 PXE 的 DISCOVER: 带 option 60 PXEClient 和 option 93."""
+    return make_discover(mac=mac, arch=arch, with_arch=with_arch)[:-1] + encode_opt(60, PXE_VENDOR) + \
+        extra + b"\xff"
+
+
+def proxy_dhcp(tmp_path, found=(("198.51.100.1", "192.0.2.150"),)):
+    g = guard_for(tmp_path, Box(found=[{"server": s, "yiaddr": y} for s, y in found]))
+    g.tick()
+    d = dhcp_for_test()
+    d.guard = g
+    return d, g
+
+
+def test_passive_foreign_offer_switches_to_proxy(tmp_path):
     box = Box()
     g = guard_for(tmp_path, box)
     g.tick()
@@ -787,43 +855,121 @@ def test_passive_foreign_offer_stops_replies(tmp_path):
     d.watch_reply(_reply_from("192.0.2.1"))       # 自己的回包: 不算
     assert g.may_reply()
     d.watch_reply(_reply_from("198.51.100.1", b"\x05"))
-    assert g.tripped and guard_state(tmp_path)["server"] == "198.51.100.1"
-    assert d.handle(make_discover(mac=M2), None) is None
-    assert d.handle_proxy(make_discover(mac=M2), ("192.0.2.10", 4011)) is None
+    assert g.state == "proxy" and guard_state(tmp_path)["server"] == "198.51.100.1"
+    assert d.handle(make_discover(mac=M2), None) is None      # 不是 PXE 客户端: 一个字都不回
+    assert d.leases == {}
+    assert d.handle_proxy(make_discover(mac=M2), ("192.0.2.10", 4011)) is not None
 
 
-def test_request_selecting_foreign_server_trips_guard(tmp_path):
+def test_request_selecting_foreign_server_switches_to_proxy(tmp_path):
     g = guard_for(tmp_path, Box())
     g.tick()
     d = dhcp_for_test()
     d.guard = g
     assert d.handle(_msg(M1, b"\x03", "198.51.100.50", "198.51.100.1"), None) is None
-    assert g.tripped
+    assert g.state == "proxy"
+
+
+def test_proxy_mode_67_offer_has_no_address(tmp_path):
+    """PXE 2.1 / dnsmasq proxy: 67 口只对 PXEClient 的 DISCOVER 回 yiaddr=0 的 OFFER,
+    带 option 60 + 54, 不带掩码/网关/租期; 客户端地址照用正式 DHCP 的."""
+    d, _ = proxy_dhcp(tmp_path)
+    reply = d.handle(make_pxe_discover(), None)
+    _, _, opts = parse_dhcp(reply)
+    assert reply[0] == 2 and opts[53] == b"\x02"
+    assert _yiaddr(reply) == "0.0.0.0"
+    assert socket.inet_ntoa(reply[20:24]) == "192.0.2.1"          # siaddr = TFTP
+    assert opts[60] == b"PXEClient" and opts[54] == socket.inet_aton("192.0.2.1")
+    assert not ({1, 3, 6, 28, 50, 51, 58, 59} & set(opts))         # 一点地址信息都不给
+    assert d.leases == {}
+
+
+def test_proxy_mode_67_offer_echoes_client_uuid(tmp_path):
+    d, _ = proxy_dhcp(tmp_path)
+    uuid = encode_opt(97, b"\x00" + bytes(range(16)))
+    _, _, opts = parse_dhcp(d.handle(make_pxe_discover(extra=uuid), None))
+    assert opts[97] == b"\x00" + bytes(range(16))
+
+
+def test_proxy_mode_67_ignores_everything_but_pxe_discover(tmp_path):
+    d, _ = proxy_dhcp(tmp_path)
+    pxe = lambda mtype, **kw: _msg(M2, mtype, **kw)[:-1] + encode_opt(60, PXE_VENDOR) + b"\xff"
+    for msg in (pxe(b"\x03", ip="192.0.2.10", server_id="192.0.2.1"),    # 选了我们也不 ACK/NAK
+                pxe(b"\x03", ip="192.0.2.10"),                           # INIT-REBOOT
+                pxe(b"\x04", ip="192.0.2.10", server_id="192.0.2.1"),    # DECLINE
+                pxe(b"\x07", ciaddr="192.0.2.10", server_id="192.0.2.1"),  # RELEASE
+                pxe(b"\x08", ciaddr="192.0.2.10"),                       # INFORM
+                make_discover(mac=M2),                                   # 没有 option 60
+                make_pxe_discover(with_arch=False),                      # 没有 option 93 (dnsmasq 也不回)
+                make_pxe_discover(arch=0),                               # BIOS: 仓库里没有 BIOS 引导
+                make_pxe_discover(arch=11)):                             # ARM64: shimx64 给了也起不来
+        assert d.handle(msg, None) is None
+    assert d.leases == {}
+
+
+def test_proxy_mode_answers_efi_x64_arch_9(tmp_path):
+    d, _ = proxy_dhcp(tmp_path)
+    assert _yiaddr(d.handle(make_pxe_discover(arch=9), None)) == "0.0.0.0"
+
+
+def test_proxy_mode_ipxe_gets_script(tmp_path):
+    d, _ = proxy_dhcp(tmp_path)
+    reply = d.handle(make_pxe_discover(extra=encode_opt(77, b"iPXE")), None)
+    assert parse_dhcp(reply)[2][67] == b"http://192.0.2.1/boot.ipxe"
+    assert _yiaddr(reply) == "0.0.0.0"
+
+
+def test_proxy_mode_4011_still_answers(tmp_path):
+    d, _ = proxy_dhcp(tmp_path)
+    reply = d.handle_proxy(_msg(M2, b"\x03", ciaddr="192.0.2.150"), ("192.0.2.150", 4011))
+    assert parse_dhcp(reply)[2][53] == b"\x05" and _yiaddr(reply) == "0.0.0.0"
+
+
+def test_4011_drops_clients_outside_our_subnet(tmp_path):
+    """单播回包到别的网段会走默认路由从管理口出去: 不回."""
+    d, _ = proxy_dhcp(tmp_path)
+    assert d.handle_proxy(_msg(M2, b"\x03", ciaddr="198.51.100.50"), ("198.51.100.50", 4011)) is None
+    d.guard = None
+    assert d.handle_proxy(make_discover(), ("198.51.100.50", 4011)) is None
+
+
+def test_serving_mode_unchanged_for_pxe_discover(tmp_path):
+    d, _ = proxy_dhcp(tmp_path, found=())
+    reply = d.handle(make_pxe_discover(), None)
+    assert _yiaddr(reply) == "192.0.2.10" and parse_dhcp(reply)[2][51]
 
 
 def test_dhcp_does_not_answer_before_guard_ready(tmp_path):
     d = dhcp_for_test()
     d.guard = guard_for(tmp_path, Box())
     assert d.handle(make_discover(mac=M1), None) is None     # 还没 tick: 没探测过
+    assert d.handle(make_pxe_discover(mac=M1), None) is None
+    assert d.handle_proxy(make_discover(mac=M1), ("192.0.2.10", 4011)) is None
     assert d.leases == {}                                    # 也不占地址
 
 
-def test_supervise_exits_foreign_code_when_guard_trips(tmp_path):
+def test_supervise_keeps_running_when_guard_goes_proxy(tmp_path):
     box = Box()
     g = guard_for(tmp_path, box)
+    ticks = []
 
     def sleep(s):
+        ticks.append(s)
         box.link = False if box.link else True
         box.found = [{"server": "198.51.100.1", "yiaddr": "198.51.100.2"}]
-    assert supervise([FakeThread("dhcp")], FakeLog(), guard=g, sleep=sleep) == EXIT_FOREIGN_DHCP == 3
+        if len(ticks) == 3:                       # 第 2 轮 tick 已重插线、探到别人
+            raise StopLoop
+    with pytest.raises(StopLoop):
+        supervise([FakeThread("dhcp")], FakeLog(), guard=g, sleep=sleep)
+    assert g.state == "proxy"
 
 
-def test_pxe_unit_prevents_restart_on_foreign_dhcp():
+def test_pxe_unit_no_longer_blocks_restart_on_foreign_dhcp():
     import pathlib
     u = (pathlib.Path(__file__).resolve().parent.parent / "deploy" / "systemd" /
          "pxe-server.service").read_text()
     line = next(l for l in u.splitlines() if l.startswith("RestartPreventExitStatus="))
-    assert "3" in line.split("=", 1)[1].split()
+    assert line.split("=", 1)[1].split() == ["2", "4"]      # 3 (别人的 DHCP 就退出) 已不用
     assert "--iface eno1" in u
 
 
@@ -943,9 +1089,11 @@ def test_tmpfiles_log_dir_readable_by_wheel_and_run_dir_exists():
     assert rows["/run/ops-cart"][0] == "d"                  # pxe-guard.json / pin-gate.json 放这
 
 
-def test_guard_state_sticks_at_foreign(tmp_path):
+def test_guard_state_sticks_at_proxy(tmp_path):
     g = guard_for(tmp_path, Box())
     g.tick()
     g.foreign("198.51.100.1", "被动监听")
     g._set("serving", "")                          # 模拟另一线程晚到的 tick
-    assert g.state == "foreign" and not g.may_reply()
+    assert g.state == "proxy" and not g.may_reply()
+    g.tick()
+    assert g.state == "proxy"

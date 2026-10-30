@@ -318,8 +318,27 @@ def check_ch9329(ctx):
     return "OK", f"{k['online']} ONLINE / {k.get('bound', 0)} BOUND"
 
 
+PXE_PROXY_TEXT = "代理模式：链路上已有别的 DHCP，推车不发地址，只回 PXE 引导"
+
+
+def pxe_proxy_detail(guard):
+    """代理模式的说明. 对方的掩码不知道, 网段按推车自己的前缀估; 推车不在里面 PXE 多半走不通
+    (客户端拿对方的地址, 要能直连推车做 4011 / TFTP / HTTP). 字段缺/坏就只给第一句."""
+    import ipaddress
+    try:
+        theirs = ipaddress.ip_interface(f"{guard['offered']}/{guard['prefix']}").network
+        ours = ipaddress.ip_address(guard["ip"])
+    except (KeyError, TypeError, ValueError):
+        return PXE_PROXY_TEXT
+    text = f"{PXE_PROXY_TEXT}；对方网段 {theirs}"
+    return text if ours in theirs else text + "；推车 LAN1 不在对方网段，PXE 引导可能走不通"
+
+
 def check_pxe(ctx, iface="eno1"):
     if ctx["svcs"].get("pxe-server", (False, False))[1]:
+        guard = ctx.get("pxe_guard", dict)()       # pxeserver 守卫状态; 装机口上有别的 DHCP 时是 proxy
+        if guard.get("state") == "proxy":
+            return "WARN", pxe_proxy_detail(guard)
         return "OK", "RUNNING"
     nic = {n["name"]: n for n in ctx["nics"]}.get(iface, {})
     return "--", "LINK UP / STANDBY" if nic.get("link") else "STANDBY"
@@ -473,6 +492,19 @@ def _safe(fn, default):
         return default
 
 
+PXE_GUARD = pxeserver.GUARD_STATE
+
+
+def pxe_guard_read(path=None):
+    """pxe-guard.json (pxeserver 守卫写); 没有/坏了给 {}."""
+    try:
+        with open(path or PXE_GUARD) as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def selftest_context():
     """真机快照. SMART 要 sudo 且慢, 自检不读. 每一样都兜住, 本函数不抛."""
     return {"nics": _safe(nics_status, []), "misc": _safe(misc_status, {}),
@@ -480,7 +512,8 @@ def selftest_context():
             "temps": _safe(lambda: temps_status(smart=lambda: None), []), "fans": _safe(fans_status, []),
             "exists": os.path.exists, "pci": pci_devices,
             "ping": lambda h: run(["ping", "-c", "1", "-W", "1", h], timeout=3)[0] == 0,
-            "videos": video_nodes, "signal": lambda dev: video_signal(dev), "wifi": wifi_status}
+            "videos": video_nodes, "signal": lambda dev: video_signal(dev), "wifi": wifi_status,
+            "pxe_guard": pxe_guard_read}
 
 
 def wifi_status():
