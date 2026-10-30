@@ -12,13 +12,14 @@
 交换机   ◄── 串口 ── FT232R ───────────────┘
 ```
 
-软件全部自研,只用 Python 标准库 + Tkinter,跑在车上的东西不装第三方包。
+软件全部自研,只用 Python 标准库 + Tkinter,跑在车上的东西不装第三方包;
+唯一例外是副屏服务 `cart-dash`,画图和推 USB 要 Pillow / pyusb,装在单独的 `/opt/pxe/venv` 里。
 
 ## 能干什么
 
 - **装机**:自研 PXE 服务端(DHCP + proxyDHCP + TFTP),目标机器网线直插即全自动装 Rocky 9;
   按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器只能进救援。
-  服务端自己也守规矩:租约到期回收、池满不发、不是自己的租约不吭声;装机口上看见别人的 DHCP 就停,
+  服务端自己也守规矩:租约到期回收、池满不发、不是自己的租约不吭声;装机口上看见别人的 DHCP 就转代理模式(不发地址、只给引导),
   网口上没有自己的地址就不回包;TFTP / HTTP 发装机菜单和 ks 前再核一遍装机模式和 MAC
 - **KVM**:HDMI 采集低延迟预览,CH9329 透传键鼠(绝对鼠标,VMware 式 Ctrl+Alt 释放);
   开机自动选有信号的画面源
@@ -31,6 +32,8 @@
 - **联网**:有线优先、无线兜底(拔网线约 17 秒切换);内置无线管理面板,
   校园网锐捷 ePortal 无浏览器自动认证(认证页主机首次记住,之后跳到陌生主机不发账号);
   改当前出口那条无线前先确认,换连接先建后删、新密码连不上自动回退
+- **副屏与 UPS**:USB 副屏常驻状态板(`cart-dash` 统一采集,车机和副屏读同一份快照);
+  APC UPS 直读 hidraw 拿电量、负载、市电状态,放电到 15% 正常关机;顶栏一排虚拟指示灯,颜色看自检、闪烁看活动
 - **OCR**:截图识字带坐标,给"看屏幕 → 找按钮 → 点"的自动化留接口
 
 ## 代码地图
@@ -58,14 +61,20 @@
 | [`serial_panel.py`](serial_panel.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务 |
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
+| [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
+| [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;`--once --preview` 导出画面不推屏 |
+| [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
+| [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;按百分比判低电量 |
+| [`lamps_core.py`](lamps_core.py) | 顶栏虚拟指示灯:每灯盯一个单调计数器(日志大小、网卡字节数、键鼠发送次数),变了就闪;串口操作头 `/dev/con-1~4` 收到 ^G 亮红 |
+| [`cart_dream.py`](cart_dream.py) | 推车"做梦":每晚 02:00 把 `CART-LOG.md` 新增部分交给车上的 Claude Code 整理成小结(不给工具、有花费上限、失败不前进),标题显示在锁屏底部 |
 
 | 目录 | 内容 |
 |---|---|
 | [`tests/`](tests/) | 离线单测,不接任何硬件也能全绿 |
 | [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
-| [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查 |
-| [`docs/`](docs/) | 优化方案、版本部署清单、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md) |
+| [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查;`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
+| [`docs/`](docs/) | 优化方案、版本部署清单、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例 |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
