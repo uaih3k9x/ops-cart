@@ -120,8 +120,10 @@ tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py
 
 运行时状态都在 `/run/ops-cart/`(tmpfiles 建,重启推车清空):`pxe-guard.json` 是装机口守卫状态,
 `pin-gate.json` 是车机 PIN 输错计数,`mpv.sock` 给 `cart_snap.py` 用。
-`pxe-server` 发现装机口上有别的 DHCP 会以退出码 3 停下且不再自动拉起:拔掉那根线、确认 LAN1 只接被测机,
-再 `systemctl restart pxe-server`。
+`pxe-server` 发现装机口上有别的 DHCP 不再停服,转**代理模式**(`pxe-guard.json` 里 `"state": "proxy"`、`"leases": false`):
+67 口不发地址,只对 x86-64 UEFI 的 PXE 客户端回 yiaddr=0 的引导 OFFER,4011 / TFTP / HTTP 照常;
+LAN1 拔掉再插上会重新探测,没有别人就恢复自己发地址。探测出错或拿不准一律按代理模式。
+代理模式要生效,推车的 `PXE_IP` 得在那个网段里(别人发的地址见 `pxe-guard.json` 的 `offered`)。
 
 装机网段只在 `/etc/ops-cart/pxe.env` 里定(`pxe-*` 三个单元和车机生成的 grub 菜单共用),车机界面不再改 LAN1 地址;
 `pxe-server` 的 `--iface eno1` 写死在单元里。校园网认证配置在 `/etc/ops-cart/campus-auth.json`(要写 `ssid`)。
