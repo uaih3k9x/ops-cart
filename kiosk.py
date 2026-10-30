@@ -9,6 +9,7 @@ v2: overrideredirect 全屏铺满; UVC 预览(mpv 嵌入); CH9329 键鼠透传
 """
 
 import os
+import shlex
 import sys
 import time
 import tkinter as tk
@@ -28,7 +29,7 @@ from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
-from netprof_panel import NetProfPanel
+from netprof_panel import NetProfPanel, ask_valid
 from wol_panel import WolPanel
 
 FONT = ("Noto Sans CJK SC", 13)
@@ -805,20 +806,25 @@ class Kiosk(tk.Tk):
 
     def cfg_lan2(self):
         """#8: 这里改的是内置连接; 「网口配置文件」改的是命名配置, 两个入口都会动 enp3s0.
-        实时状态按 netprof_core.lan2_view 单一口径读, 有冲突就把参与方写进对话框."""
+        实时状态按 netprof_core.lan2_view 单一口径读, 有冲突就把参与方写进对话框.
+        静态地址由人填并校验; 下发前确认框写明原来/改为/怎么回滚 (回滚 = 写回改之前的 ipv4 字段)."""
         def read():
-            return kc.nics_status(), kc.run(npc.CMD_CONS)[1]
+            return (kc.nics_status(), kc.run(npc.CMD_CONS)[1],
+                    npc.parse_ipv4(kc.run(npc.cmd_ipv4(kc.LAN2_CON))[1]))
 
-        def apply(cmds):
+        def apply(cmds, note):
+            res = "已下发, 状态见左侧(远程会断属正常)"
             for cmd in cmds:
                 rc, _ = kc.run(cmd, timeout=30)
                 if rc:
-                    return f"失败: {' '.join(cmd[:4])} 返回 {rc}"
-            return "已下发, 状态见左侧(远程会断属正常)"
+                    res = f"失败: {' '.join(cmd[:4])} 返回 {rc}"
+                    break
+            cartlog.event("netprof", f"{note} {res}")      # 远程断了也能在 events.log 里找到回滚命令
+            return res
 
         def ask(res):
             self.banner.config(text="")
-            nics, cons = res if not isinstance(res, Exception) else ([], "")
+            nics, cons, before = res if not isinstance(res, Exception) else ([], "", None)
             view = npc.lan2_view(kc.LAN2_CON, cons, nics)
             if view["ip"] == "-" and not view["link"]:
                 return messagebox.showerror("LAN2", "读不到 enp3s0 的状态")
@@ -830,19 +836,32 @@ class Kiosk(tk.Tk):
             if not messagebox.askyesno("LAN2 管理口", warn, icon="warning"):
                 return
             if messagebox.askyesno("LAN2", f"当前: {view['ip']} ({view['method']})\n\n改为 DHCP(自动获取)?"):
+                after = {"method": "auto", "addr": "", "gateway": "", "dns": ""}
                 cmds = kc.nmcli_set_dhcp(kc.LAN2_CON)
             else:
-                ip = simpledialog.askstring("静态 IP", "IP/前缀:", initialvalue=view["ip"])
-                if not ip:
+                old = before or {}
+                form = ask_valid(self, "静态 IP", "LAN2 地址/前缀 (预填的是当前地址, 可改):",
+                                 view["ip"] if view["ip"] != "-" else "", npc.static_form)
+                if form is None:
                     return
-                gw = simpledialog.askstring("网关", "网关(可空):")
-                dns = simpledialog.askstring("DNS", "DNS(可空):")
-                cmds = kc.nmcli_set_static(kc.LAN2_CON, ip, gw or "", dns or "")
+                addr = form["addr"]
+                gw = ask_valid(self, "网关", "网关(可空):", old.get("gateway", ""),
+                               lambda t: npc.static_form(addr, gateway=t)["gateway"]) or ""
+                dns = ask_valid(self, "DNS", "DNS(可空, 多个用逗号):", old.get("dns", ""),
+                                lambda t: npc.static_form(addr, dns=t)["dns"]) or ""
+                after = {"method": "manual", "addr": addr, "gateway": gw, "dns": dns}
+                cmds = kc.nmcli_set_static(kc.LAN2_CON, addr, gw, dns)
+            if not messagebox.askyesno("LAN2 下发确认", npc.lan2_confirm_text(kc.LAN2_CON, before, after),
+                                       icon="warning"):
+                return
+            rb = npc.lan2_rollback(kc.LAN2_CON, before)["cmds"]
+            note = (f"LAN2 管理口配置 {npc.describe_ipv4(before)} -> {npc.describe_ipv4(after)}"
+                    + (f" (回滚: {' && '.join(shlex.join(c) for c in rb)})" if rb else ""))
 
             def applied(r):
                 messagebox.showinfo("LAN2", str(r))
 
-            self._bg_action("cfg_lan2_apply", lambda: apply(cmds), applied, "正在下发 LAN2 配置…")
+            self._bg_action("cfg_lan2_apply", lambda: apply(cmds, note), applied, "正在下发 LAN2 配置…")
 
         self._bg_action("cfg_lan2", read, ask, "读取网口状态…")
 
