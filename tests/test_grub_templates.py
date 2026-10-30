@@ -92,3 +92,17 @@ def test_setup_script_does_not_write_menus_itself():
             continue
         assert not re.search(r"(>>?|\btee\b|\bcp\b|\binstall\b)[^#]*grub\.cfg", code), line
     assert "menuentry" not in sh
+
+
+@pytest.mark.parametrize("name,cfg", grub_texts())
+def test_template_has_no_winpe_entry(name, cfg):
+    """#11: WinPE 项和自动装机一样只进解锁后的 MAC 菜单, 仓库模板/脚本里一项都不许写."""
+    import pxeserver
+    assert pxeserver.WINPE_CHAIN not in cfg, name
+
+
+def test_generated_install_menu_default_is_not_winpe():
+    import pxeserver
+    cfg = kc.grub_cfg_install(winpe=True)
+    assert pxeserver.WINPE_CHAIN in cfg
+    assert pxeserver.WINPE_CHAIN not in default_entry(cfg)
