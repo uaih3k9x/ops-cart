@@ -12,7 +12,7 @@
 帧结束靠短包或收满 payload_total; 总长恰为端点包长整数倍时补一个
 type=0xff 的 16 字节帧 (假 zlp, ESP32 固件不支持真零长度包).
 
-设备配置在 iProduct 字符串里, `_` 分隔的前缀字段:
+设备配置在 vendor 接口的 iInterface 字符串里 (不是 iProduct), `_` 分隔的前缀字段:
   R<宽>x<高>   Ejpg<n>   Ergb<n>   Fps<n>   Bl<n>(按字节)
 实测 2026-10-29, ESP32-P4 板 303a:2987:
   esp32p4udisp0_R1280x800_Ejpg6_Fps46_Bl300000
@@ -33,9 +33,6 @@ TYPE_ZLP = 0xFF
 HEADER_SIZE = 16
 HEADER = struct.Struct("<HBBHHHHI")
 MAX_PAYLOAD = (1 << 22) - 1
-
-DEFAULT_WIDTH = 480
-DEFAULT_HEIGHT = 480
 
 
 def build_header(ptype, payload_total, frame_id=0, x=0, y=0, width=0, height=0, cmd=0):
@@ -73,7 +70,7 @@ _RE_RES = re.compile(r"R(\d+)x(\d+)")
 
 
 def parse_config(text):
-    """解析 iProduct, 返回 dict: width/height/enc/quality/fps/blimit.
+    """解析配置串 (iInterface), 返回 dict: width/height/enc/quality/fps/blimit.
 
     和 Windows 驱动 parse_usb_dev_info 的默认值一致:
       fps=60, enc=JPG, quality=5, blimit=1080P*4 字节.

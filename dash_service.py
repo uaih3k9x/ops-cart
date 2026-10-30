@@ -18,6 +18,7 @@ import sys
 import time
 
 import dash_core as dc
+import lamps_core
 
 SAMPLE_S = 0.2          # 快照节奏
 RECONNECT_S = 3.0       # 拔线后重连间隔
@@ -54,14 +55,15 @@ def run(once=False, preview=None, fps=DEFAULT_FPS, state_path=dc.STATE_PATH,
     disp = None
     next_try = 0.0
     max_gap = 1.0 / max(fps, 0.1)
+    moving = lamps_core.Activity()          # 计数器变了 → 那盏灯点亮 HOLD_S 秒
 
     while True:
         seq += 1
         snap = dc.collect(dict(ctx, seq=seq))
         dc.write(state_path, snap)
-        view = dc.layout_view(snap)
-        key = _view_key(view)
         now = time.time()
+        view = dc.layout_view(snap, active=moving.update(snap.get("lamps") or {}, now))
+        key = _view_key(view)
 
         want = (key != last_key or view.get("clock") != last_clock or view.get("stale"))
         if want and now - last_push >= max_gap:

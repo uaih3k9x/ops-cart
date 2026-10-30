@@ -70,7 +70,9 @@ def test_layout_locked_hides_todo():
     snap = dc.collect(_ctx())
     v = dc.layout_view(snap, locked=True)
     assert v["locked"] and v["todo"] == []
-    assert v["checks"] == {"total": 2, "bad": 1, "first_bad": "FAN", "bad_labels": ["FAN"]}
+    c = v["checks"]
+    assert (c["ok"], c["warn"], c["fail"]) == (1, 0, 1)
+    assert [p["label"] for p in c["problems"]] == ["FAN"]
 
 
 def test_layout_unlocked_keeps_todo_and_reads_kiosk_flag():
@@ -85,3 +87,173 @@ def test_layout_marks_stale_snapshot():
     snap = dict(dc.collect(_ctx()), ts=time.time())      # ts 用"现在", 不然按 1970 算
     old = dict(snap, ts=time.time() - 10)
     assert dc.layout_view(old)["stale"]
+
+
+# ---- 采集节流: 快照照样每 200 ms 写, 但慢的采集项按自己的节奏跑 (ping/自检别每轮都跑)
+
+class _Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_every_caches_within_period():
+    clk, calls = _Clock(), []
+    get = dc.every(10, lambda: calls.append(1) or len(calls), clock=clk)
+    assert get() == 1
+    clk.t += 9.9
+    assert get() == 1 and len(calls) == 1
+
+
+def test_every_refreshes_after_period():
+    clk, calls = _Clock(), []
+    get = dc.every(10, lambda: calls.append(1) or len(calls), clock=clk)
+    get()
+    clk.t += 10
+    assert get() == 2
+
+
+def test_every_failure_waits_a_period_before_retry():
+    clk, calls = _Clock(), []
+
+    def boom():
+        calls.append(1)
+        raise OSError("ping timeout")
+    get = dc.every(5, boom, clock=clk)
+    for _ in range(3):
+        try:
+            get()
+        except OSError:
+            pass
+    assert len(calls) == 1            # 坏了也别每 200 ms 再撞一次超时
+    clk.t += 5
+    try:
+        get()
+    except OSError:
+        pass
+    assert len(calls) == 2
+
+
+def test_default_ctx_throttles_selftest_and_net(monkeypatch):
+    import kiosk_core as kc
+    n = {"rows": 0, "net": 0}
+    monkeypatch.setattr(kc, "selftest_plan_read", lambda *a, **k: [])
+    monkeypatch.setattr(kc, "selftest_context", lambda: {})
+    monkeypatch.setattr(kc, "selftest_run", lambda *a: n.__setitem__("rows", n["rows"] + 1) or [])
+    monkeypatch.setattr(kc, "net_probe", lambda: n.__setitem__("net", n["net"] + 1) or ("on", ""))
+    clk = _Clock()
+    ctx = dc.default_ctx(clock=clk)
+    for _ in range(15):               # 3 秒, 200 ms 一轮
+        ctx["rows"]()
+        ctx["net"]()
+        clk.t += 0.2
+    assert n == {"rows": 1, "net": 1}
+    assert dc.PERIODS["rows"] >= 5 and dc.PERIODS["net"] >= 2
+
+
+# ---- 副屏版面 v2: 执行器两排 / 自检只算 WARN FAIL / 锁屏公告 / 开机时长
+
+def _snap(**over):
+    s = {"ts": 1000.0, "net": "on", "lan2": "192.0.2.5", "uptime": "up 1 day, 3 hours, 4 minutes",
+         "rows": [{"label": "LAN2", "state": "OK", "detail": "192.0.2.5"},
+                  {"label": "WIFI", "state": "WARN", "detail": "lab 78% IN USE"},
+                  {"label": "CAPTURE 1", "state": "--", "detail": "NO SIGNAL video0"},
+                  {"label": "CH9329", "state": "OK", "detail": "1 ONLINE"},
+                  {"label": "PXE SERVER", "state": "FAIL", "detail": "DEAD"}],
+         "slots": [{"dev": "/dev/con-1", "present": True, "baud": 9600, "count": 10},
+                   {"dev": "/dev/con-2", "present": True, "baud": None, "count": None},
+                   {"dev": "/dev/con-3", "present": False, "baud": None, "count": None},
+                   {"dev": "/dev/con-4", "present": True, "baud": None, "count": None}],
+         "lamps": {"con-1": 10, "kvm": 0, "pxe": 5, "net:eno1": 1, "net:enp3s0": 2, "net:wlp4s0": 0},
+         "notice": "请前往 B101 上课", "todo": ["换线"], "dream": "昨夜整理 10-30 · 修了 PXE"}
+    s.update(over)
+    return s
+
+
+def test_checks_count_only_warn_and_fail_as_problems():
+    c = dc.layout_view(_snap())["checks"]
+    assert (c["ok"], c["warn"], c["fail"]) == (2, 1, 1)     # "--" 是待机, 不算异常
+    assert [p["label"] for p in c["problems"]] == ["PXE SERVER", "WIFI"]   # 故障排前面
+    assert c["problems"][1]["detail"] == "lab 78% IN USE"
+
+
+def test_heads_show_baud_idle_or_unplugged():
+    heads = dc.layout_view(_snap(), active={"con-1"})["heads"]
+    assert [(h["n"], h["text"], h["health"]) for h in heads] == [
+        (1, "9600", "OK"), (2, "空闲", "OK"), (3, "未插", None), (4, "空闲", "OK")]
+    assert heads[0]["active"] and not heads[1]["active"]
+
+
+def test_lower_row_follows_selftest_health_and_activity():
+    lower = dc.layout_view(_snap(), active={"pxe"})["lower"]
+    assert [x["name"] for x in lower] == ["键鼠", "PXE", "LAN1", "LAN2", "Wi-Fi"]
+    by = {x["name"]: x for x in lower}
+    assert by["PXE"]["health"] == "FAIL" and by["PXE"]["active"]
+    assert by["Wi-Fi"]["health"] == "WARN" and by["LAN2"]["health"] == "OK"
+
+
+def test_locked_view_is_a_guide_board():
+    v = dc.layout_view(_snap(), locked=True)
+    assert v["notice"] == "请前往 B101 上课"
+    assert v["todo"] == [] and v["dream"] == ""            # 锁屏只留时间/灯/公告
+
+
+def test_unlocked_view_hides_notice_and_keeps_todo():
+    v = dc.layout_view(_snap())
+    assert v["notice"] == "" and v["todo"] == ["换线"] and v["dream"]
+
+
+def test_clock_is_wall_time_even_when_snapshot_is_stale():
+    import time as _t
+    now = _t.mktime((2026, 10, 30, 13, 5, 0, 0, 0, -1))
+    v = dc.layout_view(_snap(ts=1.0), now=now)        # 快照停了, 钟照样走
+    assert v["clock"] == "13:05" and v["date"] == "10月30日 周五" and v["stale"]
+
+
+def test_uptime_short_form():
+    assert dc.short_uptime("up 1 day, 3 hours, 4 minutes") == "1天3小时"
+    assert dc.short_uptime("up 2 hours, 5 minutes") == "2小时5分"
+    assert dc.short_uptime("up 7 minutes") == "7分"
+    assert dc.short_uptime("") == ""
+
+
+# ---- 和 kiosk 同步: conbroker 目录 / 键鼠计数 / 锁屏 (kiosk.json)
+
+def _stub_kc(monkeypatch):
+    import kiosk_core as kc
+    for name in ("selftest_plan_read", "selftest_context", "selftest_run", "net_probe"):
+        monkeypatch.setattr(kc, name, lambda *a, **k: [])
+
+
+def test_default_ctx_reads_conbroker_dir_like_kiosk(monkeypatch):
+    import lamps_core
+    import serial_panel as sp
+    _stub_kc(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(sp, "serial_conf_read", lambda *a: {"user": "ops", "data_dir": "/tmp/cb"})
+    monkeypatch.setattr(lamps_core, "slot_status", lambda ddir, *a, **k: seen.setdefault("slots", ddir))
+    monkeypatch.setattr(lamps_core, "sample",
+                        lambda ddir, kvm, **k: seen.update(lamps=ddir, kvm=kvm) or ([], {}))
+    monkeypatch.setattr(dc, "read_kiosk", lambda *a: {"locked": False, "kvm": 5})
+    ctx = dc.default_ctx()
+    ctx["slots"]()
+    ctx["lamps"]()
+    assert seen == {"slots": "/tmp/cb", "lamps": "/tmp/cb", "kvm": 5}   # 键鼠计数从 kiosk 回写里读
+
+
+def test_kiosk_reporter_writes_only_on_change(tmp_path):
+    p = str(tmp_path / "kiosk.json")
+    rep = dc.KioskReporter(p)
+    assert rep.update(locked=True, kvm=3) is True
+    assert dc.read_kiosk(p) == {"locked": True, "kvm": 3}
+    assert rep.update(locked=True, kvm=3) is False         # 没变不写盘 (200 ms 一次的采样线程里调)
+    assert rep.update(locked=False, kvm=3) is True
+    assert dc.read_kiosk(p)["locked"] is False
+
+
+def test_kiosk_reporter_swallows_write_errors(tmp_path):
+    (tmp_path / "f").write_text("")                         # 父路径是个文件, 怎么都写不进去
+    rep = dc.KioskReporter(str(tmp_path / "f" / "kiosk.json"))
+    assert rep.update(locked=True, kvm=0) is False         # /run/ops-cart 没建好也不能拖垮 kiosk

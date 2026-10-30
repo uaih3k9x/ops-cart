@@ -57,6 +57,10 @@ class FakeUtil:
     def release_interface(dev, num):
         dev.released = num
 
+    @staticmethod
+    def dispose_resources(dev):
+        dev.disposed = True
+
 
 class FakeCore:
     def __init__(self, devs):
@@ -165,3 +169,22 @@ class _FakeDisplay:
     def send(self, payload, **kw):
         self.frames += 1
         return len(payload) + 16
+
+
+def test_close_releases_and_disposes():
+    # 拔插反复重连: 不放 libusb 句柄会越攒越多
+    dev = _dev()
+    d = udisp_usb.open_display(usb=FakeUsb({0x2987: dev}))
+    d.close()
+    assert dev.released == 1 and dev.disposed is True
+
+
+def test_close_survives_release_error():
+    dev = _dev()
+    d = udisp_usb.open_display(usb=FakeUsb({0x2987: dev}))
+
+    def boom(*a):
+        raise OSError("device gone")
+    d.usb.util.release_interface = boom          # 拔掉以后 release 会抛
+    d.close()
+    assert dev.disposed is True                  # 照样把句柄放掉

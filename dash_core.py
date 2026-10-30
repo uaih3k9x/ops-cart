@@ -10,14 +10,23 @@
 """
 
 import json
+import re
 import time
 
 import atomicfile
+import lamps_core
 
 STATE_PATH = "/run/ops-cart/state.json"
 KIOSK_PATH = "/run/ops-cart/kiosk.json"    # kiosk 回写: 锁屏状态等
 TODO_PATH = "/opt/pxe/todo.md"
+NOTICE_PATH = "/opt/pxe/notice.txt"        # 锁屏公告 (kiosk 锁屏也读它)
 STALE_S = 3.0                              # 快照超过这么久没更新 = 数据源停了
+
+# 慢采集项各自的节奏(秒). 快照照样每轮写, 这些项在周期内复用上次结果:
+# 自检要 ping/systemctl/v4l2-ctl, 每 200 ms 跑一遍既浪费又会在断网时拖过 STALE_S.
+# 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
+PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
+           "todo": 30, "dream": 60, "notice": 5}
 
 
 def _pull(ctx, key, default):
@@ -44,6 +53,8 @@ def collect(ctx):
         "fans": _pull(ctx, "fans", []),
         "uptime": _pull(ctx, "uptime", ""),
         "lamps": _pull(ctx, "lamps", {}),           # {"con-1": n, ..., "kvm": n, "pxe": bytes}
+        "slots": _pull(ctx, "slots", []),           # 操作头 [{dev, present, baud, count}]
+        "notice": _pull(ctx, "notice", ""),
         "kiosk": _pull(ctx, "kiosk", {}),           # {"locked": bool, "panel": str}
         "todo": _pull(ctx, "todo", []),
         "dream": _pull(ctx, "dream", ""),
@@ -77,6 +88,25 @@ def read_kiosk(path=KIOSK_PATH):
     return d if isinstance(d, dict) else {}
 
 
+class KioskReporter:
+    """kiosk 回写 kiosk.json: 锁屏状态 + 键鼠计数. 在 kiosk 的采样线程里调,
+    只在值变了才落盘; 写失败吞掉 (/run 没建好也不能拖垮车机界面)."""
+
+    def __init__(self, path=KIOSK_PATH):
+        self.path, self._last = path, None
+
+    def update(self, locked, kvm):
+        state = {"locked": bool(locked), "kvm": int(kvm)}
+        if state == self._last:
+            return False
+        try:
+            atomicfile.write_json(self.path, state)
+        except OSError:
+            return False
+        self._last = state
+        return True
+
+
 def read_todo(path=TODO_PATH, limit=6):
     """/opt/pxe/todo.md 里没勾掉的条目, 最多 limit 条."""
     try:
@@ -98,39 +128,117 @@ def read_todo(path=TODO_PATH, limit=6):
     return out
 
 
-def layout_view(snap, locked=False):
-    """快照 + 锁屏状态 → 版面模型. 渲染层只认这个结构.
+WEEKDAYS = "一二三四五六日"
+PROBLEM_ORDER = {"FAIL": 0, "WARN": 1}
 
-    锁屏时副屏当教室引导牌: 隐藏待办, 只留时间/灯条/网络/公告.
+
+def short_uptime(text):
+    """"up 1 day, 3 hours, 4 minutes" -> "1天3小时"; 只留最大的两级."""
+    units = [("week", "周"), ("day", "天"), ("hour", "小时"), ("minute", "分")]
+    parts = []
+    for en, zh in units:
+        m = re.search(r"(\d+) %ss?\b" % en, text or "")
+        if m:
+            parts.append(m.group(1) + zh)
+    return "".join(parts[:2])
+
+
+def _checks(rows):
+    """自检汇总. "--" (没插/待机) 不算异常, 只有 WARN/FAIL 进问题列表, 故障排前."""
+    states = [r.get("state") for r in rows]
+    problems = sorted((r for r in rows if r.get("state") in PROBLEM_ORDER),
+                      key=lambda r: PROBLEM_ORDER[r["state"]])
+    return {"ok": states.count("OK"), "warn": states.count("WARN"), "fail": states.count("FAIL"),
+            "problems": [{"label": r.get("label", ""), "state": r["state"],
+                          "detail": r.get("detail", "")} for r in problems]}
+
+
+def _heads(slots, active):
+    """上排 4 个操作头: 文字同主屏执行器条 (波特率 / 空闲 / 未插)."""
+    out = []
+    for n, slot in enumerate(slots or [], 1):
+        text, health = lamps_core.slot_view(n, slot)
+        out.append({"n": n, "text": text.split("\n", 1)[1], "health": health,
+                    "active": "con-%d" % n in active})
+    return out
+
+
+def _lower(rows, active):
+    """下排: 键鼠 / PXE / LAN1 / LAN2 / Wi-Fi, 健康看自检那一行, 闪看计数器."""
+    return [{"name": name, "health": lamps_core.health_of(rows, label), "active": counter in active}
+            for name, label, counter in lamps_core.LOWER]
+
+
+def layout_view(snap, locked=False, active=(), now=None):
+    """快照 + 锁屏状态 + 正在动的计数器 → 版面模型. 渲染层只认这个结构.
+
+    锁屏时副屏当教室引导牌: 只留时间/灯条/网络/公告, 待办和昨夜整理都藏.
+    active: 最近变过的计数器名 (lamps_core.Activity 算, dash_service 传进来).
+    时钟走真实时间而不是快照时间: 采集停了钟也照走, "数据源停了" 另外提示.
     """
     snap = snap or {}
     kiosk = snap.get("kiosk") or {}
     locked = bool(locked or kiosk.get("locked"))
     rows = snap.get("rows") or []
-    bad = [r for r in rows if r.get("state") not in ("OK", "PASS", "ok")]
+    active = set(active or ())
+    now = time.time() if now is None else now
+    t = time.localtime(now)
     view = {
         "locked": locked,
-        "clock": time.strftime("%H:%M", time.localtime(snap.get("ts") or time.time())),
+        "clock": time.strftime("%H:%M", t),
+        "date": "%d月%d日 周%s" % (t.tm_mon, t.tm_mday, WEEKDAYS[t.tm_wday]),
         "net": snap.get("net") or "down",
         "lan2": snap.get("lan2") or "",
-        "uptime": snap.get("uptime") or "",
+        "uptime": short_uptime(snap.get("uptime") or ""),
         "temps": snap.get("temps") or [],
         "fans": snap.get("fans") or [],
-        "lamps": snap.get("lamps") or {},
-        "checks": {"total": len(rows), "bad": len(bad),
-                   "first_bad": (bad[0].get("label") if bad else ""),
-                   "bad_labels": [r.get("label") for r in bad][:3]},
+        "heads": _heads(snap.get("slots"), active),
+        "lower": _lower(rows, active),
+        "checks": _checks(rows),
         "todo": [] if locked else (snap.get("todo") or []),
-        "dream": snap.get("dream") or "",
-        "stale": stale(snap),
+        "dream": "" if locked else (snap.get("dream") or ""),
+        "notice": (snap.get("notice") or "") if locked else "",
+        "stale": stale(snap, now),
     }
     return view
 
 
-def default_ctx(ddir="/opt/pxe", kvm_count=0):
-    """真机采集 (cart-dash 用). 每一样都兜住, 不抛."""
+def read_notice(path=NOTICE_PATH):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def every(period, f, clock=time.monotonic):
+    """包一层: period 秒内复用上次结果. 出错也记住, 一个周期后再试 (别每轮都撞超时)."""
+    st = {"at": None, "val": None, "err": None}
+
+    def get():
+        t = clock()
+        if st["at"] is None or t - st["at"] >= period:
+            st["at"] = t
+            try:
+                st["val"], st["err"] = f(), None
+            except Exception as e:
+                st["err"] = e
+        if st["err"] is not None:
+            raise st["err"]
+        return st["val"]
+    return get
+
+
+def default_ctx(ddir=None, clock=time.monotonic):
+    """真机采集 (cart-dash 用). 每一样都兜住, 不抛.
+
+    ddir: conbroker 数据目录, 默认和车机一样取 serial_panel.data_dir (跑服务那个用户的
+    ~/.conbroker), 不是 /opt/pxe. 键鼠计数在 kiosk 进程里, 从它回写的 kiosk.json 读.
+    """
     import kiosk_core as kc
-    import lamps_core
+    import serial_panel as sp
+    if ddir is None:
+        ddir = sp.data_dir(sp.serial_conf_read())
 
     def safe(f, d=None):
         if f is None:
@@ -140,20 +248,24 @@ def default_ctx(ddir="/opt/pxe", kvm_count=0):
         except Exception:
             return d
 
-    return {
+    ctx = {
         "net": lambda: kc.net_probe()[0],    # net_state 返回 (状态, 说明), 只要状态串
         "rows": lambda: kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context()),
         "temps": lambda: kc.temps_status(smart=lambda: None),
         "lan2": lambda: _lan2_addr(kc),
-        "fans": kc.fans_status,
+        "fans": lambda: kc.fans_status(),
         "uptime": lambda: kc.misc_status().get("uptime", ""),
-        "lamps": lambda: lamps_core.sample(ddir, kvm_count)[1],
+        "lamps": lambda: lamps_core.sample(ddir, read_kiosk().get("kvm", 0))[1],
+        "slots": lambda: lamps_core.slot_status(ddir),
+        "notice": lambda: read_notice(),
         "kiosk": lambda: read_kiosk(),
         "todo": lambda: read_todo(),
-        "dream": kc.dream_line,
-        "safe": safe,
-        "now": time.time,
+        "dream": lambda: kc.dream_line(),
     }
+    for key, period in PERIODS.items():
+        ctx[key] = every(period, ctx[key], clock)
+    ctx.update(safe=safe, now=time.time)
+    return ctx
 
 
 def _lan2_addr(kc):

@@ -8,13 +8,14 @@ WorkingDirectory=/opt/pxe
 # 推车 Python 3.9 没装 Pillow/pyusb, 部署时建 venv: python3 -m venv /opt/pxe/venv
 # 再 /opt/pxe/venv/bin/pip install pillow pyusb
 ExecStart=/opt/pxe/venv/bin/python /opt/pxe/dash_service.py
+# 不缓冲 stdout, 否则 journal 里看不到"副屏已连接/推送失败"
+Environment=PYTHONUNBUFFERED=1
+# 以 root 跑: 要写 /run/ops-cart (tmpfiles 建的, root:root 0755), 自检要读采集卡 /dev/video*.
+# 快照目录由 tmpfiles 建, 这里不声明 StateDirectory (那会改 /var/lib/ops-cart 的权限, 做梦在用).
 # 屏幕拔了照常写快照, 所以不因为 USB 出错就重启; 真崩了才拉起
 Restart=on-failure
 RestartSec=5
 Nice=10
-# 副屏由 udev 规则 (60-xfz1986-udisp.rules) 给组属主, 不依赖 root
-StateDirectory=ops-cart
-StateDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target

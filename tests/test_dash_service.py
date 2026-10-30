@@ -139,3 +139,33 @@ def test_loop_pushes_only_on_change():
         except OSError:
             pass
     assert disp.sent == [b"on", b"warn"]
+
+
+def test_loop_marks_moving_counters_active(tmp_path, monkeypatch):
+    """计数器变了 → 版面里对应的灯标成 active (执行器整块点亮); 第一轮只当基线."""
+    views, n = [], {"pxe": 0, "round": 0}
+
+    class Stop(Exception):
+        pass
+
+    def lamps():
+        n["pxe"] += 100                      # PXE 日志在长 = 有机器在取文件
+        return {"pxe": n["pxe"]}
+
+    t = {"v": 1000.0}
+
+    def fake_sleep(_s):
+        n["round"] += 1
+        if n["round"] >= 3:
+            raise Stop()
+
+    monkeypatch.setattr(ds.time, "sleep", fake_sleep)
+    monkeypatch.setattr(ds.time, "time", lambda: t.__setitem__("v", t["v"] + 1) or t["v"])
+    try:
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(lamps=lamps, now=lambda: t["v"]),
+               out=io.StringIO(), preview=str(tmp_path / "p.jpg"),
+               render=lambda v: views.append(v) or b"x")
+    except Stop:
+        pass
+    pxe = [next(x for x in v["lower"] if x["name"] == "PXE")["active"] for v in views]
+    assert pxe[0] is False and pxe[-1] is True

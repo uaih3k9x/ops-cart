@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """udisp_usb: udisp 副屏的 USB 传输层 (pyusb). 协议打包在 udisp.py, 这里只管开设备/发帧.
 
-推车上是 root 才有权限开设备节点，已经装了 udev 规则
-(/etc/udev/rules.d/60-xfz1986-udisp.rules, MODE 0660 GROUP=uaih3k9x),
-所以 cart-dash 以普通用户身份就能开。没有 uaccess：推车没有 seat 会话。
+推车上设备节点默认只有 root 能开. cart-dash 以 root 跑 (见 cart-dash.service);
+手动调试想用普通用户, 推车上另有 udev 规则 60-xfz1986-udisp.rules 给了组权限.
+没有 uaccess: 推车没有 seat 会话.
 """
 
 import time
@@ -54,10 +54,13 @@ class Display:
         return len(frame)
 
     def close(self):
-        try:
-            self.usb.util.release_interface(self.dev, self.intf.bInterfaceNumber)
-        except Exception:
-            pass
+        """放接口 + 释放 libusb 句柄: 拔插反复重连时不攒句柄."""
+        for f in (lambda: self.usb.util.release_interface(self.dev, self.intf.bInterfaceNumber),
+                  lambda: self.usb.util.dispose_resources(self.dev)):
+            try:
+                f()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
