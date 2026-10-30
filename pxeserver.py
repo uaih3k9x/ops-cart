@@ -332,7 +332,7 @@ class DhcpServer:
         self.netmask, self.broadcast = str(net.netmask), str(net.broadcast_address)
         self.port = port
         self.uefi_file, self.bios_file = uefi_file, bios_file
-        self.ipxe_script = f"http://{ip}/boot.ipxe"
+        self.ipxe_script = f"http://{ip}/{IPXE_SCRIPT}"
         self.log = log
         self.leases = {}        # mac(bytes) -> [ip, 到期时间]
         self.declined = {}      # ip -> 隔离到什么时候
@@ -537,11 +537,22 @@ class DhcpServer:
 
 PXE_MODE = "/opt/pxe/pxe-mode.json"
 
+# Windows PE: GRUB 链式加载 iPXE (Rocky 的 GRUB 直接 linux wimboot 报 kernel too old), iPXE 二次 DHCP
+# 拿到 boot.ipxe, 再用 wimboot 起 PE. 文件都在 tftp 根目录下, 由 80 口的 httpserve 出.
+# ipxe.efi 必须是完整版 ipxe-x86_64.efi (snponly 被 GRUB 链式加载时认不到网卡);
+# 微PE 的 wim 里没有 bootmgfw.efi, 要单独放.
+WINPE_DIR = "win"
+WINPE_FILES = ("ipxe.efi", "wimboot", "bootmgfw.efi", "bcd", "boot.sdi", "boot.wim")
+WINPE_CHAIN = f"{WINPE_DIR}/ipxe.efi"
+IPXE_SCRIPT = "boot.ipxe"
+WINPE_TITLE = "WinPE (GRUB -> iPXE -> wimboot)"
 
-def grub_menu(ip, install=False):
+
+def grub_menu(ip, install=False, winpe=False):
     """GRUB 菜单: 救援 (默认, 不装系统) / 自动装机. 每项都给 HTTP (快) 和 TFTP (慢) 两条路.
     装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此核对是不是解锁的那台
-    (防误装; MAC 头是客户端自报的, 不当访问控制)."""
+    (防误装; MAC 头是客户端自报的, 不当访问控制).
+    winpe=True 在最后加一项 WinPE (不当默认项), 只给解锁时的 MAC 菜单用."""
     repo = f"http://{ip}:8000"
     if install:
         title, args, timeout = ("Rocky 9.8 auto install",
@@ -553,7 +564,35 @@ def grub_menu(ip, install=False):
         out.append(f"menuentry '{title} ({label})' {{\n"
                    f"    linux {src}/vmlinuz ip=dhcp {args}\n"
                    f"    initrd {src}/initrd.img\n}}\n")
+    if winpe:
+        out.append(f"menuentry '{WINPE_TITLE}' {{\n"
+                   f"    chainloader (http,{ip})/{WINPE_CHAIN}\n}}\n")
     return "\n".join(out)
+
+
+def ipxe_script():
+    """boot.ipxe: 路径相对脚本自己的 URL (http://<ip>/boot.ipxe), 不用写地址."""
+    lines = ["#!ipxe", f"kernel {WINPE_DIR}/wimboot"]
+    lines += [f"initrd -n {n} {WINPE_DIR}/{n}" for n in WINPE_FILES if n not in ("ipxe.efi", "wimboot")]
+    return "\n".join(lines + ["boot"]) + "\n"
+
+
+def winpe_missing(root):
+    """tftp 根目录下 win/ 缺的 (或空的, 拷到一半) 文件, 按 WINPE_FILES 顺序. 空列表 = 齐了."""
+    missing = []
+    for n in WINPE_FILES:
+        try:
+            ok = os.path.getsize(os.path.join(root, WINPE_DIR, n)) > 0
+        except OSError:
+            ok = False
+        if not ok:
+            missing.append(f"{WINPE_DIR}/{n}")
+    return missing
+
+
+def unlock_only_menu(text):
+    """只能给解锁那台机器的菜单: 带自动装机 (inst.ks=) 或 WinPE 链式加载项."""
+    return "inst.ks=" in text or WINPE_CHAIN in text
 
 
 def norm_mac(mac):
@@ -695,7 +734,8 @@ class TftpServer:
 
     def open_file(self, name, client):
         """-> (文件对象, 大小, 日志前缀). 找不到/越界抛 OSError.
-        GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 的, 只有已解锁、没过期、文件名就是那台 MAC 时才照发,
+        GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 或 WinPE 项的 (unlock_only_menu), 只有已解锁、没过期、
+        文件名就是那台 MAC 时才照发,
         否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走)."""
         path = tftp_safe_name(self.root, name)
         f = open(path, "rb")
@@ -705,7 +745,7 @@ class TftpServer:
             return f, size, f"TFTP RRQ {name}"
         with f:
             data = f.read()
-        if b"inst.ks=" in data:
+        if unlock_only_menu(data.decode("utf-8", "replace")):
             mac = menu_mac(base)
             if not install_allowed(mac, pxe_mode(self.pxe_mode_path, self.now())):
                 data = grub_menu(self.ip).encode()
