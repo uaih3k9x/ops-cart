@@ -141,3 +141,28 @@ def test_label_includes_load_and_voltage():
 def test_detail_partial():
     assert uc.detail({"voltage": 232.0}) == "232V"
     assert uc.detail({"load": 7}) == "7% 负载"
+
+
+# ---- hidraw 找 APC: 内核 uevent 的 HID_ID 是补零 8 位 (0003:0000051D:00000002)
+
+def _hidraw_tree(tmp_path, devs):
+    for name, hid_id in devs.items():
+        d = tmp_path / name / "device"
+        d.mkdir(parents=True)
+        (d / "uevent").write_text("DRIVER=hid-generic\nHID_ID=%s\nHID_NAME=x\n" % hid_id)
+    return str(tmp_path / "hidraw*")
+
+
+def test_hidraw_nodes_matches_real_padded_hid_id(tmp_path):
+    import ups_core as uc
+    root = _hidraw_tree(tmp_path, {
+        "hidraw0": "0003:00002109:00008888",      # USB hub 的 HID, 不是 UPS
+        "hidraw7": "0003:0000051D:00000002",      # 推车上实测的 APC Back-UPS
+    })
+    assert uc.hidraw_nodes(root) == ["/dev/hidraw7"]
+
+
+def test_hidraw_nodes_ignores_other_vendors(tmp_path):
+    import ups_core as uc
+    root = _hidraw_tree(tmp_path, {"hidraw1": "0003:00001164:0000B29D"})
+    assert uc.hidraw_nodes(root) == []

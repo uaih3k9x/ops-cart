@@ -128,6 +128,19 @@ HIDRAW_GLOB = "/sys/class/hidraw/hidraw*"
 APC_VENDOR, APC_PRODUCT = "051d", "0002"
 
 
+def _hid_id(uevent):
+    """uevent 里的 HID_ID=总线:厂商:产品 -> (厂商, 产品). 内核写的是补零 8 位十六进制
+    (0003:0000051D:00000002), 按数值比, 别按字符串拼."""
+    for line in uevent.splitlines():
+        if line.startswith("HID_ID="):
+            try:
+                _bus, vid, pid = line[7:].split(":")
+                return int(vid, 16), int(pid, 16)
+            except ValueError:
+                return None
+    return None
+
+
 def hidraw_nodes(root=HIDRAW_GLOB):
     """/sys/class/hidraw/hidrawN 里属于 APC UPS 的那些设备节点路径."""
     import glob
@@ -139,7 +152,7 @@ def hidraw_nodes(root=HIDRAW_GLOB):
                 text = f.read().upper()
         except OSError:
             continue
-        if f"HID_ID=0003:{APC_VENDOR.upper()}:{APC_PRODUCT.upper()}" in text:
+        if _hid_id(text) == (int(APC_VENDOR, 16), int(APC_PRODUCT, 16)):
             out.append("/dev/" + os.path.basename(d))
     return out
 
