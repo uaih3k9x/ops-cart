@@ -281,3 +281,117 @@ def test_match_refuses_serial_shared_with_another_disk():
 def test_match_serial_rule_must_match_the_disk_found():
     assert cc.match_disk([SATA, NVME], dict(RULE, serial="SN-EXAMPLE-2"))[0] is None
     assert cc.match_disk([SATA, NVME], dict(RULE, serial="SN-EXAMPLE-1"))[0] == "SERIALNO=SN-EXAMPLE-1"
+
+
+# ---------------------------------------------------------------- 批量清单 -> 每台放不放行
+
+M1, M2, M3 = "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"
+
+
+def _batch(**kw):
+    b = {"image": "lab-img", "rule": RULE,
+         "machines": [{"mac": M1, "disks": [NVME, SATA]},
+                      {"mac": M2.replace(":", "-").upper(), "disks": {"blockdevices": [dict(NVME, serial="SN-EXAMPLE-4")]}}]}
+    b.update(kw)
+    return b
+
+
+def _plan(purpose="clone-restore", batch=None, mac=None, missing=(), exists=("lab-img",), conf=SMB):
+    return cc.plan(purpose, conf, _batch() if batch is None else batch, IP, mac=mac, missing=missing,
+                   image_exists=lambda n: n in exists)
+
+
+def test_plan_restore_all_ok():
+    p = _plan()
+    assert p["error"] is None and p["purpose"] == "clone-restore"
+    assert [(r["mac"], r["image"], r["device"], r["reason"]) for r in p["rows"]] == [
+        (M1, "lab-img", "SERIALNO=SN-EXAMPLE-1", None), (M2, "lab-img", "SERIALNO=SN-EXAMPLE-4", None)]
+    assert p["rows"][0]["params"] == cc.boot_params("clone-restore", "lab-img", "SERIALNO=SN-EXAMPLE-1", SMB, IP)
+    assert isinstance(p["digest"], str) and len(p["digest"]) >= 12
+
+
+def test_plan_restore_match_failure_gets_no_params():
+    b = _batch()
+    b["machines"][1]["disks"] = [NVME, dict(NVME, serial="SN-EXAMPLE-5")]      # 两块一样的盘
+    p = _plan(batch=b)
+    assert p["error"] is None
+    bad = p["rows"][1]
+    assert bad["device"] is None and bad["params"] is None and "不猜" in bad["reason"]
+    assert p["rows"][0]["params"]
+
+
+def test_plan_restore_per_machine_image_and_missing_image():
+    b = _batch()
+    b["machines"][1]["image"] = "other-img"
+    p = _plan(batch=b)
+    assert p["rows"][1]["image"] == "other-img" and p["rows"][1]["params"] is None
+    assert "other-img" in p["rows"][1]["reason"]
+
+
+def test_plan_restore_nobody_ok_is_an_error():
+    b = _batch(rule={})
+    p = _plan(batch=b)
+    assert p["error"] and p["digest"] is None
+    assert all(r["params"] is None for r in p["rows"])
+
+
+def test_plan_clone_files_missing_is_an_error():
+    p = _plan(missing=["clonezilla/filesystem.squashfs"])
+    assert "clonezilla/filesystem.squashfs" in p["error"] and p["rows"] == [] and p["digest"] is None
+
+
+@pytest.mark.parametrize("batch", [None, [], {"image": "lab-img", "rule": RULE},
+                                   _batch(machines=[]), _batch(machines="x"),
+                                   _batch(machines=[{"mac": "nope", "disks": [NVME]}]),
+                                   _batch(machines=[{"mac": M1, "disks": [NVME]}, {"mac": M1.upper(), "disks": [NVME]}]),
+                                   _batch(machines=[{"disks": [NVME]}]), _batch(machines=[None]),
+                                   _batch(image="ask_user"), _batch(image=None)])
+def test_plan_bad_batch_is_an_error(batch):
+    p = cc.plan("clone-restore", SMB, batch, IP, image_exists=lambda n: True)
+    assert p["error"] and p["digest"] is None
+
+
+def test_plan_bad_conf_is_an_error():
+    p = _plan(conf={"proto": "ftp"})
+    assert p["error"] and p["digest"] is None
+    p = _plan(conf=dict(SMB, local_dir=""))
+    assert "local_dir" in p["error"]
+
+
+def test_plan_save_one_machine_and_refuses_existing_image():
+    p = _plan("clone-save", mac=M2, exists=())
+    assert p["error"] is None and [r["mac"] for r in p["rows"]] == [M2]
+    assert "savedisk lab-img SERIALNO=SN-EXAMPLE-4" in " ".join(p["rows"][0]["params"])
+    p = _plan("clone-save", mac=M2, exists=("lab-img",))
+    assert "已" in p["error"] and p["digest"] is None              # 不覆盖仓库里已有的镜像
+
+
+@pytest.mark.parametrize("mac", [None, "", "nope", M3])
+def test_plan_save_needs_a_registered_mac(mac):
+    p = _plan("clone-save", mac=mac, exists=())
+    assert p["error"] and p["digest"] is None
+
+
+def test_plan_unknown_purpose():
+    assert _plan("rocky")["error"]
+
+
+def test_plan_digest_tracks_what_gets_written():
+    a, b = _plan(), _plan()
+    assert a["digest"] == b["digest"]
+    c = _batch()
+    c["machines"][1]["disks"] = [dict(NVME, serial="SN-EXAMPLE-6")]
+    assert _plan(batch=c)["digest"] != a["digest"]
+    assert _plan(batch=_batch(image="lab-img2"), exists=("lab-img2",))["digest"] != a["digest"]
+    assert _plan(conf=dict(SMB, restore_share="other"))["digest"] != a["digest"]
+    assert _plan("clone-save", mac=M1, exists=())["digest"] != a["digest"]
+
+
+def test_plan_lines_for_the_confirm_dialog():
+    b = _batch()
+    b["machines"][1]["disks"] = []
+    lines = cc.plan_lines(_plan(batch=b))
+    assert len(lines) == 2
+    assert M1 in lines[0] and "lab-img" in lines[0] and "SERIALNO=SN-EXAMPLE-1" in lines[0]
+    assert M2 in lines[1] and "不放行" in lines[1]
+    assert cc.plan_lines(_plan(missing=["clonezilla/vmlinuz"])) == []

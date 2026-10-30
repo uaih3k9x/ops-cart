@@ -151,6 +151,26 @@ def test_pxe_tick_decide_consumed_disarms():
     assert d["disarm"] is True and MAC in d["banner"] and d["view"] == {"mode": "rescue"}
 
 
+MAC2 = "02:00:00:00:00:0b"
+
+
+def test_pxe_tick_decide_batch_waits_for_everyone_and_retires_consumed():
+    """恢复一批 (#18): 名单里全都取走菜单才上锁; 取走的那几台先把菜单删掉 (关机后再 PXE 不会再来一遍)."""
+    st = {"mode": "install", "mac": MAC, "macs": [MAC, MAC2], "since": 10, "until": 9999}
+    took = {MAC}
+    d = ui.pxe_tick_decide(st, "log", 20, consumed=lambda log, mac, since: mac in took)
+    assert d["disarm"] is False and d["retire"] == [MAC]
+    assert d["view"] == {"mode": "install", "mac": MAC, "left": 9979, "count": 2}
+    took.add(MAC2)
+    d = ui.pxe_tick_decide(st, "log", 20, consumed=lambda log, mac, since: mac in took)
+    assert d["disarm"] is True and "2 台" in d["banner"] and d["view"] == {"mode": "rescue"}
+
+
+def test_pxe_button_texts_batch():
+    a, b = ui.pxe_button_texts({"mode": "install", "mac": MAC, "left": 125, "count": 3})
+    assert "3 台" in a and "02:05" in a and "02:05" in b
+
+
 def test_pxe_tick_decide_left_never_negative():
     st = {"mode": "install", "mac": MAC, "since": 0, "until": 10}
     assert ui.pxe_tick_decide(st, "", 10.5)["view"]["left"] == 0

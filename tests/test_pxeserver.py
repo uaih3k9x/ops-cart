@@ -1168,3 +1168,113 @@ def test_tftp_winpe_menu_only_for_armed_mac(tmp_path):
     got = _fetch(root, mode, "/grub.cfg-01-02-00-00-00-00-02")
     assert "ipxe.efi" not in got and "inst.rescue" in got
     assert "ipxe.efi" not in _fetch(root, mode, "/" + ARMED_CFG, now=1001)   # 过期
+
+
+# ---- #18: Clonezilla 克隆菜单, 同 WinPE: 只进解锁后的 MAC 菜单
+
+CLONE_PARAMS = ["boot=live", "noprompt", 'ocs_live_run="ocs-sr -batch restoredisk lab-img SERIALNO=SN-EXAMPLE-1"',
+                'ocs_repository="smb://192.0.2.1/clone-ro/"']
+
+
+def test_grub_menu_clone_default_clone_then_rescue_no_ks():
+    cfg = _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS)
+    entries = cfg.split("menuentry ")[1:]
+    assert "set default=0" in cfg and "set timeout=15" in cfg
+    assert entries[0].startswith(f"'{_px.CLONE_TITLES['clone-restore']}'")
+    assert "linux (http,192.0.2.1)/clonezilla/vmlinuz boot=live noprompt " in entries[0]
+    assert 'ocs_live_run=\\"ocs-sr -batch restoredisk lab-img SERIALNO=SN-EXAMPLE-1\\"' in entries[0]
+    assert "fetch=http://192.0.2.1/clonezilla/filesystem.squashfs" in entries[0]
+    assert "initrd (http,192.0.2.1)/clonezilla/initrd.img" in entries[0]
+    assert "inst.rescue" in entries[1] and len(entries) == 3
+    assert "inst.ks" not in cfg and _px.WINPE_CHAIN not in cfg
+
+
+def test_grub_menu_clone_titles_say_what_happens():
+    assert "save" in _px.grub_menu_clone("192.0.2.1", "clone-save", CLONE_PARAMS).split("menuentry ")[1].lower()
+    assert "overwrite" in _px.CLONE_TITLES["clone-restore"].lower()
+
+
+@pytest.mark.parametrize("bad", ["x$y", "a;b", "a\\b", "a'b", "a`b", "a{b", "a}b", "a#b", "a\nb", 'a"b',
+                                 "a|b", "a&b", "a<b", ""])
+def test_grub_menu_clone_refuses_unsafe_tokens(bad):
+    with pytest.raises(ValueError):
+        _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS + [bad])
+
+
+def test_grub_menu_clone_refuses_unknown_purpose():
+    with pytest.raises(ValueError):
+        _px.grub_menu_clone("192.0.2.1", "rocky", CLONE_PARAMS)
+
+
+def test_clone_missing_lists_absent_or_empty_files(tmp_path):
+    assert _px.clone_missing(str(tmp_path)) == [f"clonezilla/{n}" for n in _px.CLONE_FILES]
+    assert set(_px.CLONE_FILES) == {"vmlinuz", "initrd.img", "filesystem.squashfs"}
+    (tmp_path / "clonezilla").mkdir()
+    for n in _px.CLONE_FILES:
+        (tmp_path / "clonezilla" / n).write_bytes(b"x")
+    assert _px.clone_missing(str(tmp_path)) == []
+    (tmp_path / "clonezilla" / "filesystem.squashfs").write_bytes(b"")
+    assert _px.clone_missing(str(tmp_path)) == ["clonezilla/filesystem.squashfs"]
+
+
+@pytest.mark.parametrize("text,want", [
+    ("linux (http,192.0.2.1)/clonezilla/vmlinuz boot=live", True),
+    ("linux /clonezilla/vmlinuz", True),
+    ('linux /vmlinuz ocs_live_run=\\"ocs-sr\\"', True),              # 换了目录名的手写克隆菜单也拦
+])
+def test_unlock_only_menu_clone(text, want):
+    assert _px.unlock_only_menu(text) is want
+
+
+def test_rescue_and_rocky_menus_have_no_clone():
+    for cfg in (grub_menu("192.0.2.1"), grub_menu("192.0.2.1", install=True), _px.grub_menu_winpe("192.0.2.1")):
+        assert "clonezilla" not in cfg and "ocs_live_run" not in cfg
+
+
+def test_tftp_clone_menu_only_for_armed_mac(tmp_path):
+    root, mode = _tree(tmp_path, armed_until=1000)
+    clone = _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS)
+    (root / ARMED_CFG).write_text(clone)
+    (root / "grub.cfg-01-02-00-00-00-00-02").write_text(clone)
+    assert "ocs_live_run" in _fetch(root, mode, "/" + ARMED_CFG)
+    got = _fetch(root, mode, "/grub.cfg-01-02-00-00-00-00-02")
+    assert "ocs_live_run" not in got and "inst.rescue" in got
+    assert "ocs_live_run" not in _fetch(root, mode, "/" + ARMED_CFG, now=1001)   # 过期
+
+
+def test_pxe_mode_batch_macs(tmp_path):
+    """恢复一批: pxe-mode.json 带 macs, 名单里的每台都放行, 名单外的不放."""
+    p = tmp_path / "m.json"
+    p.write_text(json.dumps({"mac": "02:00:00:00:00:01", "macs": ["02-00-00-00-00-01", "02:00:00:00:00:02"],
+                             "since": 1, "until": 10}))
+    st = pxe_mode(str(p), now=5)
+    assert st["macs"] == ["02:00:00:00:00:01", "02:00:00:00:00:02"]
+    assert _px.install_allowed("02:00:00:00:00:02", st) and _px.install_allowed("02:00:00:00:00:01", st)
+    assert not _px.install_allowed("02:00:00:00:00:03", st)
+    assert not _px.install_allowed("02:00:00:00:00:02", pxe_mode(str(p), now=11))   # 过期
+
+
+def test_pxe_mode_single_mac_unchanged(tmp_path):
+    p = tmp_path / "m.json"
+    p.write_text(json.dumps({"mac": "02:00:00:00:00:01", "since": 1, "until": 10}))
+    assert pxe_mode(str(p), now=5) == {"mode": "install", "mac": "02:00:00:00:00:01", "since": 1, "until": 10}
+
+
+@pytest.mark.parametrize("macs", ["02:00:00:00:00:02", ["nope"], [None], [], {"a": 1}])
+def test_pxe_mode_bad_macs_is_rescue(tmp_path, macs):
+    """名单坏了 -> 整个当没解锁 (宁可谁都不给)."""
+    p = tmp_path / "m.json"
+    p.write_text(json.dumps({"mac": "02:00:00:00:00:01", "macs": macs, "since": 1, "until": 10}))
+    assert pxe_mode(str(p), now=5) == {"mode": "rescue"}
+
+
+def test_tftp_clone_batch_members_each_get_their_menu(tmp_path):
+    root, mode = _tree(tmp_path)
+    mode.write_text(json.dumps({"mac": ARMED_MAC, "macs": [ARMED_MAC, "02:00:00:00:00:02"],
+                                "since": 0, "until": 1000}))
+    clone = _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS)
+    for n in (ARMED_CFG, "grub.cfg-01-02-00-00-00-00-02", "grub.cfg-01-02-00-00-00-00-03"):
+        (root / n).write_text(clone)
+    assert "ocs_live_run" in _fetch(root, mode, "/" + ARMED_CFG)
+    assert "ocs_live_run" in _fetch(root, mode, "/grub.cfg-01-02-00-00-00-00-02")
+    assert "ocs_live_run" not in _fetch(root, mode, "/grub.cfg-01-02-00-00-00-00-03")

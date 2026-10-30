@@ -13,7 +13,11 @@ pxeserver.grub_menu_clone. 参数出处 (官方文档):
 - PXE 启动  https://clonezilla.org/livepxe.php
 """
 
+import hashlib
+import json
 import re
+
+from pxeserver import norm_mac
 
 CLONE_PURPOSES = ("clone-save", "clone-restore")
 
@@ -101,7 +105,7 @@ def ocs_sr_cmd(purpose, image, device, multicast=None):
 
 # ---------------------------------------------------------------- 镜像仓库 (ocs_repository)
 # 启动参数文档: ocs_repository="smb://[domain;user:password@]host/path" / "(smb1|...|smb3|...)://..." /
-# "nfs|nfs4://host/path". 仓库挂到 /home/partimag, 镜像就是下面的 <镜像名>/ 目录.
+# "nfs|nfs4://host/path". 仓库挂到 Clonezilla 的镜像目录 (partimag), 镜像就是下面的 <镜像名>/ 目录.
 # 抓镜像和恢复用两个共享 (save_share 可写, restore_share 只读), 恢复不拿能写的账号去挂.
 
 _SMB_VERSIONS = ("smb", "smb1", "smb1.0", "smb2", "smb2.0", "smb2.1", "smb3", "smb3.0", "smb3.11", "smb3.1.1")
@@ -290,3 +294,94 @@ def boot_params(purpose, image, device, conf, ip, multicast=None):
     repo = repo_url(conf, purpose, ip)
     return list(_LIVE_BASE) + [f'ocs_live_run="{cmd}"', 'ocs_live_extra_param=""', 'ocs_live_batch="yes"',
                                f'ocs_repository="{repo}"']
+
+
+# ---------------------------------------------------------------- 批量清单
+# clone-batch.json: {"image": 默认镜像名, "rule": 盘匹配规则 (这一批同型号, 一条规则),
+#                    "machines": [{"mac": ..., "image": 可选覆盖, "disks": lsblk 登记}]}
+# 恢复: 名单里每台各自匹配, 匹配上的才放行; 抓镜像: 只放车机上选的那一台 (要在名单里, 盘要登记过).
+
+def _batch_error(batch):
+    if not isinstance(batch, dict):
+        return "克隆清单不是对象"
+    machines = batch.get("machines")
+    if not isinstance(machines, list) or not machines:
+        return "克隆清单里没有机器 (machines)"
+    seen = set()
+    for m in machines:
+        if not isinstance(m, dict):
+            return f"克隆清单里有一项不是对象: {m!r}"
+        try:
+            mac = norm_mac(m.get("mac") or "")
+        except ValueError:
+            return f"克隆清单里 MAC 不对: {m.get('mac')!r}"
+        if mac in seen:
+            return f"克隆清单里 {mac} 写了两次"
+        seen.add(mac)
+        err = image_name_error(m.get("image") or batch.get("image"))
+        if err:
+            return f"{mac}: {err}"
+    return None
+
+
+def plan(purpose, conf, batch, ip, mac=None, missing=(), image_exists=lambda name: False):
+    """-> {"purpose", "error", "rows", "digest"}. 车机对话框照 rows 列出来让人确认, 解锁时再算一遍,
+    digest 对不上就不写 (确认之后清单/配置被改了).
+    rows: [{"mac", "image", "device", "reason", "params"}], 放行的 params 是 boot_params, 不放行的 None + 原因.
+    error: 整批不能解锁的原因 (Clonezilla 文件不齐、配置/清单不对、一台都放不了); 这时 digest 是 None.
+    missing: tftp 树里缺的 Clonezilla 文件 (pxeserver.clone_missing); image_exists(镜像名): 仓库里有没有.
+    抓镜像: 镜像已存在就拒绝 (不覆盖); 恢复: 镜像不存在那台不放行."""
+    out = {"purpose": purpose, "error": None, "rows": [], "digest": None}
+    if purpose not in CLONE_PURPOSES:
+        out["error"] = f"克隆用途不对: {purpose!r}"
+        return out
+    if missing:
+        out["error"] = f"Clonezilla 文件不齐, 缺 {', '.join(missing)}"
+        return out
+    try:
+        repo_url(conf, purpose, ip)
+    except ValueError as e:
+        out["error"] = f"克隆配置不对: {e}"
+        return out
+    local = conf.get("local_dir")
+    if not isinstance(local, str) or not local.startswith("/"):
+        out["error"] = "克隆配置缺 local_dir (推车上镜像目录的绝对路径, 用来核对镜像在不在)"
+        return out
+    out["error"] = _batch_error(batch)
+    if out["error"]:
+        return out
+    machines = batch["machines"]
+    if purpose == "clone-save":
+        try:
+            want = norm_mac(mac or "")
+        except ValueError:
+            out["error"] = f"抓镜像要选一台机器, 不是 {mac!r}"
+            return out
+        machines = [m for m in machines if norm_mac(m["mac"]) == want]
+        if not machines:
+            out["error"] = f"{want} 不在克隆清单里 (要先登记它的盘)"
+            return out
+    for m in machines:
+        image = m.get("image") or batch.get("image")
+        device, reason = match_disk(m.get("disks"), batch.get("rule"))
+        if purpose == "clone-save" and image_exists(image):
+            out["error"] = f"镜像 {image} 已在仓库里, 不覆盖; 换个名字"
+            return out
+        if purpose == "clone-restore" and device and not image_exists(image):
+            device, reason = None, f"仓库里没有镜像 {image}"
+        params = boot_params(purpose, image, device, conf, ip) if device else None
+        out["rows"].append({"mac": norm_mac(m["mac"]), "image": image, "device": device,
+                            "reason": reason, "params": params})
+    ok = [r for r in out["rows"] if r["params"]]
+    if not ok:
+        out["error"] = "一台都放不了: " + "; ".join(f"{r['mac']} {r['reason']}" for r in out["rows"])
+        return out
+    blob = json.dumps([purpose, [[r["mac"], r["params"]] for r in ok]], sort_keys=True)
+    out["digest"] = hashlib.sha256(blob.encode()).hexdigest()[:16]
+    return out
+
+
+def plan_lines(p):
+    """确认对话框里一台一行: 放行的写镜像和目标盘, 不放行的写原因."""
+    return [f"{r['mac']}  {r['image']}  -> {r['device']}" if r["params"] else
+            f"{r['mac']}  {r['image']}  不放行: {r['reason']}" for r in p["rows"]]

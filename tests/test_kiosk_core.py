@@ -1360,3 +1360,166 @@ def test_disarm_scrubs_winpe_menus_anywhere_in_tree(tmp_path):
     assert menus == {"grub.cfg"}
     assert (tmp_path / "grub.cfg.bak-20261030").exists()
     assert (tmp_path / "boot.ipxe").exists() and (tmp_path / "win" / "boot.wim").exists()
+
+
+# ---------------------------------------------------------------- #18 克隆 (Clonezilla)
+
+CMAC2, CMAC3 = "02:00:00:00:00:02", "02:00:00:00:00:03"
+DISK1 = {"name": "nvme0n1", "model": "EXAMPLE NVME 512GB", "serial": "SN-EXAMPLE-1", "size": 512110190592,
+         "type": "disk", "tran": "nvme"}
+CRULE = {"model": "EXAMPLE NVME 512GB"}
+
+
+def _clone_env(tmp_path, files=True, image=True, machines=None):
+    root = tmp_path / "tftp"
+    root.mkdir(parents=True)
+    if files:
+        (root / "clonezilla").mkdir()
+        for n in _px.CLONE_FILES:
+            (root / "clonezilla" / n).write_bytes(b"x")
+    repo = tmp_path / "repo"
+    (repo / "lab-img").mkdir(parents=True) if image else repo.mkdir()
+    conf = tmp_path / "clone.json"
+    conf.write_text(json.dumps({"proto": "smb", "user": "clonesave", "password": "Example-pass1",
+                                "save_share": "clone-rw", "restore_share": "clone-ro", "local_dir": str(repo)}))
+    batch = tmp_path / "clone-batch.json"
+    batch.write_text(json.dumps({"image": "lab-img", "rule": CRULE, "machines": machines or [
+        {"mac": MAC, "disks": [DISK1]}, {"mac": CMAC2, "disks": [dict(DISK1, serial="SN-EXAMPLE-2")]}]}))
+    return {"root": root, "path": tmp_path / "m.json", "conf_path": conf, "batch_path": batch}
+
+
+def _cplan(env, purpose="clone-restore", mac=None):
+    return kc.clone_plan(purpose, mac=mac, root=env["root"], conf_path=env["conf_path"],
+                         batch_path=env["batch_path"])
+
+
+def _carm(env, purpose="clone-restore", mac=None, confirm="auto", now=1000):
+    if confirm == "auto":
+        confirm = _cplan(env, purpose, mac)["digest"]
+    kc.pxe_arm(mac, now=now, purpose=purpose, confirm=confirm, **env)
+
+
+def _menu(env, mac):
+    p = env["root"] / kc.mac_cfg_name(mac)
+    return p.read_text() if p.exists() else None
+
+
+def test_clone_purposes_are_arm_purposes():
+    assert {"clone-save", "clone-restore"} <= set(kc.ARM_PURPOSES)
+
+
+def test_arm_clone_restore_writes_each_batch_mac_menu(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(kc, "_pxe_event", events.append)
+    env = _clone_env(tmp_path)
+    _carm(env)
+    for mac, serial in ((MAC, "SN-EXAMPLE-1"), (CMAC2, "SN-EXAMPLE-2")):
+        cfg = _menu(env, mac)
+        assert f"restoredisk lab-img SERIALNO={serial}" in default_entry(cfg)
+        assert "inst.ks" not in cfg and "smb://192.0.2.1/clone-ro/" in cfg
+        assert "clonesave" not in cfg                                     # 恢复不带可写账号
+    rescue = (env["root"] / "grub.cfg").read_text()
+    assert "ocs_live_run" not in rescue and "clonezilla" not in rescue
+    st = kc.pxe_mode_read(path=env["path"], now=1001)
+    assert st["mode"] == "install" and st["macs"] == [MAC, CMAC2]
+    assert "clone-restore" in events[0] and "2 台" in events[0]
+
+
+def test_arm_clone_save_only_the_chosen_mac(tmp_path):
+    env = _clone_env(tmp_path, image=False)
+    _carm(env, "clone-save", mac=CMAC2)
+    cfg = _menu(env, CMAC2)
+    assert "savedisk lab-img SERIALNO=SN-EXAMPLE-2" in default_entry(cfg)
+    assert "smb://clonesave:Example-pass1@192.0.2.1/clone-rw/" in cfg
+    assert _menu(env, MAC) is None
+    assert kc.pxe_mode_read(path=env["path"], now=1001) == {"mode": "install", "mac": CMAC2, "since": 1000,
+                                                            "until": 1000 + 1800}
+
+
+def _nothing_written(env):
+    menus = [p.name for p in env["root"].glob("grub.cfg-01-*")]
+    return menus == [] and not env["path"].exists()
+
+
+def test_arm_clone_refused_when_files_missing(tmp_path):
+    env = _clone_env(tmp_path, files=False)
+    with pytest.raises(ValueError, match="clonezilla/vmlinuz"):
+        _carm(env, confirm="whatever")
+    assert _nothing_written(env)
+
+
+def test_arm_clone_refused_without_matching_confirmation(tmp_path):
+    """车机上确认的清单和真正写的不一样 (中途有人改了清单) -> 不写."""
+    env = _clone_env(tmp_path)
+    old = _cplan(env)["digest"]
+    batch = json.loads(env["batch_path"].read_text())
+    batch["machines"].append({"mac": CMAC3, "disks": [dict(DISK1, serial="SN-EXAMPLE-3")]})
+    env["batch_path"].write_text(json.dumps(batch))
+    for confirm in (old, None, ""):
+        with pytest.raises(ValueError, match="确认"):
+            _carm(env, confirm=confirm)
+    assert _nothing_written(env)
+
+
+def test_arm_clone_restore_match_failure_gets_no_menu(tmp_path):
+    env = _clone_env(tmp_path, machines=[{"mac": MAC, "disks": [DISK1]},
+                                         {"mac": CMAC2, "disks": [dict(DISK1, serial="SN-EXAMPLE-2"),
+                                                                  dict(DISK1, serial="SN-EXAMPLE-3")]}])
+    _carm(env)
+    assert "SERIALNO=SN-EXAMPLE-1" in _menu(env, MAC)
+    assert _menu(env, CMAC2) is None                                      # 两块一样的盘: 不猜
+    assert kc.pxe_mode_read(path=env["path"], now=1001)["mac"] == MAC
+
+
+def test_arm_clone_restore_nobody_matches_refused(tmp_path):
+    env = _clone_env(tmp_path, machines=[{"mac": MAC, "disks": []}])
+    with pytest.raises(ValueError):
+        _carm(env, confirm="x")
+    assert _nothing_written(env)
+
+
+def test_arm_clone_restore_refused_when_image_not_in_repo(tmp_path):
+    env = _clone_env(tmp_path, image=False)
+    with pytest.raises(ValueError):
+        _carm(env, confirm="x")
+    assert _nothing_written(env)
+
+
+def test_arm_clone_save_refused_when_image_exists(tmp_path):
+    env = _clone_env(tmp_path, image=True)
+    with pytest.raises(ValueError, match="已"):
+        _carm(env, "clone-save", mac=MAC, confirm="x")
+    assert _nothing_written(env)
+
+
+def test_clone_plan_missing_config_files(tmp_path):
+    env = _clone_env(tmp_path)
+    env["conf_path"].unlink()
+    assert "clone.json" in _cplan(env)["error"]
+    env = _clone_env(tmp_path / "b")
+    env["batch_path"].write_text("{oops")
+    assert "clone-batch.json" in _cplan(env)["error"]
+
+
+def test_disarm_scrubs_clone_menus_and_leaves_live_files(tmp_path):
+    env = _clone_env(tmp_path)
+    _carm(env)
+    (env["root"] / "EFI" / "BOOT").mkdir(parents=True)
+    (env["root"] / "EFI" / "BOOT" / "grub.cfg").write_text(_menu(env, MAC))  # 手抄进共享位置的
+    kc.pxe_disarm(root=env["root"], path=env["path"])
+    menus = {str(p.relative_to(env["root"])) for p in env["root"].rglob("grub.cfg*")}
+    assert menus == {"grub.cfg"} and not env["path"].exists()
+    assert (env["root"] / "clonezilla" / "filesystem.squashfs").exists()
+
+
+def test_retire_removes_only_given_mac_menus(tmp_path):
+    env = _clone_env(tmp_path)
+    _carm(env)
+    kc.pxe_retire([MAC], root=env["root"])
+    assert _menu(env, MAC) is None and _menu(env, CMAC2) is not None
+
+
+def test_arm_rocky_and_winpe_unaffected_by_clone_kwargs(tmp_path):
+    """老调用方式 (不带 confirm) 照旧."""
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
+    assert "inst.ks" in (tmp_path / "grub.cfg-01-02-00-00-00-00-01").read_text()

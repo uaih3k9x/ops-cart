@@ -107,3 +107,15 @@ def test_generated_rocky_menu_has_no_winpe_and_winpe_menu_has_no_ks():
     assert pxeserver.WINPE_CHAIN not in kc.grub_cfg_install()
     cfg = kc.grub_cfg_winpe()
     assert "inst.ks" not in cfg and pxeserver.WINPE_CHAIN in default_entry(cfg)
+
+
+@pytest.mark.parametrize("name,cfg", grub_texts())
+def test_template_has_no_clone_entry(name, cfg):
+    """#18: 克隆 (Clonezilla) 项和 WinPE 一样只进解锁后的 MAC 菜单, 仓库模板/脚本里一项都不许写."""
+    import pxeserver
+    assert pxeserver.CLONE_KERNEL not in cfg and "ocs_live_run" not in cfg and "ocs-sr" not in cfg, name
+
+
+def test_generated_rescue_rocky_winpe_menus_have_no_clone():
+    for cfg in (kc.grub_cfg_rescue(), kc.grub_cfg_install(), kc.grub_cfg_winpe()):
+        assert "clonezilla" not in cfg and "ocs_live_run" not in cfg

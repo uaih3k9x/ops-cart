@@ -132,3 +132,25 @@ def test_winpe_menu_gated_like_install_menu(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_clone_menu_gated_like_install_menu(tmp_path):
+    """#18: 克隆菜单只给解锁的 MAC (一批时名单里的每台); clonezilla/ 下的 live 文件不拦."""
+    import pxeserver
+    srv = serve(tmp_path, armed=False)
+    http = tmp_path / "http"
+    (tmp_path / "pxe-mode.json").write_text(json.dumps(
+        {"mac": MAC, "macs": [MAC, "02:00:00:00:00:02"], "since": 0, "until": time.time() + 600}))
+    clone = pxeserver.grub_menu_clone("192.0.2.1", "clone-restore", ["boot=live", 'ocs_live_run="ocs-sr"'])
+    for n in ("01", "02", "03"):
+        (http / f"grub.cfg-01-02-00-00-00-00-{n}").write_text(clone)
+    (http / "clonezilla").mkdir()
+    (http / "clonezilla" / "filesystem.squashfs").write_bytes(b"hsqs")
+    try:
+        assert get(srv, "grub.cfg-01-02-00-00-00-00-01") == 200
+        assert get(srv, "grub.cfg-01-02-00-00-00-00-02") == 200
+        assert get(srv, "grub.cfg-01-02-00-00-00-00-03") == 403
+        assert get(srv, "clonezilla/filesystem.squashfs") == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()

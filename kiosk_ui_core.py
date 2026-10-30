@@ -153,10 +153,17 @@ def pxe_tick_decide(st, log_text, now, consumed=kc.pxe_consumed):
     if st.get("mode") == "expired":
         return {"disarm": True, "banner": "装机模式 30 分钟到期, 已自动上锁", "view": {"mode": "rescue"}}
     if st.get("mode") == "install":
+        left = max(0, int(st["until"] - now))
+        if "macs" in st:            # 恢复一批 (#18): 全都取走才上锁, 取走的先删菜单 (retire)
+            took = [m for m in st["macs"] if consumed(log_text, m, st["since"])]
+            if len(took) == len(st["macs"]):
+                return {"disarm": True, "banner": f"这一批 {len(took)} 台都已取走菜单, 装机模式已自动上锁",
+                        "view": {"mode": "rescue"}}
+            return {"disarm": False, "banner": None, "retire": took,
+                    "view": {"mode": "install", "mac": st["mac"], "left": left, "count": len(st["macs"])}}
         if consumed(log_text, st["mac"], st["since"]):
             return {"disarm": True, "banner": f"{st['mac']} 已取走装机菜单, 装机模式已自动上锁",
                     "view": {"mode": "rescue"}}
-        left = max(0, int(st["until"] - now))
         return {"disarm": False, "banner": None, "view": {"mode": "install", "mac": st["mac"], "left": left}}
     return {"disarm": False, "banner": None, "view": {"mode": "rescue"}}
 
@@ -167,7 +174,8 @@ def pxe_button_texts(view):
         return "装机模式:  救援 (安全)", "装机"
     left = view["left"]
     mmss = f"{left // 60:02d}:{left % 60:02d}"
-    return f"警告: 装机已解锁 {view['mac'][-8:]}  {mmss}", f"警告: 装机已解锁  {mmss}"
+    who = f"{view['count']} 台" if view.get("count", 1) > 1 else view["mac"][-8:]
+    return f"警告: 装机已解锁 {who}  {mmss}", f"警告: 装机已解锁  {mmss}"
 
 
 # ---------------------------------------------------------------- 开机自检兜底
