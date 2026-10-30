@@ -152,3 +152,132 @@ def test_boot_params_are_grub_safe(purpose):
 def test_boot_params_restore_device_comes_through():
     run = _param(cc.boot_params("clone-restore", "lab-img", DEV, SMB, IP), "ocs_live_run")
     assert run.endswith(" restoredisk lab-img " + DEV + '"')
+
+
+# ---------------------------------------------------------------- 目标盘匹配
+
+NVME = {"name": "nvme0n1", "model": "EXAMPLE NVME 512GB", "serial": "SN-EXAMPLE-1", "size": 512110190592,
+        "type": "disk", "tran": "nvme", "rm": False}
+SATA = {"name": "sda", "model": "EXAMPLE SATA 1TB", "serial": "SN-EXAMPLE-2", "size": 1000204886016,
+        "type": "disk", "tran": "sata", "rm": False}
+USB = {"name": "sdb", "model": "EXAMPLE NVME 512GB", "serial": "SN-EXAMPLE-9", "size": 512110190592,
+       "type": "disk", "tran": "usb", "rm": True}
+RULE = {"model": "EXAMPLE NVME 512GB", "size_min": 500 * 10 ** 9, "size_max": 520 * 10 ** 9}
+
+
+def test_match_unique_by_model_and_size():
+    assert cc.match_disk([SATA, NVME], RULE) == ("SERIALNO=SN-EXAMPLE-1", None)
+
+
+def test_match_order_does_not_matter():
+    assert cc.match_disk([NVME, SATA], RULE) == cc.match_disk([SATA, NVME], RULE)
+
+
+def test_match_by_serial_only():
+    assert cc.match_disk([SATA, NVME], {"serial": "SN-EXAMPLE-2"}) == ("SERIALNO=SN-EXAMPLE-2", None)
+
+
+def test_match_model_is_case_and_space_insensitive_but_exact():
+    assert cc.match_disk([NVME], {"model": "  example   nvme 512gb "})[0] == "SERIALNO=SN-EXAMPLE-1"
+    dev, why = cc.match_disk([NVME], {"model": "EXAMPLE NVME"})       # 不做子串匹配
+    assert dev is None and "没有" in why
+
+
+def test_match_accepts_lsblk_json_and_string_sizes():
+    lsblk = {"blockdevices": [dict(NVME, size="512110190592"), SATA]}
+    assert cc.match_disk(lsblk, RULE)[0] == "SERIALNO=SN-EXAMPLE-1"
+
+
+def test_match_serial_spaces_become_underscores_and_are_trimmed():
+    d = dict(NVME, serial="  SN EXAMPLE 1  ")
+    assert cc.match_disk([d], RULE) == ("SERIALNO=SN_EXAMPLE_1", None)
+
+
+@pytest.mark.parametrize("rule", [None, {}, {"size_min": 1}, {"size_min": 1, "size_max": 10 ** 13},
+                                  {"tran": "nvme"}, {"model": ""}, {"model": "  "}, {"serial": ""}])
+def test_match_empty_or_weak_rule_refused(rule):
+    """规则为空 / 只有容量或接口 -> 不匹配 (同容量的盘太常见)."""
+    dev, why = cc.match_disk([NVME], rule)
+    assert dev is None and "规则" in why
+
+
+@pytest.mark.parametrize("rule", [{"model": "X", "seral": "typo"}, {"model": "X", "size_min": "big"},
+                                  {"model": "X", "size_min": -1}, {"model": "X", "size_min": 10, "size_max": 5},
+                                  {"model": 5}, {"model": "X", "size_min": True}, "model=X", ["model"]])
+def test_match_bad_rule_refused(rule):
+    dev, why = cc.match_disk([NVME], rule)
+    assert dev is None and why
+
+
+def test_match_none_found():
+    dev, why = cc.match_disk([SATA], RULE)
+    assert dev is None and "没有" in why and "SN-EXAMPLE-2" in why          # 写清登记了什么
+
+
+def test_match_multiple_refused_never_guesses():
+    twin = dict(NVME, name="nvme1n1", serial="SN-EXAMPLE-3")
+    dev, why = cc.match_disk([NVME, twin], RULE)
+    assert dev is None and "2" in why and "SN-EXAMPLE-1" in why and "SN-EXAMPLE-3" in why
+
+
+@pytest.mark.parametrize("disks", [None, [], {}, {"blockdevices": []}, "sda", [None], ["sda"]])
+def test_match_no_disks_never_defaults_to_sda(disks):
+    dev, why = cc.match_disk(disks, RULE)
+    assert dev is None and why
+    dev, why = cc.match_disk(disks, {"model": "anything"})
+    assert dev is None
+
+
+def test_match_size_bounds_inclusive_and_missing_size_fails():
+    assert cc.match_disk([NVME], dict(RULE, size_min=NVME["size"], size_max=NVME["size"]))[0]
+    assert cc.match_disk([NVME], dict(RULE, size_min=NVME["size"] + 1))[0] is None
+    assert cc.match_disk([NVME], dict(RULE, size_max=NVME["size"] - 1))[0] is None
+    nosize = {k: v for k, v in NVME.items() if k != "size"}
+    assert cc.match_disk([nosize], RULE)[0] is None
+    assert cc.match_disk([dict(NVME, size="lots")], RULE)[0] is None
+
+
+def test_match_skips_partitions_and_non_disks():
+    part = dict(NVME, name="nvme0n1p1", type="part", serial="SN-EXAMPLE-1")
+    rom = dict(NVME, name="sr0", type="rom", serial="SN-EXAMPLE-7")
+    assert cc.match_disk([part, rom, NVME], RULE) == ("SERIALNO=SN-EXAMPLE-1", None)
+    assert cc.match_disk([part, rom], RULE)[0] is None
+
+
+def test_match_skips_removable_and_usb_unless_rule_asks():
+    assert cc.match_disk([USB, NVME], RULE) == ("SERIALNO=SN-EXAMPLE-1", None)
+    assert cc.match_disk([USB], RULE)[0] is None
+    assert cc.match_disk([dict(USB, rm=False)], RULE)[0] is None          # tran=usb 也算
+    assert cc.match_disk([dict(USB, tran="sata", rm="1")], RULE)[0] is None
+    assert cc.match_disk([USB, NVME], dict(RULE, tran="usb")) == ("SERIALNO=SN-EXAMPLE-9", None)
+
+
+def test_match_tran_rule():
+    assert cc.match_disk([SATA, NVME], {"model": "EXAMPLE NVME 512GB", "tran": "nvme"})[0]
+    assert cc.match_disk([SATA, NVME], {"model": "EXAMPLE NVME 512GB", "tran": "sata"})[0] is None
+
+
+def test_match_needs_a_serial_on_the_disk():
+    for serial in (None, "", "   "):
+        dev, why = cc.match_disk([dict(NVME, serial=serial)], RULE)
+        assert dev is None and "序列号" in why
+
+
+def test_match_refuses_serial_with_unsafe_chars():
+    for serial in ('SN"1', "SN$1", "SN;reboot", "SN\\1", "SN/1", "-SN"):
+        dev, why = cc.match_disk([dict(NVME, serial=serial)], RULE)
+        assert dev is None and "序列号" in why, serial
+
+
+def test_match_refuses_serial_shared_with_another_disk():
+    """SERIALNO= 在目标机上要唯一指到一块盘; 便宜盘序列号重复时不放."""
+    dup = dict(SATA, serial="SN-EXAMPLE-1")
+    dev, why = cc.match_disk([NVME, dup], RULE)
+    assert dev is None and "重复" in why
+    dup = dict(SATA, serial="SN EXAMPLE 1")            # 空格换下划线后才撞上也算
+    assert cc.match_disk([dict(NVME, serial="SN_EXAMPLE_1"), dup], RULE)[0] is None
+
+
+def test_match_serial_rule_must_match_the_disk_found():
+    assert cc.match_disk([SATA, NVME], dict(RULE, serial="SN-EXAMPLE-2"))[0] is None
+    assert cc.match_disk([SATA, NVME], dict(RULE, serial="SN-EXAMPLE-1"))[0] == "SERIALNO=SN-EXAMPLE-1"

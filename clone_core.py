@@ -155,6 +155,121 @@ def repo_url(conf, purpose, default_server):
     return f"{scheme}://{cred}{server}/{_share(conf.get(key), False)}/"
 
 
+# ---------------------------------------------------------------- 目标盘显式匹配
+# 输入: 目标机登记的磁盘 = `lsblk -dbJ -o NAME,MODEL,SERIAL,SIZE,TYPE,TRAN,RM` 的输出 (整个 dict 或其
+# blockdevices 列表). 规则键:
+#   model     型号, 忽略大小写和多余空格后整串相等 (不做子串: "512GB" 会同时套住好几种盘)
+#   serial    序列号, 整串相等 (空格按 Clonezilla 的规矩换成 _ 后比)
+#   size_min / size_max  字节, 闭区间; 写了就要求盘报了容量
+#   tran      接口 (nvme / sata / usb ...)
+# model / serial 至少一个: 只按容量或接口太容易套到别的盘. 不认识的键整条规则作废 (拼错一个键会让规则变宽).
+# 只看整盘 (type 缺省或 disk); 可移动 / USB 盘除非规则写明 tran=usb, 否则不算候选.
+# 恰好一块才给 SERIALNO=<序列号>; 零块、多块、没序列号、序列号有怪字符、序列号和别的盘重复都不给.
+
+_RULE_KEYS = ("model", "serial", "size_min", "size_max", "tran")
+
+
+def _norm_text(s):
+    return " ".join(s.split()).casefold() if isinstance(s, str) else ""
+
+
+def _norm_serial(s):
+    return "_".join(s.split()) if isinstance(s, str) else ""
+
+
+def _size(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return None
+
+
+def _truthy(v):
+    return v is True or v == 1 or (isinstance(v, str) and v.strip().lower() in ("1", "true", "yes"))
+
+
+def rule_error(rule):
+    """规则不合格的原因; 合格返回 None."""
+    if not isinstance(rule, dict) or not rule:
+        return "盘匹配规则为空"
+    bad = [k for k in rule if k not in _RULE_KEYS]
+    if bad:
+        return f"盘匹配规则里有不认识的键 {', '.join(map(str, bad))} (只认 {', '.join(_RULE_KEYS)})"
+    for k in ("model", "serial", "tran"):
+        if k in rule and not isinstance(rule[k], str):
+            return f"盘匹配规则 {k} 要写字符串"
+    if not _norm_text(rule.get("model")) and not _norm_serial(rule.get("serial")):
+        return "盘匹配规则至少要有 model 或 serial (只按容量/接口太容易套到别的盘)"
+    for k in ("size_min", "size_max"):
+        if k in rule and (isinstance(rule[k], bool) or not isinstance(rule[k], int) or rule[k] < 0):
+            return f"盘匹配规则 {k} 要写非负整数 (字节)"
+    if rule.get("size_min", 0) > rule.get("size_max", rule.get("size_min", 0)):
+        return "盘匹配规则 size_min 比 size_max 大"
+    return None
+
+
+def _disk_list(disks):
+    if isinstance(disks, dict):
+        disks = disks.get("blockdevices")
+    if not isinstance(disks, list):
+        return []
+    return [d for d in disks if isinstance(d, dict) and d.get("type", "disk") == "disk"]
+
+
+def _fits(d, rule):
+    if "model" in rule and _norm_text(rule["model"]) and _norm_text(d.get("model")) != _norm_text(rule["model"]):
+        return False
+    if "serial" in rule and _norm_serial(rule["serial"]) and \
+            _norm_serial(d.get("serial")) != _norm_serial(rule["serial"]):
+        return False
+    tran = _norm_text(d.get("tran"))
+    want = _norm_text(rule.get("tran"))
+    if want and tran != want:
+        return False
+    if want != "usb" and (tran == "usb" or _truthy(d.get("rm"))):
+        return False
+    size = _size(d.get("size"))
+    if ("size_min" in rule or "size_max" in rule) and size is None:
+        return False
+    if "size_min" in rule and size < rule["size_min"]:
+        return False
+    if "size_max" in rule and size > rule["size_max"]:
+        return False
+    return True
+
+
+def _describe(d):
+    return f"{d.get('name', '?')} {d.get('model') or '?'} {d.get('serial') or '无序列号'} {d.get('size', '?')}"
+
+
+def match_disk(disks, rule):
+    """-> (device, None) 或 (None, 原因). device 形如 SERIALNO=SN-EXAMPLE-1, 直接给 ocs-sr 用.
+    绝不默认 sda / 第一块盘: 任何拿不准的情况都是 (None, 原因)."""
+    err = rule_error(rule)
+    if err:
+        return None, err
+    whole = _disk_list(disks)
+    if not whole:
+        return None, "没有登记这台机器的磁盘信息"
+    hits = [d for d in whole if _fits(d, rule)]
+    if not hits:
+        return None, "没有盘符合规则; 登记的盘: " + "; ".join(_describe(d) for d in whole)
+    if len(hits) > 1:
+        return None, f"有 {len(hits)} 块盘都符合规则, 不猜: " + "; ".join(_describe(d) for d in hits)
+    serial = _norm_serial(hits[0].get("serial"))
+    if not serial:
+        return None, f"匹配到的盘没有序列号, 没法用 SERIALNO= 指定: {_describe(hits[0])}"
+    device = "SERIALNO=" + serial
+    if not _SERIAL_RE.match(device):
+        return None, f"匹配到的盘序列号有不能进启动参数的字符: {hits[0].get('serial')!r}"
+    if sum(1 for d in whole if _norm_serial(d.get("serial")) == serial) > 1:
+        return None, f"序列号 {serial} 和别的盘重复, SERIALNO= 指不准"
+    return device, None
+
+
 # ---------------------------------------------------------------- 整串内核参数
 # 照 livepxe.php 的 APPEND 例子, 去掉交互相关的; fetch= (squashfs 从哪取) 是模板的事, pxeserver 加.
 _LIVE_BASE = ("boot=live", "union=overlay", "username=user", "config", "components", "quiet", "noswap",
