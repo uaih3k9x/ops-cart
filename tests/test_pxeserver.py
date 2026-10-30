@@ -665,7 +665,7 @@ class Box:
 
 
 def guard_for(tmp_path, box, events=None):
-    return PxeGuard("192.0.2.1", "eno1", FakeLog(), probe=box.probe, carrier=lambda: box.link,
+    return PxeGuard("192.0.2.1", "eno1", FakeLog(), prefix=24, probe=box.probe, carrier=lambda: box.link,
                     addr=lambda: box.addr, state_path=str(tmp_path / "pxe-guard.json"),
                     event=(events.append if events is not None else lambda m: None))
 
@@ -691,7 +691,7 @@ def test_guard_goes_proxy_on_foreign_offer_at_start(tmp_path):
     assert g.state == "proxy" and not g.may_reply() and g.may_proxy()
     st = guard_state(tmp_path)
     assert st["state"] == "proxy" and st["server"] == "198.51.100.1" and st["leases"] is False
-    assert st["offered"] == "198.51.100.50"
+    assert st["offered"] == "198.51.100.50" and st["prefix"] == 24
     assert events and "198.51.100.1" in events[0] and "不发地址" in events[0]
 
 

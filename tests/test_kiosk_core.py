@@ -407,17 +407,54 @@ def _ctx(**kw):
     return ctx
 
 
-def test_selftest_pxe_proxy_mode_says_no_addresses():
-    """#11: 装机口上有别的 DHCP 时守卫转代理模式, 自检行要看得出"不发地址"."""
-    ctx = dict(_ctx(), svcs={"pxe-server": (True, True)},
-               pxe_guard=lambda: {"state": "proxy", "leases": False, "server": "198.51.100.1"})
-    assert kc.check_pxe(ctx) == ("OK", "代理模式（不发地址）")
-    ctx["pxe_guard"] = lambda: {"state": "serving", "leases": True}
-    assert kc.check_pxe(ctx) == ("OK", "RUNNING")
-    ctx["pxe_guard"] = lambda: {}                  # 状态文件没有/读不了: 照旧
-    assert kc.check_pxe(ctx) == ("OK", "RUNNING")
+PROXY_TEXT = "代理模式：链路上已有别的 DHCP，推车不发地址，只回 PXE 引导"
+
+
+def _pxe_ctx(guard):
+    return dict(_ctx(), svcs={"pxe-server": (True, True)}, pxe_guard=lambda: guard)
+
+
+def test_selftest_pxe_proxy_mode_is_warn_with_plain_text():
+    """#11: 装机口上有别的 DHCP 时守卫转代理模式: 黄灯 + 人话."""
+    assert kc.check_pxe(_pxe_ctx({"state": "proxy", "leases": False})) == ("WARN", PROXY_TEXT)
+
+
+def test_selftest_pxe_proxy_mode_shows_their_subnet():
+    g = {"state": "proxy", "ip": "192.0.2.1", "prefix": 24, "offered": "192.0.2.150"}
+    assert kc.check_pxe(_pxe_ctx(g)) == ("WARN", PROXY_TEXT + "；对方网段 192.0.2.0/24")
+
+
+def test_selftest_pxe_proxy_mode_warns_when_cart_outside_their_subnet():
+    g = {"state": "proxy", "ip": "192.0.2.1", "prefix": 24, "offered": "198.51.100.50"}
+    assert kc.check_pxe(_pxe_ctx(g)) == (
+        "WARN", PROXY_TEXT + "；对方网段 198.51.100.0/24；推车 LAN1 不在对方网段，PXE 引导可能走不通")
+
+
+@pytest.mark.parametrize("g", [{"state": "proxy", "offered": "198.51.100.50"},          # 没 ip/prefix
+                               {"state": "proxy", "ip": "x", "prefix": 24, "offered": "y"},
+                               {"state": "proxy", "ip": "192.0.2.1", "prefix": 24, "offered": None},
+                               {"state": "proxy", "ip": "192.0.2.1", "prefix": 99, "offered": "192.0.2.9"}])
+def test_selftest_pxe_proxy_mode_bad_fields_fall_back_to_plain_text(g):
+    assert kc.check_pxe(_pxe_ctx(g)) == ("WARN", PROXY_TEXT)
+
+
+@pytest.mark.parametrize("g", [{"state": "serving", "leases": True}, {}, {"state": "no-link"}])
+def test_selftest_pxe_other_guard_states_unchanged(g):
+    assert kc.check_pxe(_pxe_ctx(g)) == ("OK", "RUNNING")
+    ctx = _pxe_ctx(g)
     del ctx["pxe_guard"]
     assert kc.check_pxe(ctx) == ("OK", "RUNNING")
+
+
+def test_proxy_mode_turns_lan1_lamp_yellow_on_dash():
+    """车机状态板和副屏灯条都吃同一个 check_pxe: 代理模式下 LAN1 灯黄, 副屏问题列表里有这一行."""
+    import dash_core
+    import lamps_core
+    rows = kc.selftest_run(kc.DEFAULT_PLAN, _pxe_ctx({"state": "proxy"}))
+    assert lamps_core.health_of(rows, "LAN1 / PXE") == "WARN"
+    lower = {x["name"]: x["health"] for x in dash_core._lower(rows, set())}
+    assert lower["LAN1"] == "WARN"
+    assert {"label": "LAN1 / PXE", "state": "WARN", "detail": PROXY_TEXT} in dash_core._checks(rows)["problems"]
 
 
 def test_selftest_context_reads_guard_state(tmp_path, monkeypatch):

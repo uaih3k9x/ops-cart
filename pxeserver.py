@@ -186,8 +186,9 @@ class PxeGuard:
     网口上得真有 --ip. 状态写 state_path (JSON), 车机自检和排障时看."""
 
     def __init__(self, ip, iface, log, probe=None, carrier=None, addr=None, state_path=GUARD_STATE,
-                 event=cart_event, now=time.time):
+                 event=cart_event, now=time.time, prefix=None):
         self.ip, self.iface, self.log = ip, iface, log
+        self.prefix = prefix        # 只写进状态文件, 车机拿它和 offered 比是不是同一网段
         self.probe = probe
         self.carrier = carrier or (lambda: read_carrier(iface))
         self.addr = addr or (lambda: iface_ipv4(iface))
@@ -280,7 +281,7 @@ class PxeGuard:
         o = self.other or {}
         doc = {"state": self.state, "detail": self.detail, "leases": self.state == "serving",
                "server": o.get("server"), "offered": o.get("offered"),
-               "iface": self.iface, "ip": self.ip, "since": self.now(), "pid": os.getpid()}
+               "iface": self.iface, "ip": self.ip, "prefix": self.prefix, "since": self.now(), "pid": os.getpid()}
         tmp = f"{self.state_path}.tmp"
         try:
             os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
@@ -854,7 +855,7 @@ def main(argv=None):
     if linux and not args.iface:
         log.warning("Linux 上没给 --iface: DHCP 只绑 %s, 收不到客户端的广播 DISCOVER", args.ip)
     guard = PxeGuard(args.ip, args.iface if linux else None, log, probe=default_probe(),
-                     state_path=args.guard_state)
+                     state_path=args.guard_state, prefix=args.prefix)
     dhcp.guard = guard
     guard.tick()                    # 先探测: 探明之前一个包都不发, 有别人的 DHCP 就只当代理
     tftp = TftpServer(args.ip, args.tftp_root, log, pxe_mode_path=args.pxe_mode)
