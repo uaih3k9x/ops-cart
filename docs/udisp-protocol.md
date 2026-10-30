@@ -75,3 +75,13 @@ ESP32 固件示例 `device_porting/esp-idf5.3_udisp_s3_st7789_example/main/app_v
 
 协议层在 [`udisp.py`](../udisp.py)，测试在 `tests/test_udisp.py`（不碰 USB）；带 USB 的实机脚本
 见 issue #6 评论。推车没装 Pillow，绘图那一侧要另想办法（或只靠 JPEG 素材）。
+
+## 背光：USB 上调不了（2026-10-30 实测）
+
+板子实为启明智显 Model3（ZX1H05F-R8，平头哥 E907），VID `303a` 和配置串 `esp32p4udisp0_…` 是照抄 xfz1986 协议的兼容标识，不是 ESP32。
+
+试探过帧头 `cmd` 字段：
+- 整帧 JPEG 带 cmd = 1–8、16、32、64、128、254、255：每帧都正常显示，亮度无变化；
+- 只发帧头的"命令包"（type=0xff，cmd = 1–8，x/y/w/h 全填 255）：被静默忽略，亮度无变化。
+
+结论：这块固件不从 USB 开放背光，亮度只能靠画面本身（配色）。
