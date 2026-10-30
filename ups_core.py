@@ -45,8 +45,16 @@ def parse(text):
 
 
 def on_battery(ups):
-    """是不是在靠电池跑 (市电断了)."""
-    return bool(ups) and ups.get("state") == "discharging"
+    """是不是在靠电池跑 (市电断了). hidraw 状态里有 OB/OL 就以它为准, 没有才看 upower:
+    upower 断电和来电都要滞后一两分钟才翻, hidraw 是即时的. 按整词比, DISCHRG 不算 OB."""
+    if not ups:
+        return False
+    words = str(ups.get("status") or "").split()
+    if "OB" in words:
+        return True
+    if "OL" in words:
+        return False
+    return ups.get("state") == "discharging"
 
 
 def low(ups, threshold=LOW_PCT):

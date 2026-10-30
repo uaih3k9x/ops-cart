@@ -15,6 +15,7 @@ import time
 
 import atomicfile
 import lamps_core
+import ups_core
 
 STATE_PATH = "/run/ops-cart/state.json"
 KIOSK_PATH = "/run/ops-cart/kiosk.json"    # kiosk 回写: 锁屏状态等
@@ -156,13 +157,11 @@ def _checks(rows):
 
 
 def _ups_line(ups):
-    """副屏头部的 UPS 一行. 走电池看 upower 的 discharging 或 hidraw 的 OB:
-    upower 要滞后一两分钟才翻, hidraw 状态是即时的."""
+    """副屏头部的 UPS 一行. 走不走电池跟车机同一个判断 (ups_core.on_battery)."""
     if not ups:
         return {"text": "UPS 未连接", "level": "dim"}
     pct = ups.get("percent")
-    on_batt = ups.get("state") == "discharging" or "OB" in str(ups.get("status") or "").split()
-    if on_batt:
+    if ups_core.on_battery(ups):
         text = "市电断开 · 电池 %s%%" % pct
         if ups.get("runtime"):
             text += " · 剩 %d 分" % (int(ups["runtime"]) // 60)
@@ -291,7 +290,6 @@ def default_ctx(ddir=None, clock=time.monotonic):
 
 
 def _ups_sample():
-    import ups_core
     return ups_core.sample_all()
 
 

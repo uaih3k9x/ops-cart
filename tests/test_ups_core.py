@@ -30,10 +30,52 @@ def test_parse_missing_percent_is_none():
     assert uc.parse("") is None
 
 
-def test_on_battery_only_when_discharging():
+def test_on_battery_from_upower_state():
     assert uc.on_battery({"state": "discharging", "percent": 90})
     assert not uc.on_battery({"state": "charging", "percent": 90})
     assert not uc.on_battery(None)
+
+
+def test_on_battery_trusts_hid_ob_before_upower_catches_up():
+    # upower 的 discharging 要滞后一两分钟, hidraw 的 OB 是即时的
+    assert uc.on_battery({"state": "fully-charged", "percent": 85, "status": "OB DISCHRG"})
+    assert uc.on_battery({"state": "charging", "percent": 85, "status": "OB"})
+
+
+def test_on_battery_only_whole_word_ob():
+    assert not uc.on_battery({"state": "charging", "percent": 85, "status": "OL CHRG"})
+    assert not uc.on_battery({"state": "charging", "percent": 85, "status": "OL"})
+    # DISCHRG 里没有完整的 OB, 不算
+    assert not uc.on_battery({"state": "charging", "percent": 85, "status": "DISCHRG"})
+    assert not uc.on_battery({"state": "charging", "percent": 85, "status": "OBX"})
+    assert not uc.on_battery({"state": "charging", "percent": 85, "status": None})
+
+
+def test_hid_ol_wins_over_lagging_upower_discharging():
+    # 来电后 upower 还报 discharging, hidraw 已经 OL: 不能当成走电池去关机
+    back = {"state": "discharging", "percent": 10, "status": "OL CHRG"}
+    assert not uc.on_battery(back)
+    assert not uc.low(back)
+    assert uc.health(dict(back, warning="none")) == "OK"
+
+
+def test_no_hid_status_falls_back_to_upower():
+    for status in (None, "", "CHRG"):
+        u = {"state": "discharging", "percent": 10, "status": status}
+        assert uc.on_battery(u)
+        assert uc.low(u)
+    assert uc.low({"state": "discharging", "percent": 10})
+    assert not uc.on_battery({"state": "charging", "percent": 10, "status": ""})
+
+
+def test_low_and_health_follow_hid_ob():
+    ob = {"state": "charging", "percent": 12, "status": "OB DISCHRG"}
+    assert uc.low(ob)
+    assert uc.health(ob) == "FAIL"
+    assert uc.health(dict(ob, percent=60)) == "WARN"
+    assert uc.label(dict(ob, percent=60)) == "电池 60% 放电"
+    # 在线时电量低也不关机
+    assert not uc.low({"state": "charging", "percent": 10, "status": "OL CHRG"})
 
 
 def test_low_uses_threshold_and_only_on_battery():
