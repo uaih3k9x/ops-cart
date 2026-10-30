@@ -395,3 +395,20 @@ def test_plan_lines_for_the_confirm_dialog():
     assert M1 in lines[0] and "lab-img" in lines[0] and "SERIALNO=SN-EXAMPLE-1" in lines[0]
     assert M2 in lines[1] and "不放行" in lines[1]
     assert cc.plan_lines(_plan(missing=["clonezilla/vmlinuz"])) == []
+
+
+def test_examples_make_a_valid_plan():
+    """examples/ 里的两份样例照抄就能用 (文档照它们写)."""
+    import json
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "examples", "clone.example.json")) as f:
+        conf = json.load(f)
+    with open(os.path.join(root, "examples", "clone-batch.example.json")) as f:
+        batch = json.load(f)
+    p = cc.plan("clone-restore", conf, batch, IP, image_exists=lambda n: n == "lab-image-example")
+    assert p["error"] is None and [r["device"] for r in p["rows"]] == ["SERIALNO=SN-EXAMPLE-1", "SERIALNO=SN-EXAMPLE-3"]
+    run = " ".join(p["rows"][0]["params"])
+    assert "smb3://192.0.2.1/clone-ro/" in run and "change-me" not in run
+    p = cc.plan("clone-save", conf, batch, IP, mac="02:00:00:00:00:01", image_exists=lambda n: False)
+    assert p["error"] is None and "smb3://clonesave:change-me-example@192.0.2.1/clone-rw/" in " ".join(p["rows"][0]["params"])
