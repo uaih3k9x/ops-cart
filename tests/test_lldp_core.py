@@ -199,3 +199,196 @@ def test_cdp_never_raises_on_truncation():
     good = cdp_frame(cdp_tlv(1, b"SW-D"), cdp_addr("192.0.2.4"), cdp_tlv(3, b"Fa0/3"))
     for i in range(len(good)):
         lc.parse_frame(good[:i])
+
+
+# ---- 邻居表: 按网口记最近一次邻居, 超过 TTL 变旧, 再久就忘掉 (注入时钟)
+
+IFACES = [("LAN1", "eth-a"), ("LAN2", "eth-b")]
+
+
+def _nb(name="SW-A", port_id="Gi0/1", hold=120):
+    return lc.parse_frame(eth(chassis(4, SW_MAC) + port(5, port_id.encode()) + ttl(hold)
+                              + tlv(5, name.encode()) + end()))
+
+
+def test_entry_state_by_ttl():
+    e = {"neighbor": _nb(hold=120), "at": 1000.0}
+    assert lc.entry_state(None, 1000.0) == "none"
+    assert lc.entry_state(e, 1000.0) == "fresh"
+    assert lc.entry_state(e, 1120.0) == "fresh"
+    assert lc.entry_state(e, 1121.0) == "stale"
+    assert lc.entry_state(e, 1120.0 + lc.FORGET_S + 1) == "none"
+
+
+def test_table_fresh_then_stale_then_forgotten():
+    t = lc.Neighbors(IFACES)
+    t.seen("eth-a", _nb(), 1000.0)
+    s = t.snapshot(1010.0)
+    assert s["LAN1"]["state"] == "fresh" and s["LAN1"]["age"] == 10
+    assert s["LAN1"]["neighbor"]["sys_name"] == "SW-A" and s["LAN1"]["iface"] == "eth-a"
+    assert s["LAN2"] == {"iface": "eth-b", "state": "none", "age": None, "neighbor": None, "error": ""}
+    assert t.snapshot(1200.0)["LAN1"]["state"] == "stale"          # 拔线了: 旧邻居变灰
+    gone = t.snapshot(1121.0 + lc.FORGET_S)["LAN1"]
+    assert gone["state"] == "none" and gone["neighbor"] is None      # 不残留
+    assert t.snapshot(1000.0)["LAN1"]["state"] == "none"             # 忘掉了就是忘掉了
+
+
+def test_table_new_port_replaces_old_neighbor():
+    t = lc.Neighbors(IFACES)
+    t.seen("eth-a", _nb(port_id="Gi0/1"), 1000.0)
+    t.seen("eth-a", _nb(port_id="Gi0/7"), 1030.0)                    # 换了口
+    assert t.snapshot(1031.0)["LAN1"]["neighbor"]["port_id"] == "Gi0/7"
+
+
+def test_table_ttl_zero_means_neighbor_left():
+    t = lc.Neighbors(IFACES)
+    t.seen("eth-a", _nb(), 1000.0)
+    t.seen("eth-a", _nb(hold=0), 1001.0)                             # 交换机关 LLDP 时发的告别帧
+    assert t.snapshot(1002.0)["LAN1"]["state"] == "none"
+
+
+def test_table_unknown_iface_ignored_and_error_means_off():
+    t = lc.Neighbors(IFACES)
+    t.seen("wlan0", _nb(), 1000.0)
+    t.error("eth-b", "没有权限 (要 root)")
+    s = t.snapshot(1000.0)
+    assert set(s) == {"LAN1", "LAN2"}
+    assert s["LAN2"]["state"] == "off" and "root" in s["LAN2"]["error"]
+    t.error("eth-b", "")
+    assert t.snapshot(1000.0)["LAN2"]["state"] == "none"
+
+
+def test_snapshot_is_json():
+    import json
+    t = lc.Neighbors(IFACES)
+    t.seen("eth-a", _nb(), 1000.0)
+    assert json.loads(json.dumps(t.snapshot(1000.0)))["LAN1"]["neighbor"]["port_id"] == "Gi0/1"
+
+
+# ---- 监听: 假套接字, 只收不发
+
+class Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class FakeSock:
+    """只有收的方法; 监听器要是调了 send/sendto 会直接 AttributeError."""
+
+    def __init__(self, frames=(), fail=None):
+        self.frames, self.fail, self.closed = list(frames), fail, False
+
+    def fileno(self):
+        return 99
+
+    def recvfrom(self, n):
+        if self.fail:
+            raise self.fail
+        if not self.frames:
+            raise BlockingIOError()
+        return self.frames.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def _all_ready(r, w, x, timeout):
+    return list(r), [], []
+
+
+def _addr(iface, pkttype=1):
+    return (iface, lc.ETH_LLDP, pkttype, 1, SRC)
+
+
+def test_watcher_reads_frames_into_table():
+    sock = FakeSock([(huawei(), _addr("eth-a")), (b"junk", _addr("eth-a"))])
+    w = lc.Watcher(IFACES, opener=lambda i: [sock] if i == "eth-a" else [], select_fn=_all_ready,
+                   clock=Clock())
+    w.poll(0)
+    s = w.snapshot()
+    assert s["LAN1"]["state"] == "fresh" and s["LAN1"]["neighbor"]["sys_name"] == "SW-A"
+    assert s["LAN2"]["state"] == "none"
+
+
+def test_watcher_ignores_outgoing_frames():
+    sock = FakeSock([(huawei(), _addr("eth-a", pkttype=lc.PACKET_OUTGOING))])
+    w = lc.Watcher(IFACES, opener=lambda i: [sock], select_fn=_all_ready, clock=Clock())
+    w.poll(0)
+    assert w.snapshot()["LAN1"]["state"] == "none"
+
+
+def test_watcher_without_root_degrades_and_retries_slowly():
+    clk, calls = Clock(), []
+
+    def opener(iface):
+        calls.append(iface)
+        raise PermissionError(1, "Operation not permitted")
+    w = lc.Watcher(IFACES, opener=opener, select_fn=_all_ready, clock=clk)
+    w.poll(0)
+    w.poll(0)
+    s = w.snapshot()
+    assert s["LAN1"]["state"] == "off" and "root" in s["LAN1"]["error"]
+    assert len(calls) == 2                                  # 两个口各试一次, 不每轮都撞
+    clk.t += lc.RETRY_S
+    w.poll(0)
+    assert len(calls) == 4
+
+
+def test_watcher_missing_iface_and_broken_socket_do_not_raise():
+    import errno
+    clk = Clock()
+    bad = FakeSock(fail=OSError(errno.ENETDOWN, "Network is down"))
+
+    def opener(iface):
+        if iface == "eth-b":
+            raise OSError(errno.ENODEV, "No such device")
+        return [bad]
+    w = lc.Watcher(IFACES, opener=opener, select_fn=_all_ready, clock=clk)
+    w.poll(0)
+    s = w.snapshot()
+    assert s["LAN2"]["state"] == "off" and "不存在" in s["LAN2"]["error"]
+    assert bad.closed and s["LAN1"]["state"] == "off"       # 拔了 USB 网卡: 关掉, 稍后重开
+    clk.t += lc.RETRY_S
+    w.poll(0)                                               # 重开, 照样不抛
+
+
+def test_watcher_select_failure_does_not_raise():
+    def boom(r, w, x, t):
+        raise OSError("bad fd")
+    sock = FakeSock()
+    w = lc.Watcher(IFACES, opener=lambda i: [sock], select_fn=boom, clock=Clock())
+    w.poll(0)
+    assert sock.closed
+
+
+def test_watcher_thread_starts_and_stops():
+    import time
+    w = lc.Watcher(IFACES, opener=lambda i: [FakeSock([(huawei(), _addr(i))])],
+                   select_fn=_all_ready)
+    w.start()
+    try:
+        for _ in range(200):
+            if w.snapshot()["LAN1"]["state"] == "fresh":
+                break
+            time.sleep(0.01)
+        assert w.snapshot()["LAN1"]["state"] == "fresh"
+    finally:
+        w.close()
+
+
+def test_real_opener_off_linux_is_unavailable(monkeypatch):
+    monkeypatch.delattr(lc.socket, "AF_PACKET", raising=False)
+    with pytest.raises(OSError):
+        lc.open_socket("eth-a")
+    w = lc.Watcher(IFACES)
+    w.poll(0)
+    assert w.snapshot()["LAN1"]["state"] == "off"
+
+
+def test_module_never_sends():
+    import os
+    src = open(os.path.join(os.path.dirname(lc.__file__), "lldp_core.py"), encoding="utf-8").read()
+    assert ".send(" not in src and ".sendto(" not in src and ".sendmsg(" not in src
