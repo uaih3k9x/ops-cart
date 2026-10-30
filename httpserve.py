@@ -7,7 +7,8 @@
 装机兜底 (车机界面不在时也不会误装):
 - ks*.cfg 只发给 pxe-mode.json 里解锁、没过期的那台机器. 认机器靠 anaconda 的 inst.ks.sendmac
   带来的 X-RHN-Provisioning-MAC-N 头 (装机菜单里有); 不报 MAC 的 (浏览器、curl) 一律 403
-- 带 inst.ks= 的 grub.cfg* 同样只给文件名里那台 MAC
+- 带 inst.ks= 或 WinPE 项的 grub.cfg* (pxeserver.unlock_only_menu) 同样只给文件名里那台 MAC;
+  boot.ipxe 和 win/ 不拦 (PE 不动硬盘, 而且菜单被取走就上锁, 之后还得取得到)
 - *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希) 永远 404
 
 这是防"误装"的核对, 不是访问控制: MAC 头 (和 TFTP 的文件名一样) 是客户端自己报的, LAN1 上能抓到
@@ -24,7 +25,8 @@ import socket
 import sys
 import time
 
-from pxeserver import PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode
+from pxeserver import (PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
+                       unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -78,7 +80,7 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
         elif base.startswith("grub.cfg") and os.path.isfile(path):
             try:
                 with open(path, "rb") as f:
-                    armed = b"inst.ks=" in f.read(64 * 1024)
+                    armed = unlock_only_menu(f.read(64 * 1024).decode("utf-8", "replace"))
             except OSError:
                 armed = False
             if armed and not install_allowed(menu_mac(base), pxe_mode(self.pxe_mode_path, self.now())):

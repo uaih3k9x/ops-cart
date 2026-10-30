@@ -931,9 +931,14 @@ def grub_cfg_rescue(env_path=None):
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
-def grub_cfg_install(env_path=None):
+def grub_cfg_install(env_path=None, winpe=False):
     return ("# 推车生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
-            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True))
+            pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True, winpe=winpe))
+
+
+def winpe_missing(root=None):
+    """tftp 根目录 win/ 下缺的 WinPE 文件; 空列表 = 齐了, 解锁菜单里才放 WinPE 项."""
+    return pxeserver.winpe_missing(str(root or TFTP_ROOT))
 
 
 _norm_mac = pxeserver.norm_mac
@@ -959,16 +964,23 @@ def pxe_mode_read(path=PXE_MODE, now=None):
 def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS):
     now = time.time() if now is None else now
     mac = _norm_mac(mac)
+    # win/ 不齐就不放 WinPE 项: iPXE 一失败, 回到 GRUB 网卡就废了, 只能整机重启, 不如不给这条路
+    missing = winpe_missing(root)
+    if not missing:
+        _write_atomic(os.path.join(root, pxeserver.IPXE_SCRIPT), pxeserver.ipxe_script())
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
-    _write_atomic(os.path.join(root, mac_cfg_name(mac)), grub_cfg_install())
+    _write_atomic(os.path.join(root, mac_cfg_name(mac)), grub_cfg_install(winpe=not missing))
     _write_atomic(path, json.dumps({"mac": mac, "since": now, "until": now + seconds}))
-    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟")
+    winpe = "WinPE 可选" if not missing else f"WinPE 不放 (缺 {', '.join(missing)})"
+    _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟; {winpe}")
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
-    只要带 inst.ks= 也一并删掉. grub.cfg.bak-* 这类手工备份 GRUB 不会去取, 不动."""
+    只要带 inst.ks= 或 WinPE 项 (pxeserver.unlock_only_menu) 也一并删掉. grub.cfg.bak-* 这类
+    手工备份 GRUB 不会去取, 不动. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
+    再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
     removed = []
     for d, _dirs, files in os.walk(root):
@@ -980,7 +992,7 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
             if not (name.startswith("grub.cfg-01-") and d == root):
                 try:
                     with open(full, errors="replace") as f:
-                        if "inst.ks=" not in f.read():
+                        if not pxeserver.unlock_only_menu(f.read()):
                             continue
                 except OSError:
                     continue

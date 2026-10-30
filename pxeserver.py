@@ -734,9 +734,8 @@ class TftpServer:
 
     def open_file(self, name, client):
         """-> (文件对象, 大小, 日志前缀). 找不到/越界抛 OSError.
-        GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 或 WinPE 项的 (unlock_only_menu), 只有已解锁、没过期、
-        文件名就是那台 MAC 时才照发,
-        否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走)."""
+        GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 或 WinPE 项的 (unlock_only_menu), 只有已解锁、
+        没过期、文件名就是那台 MAC 时才照发, 否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走)."""
         path = tftp_safe_name(self.root, name)
         f = open(path, "rb")
         size = os.fstat(f.fileno()).st_size

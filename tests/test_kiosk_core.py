@@ -1213,3 +1213,66 @@ def test_selftest_context_survives_collector_crash(monkeypatch):
     assert ctx["temps"] == [] and ctx["fans"] == []
     rows = kc.selftest_run(kc.DEFAULT_PLAN, ctx)
     assert len(rows) == len(kc.DEFAULT_PLAN)
+
+
+# ------------------------------------------------------------ #11: WinPE 只进解锁后的 MAC 菜单
+
+import pxeserver as _px  # noqa: E402
+
+WINPE_MARK = "/win/ipxe.efi"
+
+
+def _winpe_files(root, skip=()):
+    (root / "win").mkdir(exist_ok=True)
+    for n in _px.WINPE_FILES:
+        if n not in skip:
+            (root / "win" / n).write_bytes(b"x")
+
+
+def test_arm_with_winpe_files_adds_entry_and_writes_boot_ipxe(tmp_path):
+    _winpe_files(tmp_path)
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
+    cfg = (tmp_path / "grub.cfg-01-02-00-00-00-00-01").read_text()
+    assert WINPE_MARK in cfg and _px.WINPE_TITLE in cfg and "inst.ks=" in cfg
+    assert WINPE_MARK not in (tmp_path / "grub.cfg").read_text()          # 救援菜单里永远没有
+    assert (tmp_path / "boot.ipxe").read_text() == _px.ipxe_script()
+
+
+def test_arm_without_complete_win_dir_leaves_entry_out(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(kc, "_pxe_event", events.append)
+    _winpe_files(tmp_path, skip=("bootmgfw.efi",))
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
+    cfg = (tmp_path / "grub.cfg-01-02-00-00-00-00-01").read_text()
+    assert WINPE_MARK not in cfg and "inst.ks=" in cfg
+    assert not (tmp_path / "boot.ipxe").exists()
+    assert "win/bootmgfw.efi" in events[0]                                 # 维护日志里写清缺什么
+
+
+def test_winpe_missing_defaults_to_tftp_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(kc, "TFTP_ROOT", str(tmp_path))
+    assert kc.winpe_missing() == [f"win/{n}" for n in _px.WINPE_FILES]
+    _winpe_files(tmp_path)
+    assert kc.winpe_missing() == []
+
+
+def test_rescue_menu_never_has_winpe_even_with_files(tmp_path):
+    _winpe_files(tmp_path)
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
+    assert WINPE_MARK not in (tmp_path / "grub.cfg").read_text()
+
+
+def test_disarm_scrubs_winpe_menus_anywhere_in_tree(tmp_path):
+    _winpe_files(tmp_path)
+    kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
+    (tmp_path / "EFI" / "BOOT").mkdir(parents=True)
+    winpe = "set default=0\nmenuentry 'WinPE' {\n    chainloader (http,192.0.2.1)/win/ipxe.efi\n}\n"
+    (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text(winpe)             # 手写进共享位置的 WinPE 菜单
+    (tmp_path / "grub.cfg-C000020A").write_text(winpe)
+    (tmp_path / "grub.cfg.bak-20261030").write_text(winpe)                 # 手工备份: 不动
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
+    menus = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("grub.cfg*")
+             if not p.name.startswith("grub.cfg.")}
+    assert menus == {"grub.cfg"}
+    assert (tmp_path / "grub.cfg.bak-20261030").exists()
+    assert (tmp_path / "boot.ipxe").exists() and (tmp_path / "win" / "boot.wim").exists()

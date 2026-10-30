@@ -113,3 +113,22 @@ def test_backups_never_served_and_plain_files_are(tmp_path):
 def test_parse_args_pxe_mode_default():
     a = httpserve.parse_args(["80"])
     assert a.pxe_mode == "/opt/pxe/pxe-mode.json"
+
+
+def test_winpe_menu_gated_like_install_menu(tmp_path):
+    """#11: 带 WinPE 项 (没有 ks) 的 MAC 菜单也只给解锁的那台; boot.ipxe 和 win/ 不拦."""
+    srv = serve(tmp_path)
+    http = tmp_path / "http"
+    winpe = "menuentry 'WinPE' {\n    chainloader (http,192.0.2.1)/win/ipxe.efi\n}\n"
+    (http / "grub.cfg-01-02-00-00-00-00-01").write_text(winpe)
+    (http / "grub.cfg-01-02-00-00-00-00-02").write_text(winpe)
+    (http / "boot.ipxe").write_text("#!ipxe\nboot\n")
+    (http / "win").mkdir()
+    (http / "win" / "ipxe.efi").write_bytes(b"MZ")
+    try:
+        assert get(srv, "grub.cfg-01-02-00-00-00-00-01") == 200
+        assert get(srv, "grub.cfg-01-02-00-00-00-00-02") == 403
+        assert get(srv, "boot.ipxe") == 200 and get(srv, "win/ipxe.efi") == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
