@@ -4,14 +4,28 @@
 规则在 netprof_core: 发地址只在 LAN1, 切到发地址前先探测链路上有没有别人的 DHCP;
 LAN1 切到别的配置时先停 PXE 服务. 每次切换记 events.log. nmcli 放后台线程, 同 wifi_panel.
 LAN1 没插线时探测不算数 (收不到 OFFER 不代表对面没有 DHCP), 不启用发地址.
+静态地址由人填 (建议值只做预填), 确认框写明回滚方式 (#8).
 """
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
 import cartlog
 import netprof_core as npc
 from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, BridgePanel, WifiPanel, _run
+
+
+def ask_valid(parent, title, prompt, initial, check):
+    """弹输入框让人填; check(text) 抛 ValueError 就把原因告诉人, 带着刚填的值重问. 取消返回 None."""
+    text = initial
+    while True:
+        text = simpledialog.askstring(title, prompt, initialvalue=text, parent=parent)
+        if text is None:
+            return None
+        try:
+            return check(text)
+        except ValueError as ex:
+            messagebox.showerror(title, str(ex), parent=parent)
 
 
 class NetProfPanel(BridgePanel):
@@ -108,8 +122,8 @@ class NetProfPanel(BridgePanel):
         self.peer_entry.config(state="normal")
         peer = self.peer_var.get().strip()
         try:
-            self.self_lbl.config(text=f"推车将用 {npc.pick_self(peer)} (不抢默认路由)" if peer else
-                                 "填对端设备的地址, 比如交换机出厂管理地址; 推车自动挑同网段一个空地址")
+            self.self_lbl.config(text=f"建议推车用 {npc.pick_self(peer)} (不抢默认路由), 建的时候由你确认或改" if peer
+                                 else "填对端设备的地址, 比如交换机出厂管理地址; 也可以空着, 建的时候自己填推车地址")
         except ValueError as ex:
             self.self_lbl.config(text=str(ex))
 
@@ -154,8 +168,8 @@ class NetProfPanel(BridgePanel):
             return self._say("已经是这个了")
         plan = npc.plan_switch(cur, target)
         if plan["warn_remote"] and not messagebox.askyesno(
-                "LAN2 管理口", "LAN2 是管理口, 切换后经它的远程连接会断 (无线和 tailscale 还在).\n要继续吗?",
-                icon="warning"):
+                "LAN2 管理口", "LAN2 是管理口, 切换后经它的远程连接会断 (无线和 tailscale 还在).\n\n"
+                f"{plan['rollback_text']}\n\n要继续吗?", icon="warning", parent=self):
             return
 
         def work():
@@ -199,22 +213,31 @@ class NetProfPanel(BridgePanel):
 
     def create(self):
         iface, kind, label = self.iface_var.get(), self.kind_var.get(), self.label_var.get().strip()
+        peer = self.peer_var.get().strip()
+        name = npc.con_name(iface, kind, label)
         try:
-            # 静态地址只是建议值: 先算出来给人看, 确认后才允许写 NetworkManager (issue #8)
-            addr = npc.pick_self(self.peer_var.get().strip()) if kind == "static" else None
-            if kind == "static" and not messagebox.askyesno(
-                    "新建静态地址",
-                    f"将在 {iface} 上新建配置「{label}」\n"
-                    f"地址: {addr}（同网段挑的空地址，不抢默认路由）\n\n"
-                    f"确认写入 NetworkManager 并切换过去吗？",
-                    icon="question"):
-                return self._say("没确认, 未写入", ok=False)
+            why = npc.check(iface, kind) or npc.check_label(label)
+            if why:
+                raise ValueError(why)
+            if any(p["name"] == name for p in self.profs):
+                raise ValueError("同名配置已存在, 换个名字")
+            addr = None
+            if kind == "static":
+                # #8: 地址由人填; 按对端算出的空地址只做预填, 人可以改, 校验过了还要再确认一次
+                form = ask_valid(self, "推车自己的地址", f"{npc.IFACES[iface]} ({iface}) 用的 地址/前缀:",
+                                 npc.pick_self(peer) if peer else "", lambda t: npc.static_form(t, avoid=peer))
+                if form is None:
+                    return self._say("没填地址, 未写入", ok=False)
+                addr = form["addr"]
+                if not messagebox.askyesno(
+                        "新建静态地址",
+                        f"将在 {iface} 上新建配置「{label}」\n地址: {addr}（不抢默认路由）\n\n"
+                        f"{npc.rollback_text(self._active(iface), iface)}\n\n"
+                        f"确认写入 NetworkManager 并切换过去吗？", icon="question", parent=self):
+                    return self._say("没确认, 未写入", ok=False)
             cmd = npc.cmd_create(iface, kind, label, addr=addr, confirmed=True)
         except ValueError as ex:
             return self._say(str(ex), ok=False)
-        name = npc.con_name(iface, kind, label)
-        if any(p["name"] == name for p in self.profs):
-            return self._say("同名配置已存在, 换个名字", ok=False)
 
         def work():
             rc, out = _run(cmd, timeout=30)
