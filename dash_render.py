@@ -135,21 +135,22 @@ def render(view, size=(PANEL_W, PANEL_H)):
     d.text((M, 210), info, font=_font(30), fill=DIM)
     d.line([M, 262, W - M, 262], fill=LINE, width=2)
 
-    # ---- 执行器: 上排操作头, 下排键鼠/PXE/网口
+    # ---- 执行器: 上排操作头, 下排键鼠/PXE/网口, 再下面两行 LAN1 / LAN2 的 LLDP 对端
     d.text((M, 280), "操作头", font=_font(26), fill=DIM)
     heads = view.get("heads") or []
     gap, y0 = 20, 320
     tw = (W - 2 * M - gap * 3) // 4
     for i, h in enumerate(heads[:4]):
         x0 = M + i * (tw + gap)
-        _tile(d, [x0, y0, x0 + tw, y0 + 200], str(h["n"]), h["health"], h["active"],
-              _font(110), h["text"], _font(30))
+        _tile(d, [x0, y0, x0 + tw, y0 + 170], str(h["n"]), h["health"], h["active"],
+              _font(96), h["text"], _font(30))
     lower = view.get("lower") or []
-    gap, y0 = 14, 540
+    gap, y0 = 14, 506
     tw = (W - 2 * M - gap * 4) // 5
     for i, x in enumerate(lower[:5]):
         x0 = M + i * (tw + gap)
-        _tile(d, [x0, y0, x0 + tw, y0 + 110], x["name"], x["health"], x["active"], _font(32))
+        _tile(d, [x0, y0, x0 + tw, y0 + 100], x["name"], x["health"], x["active"], _font(32))
+    _peers(d, view.get("peers") or [], 614, W)
     d.line([M, 680, W - M, 680], fill=LINE, width=2)
 
     if view.get("locked"):
@@ -165,6 +166,17 @@ def render(view, size=(PANEL_W, PANEL_H)):
     else:
         d.rectangle([0, H - 8, W, H], fill=ACCENT)
     return img
+
+
+def _peers(d, peers, y, W):
+    """LAN1 / LAN2 对端: 一口一行, 收到的亮字, 过期/没收到/不可用都灰."""
+    x = M + 80
+    for p in peers[:2]:
+        d.text((M, y), p.get("name") or "", font=_font(24), fill=DIM)
+        line = wrap(p.get("text") or "", _font(24), W - M - x, 1)
+        if line:
+            d.text((x, y), line[0], font=_font(24), fill=FG if p.get("level") == "ok" else DIM)
+        y += 32
 
 
 def _work_body(d, view, W, H):

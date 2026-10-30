@@ -259,6 +259,33 @@ class Neighbors:
         return out
 
 
+NO_LLDP = "没收到 LLDP（交换机可能关了）"
+
+
+def _ago(s):
+    return "%d 分钟前" % (s // 60) if s >= 60 else "%d 秒前" % s
+
+
+def peer_line(entry):
+    """快照里一个网口 → (网口行后面那段字, ok/dim). 过期的灰显并带多久前; 坏数据当没收到."""
+    try:
+        st = entry["state"]
+        if st == "off":
+            return "LLDP 不可用: " + (entry.get("error") or "未知"), "dim"
+        if st in ("fresh", "stale"):
+            nb = entry["neighbor"]
+            parts = ["对端 %s %s" % (device_name(nb), port_name(nb))]
+            if nb.get("vlan"):
+                parts.append("VLAN %s" % nb["vlan"])
+            if st == "stale":
+                parts.append(_ago(int(entry.get("age") or 0)))
+                return " · ".join(parts), "dim"
+            return " · ".join(parts), "ok"
+    except (TypeError, KeyError, AttributeError):
+        pass
+    return NO_LLDP, "dim"
+
+
 # ======== 监听 (Linux AF_PACKET, 只收) ========
 
 ETH_P_802_2 = 0x0004            # 带 LLC 的 802.3 帧 (CDP 走这个)

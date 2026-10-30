@@ -15,6 +15,7 @@ import time
 
 import atomicfile
 import lamps_core
+import lldp_core
 import ups_core
 
 STATE_PATH = "/run/ops-cart/state.json"
@@ -27,8 +28,11 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 自检要 ping/systemctl/v4l2-ctl, 每 200 ms 跑一遍既浪费又会在断网时拖过 STALE_S.
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
-           "todo": 30, "dream": 60, "notice": 5, "ups": 5}
+           "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2}
 UPS_LOW = 20            # 走电池且电量不高于这个: 副屏变红
+# LLDP 监听哪些口 (#14): 跟下排 LAN1 / LAN2 灯同一份配置, 网口名不另写
+LLDP_IFACES = [(name, key[4:]) for name, _label, key in lamps_core.LOWER
+               if name in ("LAN1", "LAN2") and key.startswith("net:")]
 
 
 def _pull(ctx, key, default):
@@ -61,6 +65,7 @@ def collect(ctx):
         "kiosk": _pull(ctx, "kiosk", {}),           # {"locked": bool, "panel": str}
         "todo": _pull(ctx, "todo", []),
         "dream": _pull(ctx, "dream", ""),
+        "lldp": _pull(ctx, "lldp", {}),             # {"LAN1": {state, age, neighbor, error}} 见 lldp_core
     }
     return snap
 
@@ -188,6 +193,19 @@ def _lower(rows, active):
             for name, label, counter in lamps_core.LOWER]
 
 
+def peers(snap):
+    """LAN1 / LAN2 的 LLDP 对端行 [{name, text, level}]; 快照里没这项 (老 cart-dash) 就空."""
+    lldp = (snap or {}).get("lldp")
+    if not isinstance(lldp, dict):
+        return []
+    out = []
+    for name, _iface in LLDP_IFACES:
+        if name in lldp:
+            text, level = lldp_core.peer_line(lldp[name])
+            out.append({"name": name, "text": text, "level": level})
+    return out
+
+
 def layout_view(snap, locked=False, active=(), now=None):
     """快照 + 锁屏状态 + 正在动的计数器 → 版面模型. 渲染层只认这个结构.
 
@@ -218,6 +236,7 @@ def layout_view(snap, locked=False, active=(), now=None):
         "todo": [] if locked else (snap.get("todo") or []),
         "dream": "" if locked else (snap.get("dream") or ""),
         "notice": (snap.get("notice") or "") if locked else "",
+        "peers": [] if locked else peers(snap),      # 锁屏是教室引导牌, 不露交换机名
         "stale": stale(snap, now),
     }
     return view
@@ -249,11 +268,12 @@ def every(period, f, clock=time.monotonic):
     return get
 
 
-def default_ctx(ddir=None, clock=time.monotonic):
+def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
     """真机采集 (cart-dash 用). 每一样都兜住, 不抛.
 
     ddir: conbroker 数据目录, 默认和车机一样取 serial_core.data_dir (跑服务那个用户的
     ~/.conbroker), 不是 /opt/pxe. 键鼠计数在 kiosk 进程里, 从它回写的 kiosk.json 读.
+    lldp: 监听器的 snapshot (dash_service 起线程后传进来); 不给就是空.
     """
     import kiosk_core as kc
     import serial_core as sc
@@ -282,6 +302,7 @@ def default_ctx(ddir=None, clock=time.monotonic):
         "todo": lambda: read_todo(),
         "dream": lambda: kc.dream_line(),
         "ups": lambda: _ups_sample(),
+        "lldp": lldp or (lambda: {}),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)

@@ -388,6 +388,33 @@ def test_real_opener_off_linux_is_unavailable(monkeypatch):
     assert w.snapshot()["LAN1"]["state"] == "off"
 
 
+# ---- 显示: 网口那一行后面的 "对端 ..."
+
+def _entry(state, nb=None, age=None, error=""):
+    return {"iface": "eth-a", "state": state, "age": age, "neighbor": nb, "error": error}
+
+
+def test_peer_line_fresh_shows_device_port_vlan():
+    nb = lc.parse_frame(huawei())
+    assert lc.peer_line(_entry("fresh", nb, 5)) == ("对端 SW-A GigabitEthernet0/0/1 · VLAN 10", "ok")
+    nb2 = lc.parse_frame(h3c())
+    assert lc.peer_line(_entry("fresh", nb2, 5)) == ("对端 SW-C Ten-GigabitEthernet1/0/49", "ok")
+
+
+def test_peer_line_stale_is_dim_with_age():
+    nb = lc.parse_frame(cisco())
+    text, level = lc.peer_line(_entry("stale", nb, 300))
+    assert level == "dim" and text == "对端 SW-B.example.com Gi1/0/1 · VLAN 20 · 5 分钟前"
+    assert lc.peer_line(_entry("stale", nb, 45))[0].endswith("45 秒前")
+
+
+def test_peer_line_none_off_and_garbage():
+    assert lc.peer_line(_entry("none")) == ("没收到 LLDP（交换机可能关了）", "dim")
+    assert lc.peer_line(_entry("off", error="没有权限 (要 root)")) == ("LLDP 不可用: 没有权限 (要 root)", "dim")
+    assert lc.peer_line(None) == ("没收到 LLDP（交换机可能关了）", "dim")
+    assert lc.peer_line({"state": "fresh"}) == ("没收到 LLDP（交换机可能关了）", "dim")   # 坏快照不炸
+
+
 def test_module_never_sends():
     import os
     src = open(os.path.join(os.path.dirname(lc.__file__), "lldp_core.py"), encoding="utf-8").read()

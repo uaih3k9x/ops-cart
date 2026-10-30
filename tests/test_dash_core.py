@@ -283,3 +283,58 @@ def test_ups_line_low_battery_is_bad_and_missing_ups_is_dim():
     u = dc.layout_view(_snap(ups={"state": "discharging", "percent": 12}))["ups"]
     assert u["level"] == "bad" and u["text"].startswith("市电断开 · 电池 12%")
     assert dc.layout_view(_snap(ups=None))["ups"] == {"text": "UPS 未连接", "level": "dim"}
+
+
+# ---- LLDP 对端 (#14): 监听在 dash_service, 这里只管采集项和版面
+
+def _lldp(**states):
+    nb = {"proto": "lldp", "sys_name": "SW-A", "chassis_id": "02:00:00:00:00:aa", "port_id": "Gi0/1",
+          "port_subtype": 5, "port_desc": None, "vlan": 10, "ttl": 120, "mgmt": []}
+    out = {}
+    for name, st in states.items():
+        out[name] = {"iface": "x", "state": st, "age": 400 if st == "stale" else 3,
+                     "neighbor": nb if st in ("fresh", "stale") else None,
+                     "error": "没有权限 (要 root)" if st == "off" else ""}
+    return out
+
+
+def test_lldp_ifaces_come_from_lower_row_config():
+    import lamps_core
+    want = [(n, key[4:]) for n, _l, key in lamps_core.LOWER if n in ("LAN1", "LAN2")]
+    assert dc.LLDP_IFACES == want and len(want) == 2
+
+
+def test_collect_includes_lldp_and_survives_failure():
+    s = dc.collect(_ctx(lldp=lambda: _lldp(LAN1="fresh")))
+    assert s["lldp"]["LAN1"]["neighbor"]["sys_name"] == "SW-A"
+
+    def boom():
+        raise RuntimeError("listener gone")
+    assert dc.collect(_ctx(lldp=boom))["lldp"] == {}
+    assert dc.collect(_ctx())["lldp"] == {}
+    assert "lldp" in dc.PERIODS
+
+
+def test_default_ctx_wires_lldp_source(monkeypatch):
+    _stub_kc(monkeypatch)
+    assert dc.default_ctx()["lldp"]() == {}                       # 没监听器: 空, 版面不显示
+    assert dc.default_ctx(lldp=lambda: {"LAN1": 1})["lldp"]() == {"LAN1": 1}
+
+
+def test_layout_peers_follow_lan_order_and_levels():
+    v = dc.layout_view(_snap(lldp=_lldp(LAN2="off", LAN1="fresh")))
+    assert v["peers"] == [{"name": "LAN1", "text": "对端 SW-A Gi0/1 · VLAN 10", "level": "ok"},
+                          {"name": "LAN2", "text": "LLDP 不可用: 没有权限 (要 root)", "level": "dim"}]
+    stale = dc.layout_view(_snap(lldp=_lldp(LAN1="stale", LAN2="none")))["peers"]
+    assert stale[0]["level"] == "dim" and stale[0]["text"].endswith("6 分钟前")
+    assert stale[1]["text"] == "没收到 LLDP（交换机可能关了）"
+
+
+def test_layout_peers_hidden_when_locked_or_missing():
+    assert dc.layout_view(_snap(lldp=_lldp(LAN1="fresh")), locked=True)["peers"] == []
+    assert dc.layout_view(_snap())["peers"] == []                  # 老 cart-dash 的快照没这项
+    assert dc.layout_view(_snap(lldp="garbage"))["peers"] == []
+
+
+def test_peers_for_kiosk_board():
+    assert dc.peers(None) == [] and dc.peers({"lldp": _lldp(LAN1="none")})[0]["name"] == "LAN1"

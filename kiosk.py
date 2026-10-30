@@ -236,7 +236,9 @@ class Kiosk(tk.Tk):
                 self._ssd, self._ssd_ts = kc.smart_temp(), now
             temps = kc.temps_status(smart=lambda: self._ssd)
             fans = kc.fans_to_show(kc.fans_status(), self._fans_seen)
-            lines = kc.status_board_lines(rows, temps, fans, kc.misc_status()["uptime"])
+            snap = dc.read()                     # LLDP 对端只读 cart-dash 的快照, kiosk 不另起监听 (#14)
+            peers = [] if dc.stale(snap) else dc.peers(snap)
+            lines = kc.status_board_lines(rows, temps, fans, kc.misc_status()["uptime"], peers)
             ups = self._ups
             if ups:
                 lines += [("", "dim"), ("电池  " + uc.label(ups)[3:], self._ups_tag(ups))]
