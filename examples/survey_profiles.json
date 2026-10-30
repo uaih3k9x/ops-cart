@@ -1,0 +1,29 @@
+{
+  "_说明": "串口巡检命令清单 (survey_core.py). 拷到 /opt/pxe/survey_profiles.json 生效; 只能改 commands / volatile_commands / volatile, 只读规则写死在代码里. 每条命令仍要过白名单 (全称、小写、display/show 开头), 有一条不合格整次巡检拒绝执行.",
+  "huawei": {
+    "commands": [
+      "display version",
+      "display clock",
+      "display ip interface brief",
+      "display interface brief",
+      "display lldp neighbor brief",
+      "display mac-address",
+      "display arp",
+      {"cmd": "display current-configuration", "timeout": 120}
+    ],
+    "volatile_commands": ["display clock"],
+    "volatile": ["uptime is", "\\bup ?time\\b", "\\d{4}[-/]\\d\\d[-/]\\d\\d[ T]\\d\\d:\\d\\d:\\d\\d"]
+  },
+  "cisco": {
+    "commands": [
+      "show version",
+      "show clock",
+      "show ip interface brief",
+      "show cdp neighbors",
+      "show mac address-table",
+      "show arp",
+      {"cmd": "show running-config", "timeout": 120}
+    ],
+    "volatile_commands": ["show clock"]
+  }
+}
