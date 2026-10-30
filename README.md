@@ -58,9 +58,10 @@
 | [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着配置里写的那个 SSID 时跑(配置没写 SSID 就不跑);认证页主机白名单 `portal_hosts`(空时首次成功自动记住);结果写 `/run/ops-cart/campus-auth-status.json` 给面板和状态板 |
 | [`kvm_core.py`](kvm_core.py) | 画面源 ↔ 键鼠绑定:CH9329 按 CH343 序列号认身份;没绑或不在线 = 只看不操作,绝不退回随便一块 |
 | [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈(独占打开,被占用报 `Ch9329Busy`、拔线报 `Ch9329Gone`),也可当命令行工具用 |
-| [`serial_panel.py`](serial_panel.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务 |
+| [`serial_panel.py`](serial_panel.py) · [`serial_core.py`](serial_core.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务。纯逻辑(读 `serial.conf`、conbroker 命令与输出解析、选口、终端字节)在 `serial_core`,不碰 Tk,无界面的服务都用它 |
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
+| [`cart_label.py`](cart_label.py) | TSC 标签机 TSPL 生成器(只出字节流,打印由调用方 `cat > /dev/usb/lp0`):旗形线缆标签(上下对折、下半份旋转 180°)、推车线标、刻度尺、资产标签(PDF → pdftoppm → BITMAP);校准常量集中在文件头;缩写对照表校验见 [`examples/label_abbrev.json`](examples/label_abbrev.json) |
 | [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
 | [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;`--once --preview` 导出画面不推屏 |
 | [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
@@ -75,7 +76,7 @@
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查;`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
 | [`docs/`](docs/) | 优化方案、版本部署清单、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md) |
-| [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例 |
+| [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
 

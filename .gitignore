@@ -27,3 +27,6 @@ pxe.conf
 pxe-mode.json
 pxeserver.log
 video-names.json
+
+# Claude Code agent worktrees
+.claude/worktrees/

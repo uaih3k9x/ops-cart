@@ -129,20 +129,29 @@ def parse_pgm(data):
     """P5 灰度 PGM 字节 -> (宽, 高, 像素 bytearray). 头里允许 # 注释."""
     if data[:2] != b"P5":
         raise ValueError("不是 P5 灰度 PGM")
-    fields, i = [], 0
+    fields, i, n = [], 0, len(data)
     while len(fields) < 4:                       # P5 w h maxval
-        while data[i:i + 1].isspace():
+        while i < n and data[i:i + 1].isspace():
             i += 1
+        if i >= n:
+            raise ValueError("PGM 头不完整")
         if data[i:i + 1] == b"#":
-            i = data.index(b"\n", i)
+            i = data.find(b"\n", i)
+            if i < 0:
+                raise ValueError("PGM 头不完整")
             continue
         j = i
-        while not data[j:j + 1].isspace():
+        while j < n and not data[j:j + 1].isspace():
             j += 1
         fields.append(data[i:j])
         i = j
+    if i >= n:                                   # maxval 后面要有一个空白再接像素
+        raise ValueError("PGM 头不完整")
     w, h = int(fields[1]), int(fields[2])
-    return w, h, bytearray(data[i + 1:i + 1 + w * h])
+    px = bytearray(data[i + 1:i + 1 + w * h])
+    if len(px) < w * h:
+        raise ValueError(f"PGM 像素不够: 要 {w * h}, 只有 {len(px)}")
+    return w, h, px
 
 
 def asset_blocks(w, h, px):

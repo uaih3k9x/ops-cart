@@ -115,6 +115,18 @@ def test_parse_pgm_rejects_non_p5():
         cl.parse_pgm(b"P6\n2 2\n255\n" + b"\0" * 12)
 
 
+@pytest.mark.parametrize("data", [b"P5 10", b"P5\n2 2", b"P5\n# only comment", b"P5\n2 2\n255"])
+def test_parse_pgm_truncated_header_raises(data):
+    """头不完整要报错, 不能卡死 (曾经死循环)."""
+    with pytest.raises(ValueError):
+        cl.parse_pgm(data)
+
+
+def test_parse_pgm_short_pixels_raises():
+    with pytest.raises(ValueError):
+        cl.parse_pgm(b"P5\n2 2\n255\n" + b"\0" * 3)
+
+
 # ---- 行为 ----
 
 def test_short_id_pads_to_five():
