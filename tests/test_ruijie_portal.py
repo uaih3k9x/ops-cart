@@ -237,3 +237,35 @@ def test_persist_hosts_only_when_changed(tmp_path):
     assert rp._read_json(p) is None
     assert rp.persist_hosts(conf, before=None, path=p) is True
     assert rp._read_json(p)["portal_hosts"] == ["203.0.113.5"]
+
+
+# ---- 认证页换了主机: 面板上人确认后加进白名单 ----
+
+def test_pending_host_only_for_untrusted():
+    assert rp.pending_host({"state": "untrusted", "message": "wifi.example.edu:8443"}) == "wifi.example.edu:8443"
+    assert rp.pending_host({"state": "online", "message": ""}) is None
+    assert rp.pending_host({"state": "untrusted", "message": ""}) is None
+    assert rp.pending_host(None) is None
+
+
+def test_conf_trust_appends_keeps_old():
+    conf = {"iface": "wlp4s0", "user": "u", "password": "p", "portal_hosts": ["203.0.113.5"]}
+    new = rp.conf_trust(conf, "Wifi.Example.EDU:8443")
+    assert new["portal_hosts"] == ["203.0.113.5", "wifi.example.edu:8443"]
+    assert conf["portal_hosts"] == ["203.0.113.5"]                       # 不改原对象
+    assert new["password"] == "p"
+    assert rp.conf_trust(new, "wifi.example.edu:8443")["portal_hosts"] == new["portal_hosts"]   # 不重复
+
+
+@pytest.mark.parametrize("bad", ["", "a b", "http://x/", "x/eportal", "x:port", "x:99999"])
+def test_conf_trust_rejects_garbage(bad):
+    with pytest.raises(ValueError):
+        rp.conf_trust({"portal_hosts": []}, bad)
+
+
+def test_trusted_new_host_logs_in(monkeypatch):
+    """加进白名单后, 同一个陌生主机就能正常登录."""
+    _fake_curl(monkeypatch, STRANGER)
+    conf = rp.conf_trust({"iface": "wlp4s0", "user": "u", "password": "p", "portal_hosts": ["203.0.113.5"]},
+                         "198.51.100.9")
+    assert rp.run_once(conf) == "login ok"

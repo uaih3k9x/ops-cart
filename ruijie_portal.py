@@ -14,6 +14,7 @@ portal 主机白名单 (TOFU): 配置里的 portal_hosts 为空时, 第一次登
 
 import json
 import random
+import re
 import socket
 import struct
 import subprocess
@@ -171,6 +172,30 @@ def host_trust(conf, host):
     if not hosts:
         return "tofu"
     return "ok" if host in hosts else "stranger"
+
+
+_HOST_RE = re.compile(r"^[a-z0-9.-]+(:\d{1,5})?$")
+
+
+def pending_host(status):
+    """最近一次结果是"认证页不在白名单" -> 那个主机 (等人确认); 否则 None."""
+    if not status or status.get("state") != "untrusted":
+        return None
+    return status.get("message") or None
+
+
+def conf_trust(conf, host):
+    """人在面板上确认过的认证页主机加进白名单 (原来的都留着). 返回新配置, 不改原对象."""
+    host = (host or "").strip().lower()
+    m = _HOST_RE.match(host)
+    if not m or (m.group(1) and not 0 < int(m.group(1)[1:]) < 65536):
+        raise ValueError(f"不像认证页主机: {host!r}")
+    new = dict(conf)
+    hosts = list(conf.get("portal_hosts") or [])
+    if host not in hosts:
+        hosts.append(host)
+    new["portal_hosts"] = hosts
+    return new
 
 
 def run_once(conf):

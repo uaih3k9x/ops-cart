@@ -152,6 +152,8 @@ class WifiPanel(BridgePanel):
         self._btn(row, "立即认证", self.auth_now, bg="#26577c")
         self.auth_lbl = tk.Label(box, text="", font=FONT, bg=BG, fg="#8b93a7", anchor="w")
         self.auth_lbl.pack(fill="x", padx=6, pady=(0, 6))
+        self.auth_trust_row = tk.Frame(box, bg=BG)         # 认证页换了主机时才露出来
+        self.auth_trust_btn = self._btn(self.auth_trust_row, "", self.auth_trust, bg="#7c5a26")
         self._auth_render()
 
     def _auth_render(self):
@@ -163,6 +165,37 @@ class WifiPanel(BridgePanel):
         text = AUTH_STATES.get(st["state"], st["state"])
         self.auth_lbl.config(text=f"最近一次 {when}: {text} {st.get('message', '')}".rstrip(),
                              fg="#7ee787" if st.get("ok") else "#ff7b72")
+        host = rp.pending_host(st)
+        if host:
+            self.auth_trust_btn.config(text=f"信任认证页 {host}")
+            self.auth_trust_row.pack(fill="x", padx=6, pady=(0, 6))
+        else:
+            self.auth_trust_row.pack_forget()
+
+    def auth_trust(self):
+        """认证页换了主机 (学校换入口): 人确认后加进白名单, 再认证一次. 原来的主机留着."""
+        host = rp.pending_host(rp._read_json(rp.STATUS))
+        if not host:
+            return self._auth_render()
+        conf = rp._read_json(rp.CONF) or {}
+        if not messagebox.askyesno(
+                "信任新的认证页",
+                f"这次被跳到的认证页是\n\n    {host}\n\n原来信任的是: {', '.join(conf.get('portal_hosts') or []) or '(无)'}\n\n"
+                f"信任以后, 连着 {conf.get('ssid') or '配置的无线'} 时会把校园网账号密码发给它.\n"
+                "只有确定推车连的是真的校园网 (不是同名的假热点) 才点「是」.", parent=self):
+            return
+
+        def work():
+            rp.conf_save(rp.conf_trust(rp._read_json(rp.CONF) or {}, host))
+            return _run(["systemctl", "start", "campus-auth.service"], timeout=60)
+
+        def done(res):
+            if isinstance(res, Exception):
+                return self._say(f"没改成: {type(res).__name__}: {res}", ok=False)
+            self._auth_render()
+            self._say(f"已信任 {host}, 认证完成" if res[0] == 0 else f"已信任 {host}, 但认证没成功, 原因见下面一行",
+                      res[0] == 0)
+        self._bg(work, done, "保存并认证中…")
 
     def auth_save(self):
         user, pw = self.auth_user.get(), self.auth_pw.get()
