@@ -260,11 +260,12 @@ def test_select_port_matches_by_realpath():
 
 # ============================================================ 无界面: 不许拖进 tkinter
 
-def test_core_does_not_import_tkinter():
+@pytest.mark.parametrize("mod", ["serial_core", "cart_dream", "webkiosk", "dash_core", "dash_service"])
+def test_headless_modules_do_not_import_tkinter(mod):
     import os
     import subprocess
     import sys
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    r = subprocess.run([sys.executable, "-c", "import sys; sys.modules['tkinter'] = None; import serial_core"],
+    r = subprocess.run([sys.executable, "-c", f"import sys; sys.modules['tkinter'] = None; import {mod}"],
                        cwd=root, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

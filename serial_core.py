@@ -1,7 +1,7 @@
 """串口面板的纯逻辑: 读 serial.conf、拼 conbroker 命令、解析 list 输出、选口、按键/终端字节. 不碰 Tk.
 
 后端是 conbroker (以 serial.conf 里的 user 身份跑); 这里只读它的命令行输出和数据目录 (run/ logs/ chat.log),
-不直接碰串口设备. 界面在 serial_panel.py, 无界面的 (cart_dream / webkiosk / 灯条采样) 直接用这里.
+不直接碰串口设备. 界面在 serial_panel.py, 无界面的 (cart_dream / webkiosk / cart-dash / 灯条采样) 直接用这里.
 口的选法: hub 口别名 /dev/con-N 优先, 其次 /dev/serial/by-id; 板载 ttyS* 不列; 键鼠 CH9329 的口标出来.
 """
 
