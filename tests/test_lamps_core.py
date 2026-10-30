@@ -134,5 +134,5 @@ def test_slot_for_lamp_gives_device_path():
     assert lc.slot_for_lamp("con-1") == "/dev/con-1"
     assert lc.slot_for_lamp("con-4") == "/dev/con-4"
     # 面板真正能用它选中
-    import serial_panel as sp
-    assert sp.select_port(["/dev/con-1", "/dev/con-3"], lc.slot_for_lamp("con-3")) == ("/dev/con-3", True)
+    import serial_core as sc
+    assert sc.select_port(["/dev/con-1", "/dev/con-3"], lc.slot_for_lamp("con-3")) == ("/dev/con-3", True)

@@ -15,7 +15,7 @@ import tempfile
 import time
 
 import atomicfile
-from serial_panel import serial_conf_read
+from serial_core import serial_conf_read
 
 CART_LOG = "/opt/pxe/CART-LOG.md"
 STATE = "/var/lib/ops-cart/dream.json"

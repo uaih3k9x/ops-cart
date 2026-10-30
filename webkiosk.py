@@ -27,7 +27,7 @@ import cartlog
 import ch9329
 import kiosk_core as kc
 import kvm_core as kvm
-import serial_panel as sp
+import serial_core as sc
 import web_core as wc
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -67,7 +67,7 @@ def audit_path():
 
 
 def _real_serial_dir():
-    return sp.data_dir(sp.serial_conf_read())
+    return sc.data_dir(sc.serial_conf_read())
 
 
 class App:

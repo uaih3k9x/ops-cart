@@ -24,7 +24,7 @@ import kvm_core as kvm
 import lamps_core as lc
 import netprof_core as npc
 import ups_core as uc
-import serial_panel as sp
+import serial_core as sc
 from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
@@ -297,11 +297,11 @@ class Kiosk(tk.Tk):
 
     def _lamp_sample(self):
         """常驻采样线程里跑: 只读文件和 /proc, 不碰 Tk (_kvm_count 是 int, 读一下是原子的)."""
-        conf = sp.serial_conf_read()
+        conf = sc.serial_conf_read()
         on_bell = self._beeper.ring if conf.get("bell_beep") else None   # serial.conf 开了才响主板蜂鸣
         # 副屏 (cart-dash) 拿不到这两样: 锁屏看锁屏窗口在不在, 键鼠看入队计数. 只在变了时写盘
         self._kiosk_report.update(self._lock_win is not None, self._kvm_count)
-        return lc.sample(sp.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
+        return lc.sample(sc.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
 
     def _ups_sample(self):
         """后台线程: 每秒读一次 upower (命令行, 只读). 读不到就返回 None."""

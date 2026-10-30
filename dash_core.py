@@ -252,13 +252,13 @@ def every(period, f, clock=time.monotonic):
 def default_ctx(ddir=None, clock=time.monotonic):
     """真机采集 (cart-dash 用). 每一样都兜住, 不抛.
 
-    ddir: conbroker 数据目录, 默认和车机一样取 serial_panel.data_dir (跑服务那个用户的
+    ddir: conbroker 数据目录, 默认和车机一样取 serial_core.data_dir (跑服务那个用户的
     ~/.conbroker), 不是 /opt/pxe. 键鼠计数在 kiosk 进程里, 从它回写的 kiosk.json 读.
     """
     import kiosk_core as kc
-    import serial_panel as sp
+    import serial_core as sc
     if ddir is None:
-        ddir = sp.data_dir(sp.serial_conf_read())
+        ddir = sc.data_dir(sc.serial_conf_read())
 
     def safe(f, d=None):
         if f is None:

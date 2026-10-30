@@ -229,10 +229,10 @@ def _stub_kc(monkeypatch):
 
 def test_default_ctx_reads_conbroker_dir_like_kiosk(monkeypatch):
     import lamps_core
-    import serial_panel as sp
+    import serial_core as sc
     _stub_kc(monkeypatch)
     seen = {}
-    monkeypatch.setattr(sp, "serial_conf_read", lambda *a: {"user": "ops", "data_dir": "/tmp/cb"})
+    monkeypatch.setattr(sc, "serial_conf_read", lambda *a: {"user": "ops", "data_dir": "/tmp/cb"})
     monkeypatch.setattr(lamps_core, "slot_status", lambda ddir, *a, **k: seen.setdefault("slots", ddir))
     monkeypatch.setattr(lamps_core, "sample",
                         lambda ddir, kvm, **k: seen.update(lamps=ddir, kvm=kvm) or ([], {}))
