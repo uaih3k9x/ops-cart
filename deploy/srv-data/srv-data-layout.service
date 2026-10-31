@@ -1,0 +1,14 @@
+# 数据盘挂上后建目录布局 (#11). 没挂上 (没装盘 / UUID 不对) 就什么都不做, 不往根分区写.
+[Unit]
+Description=推车数据盘目录布局
+Requires=srv-data.mount
+After=srv-data.mount
+ConditionPathIsMountPoint=/srv/data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemd-tmpfiles --create /etc/ops-cart/srv-data.tmpfiles.conf
+
+[Install]
+WantedBy=srv-data.mount
