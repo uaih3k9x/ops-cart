@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cart_mcp: 推车 MCP 服务 (issue #19). 只读工具, 不往任何设备写; 协议和校验在 mcp_core.
+"""cart_mcp: 推车 MCP 服务 (issue #19). 协议和校验在 mcp_core; 串口写工具 (#21) 在 mcp_serial.
 
     sudo python3 /opt/pxe/cart_mcp.py stdio     # 本机 / ssh 上来的 Agent (ssh 本身就是认证)
     sudo python3 /opt/pxe/cart_mcp.py http      # tailnet: 只绑 127.0.0.1 和 tailnet 地址, 要 Bearer 令牌
@@ -10,6 +10,8 @@ Claude Code 接法 (地址、令牌换成自己的):
 
 工具: list_threads (槽位 1-4) / read_output (走 conbroker tail, 不直开串口) / screenshot (cart_snap) /
       cart_status (/run/ops-cart/state.json) / pxe_status (只读, 解锁见 #24).
+写串口 (#21, mcp_serial): 写租约 + 闸门 (只读命令直发, 其余挂起等人确认) + 急停. 车机上确认 / 解除:
+    sudo python3 /opt/pxe/cart_mcp.py pending | confirm <编号> | reject <编号> | estop [槽位] | resume <槽位|all>
 要 root: 截图要采集卡和 mpv 的 socket, 读串口输出要 sudo -u <serial.conf 的 user> 跑 conbroker.
 令牌和端口在 /etc/ops-cart/mcp.json (样例 examples/mcp.example.json), 每个请求重读, 加令牌不用重启.
 审计每次调用一行 JSON, 落 /var/log/ops-cart/mcp-audit.log.
@@ -31,6 +33,7 @@ import kiosk_core as kc
 import lamps_core
 import mcp_core as mc
 import mcp_label
+import mcp_serial
 import serial_core
 
 MCP_CONF = "/etc/ops-cart/mcp.json"
@@ -63,9 +66,9 @@ SLOT_PARAM = {"type": "integer", "minimum": 1, "maximum": 4, "required": True,
               "description": "操作头槽位 1-4 (对应 /dev/con-N)"}
 
 
-def build_tools(slots, tail, snap, state, pxe, now=time.time):
+def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {}):
     """slots() -> lamps_core.slot_status 那样的 4 项; tail(dev, n) -> 文本; snap(dev|None) -> (png, 哪块卡);
-    state() -> 快照 dict 或 None; pxe() -> dict. 出错抛 mc.ToolError. 测试里全换成假的."""
+    state() -> 快照 dict 或 None; pxe() -> dict; writer() -> {槽位: 写租约持有者}. 出错抛 mc.ToolError. 测试里全换成假的."""
 
     def _slot(n):
         s = slots()[n - 1]
@@ -76,7 +79,7 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time):
         return s
 
     def list_threads(_a):
-        out = []
+        out, writers = [], writer()
         for n, s in enumerate(slots(), 1):
             name = None
             if s["present"] and s["baud"]:              # 线拔了 / 没服务: 名字清空, 不读旧日志
@@ -86,7 +89,7 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time):
                     pass
             out.append({"slot": n, "dev": s["dev"], "present": bool(s["present"]), "service": bool(s["baud"]),
                         "baud": s["baud"], "name": name, "label": mc.slot_label(n, name),
-                        "writer": None})               # 写入者等写租约 (#21), 这一版恒为空
+                        "writer": writers.get(n)})     # 写租约持有者 (#21)
         return [mc.json_content({"threads": out})]
 
     def read_output(a):
@@ -116,7 +119,7 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time):
 
     return [
         mc.Tool("list_threads", "列出串口操作头槽位 1-4 的执行绪: 线在不在、有没有在跑的 conbroker 服务、波特率、"
-                "从提示符认出的设备名 (华为 <名>/[名]), 写入者 (这一版恒为空). 名字只是标签, 以槽位号为准.",
+                "从提示符认出的设备名 (华为 <名>/[名]), 写入者 (写租约持有者). 名字只是标签, 以槽位号为准.",
                 {}, list_threads),
         mc.Tool("read_output", "读某个槽位串口最近 N 行输出 (经 conbroker tail 读它的日志, 不直接开串口). 只读.",
                 {"slot": SLOT_PARAM,
@@ -182,8 +185,11 @@ def read_pxe(mode_path=kc.PXE_MODE, root=kc.TFTP_ROOT, guard_path=None, now=None
 
 
 def real_tools():
-    return build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap,
-                       state=dash_core.read, pxe=read_pxe) + mcp_label.real_label_tools()   # 标签 (#20)
+    store = mcp_serial.Store()
+    return (build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap, state=dash_core.read, pxe=read_pxe,
+                        writer=lambda: mcp_serial.writers(store))
+            + mcp_serial.real_tools(conbroker_tail, store)      # 写串口 (#21)
+            + mcp_label.real_label_tools())                     # 标签 (#20)
 
 
 def version():
@@ -308,14 +314,17 @@ def serve_http(server, port, audit, conf=conf_read):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="ops-cart MCP 服务 (只读工具)")
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in mcp_serial.CLI_CMDS:        # 车机上确认 / 急停 / 解除 (#21)
+        return mcp_serial.cli(argv)
+    ap = argparse.ArgumentParser(description="ops-cart MCP 服务")
     ap.add_argument("mode", choices=["stdio", "http"])
     ap.add_argument("--port", type=int, help="HTTP 端口, 默认取 mcp.json 的 port (8765)")
     ap.add_argument("--conf", default=MCP_CONF, help="令牌/端口配置")
     ap.add_argument("--audit", default=mc.AUDIT_PATH, help="审计日志 (JSONL)")
     a = ap.parse_args(argv)
     audit = mc.Audit(a.audit)
-    server = mc.Server(real_tools(), audit=audit, version=version())
+    server = mcp_serial.Server(real_tools(), audit=audit, version=version())    # 写工具要知道"谁"
     if a.mode == "stdio":
         for s in (sys.stdin, sys.stdout):
             if hasattr(s, "reconfigure"):

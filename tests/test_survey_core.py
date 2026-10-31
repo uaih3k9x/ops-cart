@@ -106,6 +106,17 @@ def test_unknown_vendor_rejected(vendor):
     assert not sv.is_readonly("show version", vendor)
 
 
+def test_extra_verbs_only_add_verbs_keep_other_rules():
+    """#21 闸门第 1 层: 规则文件可以给内置厂商加只读动词 (ping), 其余规则 (禁字符、管道、全称) 照旧."""
+    assert not sv.is_readonly("ping 192.0.2.1", "huawei")
+    assert sv.is_readonly("ping 192.0.2.1", "huawei", extra_verbs=["ping"])
+    assert sv.is_readonly("display version", "huawei", extra_verbs=["ping"])
+    assert not sv.is_readonly("ping 192.0.2.1 ; save", "huawei", extra_verbs=["ping"])
+    assert not sv.is_readonly("ping", "huawei", extra_verbs=["ping"])
+    assert not sv.is_readonly("ping 192.0.2.1 | save x", "huawei", extra_verbs=["ping"])
+    assert not sv.is_readonly("ls -l", "linux", extra_verbs=["ls"])        # 没有内置规则的厂商照样不放
+
+
 def test_check_commands_reports_all_bad():
     bad = sv.check_commands(["display version", "save", "dis cur"], "huawei")
     assert bad == ["save", "dis cur"]

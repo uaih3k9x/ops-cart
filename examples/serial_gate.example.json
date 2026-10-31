@@ -1,0 +1,11 @@
+{
+  "_说明": "串口写闸门第 1 层规则 (#21, serial_write_core.load_rules). 拷到 /etc/ops-cart/serial-gate.json (root 0644) 生效, 每条命令都重读, 改了不用重启. 只能加不能放松: 只读白名单的语法规则 (全称、小写、禁 ; & < > ` $ # !、管道只许 include/exclude/...) 写死在 survey_core 里; 这里只能给内置厂商 (huawei / cisco) 追加只读动词、追加高危词、给槽位登记厂商. 高危词内置的删不掉 (save reboot reset format delete ...). 文件坏了 = 内置默认.",
+  "_slots": "槽位 -> 厂商. 没登记的槽位: auto_huawei=true 时最后一行是华为 <名>/[名] 提示符才按华为算; 思科式 名# 和 Linux 的 bash# 分不开, 要用就在这里登记. 登记了的槽位也得停在该厂商的提示符上才放行.",
+  "slots": {},
+  "auto_huawei": true,
+  "vendors": {
+    "huawei": {"extra_verbs": ["ping", "tracert"]},
+    "cisco": {"extra_verbs": ["ping", "traceroute"]}
+  },
+  "danger": ["license", "patch"]
+}
