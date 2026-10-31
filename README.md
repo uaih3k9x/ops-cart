@@ -33,7 +33,8 @@
   校园网锐捷 ePortal 无浏览器自动认证(认证页主机首次记住,之后跳到陌生主机不发账号);
   改当前出口那条无线前先确认,换连接先建后删、新密码连不上自动回退
 - **副屏与 UPS**:USB 副屏常驻状态板(`cart-dash` 统一采集,车机和副屏读同一份快照);
-  APC UPS 直读 hidraw 拿电量、负载、市电状态,放电到 15% 正常关机;顶栏一排虚拟指示灯,颜色看自检、闪烁看活动
+  APC UPS 直读 hidraw 拿电量、负载、市电状态;低电量两段式:≤25% 或估计剩不到 8 分钟先琥珀一行预告(推到手机),
+  到 15% 再 30 秒倒计时、插回市电自动取消,走完才正常关机(日志 `/var/log/ops-cart/ups.log`);顶栏一排虚拟指示灯,颜色看自检、闪烁看活动
 - **OCR 与屏幕配方**:截图识字带坐标;`recipe.py boot-pxe` 自动进启动菜单选网络启动
 - **Agent 接入**:MCP 服务把串口输出、截屏、推车状态开放给 Claude Code 等现成 Agent(第一版只读,写设备另行把关)
 - **机房辅助**:LLDP 显示网线对面的交换机和口;串口一键只读巡检并比对配置漂移;TSC 线缆/资产标签;关键事件推到手机;Clonezilla 整盘克隆(解锁 MAC + 目标盘显式匹配)
@@ -76,7 +77,7 @@
 | [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
 | [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;`--once --preview` 导出画面不推屏 |
 | [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
-| [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;按百分比判低电量 |
+| [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;低电量两段式的判断 `shutdown_stage`(预告 / 倒计时 / 关机,车机和副屏共用) |
 | [`lamps_core.py`](lamps_core.py) | 顶栏虚拟指示灯:每灯盯一个单调计数器(日志大小、网卡字节数、键鼠发送次数),变了就闪;串口操作头 `/dev/con-1~4` 收到 ^G 亮红 |
 | [`cart_dream.py`](cart_dream.py) | 推车"做梦":每晚 02:00 把 `CART-LOG.md` 新增部分交给车上的 Claude Code 整理成小结(不给工具、有花费上限、失败不前进),标题显示在锁屏底部 |
 
