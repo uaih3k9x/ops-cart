@@ -17,8 +17,12 @@ import os
 import re
 import subprocess
 
-LOW_PCT = 15                    # 放电到这个百分比就正常关机
+LOW_PCT = 15                    # 放电到这个百分比进关机倒计时
+WARN_PCT = 25                   # 放电到这个百分比先预告 (10/31 演练: 约 3.7%/分, 25%->15% 约 2.7 分钟)
+WARN_RUNTIME_S = 8 * 60         # 或 UPS 估计剩余 (hidraw battery.runtime) 不到这么多秒, 也预告
+COUNTDOWN_S = 30                # 到 LOW_PCT 后倒计时这么多秒再关机, 期间插回市电取消
 UPS_KEY = "ups"                 # 顶栏电池灯在 _lamps 里的键
+UPS_LOG = "/var/log/ops-cart/ups.log"   # 目录由 tmpfiles 建, logrotate 管 *.log
 
 _DEV = re.compile(r"ups_hiddev|hiddev\d+")
 _FIELDS = {
@@ -60,6 +64,109 @@ def on_battery(ups):
 def low(ups, threshold=LOW_PCT):
     """放电且电量到了阈值: 该正常关机了."""
     return on_battery(ups) and ups.get("percent", 100) <= threshold
+
+
+# ---------------------------------------------------------------- 两段式低电量关机
+# 10/31 放电演练: 15% 时整屏大红字、3 秒就关, 没有预告, 很吓人. 改成:
+#   normal    在市电, 或在电池但电量/剩余时间都还够
+#   warn      在电池且 电量 <= WARN_PCT 或 估计剩余 < WARN_RUNTIME_S: 琥珀色一行预告
+#   countdown 在电池且 电量 <= LOW_PCT: COUNTDOWN_S 秒倒计时, 插回市电取消
+#   poweroff  倒计时走完: 正常关机
+# 判断是纯函数, 时间由调用方注入; kiosk (真关机的那个) 和副屏共用.
+
+_MAINS_STATES = ("charging", "fully-charged", "pending-charge")
+
+
+def _on_mains(ups):
+    """有正面证据说市电回来了: hidraw 的 OL, 或 upower 说在充电/充满. 读不到/说不清都不算."""
+    if not isinstance(ups, dict):
+        return False
+    words = str(ups.get("status") or "").split()
+    if "OL" in words:
+        return True
+    if "OB" in words:
+        return False
+    return ups.get("state") in _MAINS_STATES
+
+
+def shutdown_stage(ups, since=None, now=0.0):
+    """-> (阶段, 倒计时剩几秒). 阶段: normal / warn / countdown / poweroff; 剩几秒只在后两个有值.
+
+    since: 倒计时开始的时间 (调用方在第一次拿到 countdown 时记下 now), 没在倒计时就 None.
+    倒计时中只认"插回市电"取消; 电量读不到、字段缺了、电池回弹到阈值以上都按仍在电池继续 (fail-safe).
+    """
+    if since is not None:
+        if _on_mains(ups):
+            return "normal", None
+        left = COUNTDOWN_S - (now - since)
+        if left <= 0:
+            return "poweroff", 0
+        return "countdown", int(-(-left // 1))        # 向上取整: 还剩 0.5 秒显示 1, 到 0 才关
+    if not on_battery(ups):
+        return "normal", None
+    pct = ups.get("percent", 100)
+    if pct <= LOW_PCT:
+        return "countdown", COUNTDOWN_S
+    runtime = ups.get("runtime")
+    if pct <= WARN_PCT or (runtime is not None and runtime < WARN_RUNTIME_S):
+        return "warn", None
+    return "normal", None
+
+
+def _pct(ups):
+    pct = ups.get("percent") if isinstance(ups, dict) else None
+    return "--" if pct is None else f"{pct}%"
+
+
+def _left_min(ups):
+    """UPS 估计剩余, 中文; 没有 hidraw 的 runtime 就 None (upower 的 time to empty 不可信, 不用)."""
+    runtime = ups.get("runtime") if isinstance(ups, dict) else None
+    if runtime is None:
+        return None
+    return "约剩不到 1 分钟" if runtime < 60 else f"约剩 {int(runtime) // 60} 分钟"
+
+
+def alert(ups, stage, left=None):
+    """预告/倒计时的提示 -> {text, short, level}; normal 返回 None.
+    text 给车机顶栏和副屏横条, short 给锁屏右上角和副屏头部那一行. level: warn=琥珀, bad=红."""
+    if stage == "warn":
+        m = _left_min(ups)
+        head = f"电池{m}" if m else f"电池剩 {_pct(ups)}"
+        return {"text": f"{head}，到 {LOW_PCT}% 自动关机，请插回市电",
+                "short": f"{head} · {LOW_PCT}% 自动关机", "level": "warn"}
+    if stage == "countdown":
+        when = f"{left} 秒后" if left is not None else "即将"
+        return {"text": f"电量 {_pct(ups)}，{when}自动关机 · 插回市电可取消",
+                "short": f"{when}关机 · 插回市电取消", "level": "bad"}
+    if stage == "poweroff":
+        return {"text": f"电量 {_pct(ups)}，正在关机", "short": "正在关机", "level": "bad"}
+    return None
+
+
+def stage_log(prev, stage, ups):
+    """阶段变化 -> 一行日志; 没变化或不值得记返回 None."""
+    if prev == stage:
+        return None
+    pct = _pct(ups)
+    if stage == "warn":
+        m = _left_min(ups)
+        return f"低电量预告: 电池 {pct}" + (f", {m}" if m else "") + f", 到 {LOW_PCT}% 自动关机"
+    if stage == "countdown":
+        return f"电量 {pct} 到阈值 {LOW_PCT}%, {COUNTDOWN_S} 秒后正常关机, 插回市电可取消"
+    if stage == "poweroff":
+        return f"倒计时结束, 正常关机 (电量 {pct})"
+    if prev == "countdown":
+        return f"市电恢复, 取消关机倒计时 (电量 {pct})"
+    if prev == "warn":
+        return f"市电恢复, 解除低电量预告 (电量 {pct})"
+    return None
+
+
+def log(msg, path=UPS_LOG):
+    """写 /var/log/ops-cart/ups.log, 同时进 events.log. 写失败吞掉 (cartlog 负责)."""
+    import cartlog
+    cartlog.event("ups", msg, path=path)
+    cartlog.event("ups", msg, path=cartlog.EVENTS)
 
 
 def detail(ups):
