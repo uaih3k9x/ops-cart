@@ -1,0 +1,8 @@
+{
+  "_说明": "放到 /etc/ops-cart/mcp.json (root 0600). tokens: 名字 -> 令牌, 名字进审计日志的 who. 令牌用 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' 生成, 短于 24 字符的不认 (下面的占位就不认). hosts: 用主机名访问时把名字加进来 (挡 DNS rebinding), 直接用 IP 不用加.",
+  "port": 8765,
+  "tokens": {
+    "claude-laptop": "CHANGE-ME"
+  },
+  "hosts": []
+}

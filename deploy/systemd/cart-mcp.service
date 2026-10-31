@@ -1,0 +1,22 @@
+[Unit]
+Description=ops-cart MCP 服务 (只读工具; 只绑本机和 tailnet 地址, 要 Bearer 令牌)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# 不依赖 kiosk.service / cart-dash: 那边挂了工具各自报错, 服务照样在
+
+[Service]
+# root: 截图要采集卡和 mpv 的 socket (root), 读串口输出要 sudo -u <serial.conf 的 user> 跑 conbroker tail.
+# 令牌在 /etc/ops-cart/mcp.json (root 0600, 样例 examples/mcp.example.json); 没配令牌 = 谁都进不来.
+# 只用 stdio (ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio) 的话不用开这个单元. 默认不开机自启.
+ExecStart=/usr/bin/python3 /opt/pxe/cart_mcp.py http
+WorkingDirectory=/opt/pxe
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

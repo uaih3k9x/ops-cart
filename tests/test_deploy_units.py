@@ -61,3 +61,19 @@ def test_cart_notify_units_read_only_oneshot_timer():
     assert "cart-dash.service" not in body                 # 只读状态文件, 不依赖也不拉起 cart-dash
     assert "StateDirectory" not in body                    # /var/lib/ops-cart 的权限做梦在用, 别改
     assert "OnUnitActiveSec=30" in t and "WantedBy=timers.target" in t
+
+
+def test_cart_mcp_unit_http_without_bind_override():
+    u = unit("cart-mcp.service")
+    body = "\n".join(l for l in u.splitlines() if not l.lstrip().startswith("#"))
+    assert "ExecStart=/usr/bin/python3 /opt/pxe/cart_mcp.py http" in body
+    assert "--bind" not in body and "kiosk.service" not in body     # 监听地址由程序自己筛 (本机 + tailnet)
+
+
+def test_mcp_example_conf_token_is_not_usable():
+    import json
+    import mcp_core as mc
+    conf = json.loads((UNITS.parent.parent / "examples" / "mcp.example.json").read_text())
+    assert conf["port"] == 8765 and conf["tokens"]
+    for tok in conf["tokens"].values():                 # 照抄样例上线也进不来
+        assert mc.token_who(f"Bearer {tok}", conf["tokens"]) is None
