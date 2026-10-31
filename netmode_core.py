@@ -87,7 +87,7 @@ def describe(r):
     if r["mode"] == "static":
         text += f" {p['addr']}" + (f" 网关 {p['gateway']}" if p.get("gateway") else "") \
             + (f" 经网关去 {p['routes']}" if p.get("routes") else "") \
-            + (f" DNS {p['dns']}" if p.get("dns") else "") + f" · {EGRESS.get(p['egress'], p['egress'])}"
+            + (f" DNS {p['dns']}" if p.get("dns") else "") + f" · {dict(EGRESS, primary='主出口 (旧版, 再建按备用)').get(p['egress'], p['egress'])}"
     return text
 
 
@@ -234,6 +234,8 @@ def _settings(iface, r):
     gw = p.get("gateway") or ""
     egress = p.get("egress", "never")
     egress = egress_for_gateway(iface, egress, gw) if egress == "never" else egress
+    if egress == "primary" and iface not in NO_EGRESS:   # 1.09.00 的老记录: 有线不再当主出口, 按备用建
+        egress = "backup"
     routes = ", ".join(f"{n.strip()} {gw}" for n in (p.get("routes") or "").split(",") if n.strip())
     return (["ipv4.method", "manual", "ipv4.addresses", p["addr"],
              "ipv4.gateway", gw if egress != "never" else "", "ipv4.routes", routes,

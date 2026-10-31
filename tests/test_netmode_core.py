@@ -263,11 +263,20 @@ def test_lan1_egress_refused_even_if_params_forged(egress):
         nm.apply_steps(forged, uuids())
 
 
-def test_lan2_primary_from_old_state_refused():
-    forged = nm.rec("static", "enp3s0", {"addr": "192.0.2.5/24", "gateway": "192.0.2.1", "dns": "",
-                                          "egress": "primary"})
-    with pytest.raises(ValueError, match="主出口"):
-        nm.apply_steps(forged, uuids())
+def test_lan2_primary_from_old_state_rebuilt_as_backup():
+    """1.09.00 可能记过 LAN2 主出口: 不能因此切不走 (恢复原模式要重建它), 按备用出口建."""
+    old = nm.rec("static", "enp3s0", {"addr": "192.0.2.5/24", "gateway": "192.0.2.1", "dns": "",
+                                       "egress": "primary"})
+    kv = kv_of(nm.apply_steps(old, uuids())[0][0])
+    assert kv["ipv4.route-metric"] == str(wc.WIRED_BACKUP_METRIC) and kv["ipv4.never-default"] == "no"
+    st = nm.empty_state()
+    st["modes"].append(dict(old, res=[{"con": "u0", "name": "cart-enp3s0-static", "iface": "enp3s0"}],
+                            status="ok"))
+    plan = nm.plan_switch(st, nm.rec("dhcp", "enp3s0"), CONS, uuids())
+    assert plan["undo"] == [["nmcli", "con", "delete", "uuid", "u0"]]
+    assert nm.describe(old).endswith("主出口 (旧版, 再建按备用)")
+    with pytest.raises(ValueError, match="主出口"):                   # 新填的表单照样不给主出口
+        nm.static_params("enp3s0", "192.0.2.5/24", "192.0.2.1", "", "primary")
 
 
 def test_off_disables_both_families():
