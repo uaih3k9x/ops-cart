@@ -191,21 +191,22 @@ def _is_serve(name):
     return bool(p and p["kind"] == "serve")
 
 
-def apply_steps(r, new_uuid):
-    """记录 -> (命令清单, 占用). new_uuid() 给新连接定 uuid (测试里注入, 好对得上)."""
+def apply_steps(r, new_uuid, link=True):
+    """记录 -> (命令清单, 占用). new_uuid() 给新连接定 uuid (测试里注入, 好对得上).
+    link=False (确定没插线): NM 不让 con up, 只建好配置, 插上线 NM 按优先级自动连."""
     for iface in r["ports"]:
         why = check_mode(iface, r["mode"])
         if why:
             raise ValueError(why)
+    up = [] if link is False else [["nmcli", "con", "up", "uuid"]]
     if r["mode"] == LEGACY:
         u, name = r["params"].get("uuid"), r["params"].get("name")
         if not u:
             return [], []
-        return _stop_pxe(r["ports"][0], _is_serve(name)) + [["nmcli", "con", "up", "uuid", u]], []
+        return _stop_pxe(r["ports"][0], _is_serve(name)) + [c + [u] for c in up], []
     iface = r["ports"][0]
     u = new_uuid()
-    cmds = _stop_pxe(iface) + [_con_add(iface, r["mode"], u, _settings(iface, r)),
-                               ["nmcli", "con", "up", "uuid", u]]
+    cmds = _stop_pxe(iface) + [_con_add(iface, r["mode"], u, _settings(iface, r))] + [c + [u] for c in up]
     return cmds, [{"con": u, "name": con_name(iface, r["mode"]), "iface": iface}]
 
 
@@ -280,9 +281,14 @@ def _bare(r):
     return {"mode": r["mode"], "ports": list(r["ports"]), "params": dict(r["params"])}
 
 
-def plan_switch(st, new, cons_text, new_uuid):
-    """当前 (状态文件里的, 没有就按现状认旧连接) -> new. 返回执行器和确认框要的全部东西, 不跑任何命令."""
+def plan_switch(st, new, cons_text, new_uuid, links=None):
+    """当前 (状态文件里的, 没有就按现状认旧连接) -> new. 返回执行器和确认框要的全部东西, 不跑任何命令.
+    links = {网口: 插没插线}; 确定没插线 (False) 的口只建配置不 up, 读不到 (None) 照常 up."""
     ports = list(new["ports"])
+    links = links or {}
+
+    def steps(r):
+        return apply_steps(r, new_uuid, links.get(r["ports"][0]) is not False)
     cur = []
     for p in ports:
         r = owner(st, p)
@@ -295,16 +301,16 @@ def plan_switch(st, new, cons_text, new_uuid):
                              f"先撤掉它, 再单独切 {PORTS[p]}")
         if r not in cur:
             cur.append(r)
-    apply, res = apply_steps(new, new_uuid)
+    apply, res = steps(new)
     new = dict(_bare(new), res=res)
     restore, restore_recs = [], []
     for r in cur:
-        cmds, rres = apply_steps(_bare(r), new_uuid)
+        cmds, rres = steps(_bare(r))
         restore += cmds
         restore_recs.append(dict(_bare(r), res=rres))
     clean, clean_recs = [], []
     for p in ports:
-        cmds, cres = apply_steps(rec(CLEAN[p], p), new_uuid)
+        cmds, cres = steps(rec(CLEAN[p], p))
         clean += cmds
         clean_recs.append(dict(rec(CLEAN[p], p), res=cres))
     undo = [c for r in cur for c in undo_steps(r)]
@@ -313,6 +319,7 @@ def plan_switch(st, new, cons_text, new_uuid):
             "clean": clean, "clean_recs": clean_recs,
             "probe": new["mode"] == LEGACY and _is_serve(new["params"].get("name")),
             "stop_pxe": any(c[0] == "systemctl" for c in apply),
+            "no_link": [p for p in ports if links.get(p) is False],
             "warn_remote": LAN2 in ports, "primary": new["params"].get("egress") == "primary"}
 
 
@@ -369,7 +376,8 @@ def run_switch(plan, st, run, save, log=None, now=time.time):
         for r in plan["cur"]:
             if r["mode"] != LEGACY or r["params"].get("uuid"):
                 prev.update({p: _bare(r) for p in r["ports"]})
-        return True, done([plan["new"]], prev), f"{where} 切换成功: {describe(plan['new'])}"
+        later = f" · {_ports_text(plan['no_link'])} 没插线, 插上线自动连" if plan.get("no_link") else ""
+        return True, done([plan["new"]], prev), f"{where} 切换成功: {describe(plan['new'])}{later}"
 
     log(f"apply {where} {describe(plan['new'])}: 失败 {why}")
     _run_all(plan["rollback"], run)
@@ -453,6 +461,8 @@ def confirm_text(plan, ip=""):
         lines.append("选了主出口: 推车默认出网会走这个口, tailscale / 远程可能断一下.")
     if plan["stop_pxe"]:
         lines.append("会先停 PXE 装机服务; 要用再去「装机」页打开.")
+    if plan["no_link"]:
+        lines.append(f"{_ports_text(plan['no_link'])} 没插线: 只把配置建好, 插上线 NetworkManager 自动连上.")
     if plan["probe"]:
         lines.append("交还装机配置前先探测链路上有没有别的 DHCP, 有 (或没插线探测不了) 就不切.")
     if lines[-1]:

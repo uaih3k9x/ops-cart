@@ -28,7 +28,7 @@ class _Var:
         self.value = value
 
 
-def _fake(monkeypatch, tmp_path, port="enp3s0", form=None, yes=True, state=None):
+def _fake(monkeypatch, tmp_path, port="enp3s0", form=None, yes=True, state=None, links=None):
     """假面板: 只带 apply/_switch 用到的字段; 记下弹了哪些确认框、进没进后台、说了什么."""
     calls = {"bg": [], "say": [], "ask": [], "events": [], "ran": []}
     monkeypatch.setattr(panel.messagebox, "askyesno", lambda t, m, **k: calls["ask"].append(m) or yes)
@@ -37,7 +37,7 @@ def _fake(monkeypatch, tmp_path, port="enp3s0", form=None, yes=True, state=None)
     state = state or nmc.empty_state()
     fake = SimpleNamespace(
         port=port, state=state, cons_text=CONS, state_path=str(tmp_path / "netmode.json"),
-        views=nmc.port_views(state, CONS, IP_BR, ROUTES, {"eno1": True, "enp3s0": True}),
+        views=nmc.port_views(state, CONS, IP_BR, ROUTES, links or {"eno1": True, "enp3s0": True}),
         _form=lambda: dict(form or {}), after=lambda ms, fn: None, reload=lambda: None,
         _say=lambda *a, **k: calls["say"].append((a[0], a[1] if len(a) > 1 else k.get("ok", True))),
         _bg=lambda work, done, note="": calls["bg"].append((work, done)))
@@ -92,6 +92,17 @@ def test_apply_yes_switches_writes_state_and_events(monkeypatch, tmp_path):
     assert fake.state is not None and nmc.owner(fake.state, "enp3s0")["status"] == "ok"
     assert [k for k, _ in calls["events"]] == ["netmode", "netmode"]   # undo / apply 各一行
     assert calls["say"][-1][1] is True
+
+
+def test_apply_on_unplugged_port_only_creates_profile(monkeypatch, tmp_path):
+    """先按设备出厂网段配好 LAN1 再插线: 没插线不 con up (NM 会拒), 不该当成失败回滚."""
+    calls, fake = _fake(monkeypatch, tmp_path, port="eno1", links={"eno1": False, "enp3s0": True},
+                        form={"mode": "static", "addr": "192.0.2.250/24", "egress": "never"})
+    panel.NetModePanel.apply(fake)
+    assert "没插线" in calls["ask"][0]
+    _finish(calls)
+    assert any("con add" in c for c in calls["ran"]) and not any(c.startswith("nmcli con up") for c in calls["ran"])
+    assert calls["say"][-1][1] is True and "插上线" in calls["say"][-1][0]
 
 
 def test_apply_failure_says_rolled_back(monkeypatch, tmp_path):

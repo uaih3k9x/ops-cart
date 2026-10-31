@@ -244,7 +244,8 @@ class NetModePanel(BridgePanel):
         if nmc.same(view["rec"], new) and not view["drift"]:
             return self._say("已经是这个了")
         try:
-            plan = nmc.plan_switch(self.state, new, self.cons_text, lambda: str(uuid.uuid4()))
+            plan = nmc.plan_switch(self.state, new, self.cons_text, lambda: str(uuid.uuid4()),
+                                   links={v["iface"]: v["link"] for v in self.views})
         except ValueError as ex:
             return self._say(str(ex), ok=False)
         ip = view["ip"] if view["ip"] != "-" else ""

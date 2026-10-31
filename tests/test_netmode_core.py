@@ -305,6 +305,18 @@ def test_plan_never_mentions_wifi():
         assert "wlp4s0" not in text and "6c4d-1" not in text and "campus-net" not in text
 
 
+def test_plan_without_link_only_creates_profile():
+    """没插线 NM 不让 con up (设备 unavailable); 先摸设备网段再插线是常见用法: 只建好, 插上 NM 自动连."""
+    st = nm.empty_state()
+    plan = nm.plan_switch(st, static("eno1"), CONS, uuids(), links={"eno1": False})
+    assert not any(c[:3] == ["nmcli", "con", "up"] for c in plan["apply"] + plan["clean"])
+    assert any(c[:3] == ["nmcli", "con", "add"] for c in plan["apply"])
+    assert plan["no_link"] == ["eno1"]
+    assert "没插线" in nm.confirm_text(plan)
+    plan = nm.plan_switch(st, static("eno1"), CONS, uuids(), links={"eno1": None})    # 读不到: 照常 up
+    assert plan["apply"][-1][:3] == ["nmcli", "con", "up"] and plan["no_link"] == []
+
+
 def test_plan_probe_only_when_handing_back_to_serve_profile():
     plan = nm.plan_switch(nm.empty_state(), nm.legacy("eno1", "a737-4", "Lan1-pxe"), CONS, uuids())
     assert plan["probe"] is True
