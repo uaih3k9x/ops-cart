@@ -313,3 +313,29 @@ def test_http_parse_error(http_srv):
     port, _ = http_srv
     st, _, data = _post(port, b"{nope")
     assert st == 200 and json.loads(data)["error"]["code"] == -32700
+
+
+# ------------------------------------------------------------ #21 写路径接进来
+
+def test_list_threads_shows_writer():
+    f = Fake()
+    tools = cm.build_tools(slots=lambda: f.slots, tail=f.tail, snap=f.snap, state=lambda: f.state_doc,
+                           pxe=dict, writer=lambda: {1: "agentA", 2: None, 3: None, 4: None})
+    th = _json(_call(mc.Server(tools), "list_threads"))["threads"]
+    assert [t["writer"] for t in th] == ["agentA", None, None, None]
+
+
+def test_real_tools_include_serial_write_tools():
+    names = {t.name for t in cm.real_tools()}
+    assert {"send_command", "send_key", "lease_acquire", "lease_renew", "lease_release", "pending_list",
+            "estop"} <= names
+    assert "resume" not in names
+
+
+def test_main_dispatches_serial_cli(monkeypatch):
+    import mcp_serial
+    seen = []
+    monkeypatch.setattr(mcp_serial, "cli", lambda argv: seen.append(argv) or 0)
+    assert cm.main(["confirm", "3"]) == 0
+    assert cm.main(["estop"]) == 0
+    assert seen == [["confirm", "3"], ["estop"]]
