@@ -466,3 +466,69 @@ def test_collect_carries_agent():
     snap = dc.collect({"agent": lambda: _agent(s2={"estop": True})})
     assert snap["agent"][1]["estop"]
     assert dc.collect({})["agent"] is None
+
+
+# ---- 深浅模式 (#31): cart-dash 按日出日落判断, 并进快照, 车机和副屏都读这一份
+
+THEME_DARK = {"mode": "dark", "setting": None, "next_switch": None}
+
+
+def test_collect_theme_default_is_dark():
+    assert dc.collect(_ctx())["theme"] == THEME_DARK               # 没接采集: 深色 (现状)
+
+    def boom():
+        raise OSError("conf gone")
+    assert dc.collect(_ctx(theme=boom))["theme"] == THEME_DARK
+    assert dc.collect(_ctx(theme=lambda: {"mode": "light"}))["theme"] == {"mode": "light"}
+
+
+def _theme_conf(tmp_path, **conf):
+    p = tmp_path / "theme.json"
+    p.write_text(json.dumps(conf))
+    return str(p)
+
+
+# 伦敦 2026-06-21: 日出 ~03:43 UTC, 日落 ~20:21 UTC
+LONDON_NOON = 1782043200.0          # 2026-06-21 12:00 UTC
+LONDON_SUNSET = 1782073294.0        # 2026-06-21 20:21:34 UTC
+
+
+def test_theme_sampler_auto(tmp_path):
+    conf = _theme_conf(tmp_path, lat=51.508, lon=-0.126)
+    t = {"now": LONDON_NOON}
+    get = dc.theme_sampler(conf, str(tmp_path / "state.json"), clock=lambda: t["now"])
+    th = get()
+    assert th["mode"] == "light" and th["setting"] == "auto"
+    assert th["next_switch"] == pytest.approx(LONDON_SUNSET + 20 * 60, abs=60)
+    t["now"] = LONDON_SUNSET + 10 * 60                             # 缓冲里: 维持上一轮的浅色
+    assert get()["mode"] == "light"
+    t["now"] = LONDON_SUNSET + 21 * 60
+    assert get()["mode"] == "dark"
+
+
+def test_theme_sampler_last_from_previous_snapshot(tmp_path):
+    conf = _theme_conf(tmp_path, lat=51.508, lon=-0.126)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"theme": {"mode": "dark"}}))       # cart-dash 重启前是深色
+    get = dc.theme_sampler(conf, str(state), clock=lambda: LONDON_SUNSET - 5 * 60)
+    assert get()["mode"] == "dark"                                 # 缓冲里接着用上一份快照的
+    state.write_text("{broken")
+    assert dc.theme_sampler(conf, str(state), clock=lambda: LONDON_SUNSET - 5 * 60)()["mode"] == "light"
+
+
+def test_theme_sampler_fixed_missing_and_bad_conf(tmp_path):
+    state = str(tmp_path / "state.json")
+    fixed = dc.theme_sampler(_theme_conf(tmp_path, mode="light"), state, clock=lambda: 0.0)()
+    assert fixed == {"mode": "light", "setting": "light", "next_switch": None}
+    missing = dc.theme_sampler(str(tmp_path / "nope.json"), state, clock=lambda: LONDON_NOON)()
+    assert missing == {"mode": "dark", "setting": "auto", "next_switch": None}
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"mode": "night"}')
+    assert dc.theme_sampler(str(bad), state, clock=lambda: LONDON_NOON)() == THEME_DARK
+
+
+def test_default_ctx_wires_theme(monkeypatch):
+    _stub_kc(monkeypatch)
+    monkeypatch.setattr(dc, "theme_sampler", lambda *a, **k: (lambda: {"mode": "light"}))
+    assert dc.default_ctx()["theme"]() == {"mode": "light"}
+    assert "theme" in dc.PERIODS                                   # 不必每 200 ms 读一次配置

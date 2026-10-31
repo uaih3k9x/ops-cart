@@ -19,6 +19,7 @@ import confirm_core
 import lamps_core
 import lldp_core
 import pxeserver
+import sun_core
 import ups_core
 
 STATE_PATH = "/run/ops-cart/state.json"
@@ -32,10 +33,13 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
            "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2, "pxe": 1,
-           "svcs": 5, "version": 300}
+           "svcs": 5, "version": 300, "theme": 5}
 # LLDP 监听哪些口 (#14): 跟下排 LAN1 / LAN2 灯同一份配置, 网口名不另写
 LLDP_IFACES = [(name, key[4:]) for name, _label, key in lamps_core.LOWER
                if name in ("LAN1", "LAN2") and key.startswith("net:")]
+
+
+THEME_DARK = {"mode": "dark", "setting": None, "next_switch": None}   # 判断不了就深色 (现状)
 
 
 def _pull(ctx, key, default):
@@ -73,6 +77,7 @@ def collect(ctx):
         "svcs": _pull(ctx, "svcs", {}),             # {"chronyd": (enabled, active), "kiosk": ...} 开机自检用 #26
         "version": _pull(ctx, "version", ""),       # "Ver 1.08.03   Build ..." 开机自检抬头
         "agent": _pull(ctx, "agent", None),         # Agent 写串口每槽位 [{estop, pending, writer, sending}] #23
+        "theme": _pull(ctx, "theme", dict(THEME_DARK)),  # 深浅模式 {mode, setting, next_switch} #31
     }
     return snap
 
@@ -568,11 +573,27 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "lldp": lldp or (lambda: {}),
         "pxe": lambda: kc.pxe_guard_live(),
         "agent": lambda: agent_sample(),
+        "theme": theme_sampler(),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)
     ctx.update(safe=safe, now=time.time)
     return ctx
+
+
+def theme_sampler(conf_path=sun_core.CONF_PATH, state_path=STATE_PATH, clock=time.time):
+    """深浅模式采集 (#31): 每次重读 theme.json (改了不用重启), last 用上一轮的结果;
+    cart-dash 刚起来时从上一份快照接上, 重启不在日出日落缓冲里来回跳.
+    -> {"mode": "dark"/"light", "setting": 档位 (配置读不懂为 None), "next_switch": 时间戳或 None}"""
+    st = {"last": ((read(state_path) or {}).get("theme") or {}).get("mode")}
+
+    def get():
+        conf, now = sun_core.read_conf(conf_path), clock()
+        mode = sun_core.want_mode(now, conf, st["last"])
+        st["last"] = mode
+        setting = conf.get("mode", "auto") if isinstance(conf, dict) else None
+        return {"mode": mode, "setting": setting, "next_switch": sun_core.next_switch(now, conf, mode)}
+    return get
 
 
 def _ups_sample():
