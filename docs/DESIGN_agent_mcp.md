@@ -77,3 +77,13 @@
 2. **实体急停按钮**（USB 大红蘑菇头）要不要进第一版规划？
 3. ~~工具粒度~~：已定，只给行级命令 + 固定特殊键。
 4. **P0 的缩写对照表**：要不要我现在就起一个初稿（按厂商/设备类型，中文端口名/长设备名 → 短 ASCII）？
+
+## 八、P1 落地记录（#19）
+
+- 代码：`mcp_core.py`（协议 / 校验 / 命名 / 审计 / HTTP 检查，纯逻辑）+ `cart_mcp.py`（stdio、HTTP、真机读数）。
+- 工具：`list_threads`、`read_output`、`screenshot`、`cart_status`、`pxe_status`，全部 `readOnlyHint`。
+- **认证没用 `web_core.Sessions`**：那套令牌要先在网页上输 PIN 才签发，Agent 走不了这一步。改成 `/etc/ops-cart/mcp.json` 里的静态 Bearer 令牌（名字进审计的 who，短于 24 字符不认）；来源过滤、Host 白名单、Origin 同源照搬 `web_core`。stdio 不另设认证，靠 ssh。
+- **监听**：不绑 0.0.0.0，只绑 `ip -j addr` 里的本机和 tailnet 地址，每 30 秒补绑新出现的（tailscaled 后起）；每个请求再按来源过滤一遍。
+- **命名**：只认顶格的华为提示符（`?` 帮助是缩进的），子视图 `[名-GigabitEthernet0/0/1]` 优先对齐窗口里见过的 `<名>`，对不上再按视图关键字切；线拔了或没服务名字为空，不读旧日志。
+- **PXE 用途**：`pxe-mode.json` 不记用途，从那台 MAC 的菜单内容反推。
+- 写入者字段恒为空，等 #21 的写租约。审计 `/var/log/ops-cart/mcp-audit.log`（JSONL，`*.log` 现成 logrotate 管）。
