@@ -299,6 +299,8 @@ def test_stage_log_only_on_transitions():
     assert "市电恢复" in msg and "取消" in msg
     assert "关机" in uc.stage_log("countdown", "poweroff", _ob(percent=14))
     assert "解除" in uc.stage_log("warn", "normal", {"state": "charging", "percent": 22})
+    # 还在电池, 只是估计剩余时间随负载回升过了 8 分钟: 不能说"市电恢复"
+    assert uc.stage_log("warn", "normal", _ob(percent=40, runtime=600)) is None
 
 
 def test_log_goes_to_ops_cart_dir_and_events(tmp_path, monkeypatch):

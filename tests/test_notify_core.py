@@ -51,6 +51,20 @@ def test_collect_low_battery_uses_ups_core_threshold():
     assert snap(ups=LOW)["values"]["ups.low"] is True
 
 
+def test_low_battery_pushes_at_the_warning_stage_not_at_shutdown(tmp_path):
+    # 两段式 (#4): 15% 时只剩 30 秒倒计时, timer 30 s 一次来不及; 预告 (<=25% 或估计剩 <8 分钟) 就推
+    warn = dict(OB, percent=22, runtime=400)
+    assert snap(ups=warn)["values"]["ups.low"] is True
+    assert snap(ups=dict(OB, percent=60, runtime=300))["values"]["ups.low"] is True
+    assert snap(ups=dict(OB, percent=60, runtime=3000))["values"]["ups.low"] is False
+    _, _, st = run(None, snap(ups=OB), T0)
+    keys, ev, st = run(st, snap(ups=warn), T0 + 30)
+    assert keys == ["ups.low"] and ev[0]["prio"] == 5
+    assert ev[0]["text"] == "推车电池约剩 6 分钟（22%），到 15% 自动关机，赶紧接市电"
+    keys, _, st = run(st, snap(ups=LOW), T0 + 60)       # 再掉到 15% 进倒计时: 同一项, 不重复推
+    assert keys == []
+
+
 def test_collect_unknowns_are_none_and_never_raise():
     def boom():
         raise OSError("no")

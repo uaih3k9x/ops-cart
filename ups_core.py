@@ -118,7 +118,7 @@ def _pct(ups):
     return "--" if pct is None else f"{pct}%"
 
 
-def _left_min(ups):
+def left_text(ups):
     """UPS 估计剩余, 中文; 没有 hidraw 的 runtime 就 None (upower 的 time to empty 不可信, 不用)."""
     runtime = ups.get("runtime") if isinstance(ups, dict) else None
     if runtime is None:
@@ -130,7 +130,7 @@ def alert(ups, stage, left=None):
     """预告/倒计时的提示 -> {text, short, level}; normal 返回 None.
     text 给车机顶栏和副屏横条, short 给锁屏右上角和副屏头部那一行. level: warn=琥珀, bad=红."""
     if stage == "warn":
-        m = _left_min(ups)
+        m = left_text(ups)
         head = f"电池{m}" if m else f"电池剩 {_pct(ups)}"
         return {"text": f"{head}，到 {LOW_PCT}% 自动关机，请插回市电",
                 "short": f"{head} · {LOW_PCT}% 自动关机", "level": "warn"}
@@ -149,7 +149,7 @@ def stage_log(prev, stage, ups):
         return None
     pct = _pct(ups)
     if stage == "warn":
-        m = _left_min(ups)
+        m = left_text(ups)
         return f"低电量预告: 电池 {pct}" + (f", {m}" if m else "") + f", 到 {LOW_PCT}% 自动关机"
     if stage == "countdown":
         return f"电量 {pct} 到阈值 {LOW_PCT}%, {COUNTDOWN_S} 秒后正常关机, 插回市电可取消"
@@ -157,7 +157,7 @@ def stage_log(prev, stage, ups):
         return f"倒计时结束, 正常关机 (电量 {pct})"
     if prev == "countdown":
         return f"市电恢复, 取消关机倒计时 (电量 {pct})"
-    if prev == "warn":
+    if prev == "warn" and _on_mains(ups):     # 还在电池只是估计时间回升了: 不记
         return f"市电恢复, 解除低电量预告 (电量 {pct})"
     return None
 
