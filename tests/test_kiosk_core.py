@@ -551,6 +551,16 @@ def test_branding_defaults_and_override(tmp_path):
     assert b["logo"] == str(tmp_path / "logo.png")
 
 
+def test_branding_dark_logo_preferred_when_dark(tmp_path):
+    (tmp_path / "logo-dark.png").write_bytes(b"png")
+    assert kc.branding_read(str(tmp_path))["logo"] == str(tmp_path / "logo-dark.png")   # 只有深色版也用
+    (tmp_path / "logo.png").write_bytes(b"png")
+    assert kc.branding_read(str(tmp_path))["logo"] == str(tmp_path / "logo-dark.png")
+    assert kc.branding_read(str(tmp_path), dark=False)["logo"] == str(tmp_path / "logo.png")
+    (tmp_path / "logo.png").unlink()
+    assert kc.branding_read(str(tmp_path), dark=False)["logo"] is None      # 白字放浅底上看不见, 宁可不放
+
+
 def test_branding_bad_json_falls_back(tmp_path):
     (tmp_path / "branding.json").write_text("{oops")
     assert kc.branding_read(str(tmp_path))["title"] == "OPS-CART"

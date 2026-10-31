@@ -270,16 +270,17 @@ BRANDING_DIR = "/opt/pxe/branding"     # 不进仓库; 放 branding.json + logo.
 BRANDING_DEFAULT = {"title": "OPS-CART", "subtitle": "SYSTEM STARTUP"}
 
 
-def branding_read(d=BRANDING_DIR):
-    """{"title", "subtitle", "logo"(路径或 None)}; 缺文件/坏 JSON 用默认."""
+def branding_read(d=BRANDING_DIR, dark=True):
+    """{"title", "subtitle", "logo"(路径或 None)}; 缺文件/坏 JSON 用默认.
+    深色界面先找 logo-dark.png (去了白底的透明图), 没有再用 logo.png; 浅色只用 logo.png."""
     b = dict(BRANDING_DEFAULT)
     try:
         with open(f"{d}/branding.json") as f:
             b.update({k: v for k, v in json.load(f).items() if isinstance(v, str)})
     except (OSError, ValueError):
         pass
-    logo = f"{d}/logo.png"
-    b["logo"] = logo if os.path.exists(logo) else None
+    names = ("logo-dark.png", "logo.png") if dark else ("logo.png",)
+    b["logo"] = next((f"{d}/{n}" for n in names if os.path.exists(f"{d}/{n}")), None)
     return b
 
 
