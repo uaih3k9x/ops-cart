@@ -36,7 +36,7 @@
   确认框直接列出要执行的命令和 undo 命令,切失败自动回到原来的
 - **副屏与 UPS**:USB 副屏常驻状态板(`cart-dash` 统一采集,车机和副屏读同一份快照);
   APC UPS 直读 hidraw 拿电量、负载、市电状态;低电量两段式:≤25% 或估计剩不到 8 分钟先琥珀一行预告(推到手机),
-  到 15% 再 30 秒倒计时、插回市电自动取消,走完才正常关机(日志 `/var/log/ops-cart/ups.log`);顶栏一排虚拟指示灯,颜色看自检、闪烁看活动
+  到 15% 再 30 秒倒计时、插回市电自动取消,走完才正常关机(日志 `/var/log/ops-cart/ups.log`);屏幕底下一排虚拟指示灯(CDE 前面板),颜色看自检、闪烁看活动
 - **OCR 与屏幕配方**:截图识字带坐标;`recipe.py boot-pxe` 自动进启动菜单选网络启动
 - **Agent 接入**:MCP 服务把串口输出、截屏、推车状态开放给 Claude Code 等现成 Agent;写串口要拿有期限的写租约,
   只读命令直发、其余挂起等人在推车上确认,Agent 和人都能一键急停(只停发送,不往设备插字节),解除只能人在本机
@@ -85,13 +85,15 @@
 | [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;车机 kiosk 没就绪(kiosk.json 里的 pid 不在了)画开机自检,逐行出结果;`--once --preview` 导出画面不推屏 |
 | [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
 | [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;低电量两段式的判断 `shutdown_stage`(预告 / 倒计时 / 关机,车机和副屏共用) |
-| [`lamps_core.py`](lamps_core.py) | 顶栏虚拟指示灯:每灯盯一个单调计数器(日志大小、网卡字节数、键鼠发送次数),变了就闪;串口操作头 `/dev/con-1~4` 收到 ^G 亮红 |
+| [`theme.py`](theme.py) | 车机 / 副屏的颜色、字体、斜边都在这里,业务代码只引用名字(测试扫描兜底);CDE 深色(#28),`setup(root)` 启动时挑字体(Unifont,没有退回 Noto)、设 Tk 默认控件的 option 数据库;`unreadable(w)` 查控件树里字和底够不够 4.5:1 |
+| [`lamps_core.py`](lamps_core.py) | 执行器条(屏幕底下)虚拟指示灯:每灯盯一个单调计数器(日志大小、网卡字节数、键鼠发送次数),变了就闪;串口操作头 `/dev/con-1~4` 收到 ^G 亮红 |
 | [`cart_dream.py`](cart_dream.py) | 推车"做梦":每晚 02:00 把 `CART-LOG.md` 新增部分交给车上的 Claude Code 整理成小结(不给工具、有花费上限、失败不前进),标题显示在锁屏底部 |
 
 | 目录 | 内容 |
 |---|---|
 | [`tests/`](tests/) | 离线单测,不接任何硬件也能全绿 |
 | [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
+| [`fonts/`](fonts/) | 车机和副屏的界面字体 Unifont 16px 点阵(OTF + 授权原文),部署装到 `/usr/local/share/fonts/ops-cart/`;取不到车机退回 Noto,自检 `UI FONT` 一行变 WARN |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查;`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
 | [`docs/`](docs/) | 优化方案、版本部署清单、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[网口模式](docs/NETMODE.md) |
@@ -128,7 +130,9 @@ python3 cart_ocr.py shot.png --find "Boot Menu"
 
 ```bash
 scripts/stamp-build.sh                         # 生成 BUILD(提交数 + 哈希)
-scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web icons cart:/opt/pxe/
+scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web icons fonts cart:/opt/pxe/
+# 界面字体 (#28): 只装 OTF (Rocky 9 的 FreeType 读不了 OTB); 别装 bitmap-fangsongti-fonts (会抢全系统默认 monospace)
+sudo install -D -m 644 /opt/pxe/fonts/unifont-18.0.01.otf /usr/local/share/fonts/ops-cart/unifont-18.0.01.otf && sudo fc-cache -f
 sudo install -d -m 755 /etc/ops-cart
 sudo install -m 644 deploy/pxe.env.example /etc/ops-cart/pxe.env   # 改成现场的装机网段
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
