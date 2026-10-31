@@ -30,7 +30,6 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
            "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2, "pxe": 1}
-UPS_LOW = 20            # 走电池且电量不高于这个: 副屏变红
 # LLDP 监听哪些口 (#14): 跟下排 LAN1 / LAN2 灯同一份配置, 网口名不另写
 LLDP_IFACES = [(name, key[4:]) for name, _label, key in lamps_core.LOWER
                if name in ("LAN1", "LAN2") and key.startswith("net:")]
@@ -105,8 +104,10 @@ class KioskReporter:
     def __init__(self, path=KIOSK_PATH):
         self.path, self._last = path, None
 
-    def update(self, locked, kvm):
+    def update(self, locked, kvm, ups_since=None):
         state = {"locked": bool(locked), "kvm": int(kvm)}
+        if ups_since is not None:           # 低电量关机倒计时的起点 (#4), 副屏据此算剩几秒
+            state["ups_since"] = ups_since
         if state == self._last:
             return False
         try:
@@ -163,8 +164,20 @@ def _checks(rows):
                           "detail": r.get("detail", "")} for r in problems]}
 
 
-def _ups_line(ups):
-    """副屏头部的 UPS 一行. 走不走电池跟车机同一个判断 (ups_core.on_battery)."""
+def _ups_stage(ups, kiosk, now):
+    """低电量关机阶段 (#4): 跟车机同一个 ups_core.shutdown_stage. 倒计时起点只有 kiosk 知道 (它真关机),
+    从 kiosk.json 读; 没回写起点时倒计时不编秒数 (left=None -> "即将自动关机")."""
+    since = kiosk.get("ups_since")
+    since = since if isinstance(since, (int, float)) else None
+    stage, left = ups_core.shutdown_stage(ups, since, now)
+    if stage == "countdown" and since is None:
+        left = None
+    return stage, left
+
+
+def _ups_line(ups, stage="normal"):
+    """副屏头部的 UPS 一行. 走不走电池跟车机同一个判断 (ups_core.on_battery).
+    走电池是琥珀; 只有进了关机倒计时才红 (预告阶段不用红, 10/31 演练定的)."""
     if not ups:
         return {"text": "UPS 未连接", "level": "dim"}
     pct = ups.get("percent")
@@ -172,7 +185,7 @@ def _ups_line(ups):
         left = " · 剩 %d 分" % (int(ups["runtime"]) // 60) if ups.get("runtime") else ""
         # short: 头部右边放不下全文时用 (大时钟占了左边大半), 见 dash_render.ups_fit
         return {"text": "市电断开 · 电池 %s%%" % pct + left, "short": "断电 · %s%%" % pct + left,
-                "level": "bad" if (pct or 0) <= UPS_LOW else "warn"}
+                "level": "bad" if stage in ("countdown", "poweroff") else "warn"}
     text = "电池 %s%%" % pct
     if ups.get("load") is not None:
         text += " · 负载 %s%%" % ups["load"]
@@ -232,13 +245,15 @@ def layout_view(snap, locked=False, active=(), now=None):
     active = set(active or ())
     now = time.time() if now is None else now
     t = time.localtime(now)
+    ups_stage, ups_left = _ups_stage(snap.get("ups"), kiosk, now)
     view = {
         "locked": locked,
         "clock": time.strftime("%H:%M", t),
         "date": "%d月%d日 周%s" % (t.tm_mon, t.tm_mday, WEEKDAYS[t.tm_wday]),
         "net": snap.get("net") or "down",
         "lan2": snap.get("lan2") or "",
-        "ups": _ups_line(snap.get("ups")),
+        "ups": _ups_line(snap.get("ups"), ups_stage),
+        "ups_alert": ups_core.alert(snap.get("ups"), ups_stage, ups_left),   # 预告/倒计时横条 (#4)
         "uptime": short_uptime(snap.get("uptime") or ""),
         "temps": snap.get("temps") or [],
         "fans": snap.get("fans") or [],

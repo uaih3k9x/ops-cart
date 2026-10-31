@@ -125,6 +125,43 @@ def test_ups_line_on_battery_never_overlaps_clock(clock):
     assert size >= r.UPS_MIN_PX
 
 
+# ---- 两段式低电量关机 (#4): 预告琥珀横条, 倒计时红横条, 都只占头部那一条, 不铺满
+
+OB22 = {"state": "discharging", "percent": 22, "status": "OB DISCHRG", "runtime": 400}
+
+
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("ups,kiosk,color", [
+    (OB22, {}, r.WARN),
+    (dict(OB22, percent=15), {"ups_since": 10 ** 12}, r.BAD),
+])
+def test_render_ups_alert_band(locked, ups, kiosk, color):
+    from PIL import ImageColor
+    img = r.render(dc.layout_view(_full_snap(ups=ups, kiosk=kiosk), locked=locked))
+    assert img.getpixel((4, 230)) == ImageColor.getrgb(color)
+    assert img.getpixel((4, 700)) != ImageColor.getrgb(color)      # 只是一条, 下面照常
+
+
+def test_render_ups_countdown_beats_serve_but_warn_yields_to_it():
+    from PIL import ImageColor
+    serve_expired = {"state": "expired", "until": 1, "window": 1800}
+    low = dict(OB22, percent=15)
+    img = r.render(dc.layout_view(_full_snap(ups=low, pxe=serve_expired)))
+    assert img.getpixel((4, 230)) == ImageColor.getrgb(r.BAD)       # 倒计时压过"到时停发"
+    serving = {"state": "serving", "until": 10 ** 12, "window": 1800}
+    img = r.render(dc.layout_view(_full_snap(ups=OB22, pxe=serving)))
+    assert img.getpixel((4, 230)) == ImageColor.getrgb(r.BAD)       # 预告让位给发地址那条红
+
+
+@pytest.mark.parametrize("stage,left", [("warn", None), ("countdown", 30), ("poweroff", 0)])
+def test_ups_alert_band_text_fits_panel(stage, left):
+    import ups_core
+    alert = ups_core.alert(dict(OB22, percent=100, runtime=5999), stage, left)
+    text, px = r.band_fit(alert)
+    assert r._font(px).getlength(text) <= r.PANEL_W - 2 * r.M
+    assert text == alert["text"]                                     # 全文放得下, 不该退成短写法
+
+
 def test_ups_line_keeps_full_text_when_it_fits():
     ups = {"text": "电池 100% · 负载 18%", "level": "ok"}
     assert r.ups_fit(ups, "23:58") == ("电池 100% · 负载 18%", r.UPS_PX)
