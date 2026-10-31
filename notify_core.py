@@ -255,7 +255,8 @@ def save_state(path, st):
 # 没有这个文件 / enabled=false = 只写 events.log, 一个包都不往外发.
 
 CONF_PATH = "/etc/ops-cart/notify.json"
-KINDS = ("ntfy", "feishu-webhook")
+KINDS = ("ntfy", "feishu-webhook", "feishu-app")
+FEISHU_API = "https://open.feishu.cn/open-apis"
 MAX_OUTBOX = 20             # 网断太久时最多攒这么多条 (同一监视项只留最后一条)
 LATE_S = 60                 # 比事件晚这么久才发出去的, 前面标 [补发 时:分]
 
@@ -277,6 +278,11 @@ def load_conf(path=CONF_PATH):
         return None
     if conf.get("kind") not in KINDS:
         raise ValueError(f"{path}: kind 只支持 {', '.join(KINDS)}")
+    if conf["kind"] == "feishu-app":
+        missing = [k for k in ("app_id", "app_secret", "chat_id") if not str(conf.get(k) or "").strip()]
+        if missing:
+            raise ValueError(f"{path}: 飞书应用要写 {', '.join(missing)}")
+        return conf
     if not str(conf.get("url") or "").startswith(("https://", "http://")):
         raise ValueError(f"{path}: url 要是 http(s) 地址")
     if conf["kind"] == "feishu-webhook" and not conf["url"].startswith("https://"):
@@ -351,8 +357,61 @@ def feishu_sender(conf, opener=None, clock=None):
     return send
 
 
+def _feishu_post(opener, url, body, timeout, token=None):
+    """飞书开放平台 POST -> 正文 dict; code != 0 (HTTP 200 也算) 抛 OSError, 不带请求内容 (里面可能有密钥)."""
+    import urllib.error
+    import urllib.request
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                 headers=headers, method="POST")
+    try:
+        with opener(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as ex:            # 权限不够等回 4xx, 正文里照样有 code/msg
+        raw = ex.read()
+    try:
+        r = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise OSError(f"飞书回的不是 JSON: {raw[:80]!r}") from None
+    if r.get("code") != 0:
+        raise OSError(f"飞书回 code={r.get('code')} {str(r.get('msg') or '')[:120]}".strip())
+    return r
+
+
+def feishu_app_sender(conf, opener=None, clock=None):
+    """推车专用飞书应用 (只开发消息): app_id/app_secret 换 tenant_access_token, 往 chat_id 那个群发文本.
+    token 2 小时有效, 同一进程里留 5 分钟余量复用. 失败抛 OSError."""
+    import time
+    import urllib.request
+    opener = opener or urllib.request.urlopen
+    clock = clock or time.time
+    timeout = float(conf.get("timeout") or 10)
+    cache = {"tok": None, "until": 0.0}
+
+    def token():
+        now = clock()
+        if not cache["tok"] or now >= cache["until"]:
+            r = _feishu_post(opener, FEISHU_API + "/auth/v3/tenant_access_token/internal",
+                             {"app_id": conf["app_id"], "app_secret": conf["app_secret"]}, timeout)
+            cache["tok"], cache["until"] = r["tenant_access_token"], now + int(r.get("expire") or 7200) - 300
+        return cache["tok"]
+
+    def send(ev):
+        text = ev["text"]
+        if conf.get("title"):
+            text = f"【{conf['title']}】{text}"
+        _feishu_post(opener, FEISHU_API + "/im/v1/messages?receive_id_type=chat_id",
+                     {"receive_id": conf["chat_id"], "msg_type": "text",
+                      "content": json.dumps({"text": text}, ensure_ascii=False)}, timeout, token())
+    return send
+
+
 def make_sender(conf, opener=None, clock=None):
     """按 kind 选发送器."""
+    if conf.get("kind") == "feishu-app":
+        return feishu_app_sender(conf, opener, clock)
     if conf.get("kind") == "feishu-webhook":
         return feishu_sender(conf, opener, clock)
     return ntfy_sender(conf, opener)

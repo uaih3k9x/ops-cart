@@ -69,7 +69,7 @@
 | [`tspl_preview.py`](tspl_preview.py) | 不在打印机边上时把 TSPL 画成 HTML/SVG:旗面轮廓、折痕、对折后正反面;查出界和对折对称。开发机工具 |
 | [`lldp_core.py`](lldp_core.py) | LLDP/CDP 被动监听(只收不发):LAN1/LAN2 对面是哪台交换机的哪个口,经 cart-dash 进快照,副屏和状态板显示;给线缆标签对端出建议值 |
 | [`survey_core.py`](survey_core.py) | 串口一键只读巡检:命令白名单 fail-closed(只认全称 `display`/`show`),走 conbroker 发、存档、和上一份比对配置漂移;串口面板「巡检」按钮 |
-| [`notify_core.py`](notify_core.py) | 关键事件推到手机(UPS、守卫、校园网认证、服务挂了、非正常重启):只读状态文件、只在变化时推、防抖冷却;渠道 ntfy 或飞书群机器人,默认不外发 |
+| [`notify_core.py`](notify_core.py) | 关键事件推到手机(UPS、守卫、校园网认证、服务挂了、非正常重启):只读状态文件、只在变化时推、防抖冷却;渠道 ntfy、飞书群自定义机器人或推车专用飞书应用(只开发消息权限),默认不外发 |
 | [`recipe_core.py`](recipe_core.py) · [`recipe.py`](recipe.py) | 屏幕自动化配方:截图 + OCR + CH9329,第一个配方 `boot-pxe` 自动进启动菜单选网络启动;配方里不许出现保存类按键 |
 | [`clone_core.py`](clone_core.py) | 整盘克隆(Clonezilla over PXE):解锁用途 clone-save / clone-restore、启动参数生成、目标盘按型号/序列号显式匹配(绝不默认 sda)、批量清单确认;见 [`docs/CLONE.md`](docs/CLONE.md) |
 | [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |

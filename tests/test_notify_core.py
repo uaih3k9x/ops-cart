@@ -557,6 +557,90 @@ def test_feishu_example_conf_is_valid_and_placeholder():
     assert conf["kind"] == "feishu-webhook" and conf["url"].endswith("/00000000-0000-0000-0000-000000000000")
 
 
+
+# ---------------------------------------------------------------- 飞书应用机器人 (推车专用应用, 只开收发消息)
+
+APP = {"kind": "feishu-app", "app_id": "cli_example0000000000", "app_secret": "example-secret-not-real",
+       "chat_id": "oc_00000000000000000000000000000000", "title": "推车"}
+
+
+class SeqOpener(FakeOpener):
+    """按顺序回不同正文: 先换 token, 再发消息."""
+
+    def __init__(self, bodies):
+        super().__init__()
+        self.bodies = list(bodies)
+
+    def __call__(self, req, timeout=None):
+        self.reqs.append((req, timeout))
+        return FakeResp(200, self.bodies.pop(0))
+
+
+TOK = b'{"code":0,"msg":"ok","tenant_access_token":"t-example","expire":7200}'
+
+
+def test_feishu_app_gets_token_then_posts_to_chat():
+    import json
+    op = SeqOpener([TOK, b'{"code":0,"msg":"success"}'])
+    nc.make_sender(APP, opener=op)({"key": "ups.power", "text": "转电池供电", "prio": 4, "ts": T0})
+    (treq, _), (mreq, _) = op.reqs
+    assert treq.full_url.endswith("/open-apis/auth/v3/tenant_access_token/internal")
+    assert json.loads(treq.data) == {"app_id": APP["app_id"], "app_secret": APP["app_secret"]}
+    assert mreq.full_url.endswith("/open-apis/im/v1/messages?receive_id_type=chat_id")
+    assert mreq.full_url.startswith("https://open.feishu.cn/")
+    assert {k.lower(): v for k, v in mreq.header_items()}["authorization"] == "Bearer t-example"
+    body = json.loads(mreq.data.decode("utf-8"))
+    assert body["receive_id"] == APP["chat_id"] and body["msg_type"] == "text"
+    assert json.loads(body["content"]) == {"text": "【推车】转电池供电"}
+
+
+def test_feishu_app_reuses_token_until_near_expiry():
+    op = SeqOpener([TOK, b'{"code":0}', b'{"code":0}', TOK, b'{"code":0}'])
+    now = [1000.0]
+    send = nc.make_sender(APP, opener=op, clock=lambda: now[0])
+    ev = {"key": "k", "text": "x", "prio": 3, "ts": T0}
+    send(ev)
+    now[0] += 3600
+    send(ev)                                            # 还在有效期内: 不再换 token
+    now[0] += 7200
+    send(ev)                                            # 过期了: 重新换
+    urls = [r.full_url for r, _ in op.reqs]
+    assert sum("tenant_access_token" in u for u in urls) == 2 and len(urls) == 5
+
+
+@pytest.mark.parametrize("bodies", [
+    [b'{"code":10014,"msg":"app secret invalid"}'],
+    [TOK, b'{"code":99991672,"msg":"Access denied"}'],
+    [b"not json"],
+])
+def test_feishu_app_raises_on_api_error(bodies):
+    send = nc.make_sender(APP, opener=SeqOpener(bodies))
+    with pytest.raises(OSError):
+        send({"key": "k", "text": "x", "prio": 3, "ts": T0})
+
+
+def test_feishu_app_error_does_not_leak_secret():
+    send = nc.make_sender(APP, opener=SeqOpener([b'{"code":10014,"msg":"app secret invalid"}']))
+    with pytest.raises(OSError) as ex:
+        send({"key": "k", "text": "x", "prio": 3, "ts": T0})
+    assert APP["app_secret"] not in str(ex.value)
+
+
+def test_load_conf_feishu_app_needs_ids_not_url(tmp_path):
+    import json
+    p = tmp_path / "n.json"
+    p.write_text(json.dumps(APP))
+    assert nc.load_conf(str(p))["kind"] == "feishu-app"
+    for k in ("app_id", "app_secret", "chat_id"):
+        p.write_text(json.dumps({x: v for x, v in APP.items() if x != k}))
+        with pytest.raises(ValueError):
+            nc.load_conf(str(p))
+
+
+def test_feishu_app_example_conf_is_valid_and_placeholder():
+    conf = nc.load_conf(str(EXAMPLE.parent / "notify.feishu-app.example.json"))
+    assert conf["kind"] == "feishu-app" and conf["chat_id"].startswith("oc_000")
+
 # ---------------------------------------------------------------- #11 自己发地址限时
 
 def test_guard_expired_is_pushed_with_renew_hint():

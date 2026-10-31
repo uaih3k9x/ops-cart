@@ -1,0 +1,8 @@
+{
+  "kind": "feishu-app",
+  "app_id": "cli_0000000000000000",
+  "app_secret": "推车专用应用的 App Secret (只开 im:message:send_as_bot)",
+  "chat_id": "oc_00000000000000000000000000000000",
+  "title": "推车",
+  "timeout": 10
+}
