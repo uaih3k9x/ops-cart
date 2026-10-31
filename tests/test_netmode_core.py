@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import time
 
 import pytest
 
@@ -45,15 +46,22 @@ def flat(cmds):
     return [" ".join(c) for c in cmds]
 
 
-def static(iface="enp3s0", egress="never", gateway="", dns="", addr="192.0.2.5/24"):
-    return nm.rec("static", iface, nm.static_params(iface, addr, gateway, dns, egress))
+def static(iface="enp3s0", egress="never", gateway="", dns="", addr="192.0.2.5/24", routes=""):
+    return nm.rec("static", iface, nm.static_params(iface, addr, gateway, dns, egress, routes=routes))
 
 
 # ------------------------------------------------------------ 出口优先级常量 (#25, 和 #7 共用)
 
 def test_egress_metrics_compare_against_wifi_in_one_place():
-    assert wc.WIRED_PRIMARY_METRIC < wc.WIFI_METRIC < wc.WIRED_BACKUP_METRIC
-    assert nm.EGRESS_METRIC == {"primary": wc.WIRED_PRIMARY_METRIC, "backup": wc.WIRED_BACKUP_METRIC}
+    assert wc.WIFI_METRIC < wc.WIRED_BACKUP_METRIC
+    assert nm.EGRESS_METRIC == {"backup": wc.WIRED_BACKUP_METRIC}
+
+
+def test_no_primary_egress_wifi_is_the_only_primary():
+    """10/31: 主出口只有 Wi-Fi; 有线最多当备用出口."""
+    assert nm.EGRESS == {"never": "不当出口", "backup": "备用出口"}
+    with pytest.raises(ValueError):
+        nm.static_params("enp3s0", "192.0.2.5/24", "192.0.2.1", "", "primary")
 
 
 # ------------------------------------------------------------ 规则
@@ -77,30 +85,63 @@ def test_rec_refuses_wifi_and_unknown_ports():
 
 # ------------------------------------------------------------ 静态表单 (一页填完)
 
-def test_static_params_never_drops_gateway():
+def test_static_params_lan2_never_with_gateway_becomes_backup():
+    """10/31 现场: 网关一直能填; LAN2 不当出口 + 网关 是矛盾组合, 按备用出口算 (排在无线后面)."""
     p = nm.static_params("enp3s0", "192.0.2.5/24", "192.0.2.1", "192.0.2.53", "never")
-    assert p == {"addr": "192.0.2.5/24", "gateway": "", "dns": "192.0.2.53", "egress": "never"}
+    assert p == {"addr": "192.0.2.5/24", "gateway": "192.0.2.1", "dns": "192.0.2.53", "egress": "backup",
+                 "routes": ""}
+    p = nm.static_params("enp3s0", "192.0.2.5/24", "", "192.0.2.53", "never")
+    assert p == {"addr": "192.0.2.5/24", "gateway": "", "dns": "192.0.2.53", "egress": "never", "routes": ""}
 
 
-@pytest.mark.parametrize("egress", ["backup", "primary"])
-def test_static_params_egress_needs_gateway(egress):
+def test_egress_for_gateway_only_fixes_the_contradiction():
+    assert nm.egress_for_gateway("enp3s0", "never", "192.0.2.1") == "backup"     # 填了网关: 自动备用出口
+    assert nm.egress_for_gateway("enp3s0", "backup", "192.0.2.1") == "backup"
+    assert nm.egress_for_gateway("enp3s0", "backup", "") == "never"              # 清空网关: 回到不当出口
+    assert nm.egress_for_gateway("enp3s0", "backup", "  ") == "never"
+    assert nm.egress_for_gateway("enp3s0", "never", "") == "never"
+    assert nm.egress_for_gateway("eno1", "never", "192.0.2.1") == "never"        # LAN1 永远不当出口
+    assert nm.egress_for_gateway("eno1", "backup", "192.0.2.1") == "never"
+
+
+def test_static_params_backup_needs_gateway():
     with pytest.raises(ValueError, match="网关"):
-        nm.static_params("enp3s0", "192.0.2.5/24", "", "", egress)
-    p = nm.static_params("enp3s0", "192.0.2.5/24", "192.0.2.1", "", egress)
-    assert p["gateway"] == "192.0.2.1" and p["egress"] == egress
+        nm.static_params("enp3s0", "192.0.2.5/24", "", "", "backup")
+    p = nm.static_params("enp3s0", "192.0.2.5/24", "192.0.2.1", "", "backup")
+    assert p["gateway"] == "192.0.2.1" and p["egress"] == "backup"
 
 
-@pytest.mark.parametrize("egress", ["backup", "primary"])
-def test_static_params_lan1_never_egress(egress):
+def test_static_params_lan1_never_egress_but_keeps_gateway():
+    """LAN1 永远不当出口 (连备用都不行); 网关照样能填, 只给「经网关去的网段」用."""
     with pytest.raises(ValueError, match="LAN1"):
-        nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", egress)
+        nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "backup")
+    p = nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never")
+    assert p["egress"] == "never" and p["gateway"] == "192.0.2.1" and p["routes"] == ""
+
+
+def test_static_params_routes_via_gateway():
+    p = nm.static_params("eno1", "192.0.2.5/25", "192.0.2.1", "", "never",
+                         routes=" 198.51.100.0/24 , 203.0.113.0/26")
+    assert p["routes"] == "198.51.100.0/24, 203.0.113.0/26"
+    with pytest.raises(ValueError, match="网关"):                       # 有网段没网关: 去不了
+        nm.static_params("eno1", "192.0.2.5/24", "", "", "never", routes="198.51.100.0/24")
+    with pytest.raises(ValueError, match="默认路由"):                   # 0.0.0.0/0 = 当出口, 不许
+        nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never", routes="0.0.0.0/0")
+    with pytest.raises(ValueError, match="本口网段"):                   # 和本口网段重叠
+        nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never", routes="192.0.2.128/25")
+    with pytest.raises(ValueError, match="网段"):
+        nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never", routes="198.51.100.7")
+    with pytest.raises(ValueError, match="网段"):
+        nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never", routes="198.51.100.7/24")
+    with pytest.raises(ValueError, match="网段"):
+        nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never", routes="hello")
 
 
 def test_static_params_reuses_static_form_checks():
     with pytest.raises(ValueError, match="前缀"):
         nm.static_params("enp3s0", "192.0.2.5")              # 不猜 /24
     with pytest.raises(ValueError, match="网段"):
-        nm.static_params("enp3s0", "192.0.2.5/24", "198.51.100.1", "", "primary")
+        nm.static_params("enp3s0", "192.0.2.5/24", "198.51.100.1", "", "backup")
     with pytest.raises(ValueError, match="对端"):
         nm.static_params("enp3s0", "192.0.2.5/24", avoid="192.0.2.5")
     with pytest.raises(ValueError):
@@ -108,15 +149,19 @@ def test_static_params_reuses_static_form_checks():
 
 
 def test_target_from_form():
-    olds = nm.port_views(nm.empty_state(), CONS, IP_BR, ROUTES, LINK)[0]["legacy"]
     assert nm.target("eno1", {"mode": "off"}) == nm.rec("off", "eno1")
-    assert nm.target("eno1", {"mode": "legacy", "legacy": "Lan1-pxe"}, olds) == \
-        nm.legacy("eno1", "a737-4", "Lan1-pxe")
-    with pytest.raises(ValueError, match="旧配置"):
-        nm.target("eno1", {"mode": "legacy", "legacy": ""}, olds)
+    with pytest.raises(ValueError, match="交还旧配置"):                  # 10/31 去掉了
+        nm.target("eno1", {"mode": "legacy", "legacy": "Lan1-pxe"})
+    r = nm.target("enp3s0", {"mode": "static", "addr": "192.0.2.1/24", "gateway": "192.0.2.254",
+                             "egress": "never"})
+    assert r["params"]["egress"] == "backup" and r["params"]["gateway"] == "192.0.2.254"
+    r = nm.target("eno1", {"mode": "static", "addr": "192.0.2.1/24", "gateway": "192.0.2.254",
+                           "egress": "never", "routes": "198.51.100.0/24"})
+    assert r["params"]["egress"] == "never" and r["params"]["routes"] == "198.51.100.0/24"
     r = nm.target("enp3s0", {"mode": "static", "addr": " 192.0.2.5/25 ", "gateway": "192.0.2.1",
                              "dns": "", "egress": "backup", "peer": "192.0.2.9"})
-    assert r["params"] == {"addr": "192.0.2.5/25", "gateway": "192.0.2.1", "dns": "", "egress": "backup"}
+    assert r["params"] == {"addr": "192.0.2.5/25", "gateway": "192.0.2.1", "dns": "", "egress": "backup",
+                           "routes": ""}
     with pytest.raises(ValueError, match="对端"):
         nm.target("enp3s0", {"mode": "static", "addr": "192.0.2.9/24", "peer": "192.0.2.9"})
 
@@ -125,27 +170,35 @@ def test_form_hint_by_mode():
     assert "DHCP" in nm.form_hint("enp3s0", "dhcp", {})
     assert "不当出口" in nm.form_hint("eno1", "dhcp", {})
     assert "不配地址" in nm.form_hint("eno1", "off", {})
-    assert "不会删" in nm.form_hint("eno1", "legacy", {})
     assert "地址/前缀" in nm.form_hint("enp3s0", "static", {"addr": ""})
     h = nm.form_hint("enp3s0", "static", {"addr": "192.0.2.5/25", "gateway": "192.0.2.1", "egress": "backup"})
     assert "192.0.2.0/25" in h and "1000" in h and "900" in h
     assert "前缀" in nm.form_hint("enp3s0", "static", {"addr": "192.0.2.5"})          # 报错, 不猜
-    assert "网关" in nm.form_hint("enp3s0", "static", {"addr": "192.0.2.5/24", "egress": "primary"})
+    assert "网关" in nm.form_hint("enp3s0", "static", {"addr": "192.0.2.5/24", "egress": "backup"})
+    h = nm.form_hint("enp3s0", "static", {"addr": "192.0.2.1/24", "egress": "never"})
+    assert "不当出口" in h and "填了网关" in h                          # 说清楚填网关会怎样
+    h = nm.form_hint("enp3s0", "static", {"addr": "192.0.2.1/24", "gateway": "192.0.2.254", "egress": "never"})
+    assert "备用出口" in h and "1000" in h and "清空网关" in h
+    h = nm.form_hint("eno1", "static", {"addr": "192.0.2.1/24", "gateway": "192.0.2.254"})
+    assert "不起作用" in h and "经网关去的网段" in h                     # 有网关没网段: 提示, 不拦
+    h = nm.form_hint("eno1", "static", {"addr": "192.0.2.1/24", "gateway": "192.0.2.254",
+                                        "routes": "198.51.100.0/24"})
+    assert "198.51.100.0/24" in h and "192.0.2.254" in h and "不当出口" in h
 
 
 def test_form_state_greys_out_what_does_not_apply():
     s = nm.form_state("eno1", "static", "never")
-    assert s["addr"] and not s["gateway"] and s["egress"] == {"never": True, "backup": False, "primary": False}
-    s = nm.form_state("enp3s0", "static", "primary")
-    assert s["gateway"] and all(s["egress"].values())
+    assert s["addr"] and s["gateway"] and s["routes"] and s["egress"] == {"never": True, "backup": False}
+    s = nm.form_state("enp3s0", "static", "never")
+    assert s["gateway"] and s["routes"] and all(s["egress"].values())  # 网关在静态模式下永远能填
     s = nm.form_state("enp3s0", "dhcp", "never")
-    assert not s["addr"] and not s["gateway"] and not any(s["egress"].values())
+    assert not s["addr"] and not s["gateway"] and not s["routes"] and not any(s["egress"].values())
 
 
 # ------------------------------------------------------------ apply 命令清单 (纯函数)
 
-def test_static_primary_on_lan2():
-    cmds, res = nm.apply_steps(static(egress="primary", gateway="192.0.2.1"), uuids())
+def test_static_backup_on_lan2():
+    cmds, res = nm.apply_steps(static(egress="backup", gateway="192.0.2.1"), uuids())
     add, up = cmds
     assert add[:4] == ["nmcli", "con", "add", "type"]
     kv = kv_of(add)
@@ -154,7 +207,8 @@ def test_static_primary_on_lan2():
     assert kv["ipv4.gateway"] == "192.0.2.1"
     assert kv["ipv4.dns"] == ""                                   # 留空显式清掉
     assert kv["ipv4.never-default"] == "no" and kv["ipv6.never-default"] == "no"
-    assert kv["ipv4.route-metric"] == kv["ipv6.route-metric"] == str(wc.WIRED_PRIMARY_METRIC)
+    assert kv["ipv4.route-metric"] == kv["ipv6.route-metric"] == str(wc.WIRED_BACKUP_METRIC)
+    assert kv["ipv4.routes"] == ""                                # 没网段也显式清掉
     assert up == ["nmcli", "con", "up", "uuid", "u1"]
     assert res == [{"con": "u1", "name": "cart-enp3s0-static", "iface": "enp3s0"}]
 
@@ -180,11 +234,49 @@ def test_lan1_modes_stop_pxe_and_never_default():
     assert kv["ipv4.method"] == "auto" and kv["ipv4.never-default"] == "yes" and kv["ipv6.never-default"] == "yes"
 
 
-def test_lan1_egress_refused_even_if_params_forged():
+def test_lan1_routes_via_gateway_without_default_route():
+    r = nm.rec("static", "eno1", nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never",
+                                                  routes="198.51.100.0/24, 203.0.113.0/26"))
+    kv = kv_of(nm.apply_steps(r, uuids())[0][1])
+    assert kv["ipv4.never-default"] == "yes" and kv["ipv6.never-default"] == "yes"
+    assert kv["ipv4.routes"] == "198.51.100.0/24 192.0.2.1, 203.0.113.0/26 192.0.2.1"
+    assert kv["ipv4.gateway"] == ""                               # 网关只走静态路由, 不进默认路由
+    r = nm.rec("static", "eno1", nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", "", "never"))
+    kv = kv_of(nm.apply_steps(r, uuids())[0][1])
+    assert kv["ipv4.routes"] == "" and kv["ipv4.gateway"] == ""   # 有网关没网段: 网关不起作用
+
+
+def test_never_default_and_gateway_never_written_together():
+    """状态文件里的老记录 (或手改的) 是 不当出口 + 网关: 按备用出口建, 不写出 never-default yes + 网关."""
+    forged = nm.rec("static", "enp3s0", {"addr": "192.0.2.5/24", "gateway": "192.0.2.1", "dns": "",
+                                          "egress": "never"})
+    kv = kv_of(nm.apply_steps(forged, uuids())[0][0])
+    assert kv["ipv4.gateway"] == "192.0.2.1" and kv["ipv4.never-default"] == "no"
+    assert kv["ipv4.route-metric"] == str(wc.WIRED_BACKUP_METRIC)
+
+
+@pytest.mark.parametrize("egress", ["backup", "primary"])
+def test_lan1_egress_refused_even_if_params_forged(egress):
     forged = nm.rec("static", "eno1", {"addr": "192.0.2.5/24", "gateway": "192.0.2.1", "dns": "",
-                                        "egress": "primary"})
+                                        "egress": egress})
     with pytest.raises(ValueError, match="LAN1"):
         nm.apply_steps(forged, uuids())
+
+
+def test_lan2_primary_from_old_state_rebuilt_as_backup():
+    """1.09.00 可能记过 LAN2 主出口: 不能因此切不走 (恢复原模式要重建它), 按备用出口建."""
+    old = nm.rec("static", "enp3s0", {"addr": "192.0.2.5/24", "gateway": "192.0.2.1", "dns": "",
+                                       "egress": "primary"})
+    kv = kv_of(nm.apply_steps(old, uuids())[0][0])
+    assert kv["ipv4.route-metric"] == str(wc.WIRED_BACKUP_METRIC) and kv["ipv4.never-default"] == "no"
+    st = nm.empty_state()
+    st["modes"].append(dict(old, res=[{"con": "u0", "name": "cart-enp3s0-static", "iface": "enp3s0"}],
+                            status="ok"))
+    plan = nm.plan_switch(st, nm.rec("dhcp", "enp3s0"), CONS, uuids())
+    assert plan["undo"] == [["nmcli", "con", "delete", "uuid", "u0"]]
+    assert nm.describe(old).endswith("主出口 (旧版, 再建按备用)")
+    with pytest.raises(ValueError, match="主出口"):                   # 新填的表单照样不给主出口
+        nm.static_params("enp3s0", "192.0.2.5/24", "192.0.2.1", "", "primary")
 
 
 def test_off_disables_both_families():
@@ -202,7 +294,7 @@ def test_lan2_dhcp_is_plain_dhcp():
     assert kv["ipv4.method"] == "auto" and "ipv4.never-default" not in kv
 
 
-def test_legacy_apply_only_brings_it_up_and_owns_nothing():
+def test_legacy_restore_only_brings_it_up_and_owns_nothing():
     cmds, res = nm.apply_steps(nm.legacy("eno1", "a737-4", "Lan1-pxe"), uuids())
     assert cmds == [["nmcli", "con", "up", "uuid", "a737-4"]] and res == []
     assert nm.apply_steps(nm.legacy("eno1"), uuids()) == ([], [])     # 原来什么都没生效: 没东西可恢复
@@ -299,7 +391,7 @@ def test_plan_multi_port_mode_blocks_single_port_switch():
 def test_plan_never_mentions_wifi():
     st = nm.empty_state()
     for new in (nm.rec("off", "eno1"), nm.rec("dhcp", "eno1"), nm.rec("dhcp", "enp3s0"),
-                static(egress="primary", gateway="192.0.2.1"), static("eno1")):
+                static(egress="backup", gateway="192.0.2.1"), static("eno1")):
         plan = nm.plan_switch(st, new, CONS, uuids())
         text = " ".join(flat(plan["commands"] + plan["rollback"] + plan["restore"] + plan["clean"]))
         assert "wlp4s0" not in text and "6c4d-1" not in text and "campus-net" not in text
@@ -317,12 +409,10 @@ def test_plan_without_link_only_creates_profile():
     assert plan["apply"][-1][:3] == ["nmcli", "con", "up"] and plan["no_link"] == []
 
 
-def test_plan_probe_only_when_handing_back_to_serve_profile():
-    plan = nm.plan_switch(nm.empty_state(), nm.legacy("eno1", "a737-4", "Lan1-pxe"), CONS, uuids())
-    assert plan["probe"] is True
-    assert not any("systemctl" in c for c in plan["apply"])        # 回装机配置不停 PXE
-    plan = nm.plan_switch(nm.empty_state(), nm.rec("off", "eno1"), CONS, uuids())
-    assert plan["probe"] is False
+def test_plan_refuses_handing_back_to_legacy():
+    """「交还旧配置」去掉了; 1.09.00 留下的 prev 可能还指着旧连接, 「回到上一个」要说人话, 不能去 up 一条删掉的."""
+    with pytest.raises(ValueError, match="交还旧配置"):
+        nm.plan_switch(nm.empty_state(), nm.legacy("eno1", "a737-4", "Lan1-pxe"), CONS, uuids())
 
 
 # ------------------------------------------------------------ 执行: 失败自动 undo 并恢复原模式
@@ -404,15 +494,6 @@ def test_run_switch_from_unmanaged_failure_brings_legacy_back():
     assert "Lan1-pxe" in msg
 
 
-def test_run_switch_handback_to_legacy_leaves_port_unmanaged():
-    st = _managed_static_state()
-    plan = nm.plan_switch(st, nm.legacy("enp3s0", "1603-3", "enp3s0"), CONS, uuids())
-    box = Box()
-    ok, new, _ = nm.run_switch(plan, st, box.run, box.save, box.log)
-    assert ok and box.ran == ["nmcli con delete uuid u0", "nmcli con up uuid 1603-3"]
-    assert nm.owner(new, "enp3s0") is None and new["prev"]["enp3s0"]["mode"] == "static"
-
-
 def test_run_switch_undo_that_fails_is_kept_for_next_time():
     """undo 没撤掉的 (NM 忙之类) 留进 stale, 下次切换再撤, 不能就此忘了."""
     st = _managed_static_state()
@@ -435,6 +516,7 @@ def test_run_switch_failed_rollback_leftover_survives_legacy_restore():
     assert rec["mode"] == "legacy" and [x["con"] for x in rec["stale"]] == ["u1"]
     lan2 = nm.port_views(new, CONS, IP_BR, ROUTES, LINK)[1]
     assert not lan2["managed"] and "旧配置「enp3s0」" in lan2["title"] and "没撤掉" in lan2["drift"]
+    assert not any("1603-3" in c and "delete" in c for c in box.ran)  # 没切成: 旧连接一条不删
 
 
 def test_run_switch_cannot_write_state_touches_nothing():
@@ -474,9 +556,6 @@ def test_view_first_run_infers_unmanaged_without_changing_anything():
     assert lan1["managed"] is False and lan1["mode"] == "legacy" and "Lan1-pxe" in lan1["title"]
     assert lan1["ip"] == "192.0.2.1/24" and lan1["egress"] == ""
     assert lan2["egress"] == "默认出口" and lan2["ip"] == "198.51.100.7/24"
-    assert [c["name"] for c in lan2["legacy"]] == ["enp3s0", "cart-enp3s0-static-华为交换机"]
-    assert [c["name"] for c in lan1["legacy"]] == ["Lan1-pxe"]
-    assert lan1["legacy"][0]["serve"] is True
 
 
 def test_view_managed_and_drift():
@@ -488,7 +567,6 @@ def test_view_managed_and_drift():
         "\ncart-enp3s0-static:u0:802-3-ethernet:enp3s0:yes"
     lan2 = nm.port_views(st, cons, IP_BR, ROUTES, LINK)[1]
     assert lan2["drift"] == ""
-    assert [c["name"] for c in lan2["legacy"]] == ["enp3s0", "cart-enp3s0-static-华为交换机"]   # 自己的不算旧配置
 
 
 def test_view_unfinished_switch_is_flagged():
@@ -507,29 +585,28 @@ def test_view_backup_egress_and_no_link():
 # ------------------------------------------------------------ 确认框 / 日志
 
 def test_confirm_text_shows_commands_and_undo():
-    plan = nm.plan_switch(nm.empty_state(), static(egress="primary", gateway="192.0.2.1"), CONS, uuids())
+    plan = nm.plan_switch(nm.empty_state(), static(egress="backup", gateway="192.0.2.1"), CONS, uuids())
     text = nm.confirm_text(plan, ip="198.51.100.7/24")
     assert "LAN2 (enp3s0)" in text and "原来" in text and "改为" in text
     assert "198.51.100.7/24" in text and "旧配置「enp3s0」" in text
     assert "将执行的命令" in text and "nmcli con add" in text
     assert "出问题时的 undo 命令" in text and "nmcli con delete uuid u1" in text
     assert "nmcli con up uuid 1603-3" in text                          # 回到原来
-    assert "管理口" in text and "tailscale" in text                     # LAN2 远程会断 + 主出口提示
-    assert "主出口" in text
+    assert "管理口" in text and "tailscale" in text                     # LAN2 远程会断
+    assert "备用出口" in text and "主出口" not in text
 
 
-def test_confirm_text_lan1_mentions_pxe_stop_and_probe():
+def test_confirm_text_lan1_mentions_pxe_stop():
     text = nm.confirm_text(nm.plan_switch(nm.empty_state(), nm.rec("off", "eno1"), CONS, uuids()))
-    assert "PXE" in text and "管理口" not in text
-    text = nm.confirm_text(nm.plan_switch(nm.empty_state(), nm.legacy("eno1", "a737-4", "Lan1-pxe"),
-                                          CONS, uuids()))
-    assert "探测" in text
+    assert "PXE" in text and "管理口" not in text and "探测" not in text
 
 
 def test_describe_records():
     assert nm.describe(nm.rec("off", "eno1")) == "关闭"
     assert nm.describe(static(egress="backup", gateway="192.0.2.1", dns="192.0.2.53")) == \
         "静态 IP 192.0.2.5/24 网关 192.0.2.1 DNS 192.0.2.53 · 备用出口"
+    r = nm.rec("static", "eno1", nm.static_params("eno1", "192.0.2.5/24", "192.0.2.1", routes="198.51.100.0/24"))
+    assert nm.describe(r) == "静态 IP 192.0.2.5/24 网关 192.0.2.1 经网关去 198.51.100.0/24 · 不当出口"
     assert nm.describe(nm.legacy("eno1", "a737-4", "Lan1-pxe")) == "未托管 · 旧配置「Lan1-pxe」"
     assert nm.describe(nm.legacy("eno1")) == "未托管 · 没有生效的连接"
 
@@ -551,3 +628,184 @@ def test_crash_during_handback_still_knows_what_to_undo():
     plan = nm.plan_switch(st, nm.rec("dhcp", "enp3s0"), CONS, uuids())
     assert plan["undo"] == [["nmcli", "con", "delete", "uuid", "u0"]]
     assert plan["restore"] == [["nmcli", "con", "up", "uuid", "1603-3"]]
+
+
+# ------------------------------------------------------------ 接管时删旧配置 (10/31: 交还旧配置去掉了)
+
+def _detail(name, uuid, ifname):
+    """nmcli -t con show uuid <u> 的样子 (只留要用的几行)."""
+    return "\n".join([f"connection.id:{name}", f"connection.uuid:{uuid}", "connection.type:802-3-ethernet",
+                      f"connection.interface-name:{ifname}", "ipv4.method:manual"])
+
+
+CONS_OLD = CONS + "\nOld-lan1:cccc-6:802-3-ethernet::no"
+DETAILS = {"1603-3": _detail("enp3s0", "1603-3", "enp3s0"), "a737-4": _detail("Lan1-pxe", "a737-4", "eno1"),
+           "bbbb-5": _detail("cart-enp3s0-static-华为交换机", "bbbb-5", "enp3s0"),
+           "eeee-8": _detail("Wired connection 1", "eeee-8", ""), "cccc-6": _detail("Old-lan1", "cccc-6", "eno1"),
+           "6c4d-1": _detail("campus-net", "6c4d-1", "wlp4s0")}
+
+
+def _names(cons):
+    return [c["name"] for c in cons]
+
+
+def test_old_cons_bound_to_this_port_or_active_here():
+    st = nm.empty_state()
+    assert _names(nm.old_cons(st, "eno1", CONS_OLD, DETAILS)) == ["Lan1-pxe", "Old-lan1"]
+    # 没绑网口、也没在这个口上生效的 (Wired connection 1) 不删; 绑在 LAN1 的 Old-lan1 不归 LAN2; 无线永远不碰
+    assert _names(nm.old_cons(st, "enp3s0", CONS_OLD, DETAILS)) == ["enp3s0", "cart-enp3s0-static-华为交换机"]
+
+
+def test_old_cons_without_details_only_the_active_one():
+    """读不到 interface-name 的: 只认正在这个口上生效的那条 (它不可能绑在别的口上), 别的一条不删."""
+    assert _names(nm.old_cons(nm.empty_state(), "enp3s0", CONS_OLD, {})) == ["enp3s0"]
+    assert _names(nm.old_cons(nm.empty_state(), "eno1", CONS_OLD, None)) == ["Lan1-pxe"]
+
+
+def test_old_cons_unbound_but_active_here_counts():
+    cons = CONS_OLD.replace("Wired connection 1:eeee-8:802-3-ethernet::no",
+                            "Wired connection 1:eeee-8:802-3-ethernet:enp3s0:yes") \
+        .replace("enp3s0:1603-3:802-3-ethernet:enp3s0:yes", "enp3s0:1603-3:802-3-ethernet::no")
+    assert "Wired connection 1" in _names(nm.old_cons(nm.empty_state(), "enp3s0", cons, DETAILS))
+
+
+def test_old_cons_skips_what_the_cart_owns():
+    st = _managed_static_state()
+    st["modes"][0]["res"][0]["con"] = "bbbb-5"                         # 推车自己记着的那条不算旧配置
+    assert _names(nm.old_cons(st, "enp3s0", CONS_OLD, DETAILS)) == ["enp3s0"]
+
+
+def test_old_cons_bound_to_other_port_never_deleted():
+    details = dict(DETAILS, **{"1603-3": _detail("enp3s0", "1603-3", "eno1")})    # 绑在 LAN1 上: LAN2 不碰
+    cons = CONS_OLD.replace("enp3s0:1603-3:802-3-ethernet:enp3s0:yes", "enp3s0:1603-3:802-3-ethernet::no")
+    assert "enp3s0" not in _names(nm.old_cons(nm.empty_state(), "enp3s0", cons, details))
+
+
+def test_plan_from_unmanaged_purges_old_cons_after_apply():
+    plan = nm.plan_switch(nm.empty_state(), nm.rec("off", "eno1"), CONS_OLD, uuids(), details=DETAILS)
+    assert _names(plan["purge"]) == ["Lan1-pxe", "Old-lan1"]
+    assert plan["purge"][0]["uuid"] == "a737-4" and "interface-name:eno1" in plan["purge"][0]["dump"]
+    assert ["nmcli", "con", "delete", "uuid", "a737-4"] not in plan["commands"]      # 不进 undo/apply
+    assert ["nmcli", "con", "up", "uuid", "a737-4"] in plan["restore"]              # 失败时旧的还在, up 回去
+    plan = nm.plan_switch(_managed_static_state(), nm.rec("dhcp", "enp3s0"), CONS_OLD, uuids(), details=DETAILS)
+    assert plan["purge"] == []                                                       # 已托管: 不再删
+
+
+def test_plan_purge_never_touches_wifi_or_other_port():
+    plan = nm.plan_switch(nm.empty_state(), nm.rec("dhcp", "enp3s0"), CONS_OLD, uuids(), details=DETAILS)
+    assert not any(c["uuid"] in ("6c4d-1", "a737-4", "cccc-6") for c in plan["purge"])
+
+
+def _bk(box, where="/b/20261031-101500", fail=None):
+    box.backed = None
+
+    def backup(cons):
+        box.backed = [c["name"] for c in cons]
+        if fail:
+            raise OSError(fail)
+        return where
+    return backup
+
+
+def test_run_switch_backs_up_then_deletes_old_cons():
+    st = nm.empty_state()
+    plan = nm.plan_switch(st, nm.rec("off", "eno1"), CONS_OLD, uuids(), details=DETAILS)
+    box = Box()
+    ok, new, msg = nm.run_switch(plan, st, box.run, box.save, box.log, backup=_bk(box))
+    assert ok and box.backed == ["Lan1-pxe", "Old-lan1"]
+    i = box.ran.index("nmcli con up uuid u1")
+    assert box.ran[i + 1:] == ["nmcli con delete uuid a737-4", "nmcli con delete uuid cccc-6"]   # apply 成功之后才删
+    assert "Lan1-pxe" in msg and "/b/20261031-101500" in msg
+    assert any("删旧配置" in m and "Lan1-pxe" in m and "/b/20261031-101500" in m for m in box.logs)
+    assert "eno1" not in new["prev"]                                     # 旧连接删了, 上一个不指向它
+    assert nm.owner(new, "eno1")["mode"] == "off"
+
+
+def test_run_switch_backup_fails_keeps_old_cons():
+    st = nm.empty_state()
+    plan = nm.plan_switch(st, nm.rec("off", "eno1"), CONS_OLD, uuids(), details=DETAILS)
+    box = Box()
+    ok, _, msg = nm.run_switch(plan, st, box.run, box.save, box.log, backup=_bk(box, fail="disk full"))
+    assert ok and not any("delete" in c for c in box.ran)                # fail-closed: 备份不成就不删
+    assert "没删" in msg and "disk full" in msg
+    assert any("备份失败" in m for m in box.logs)
+
+
+def test_run_switch_without_backup_hook_deletes_nothing():
+    st = nm.empty_state()
+    plan = nm.plan_switch(st, nm.rec("off", "eno1"), CONS_OLD, uuids(), details=DETAILS)
+    box = Box()
+    ok, _, msg = nm.run_switch(plan, st, box.run, box.save, box.log)
+    assert ok and not any("delete" in c for c in box.ran) and "没删" in msg
+
+
+def test_run_switch_failed_apply_never_deletes_old_cons():
+    st = nm.empty_state()
+    plan = nm.plan_switch(st, nm.rec("off", "eno1"), CONS_OLD, uuids(), details=DETAILS)
+    box = Box("con up uuid u1")
+    ok, _, _ = nm.run_switch(plan, st, box.run, box.save, box.log, backup=_bk(box))
+    assert not ok and box.backed is None and box.ran[-1] == "nmcli con up uuid a737-4"
+    assert not any("a737-4" in c and "delete" in c for c in box.ran)
+
+
+def test_run_switch_delete_that_fails_is_reported():
+    st = nm.empty_state()
+    plan = nm.plan_switch(st, nm.rec("off", "eno1"), CONS_OLD, uuids(), details=DETAILS)
+    box = Box("con delete uuid cccc-6")
+    ok, _, msg = nm.run_switch(plan, st, box.run, box.save, box.log, backup=_bk(box))
+    assert ok and "Old-lan1" in msg and "没删掉" in msg
+    assert any("Old-lan1" in m and "失败" in m for m in box.logs)
+
+
+def _stamp(t):
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime(t))
+
+
+def test_backup_cons_copies_keyfile_or_saves_nmcli_text(tmp_path):
+    nm_dir, root = tmp_path / "sc", tmp_path / "bk"
+    nm_dir.mkdir()
+    (nm_dir / "Lan1-pxe.nmconnection").write_text("[connection]\nid=Lan1-pxe\nuuid=a737-4\n")
+    (nm_dir / "renamed.nmconnection").write_text("[connection]\nid=Old-lan1\nuuid=cccc-6\n")
+    cons = [{"name": "Lan1-pxe", "uuid": "a737-4", "dump": DETAILS["a737-4"]},
+            {"name": "Old-lan1", "uuid": "cccc-6", "dump": DETAILS["cccc-6"]},
+            {"name": "a/b", "uuid": "eeee-8", "dump": DETAILS["eeee-8"]}]
+    where = nm.backup_cons(cons, root=str(root), nm_dir=str(nm_dir), now=lambda: 1793440000)
+    d = root / _stamp(1793440000)
+    assert where == str(d)
+    assert (d / "Lan1-pxe.nmconnection").read_text().endswith("uuid=a737-4\n")
+    assert (d / "renamed.nmconnection").exists()                         # 文件名对不上就按 uuid 找
+    assert "interface-name:" in (d / "a_b.nmcli.txt").read_text()        # 没 keyfile: 存 nmcli 输出
+
+
+def test_backup_cons_fails_closed_without_anything_to_save(tmp_path):
+    with pytest.raises(OSError):
+        nm.backup_cons([{"name": "x", "uuid": "u", "dump": ""}], root=str(tmp_path / "bk"),
+                       nm_dir=str(tmp_path / "none"))
+    (tmp_path / "file").write_text("")
+    with pytest.raises(OSError):                                         # 备份目录建不了
+        nm.backup_cons([{"name": "x", "uuid": "u", "dump": "a:b"}], root=str(tmp_path / "file" / "bk"),
+                       nm_dir=str(tmp_path / "none"))
+
+
+def test_confirm_text_lists_old_cons_to_delete_and_pxe_warning():
+    plan = nm.plan_switch(nm.empty_state(), static("eno1"), CONS_OLD, uuids(), details=DETAILS)
+    text = nm.confirm_text(plan)
+    assert "将删除旧配置: Lan1-pxe、Old-lan1" in text and nm.BACKUP_DIR in text
+    assert "nmcli con delete uuid a737-4" in text
+    assert "装机口地址要用静态 IP 重建, PXE 服务会停" in text
+    plan = nm.plan_switch(nm.empty_state(), nm.rec("dhcp", "enp3s0"), CONS_OLD, uuids(), details=DETAILS)
+    text = nm.confirm_text(plan)
+    assert "将删除旧配置: enp3s0、cart-enp3s0-static-华为交换机" in text and "装机口地址" not in text
+
+
+def test_confirm_text_pxe_warning_when_pxe_server_runs_on_port():
+    details = dict(DETAILS, **{"a737-4": _detail("lab", "a737-4", "eno1")})
+    cons = CONS_OLD.replace("Lan1-pxe:a737-4", "lab:a737-4")
+    plan = nm.plan_switch(nm.empty_state(), nm.rec("off", "eno1"), cons, uuids(), details=details)
+    assert "装机口地址" not in nm.confirm_text(plan)
+    plan = nm.plan_switch(nm.empty_state(), nm.rec("off", "eno1"), cons, uuids(), details=details,
+                          pxe_active=True)
+    assert "装机口地址要用静态 IP 重建" in nm.confirm_text(plan)
+    plan = nm.plan_switch(nm.empty_state(), nm.rec("dhcp", "enp3s0"), cons, uuids(), details=details,
+                          pxe_active=True)
+    assert "装机口地址" not in nm.confirm_text(plan)                     # PXE 只在 LAN1 上

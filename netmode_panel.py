@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Kiosk 网口模式面板 (#12): 上面按网口 (LAN1 / LAN2) 列当前模式、实际地址、是不是默认出口;
-选中一个口, 下面选模式 (关闭 / DHCP / 静态 / 交还旧配置), 静态一页填完 (地址/前缀、网关、DNS、出口优先级).
+选中一个口, 下面选模式 (关闭 / DHCP / 静态), 静态一页填完 (地址/前缀、网关、经网关去的网段、DNS、出口).
 
 规则都在 netmode_core: 切换 = undo 当前 -> apply 新, 失败自动撤并恢复原来的; 确认框直接列出
-"将执行的命令"和"出问题时的 undo 命令". 每次 apply / undo 写 events.log ([netmode]).
+"将执行的命令"、"将删除旧配置"和"出问题时的 undo 命令". 每次 apply / undo / 删旧配置写 events.log ([netmode]).
 取代旧的「网口配置文件」面板和「LAN2 管理口配置」两个入口 (#8: 两套入口改同一个口, 手感不对).
-交还装机配置 (Lan1-pxe) 前照旧先探测链路上有没有别人的 DHCP. 无线不归这里管, 永远留作后路.
+10/31: 网关一直能填 (LAN2 填了自动备用出口, LAN1 只给经网关的网段用); 「交还旧配置」去掉,
+第一次接管一个口时新模式起来后备份再删它的旧配置. 无线不归这里管, 永远留作后路.
 nmcli 放后台线程, 同 wifi_panel.
 """
 
@@ -25,10 +26,11 @@ class NetModePanel(BridgePanel):
     _btn = WifiPanel._btn
     _say = WifiPanel._say
 
-    def __init__(self, master, want=None, state_path=nmc.STATE_PATH):
+    def __init__(self, master, want=None, state_path=nmc.STATE_PATH, backup_root=nmc.BACKUP_DIR,
+                 nm_dir=nmc.NM_DIR):
         super().__init__(master, bg=BG)
-        self.state_path = state_path
-        self.state, self.cons_text = nmc.empty_state(), ""
+        self.state_path, self.backup_root, self.nm_dir = state_path, backup_root, nm_dir
+        self.state, self.cons_text, self.details, self.pxe_active = nmc.empty_state(), "", {}, False
         self.views = nmc.port_views(self.state, "", "", "", {})
         self.port = want if want in nmc.PORTS else nmc.LAN2
         self._build()
@@ -36,9 +38,9 @@ class NetModePanel(BridgePanel):
 
     # ------------------------------------------------------------ UI
 
-    def _entry(self, parent, text, var, width):
+    def _entry(self, parent, text, var, width, on_change=None):
         tk.Label(parent, text=text, font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
-        var.trace_add("write", lambda *_: self._form_changed())
+        var.trace_add("write", lambda *_: (on_change or self._form_changed)())
         e = tk.Entry(parent, textvariable=var, width=width, font=FONT_MONO, bg="#10141c", fg=FG,
                      insertbackground=FG, relief="flat", disabledbackground=BOX)
         e.pack(side="left", padx=6, ipady=3)
@@ -69,13 +71,6 @@ class NetModePanel(BridgePanel):
         tk.Label(row, text="模式:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
         self.mode_var = tk.StringVar(value="dhcp")
         self.mode_btns = {m: self._radio(row, self.mode_var, m, nmc.MODES[m]["title"]) for m in nmc.MODES}
-        self.mode_btns[nmc.LEGACY] = self._radio(row, self.mode_var, nmc.LEGACY, "交还旧配置:")
-        self.legacy_var = tk.StringVar(value="")
-        self.legacy_om = tk.OptionMenu(row, self.legacy_var, "")
-        self.legacy_om.config(font=FONT, bg=BOX, fg=FG, activebackground="#3a4560", relief="flat",
-                              highlightthickness=0)
-        self.legacy_om["menu"].config(font=FONT, bg=BOX, fg=FG)
-        self.legacy_om.pack(side="left", padx=4)
 
         # 静态: 本机 地址/前缀 是主输入 (不猜掩码, #13); 对端可选, 只防撞址 / 按它预填; 模板 = 设备出厂地址
         row = tk.Frame(self.box, bg=BG)
@@ -95,9 +90,13 @@ class NetModePanel(BridgePanel):
 
         row = tk.Frame(self.box, bg=BG)
         row.pack(fill="x", pady=4)
-        self.gw_var, self.dns_var = tk.StringVar(), tk.StringVar()
-        self.gw_e = self._entry(row, "网关:", self.gw_var, 16)
+        self.gw_var, self.dns_var, self.routes_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.gw_e = self._entry(row, "网关:", self.gw_var, 16, on_change=self._gateway_changed)
         self.dns_e = self._entry(row, "DNS(可空, 逗号分隔):", self.dns_var, 24)
+
+        row = tk.Frame(self.box, bg=BG)
+        row.pack(fill="x", pady=4)
+        self.routes_e = self._entry(row, "经网关去的网段(可空, 逗号分隔):", self.routes_var, 36)
 
         row = tk.Frame(self.box, bg=BG)
         row.pack(fill="x", pady=4)
@@ -121,22 +120,27 @@ class NetModePanel(BridgePanel):
     def _form(self):
         return {"mode": self.mode_var.get(), "addr": self.addr_var.get(), "peer": self.peer_var.get(),
                 "gateway": self.gw_var.get(), "dns": self.dns_var.get(), "egress": self.egress_var.get(),
-                "legacy": self.legacy_var.get()}
+                "routes": self.routes_var.get()}
+
+    def _gateway_changed(self):
+        """10/31: LAN2 填了网关还是「不当出口」就自动改备用出口, 清空网关回到不当出口; LAN1 永远不当出口.
+        只在网关框变化时纠正, 用户自己点的出口照旧 (提示行说明会怎样)."""
+        self.egress_var.set(nmc.egress_for_gateway(self.port, self.egress_var.get(), self.gw_var.get()))
+        self._form_changed()
 
     def _form_changed(self):
         mode = self.mode_var.get()
         st = nmc.form_state(self.port, mode, self.egress_var.get())
         if not st["egress"].get(self.egress_var.get()) and mode == "static":
-            self.egress_var.set("never")                   # LAN1 不许当出口: 选不了的项落回"不当出口"
+            self.egress_var.set("never")                   # LAN1 不当出口 / 老记录的主出口: 落回"不当出口"
             st = nmc.form_state(self.port, mode, "never")
         for w in (self.addr_e, self.peer_e, self.prefill_btn, self.tpl_om):
             w.config(state="normal" if st["addr"] else "disabled")
-        for w in (self.gw_e,):
-            w.config(state="normal" if st["gateway"] else "disabled")
+        self.gw_e.config(state="normal" if st["gateway"] else "disabled")
+        self.routes_e.config(state="normal" if st["routes"] else "disabled")
         self.dns_e.config(state="normal" if st["addr"] else "disabled")
         for k, b in self.egress_btns.items():
             b.config(state="normal" if st["egress"][k] else "disabled")
-        self.legacy_om.config(state="normal" if mode == nmc.LEGACY else "disabled")
         self.hint.config(text=nmc.form_hint(self.port, mode, self._form()))
 
     def _use_template(self):
@@ -164,12 +168,16 @@ class NetModePanel(BridgePanel):
             st = nmc.load_state(self.state_path)
             cons = _run(npc.CMD_CONS)[1]
             links = {i: npc.carrier(i) for i in nmc.PORTS}
-            return st, cons, nmc.port_views(st, cons, _run(npc.CMD_IP_BR)[1], _run(nmc.CMD_ROUTES)[1], links)
+            # 以太网连接的详情: 认 interface-name (接管时删哪些旧配置), 没 keyfile 时也当备份文本
+            details = {u: _run(nmc.cmd_con_detail(u))[1] for u in nmc.eth_uuids(cons)}
+            pxe = _run(["systemctl", "is-active", "--quiet", "pxe-server"])[0] == 0
+            return st, cons, details, pxe, nmc.port_views(st, cons, _run(npc.CMD_IP_BR)[1],
+                                                          _run(nmc.CMD_ROUTES)[1], links)
 
         def done(res):
             if isinstance(res, Exception):
                 return self._say(f"读取失败: {res}", ok=False)
-            self.state, self.cons_text, self.views = res
+            self.state, self.cons_text, self.details, self.pxe_active, self.views = res
             self._render()
             self._pick(self.port)
             self._say(self.state.get("broken") or "选一个网口, 在下面改模式")
@@ -194,7 +202,7 @@ class NetModePanel(BridgePanel):
             self._pick(self.views[cur[0]]["iface"])
 
     def _pick(self, iface):
-        """选中一个口: 表单按它当前的模式预填 (未托管就预选交还给正在用的那条旧连接)."""
+        """选中一个口: 表单按它当前的模式预填 (未托管就预选干净状态, 不自动改任何东西)."""
         self.port = iface
         v = self._view(iface)
         idx = [x["iface"] for x in self.views].index(iface)
@@ -203,18 +211,12 @@ class NetModePanel(BridgePanel):
         self.box.config(text=f" {v['port']} ({iface}) 改模式 ")
         self.drift_lbl.config(text=v["drift"])
         for m, b in self.mode_btns.items():
-            b.config(state="disabled" if nmc.check_mode(iface, m) or (m == nmc.LEGACY and not v["legacy"])
-                     else "normal")
-        menu = self.legacy_om["menu"]
-        menu.delete(0, "end")
-        for c in v["legacy"]:
-            menu.add_command(label=c["name"], command=lambda n=c["name"]: self.legacy_var.set(n))
-        active = next((c["name"] for c in v["legacy"] if c["active"]), v["legacy"][0]["name"] if v["legacy"] else "")
-        self.legacy_var.set(active)
+            b.config(state="disabled" if nmc.check_mode(iface, m) else "normal")
         p = v["rec"]["params"]
-        self.mode_var.set(v["mode"] if v["managed"] or v["legacy"] else nmc.CLEAN[iface])
+        self.mode_var.set(v["mode"] if v["managed"] else nmc.CLEAN[iface])
         self.addr_var.set(p.get("addr", ""))
-        self.gw_var.set(p.get("gateway", ""))
+        self.gw_var.set(p.get("gateway", ""))           # 先填网关 (会自动纠正出口), 再按记录落出口
+        self.routes_var.set(p.get("routes", ""))
         self.dns_var.set(p.get("dns", ""))
         self.egress_var.set(p.get("egress", "never"))
         self._form_changed()
@@ -223,7 +225,7 @@ class NetModePanel(BridgePanel):
 
     def apply(self):
         try:
-            new = nmc.target(self.port, self._form(), self._view(self.port)["legacy"])
+            new = nmc.target(self.port, self._form())
         except ValueError as ex:
             return self._say(str(ex), ok=False)
         self._switch(new)
@@ -236,6 +238,8 @@ class NetModePanel(BridgePanel):
         prev = self.state.get("prev", {}).get(self.port)
         if not prev:
             return self._say("这个口还没切换过, 没有上一个", ok=False)
+        if prev["mode"] == nmc.LEGACY:                  # 1.09.00 记下的旧连接
+            return self._say(nmc.NO_HANDBACK, ok=False)
         self._switch(prev)
 
     def _switch(self, new):
@@ -245,29 +249,23 @@ class NetModePanel(BridgePanel):
             return self._say("已经是这个了")
         try:
             plan = nmc.plan_switch(self.state, new, self.cons_text, lambda: str(uuid.uuid4()),
-                                   links={v["iface"]: v["link"] for v in self.views})
+                                   links={v["iface"]: v["link"] for v in self.views},
+                                   details=self.details, pxe_active=self.pxe_active)
         except ValueError as ex:
             return self._say(str(ex), ok=False)
         ip = view["ip"] if view["ip"] != "-" else ""
-        if not messagebox.askyesno("切换网口模式", nmc.confirm_text(plan, ip), icon="warning", parent=self):
+        if not messagebox.askyesno("切换网口模式", nmc.confirm_text(plan, ip, self.backup_root),
+                                   icon="warning", parent=self):
             return self._say("没确认, 网口没动", ok=False)
-        state, path = self.state, self.state_path
+        state, path, root, nm_dir = self.state, self.state_path, self.backup_root, self.nm_dir
 
         def log(msg):
             cartlog.event("netmode", msg)
 
         def work():
-            if plan["probe"]:
-                _run(["systemctl", "stop", "pxe-server"])           # 别听见自己
-                offers = npc.dhcp_probe(iface)
-                why = ("LAN1 没插线 (或读不到链路状态), 探测不了对面有没有 DHCP; 插好线再切" if offers.unknown else
-                       "对面已经有 DHCP 服务器 (" + ", ".join(o["server"] for o in offers) +
-                       "), 你插进别人的网络里了, 不交还装机配置" if offers else "")
-                if why:
-                    log(f"{nmc.PORTS[iface]} 交还 {new['params'].get('name')} 未切: {why}")
-                    return False, None, why
             return nmc.run_switch(plan, state, lambda c: _run(c, timeout=UP_TIMEOUT),
-                                  lambda s: nmc.save_state(path, s), log)
+                                  lambda s: nmc.save_state(path, s), log,
+                                  backup=lambda cons: nmc.backup_cons(cons, root=root, nm_dir=nm_dir))
 
         def done(res):
             if isinstance(res, Exception):
@@ -276,8 +274,6 @@ class NetModePanel(BridgePanel):
                 ok, st, msg = res
                 if st is not None:
                     self.state = st
-            if ok and new["mode"] == nmc.LEGACY and plan["probe"]:
-                msg += " · PXE 服务没自动开, 要用去「装机」页打开"
             self._say(msg, ok)
             self.after(300, self.reload)
-        self._bg(work, done, "探测对面有没有 DHCP…" if plan["probe"] else "切换中…")
+        self._bg(work, done, "切换中…")
