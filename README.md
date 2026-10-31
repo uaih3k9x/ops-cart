@@ -56,8 +56,8 @@
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
 | [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序;面板底部改校园网认证账号、立即认证、看最近结果 |
 | [`wifi_prefer.py`](wifi_prefer.py) | 定时让优先级真正生效:看得见更高优先级的已保存网络就切过去,失败冷却 30 分钟 |
-| [`netmode_panel.py`](netmode_panel.py) · [`netmode_core.py`](netmode_core.py) | 网口模式(#12):LAN1 / LAN2 每个口一个模式(关闭 / DHCP / 静态 / 交还旧配置),切换 = undo 当前 → apply 新,失败撤新的、恢复原来的,再不行落到干净状态(LAN1 关闭、LAN2 DHCP);每个模式记下自己建的 `cart-` 连接(按 uuid)和改过的内核参数原值,状态写 `/var/lib/ops-cart/netmode.json`;旧连接只认不删;静态出口优先级和 Wi-Fi 的 metric 比(常量在 `wifi_core`,#7 共用),LAN1 不当出口;无线永远不碰。设计见 [`docs/NETMODE.md`](docs/NETMODE.md) |
-| [`netprof_core.py`](netprof_core.py) | 网口共用小件:认旧连接名、静态地址校验 `static_form` / 按对端预填(不猜 /24)、DHCP 探测(没插线不探测,结果算"未知";交还装机配置前和 pxeserver 守卫都用) |
+| [`netmode_panel.py`](netmode_panel.py) · [`netmode_core.py`](netmode_core.py) | 网口模式(#12):LAN1 / LAN2 每个口一个模式(关闭 / DHCP / 静态),切换 = undo 当前 → apply 新,失败撤新的、恢复原来的,再不行落到干净状态(LAN1 关闭、LAN2 DHCP);每个模式记下自己建的 `cart-` 连接(按 uuid)和改过的内核参数原值,状态写 `/var/lib/ops-cart/netmode.json`;第一次接管一个口时,新模式起来后把这个口上的旧连接备份到 `/var/lib/ops-cart/nm-backup/` 再删(备份不成就不删);网关一直能填,主出口只有 Wi-Fi,LAN2 填了网关自动当备用出口(metric 排在 Wi-Fi 后面,常量在 `wifi_core`,#7 共用),LAN1 永不当出口、网关只走「经网关去的网段」;无线永远不碰。设计见 [`docs/NETMODE.md`](docs/NETMODE.md) |
+| [`netprof_core.py`](netprof_core.py) | 网口共用小件:认旧连接名、静态地址校验 `static_form` / 按对端预填(不猜 /24)、DHCP 探测(没插线不探测,结果算"未知";pxeserver 守卫用) |
 | [`wol_panel.py`](wol_panel.py) · [`wol_core.py`](wol_core.py) | 网络唤醒:常用目标清单 + 临时输 MAC,从选定网口广播魔术包 |
 | [`atomicfile.py`](atomicfile.py) | 防断电写文件:临时文件 → fsync → 改名,配置要么旧要么新 |
 | [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
