@@ -94,3 +94,17 @@ def test_kvm_broker_unit_socket_and_hardening():
     assert "kiosk.service" not in body and "webkiosk.service" not in body     # 谁都不依赖谁, 代理不在客户端直开
     rot = (UNITS.parent / "logrotate.d" / "ops-cart").read_text()
     assert "/var/log/ops-cart/*.log" in rot and "copytruncate" in rot
+
+
+def test_serial_req_units_only_stop_direction_from_web():
+    """#23 网页急停 / 拒绝: ops-web 只能往 serial-req 目录投请求, root 的 oneshot 执行 (只认停的方向)."""
+    import mcp_serial
+    p, s = unit("cart-serial-req.path"), unit("cart-serial-req.service")
+    assert f"DirectoryNotEmpty={mcp_serial.REQ_DIR}" in p and "WantedBy=multi-user.target" in p
+    body = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#"))
+    assert "Type=oneshot" in body and "ExecStart=/usr/bin/python3 /opt/pxe/mcp_serial.py requests" in body
+    assert "User=" not in body                              # root: 要改 0600 的状态文件
+    tmp = (UNITS.parent / "tmpfiles.d" / "ops-cart.conf").read_text()
+    assert f"d {mcp_serial.REQ_DIR} 0700 ops-web ops-web -" in tmp
+    web = unit("webkiosk.service")
+    assert f"ReadWritePaths=-{mcp_serial.REQ_DIR}" in web

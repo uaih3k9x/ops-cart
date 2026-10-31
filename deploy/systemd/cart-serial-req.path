@@ -1,0 +1,9 @@
+[Unit]
+Description=网页串口急停 / 拒绝请求 (#23): serial-req 目录里有文件就拉起 cart-serial-req.service
+
+[Path]
+# 目录由 tmpfiles 建 (ops-web 0700); 网页口 (ops-web) 只能往这里投文件, 改不了状态文件
+DirectoryNotEmpty=/run/ops-cart/serial-req
+
+[Install]
+WantedBy=multi-user.target
