@@ -460,6 +460,14 @@ def boot_items(snap, now):
             _boot_kiosk(snap)]
 
 
+def boot_verdict(lines):
+    """#29: 自检行全出了结果且全绿 (ok, 没装没插的 off 不算问题) → 最后一行彩蛋; 否则 None, 照旧摘要."""
+    if not lines or any(ln.get("state") not in ("ok", "off") for ln in lines):
+        return None
+    import kiosk_core as kc
+    return {"label": kc.ALL_ONLINE[0], "status": kc.ALL_ONLINE[1]}
+
+
 class BootTracker:
     """副屏开机自检的状态机: kiosk 就绪 → view() 返回 None (照常画); 否则返回自检版面.
 
@@ -505,7 +513,8 @@ class BootTracker:
             return None
         t = time.localtime(now)
         return {"boot": True, "title": "OPS-CART", "version": snap.get("version") or "",
-                "clock": time.strftime("%H:%M", t), "lines": lines, "stale": stale(snap, now)}
+                "clock": time.strftime("%H:%M", t), "lines": lines, "verdict": boot_verdict(lines),
+                "stale": stale(snap, now)}
 
 
 def read_notice(path=NOTICE_PATH):

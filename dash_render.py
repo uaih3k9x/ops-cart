@@ -248,6 +248,12 @@ def boot_status_box(i, W=PANEL_W):
     return (W - M - BOOT_STATUS_W, y, W - M, y + 56)
 
 
+def boot_verdict_box(n, W=PANEL_W):
+    """n 行自检下面那一行 (全绿彩蛋 #29 / 摘要) 的结果栏框."""
+    y = BOOT_Y0 + n * BOOT_ROW + 10 + 24
+    return (W - M - BOOT_STATUS_W, y, W - M, y + 44)
+
+
 def _dashes(d, y, W):
     for x in range(M, W - M, 24):
         d.line([x, y, min(x + 12, W - M), y], fill=DIM, width=2)
@@ -261,19 +267,11 @@ def _boot_body(d, view, W, H):
     _dashes(d, 206, W)
 
     lines = view.get("lines") or []
-    lf, sf, df = _font(36), _font(36), _font(26)
+    df = _font(26)
     for i, ln in enumerate(lines):
         x0, y, x1, _ = boot_status_box(i, W)
         color = BOOT_COLOR.get(ln.get("state"), DIM)
-        status = ln.get("status") or ""
-        label = ln.get("label") or ""
-        d.text((M, y + 8), label, font=lf, fill=BAD if ln.get("state") == "fail" else FG)
-        d.text((x1, y + 8), status, font=sf, fill=color, anchor="ra")
-        dot_l = M + lf.getlength(label) + 14            # 名称和结果之间一串点, 开机自检的样子
-        dot_r = x1 - sf.getlength(status) - 14
-        n = int((dot_r - dot_l) // df.getlength("."))
-        if n > 2:
-            d.text((dot_l, y + 14), "." * n, font=df, fill=LINE if ln.get("state") == "wait" else DIM)
+        _boot_line(d, y + 8, ln, color, W)
         detail = wrap(ln.get("detail") or "", df, W - 2 * M - 20, 1)
         if detail:
             d.text((M + 20, y + 58), detail[0], font=df, fill=color if ln.get("state") == "late" else DIM)
@@ -284,8 +282,25 @@ def _boot_body(d, view, W, H):
     summary = "  ".join(s for s in ("正常 %d" % states.count("ok"),
                                     "等待 %d" % (states.count("wait") + states.count("late")),
                                     "故障 %d" % states.count("fail") if "fail" in states else "") if s)
-    d.text((M, y + 24), summary, font=_font(30), fill=BAD if "fail" in states else FG)
+    if view.get("verdict"):     # 全绿 (#29): 摘要换成 "ALL UNITS ONLINE ····· 意念合一", 跟上面同一排法
+        _boot_line(d, boot_verdict_box(len(lines), W)[1], dict(view["verdict"], state="ok"), BOOT_COLOR["ok"], W)
+    else:
+        d.text((M, y + 24), summary, font=_font(30), fill=BAD if "fail" in states else FG)
     d.text((M, y + 70), "车机就绪后自动切到状态板", font=_font(26), fill=DIM)
+
+
+def _boot_line(d, y, ln, color, W):
+    """一行 "名称 ······ 结果": 名称左、结果右对齐到结果栏, 中间一串点 (开机自检的样子)."""
+    lf, df = _font(36), _font(26)
+    status, label = ln.get("status") or "", ln.get("label") or ""
+    x1 = W - M
+    d.text((M, y), label, font=lf, fill=BAD if ln.get("state") == "fail" else FG)
+    d.text((x1, y), status, font=lf, fill=color, anchor="ra")
+    dot_l = M + lf.getlength(label) + 14
+    dot_r = x1 - lf.getlength(status) - 14
+    n = int((dot_r - dot_l) // df.getlength("."))
+    if n > 2:
+        d.text((dot_l, y + 6), "." * n, font=df, fill=LINE if ln.get("state") == "wait" else DIM)
 
 
 def _peers(d, peers, y, W):

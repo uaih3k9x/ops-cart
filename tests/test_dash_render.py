@@ -226,6 +226,18 @@ def test_render_boot_late_lines_are_amber():
     assert all(_has(img, r.boot_status_box(i), r.WARN) for i in range(len(v["lines"])))
 
 
+def test_render_boot_verdict_line_is_green_and_replaces_summary():
+    """#29: 全绿时自检行下面画 "ALL UNITS ONLINE ..... 意念合一", 结果栏绿; 不全绿不画."""
+    v = _boot_view()
+    n = len(v["lines"])
+    assert v["verdict"] is None
+    assert not _has(r.render(v), r.boot_verdict_box(n), r.ACCENT)
+    egg = dict(v, verdict={"label": "ALL UNITS ONLINE", "status": "意念合一"})
+    img = r.render(egg)
+    assert _has(img, r.boot_verdict_box(n), r.ACCENT)
+    assert r.boot_verdict_box(n)[3] < r.PANEL_H - 70                  # 不跟底栏打架
+
+
 def test_render_boot_stale_banner():
     from PIL import ImageColor
     img = r.render(dict(_boot_view(), stale=True))

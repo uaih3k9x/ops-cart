@@ -541,6 +541,25 @@ def test_selftest_line_format():
     assert line.startswith("LAN2 ") and ". OK" in line and line.endswith("203.0.113.4")
 
 
+def test_selftest_verdict_all_green_is_all_units_online():
+    """#29: 全绿 (OK, 没插的 "--" 不算问题) 最后一行写彩蛋, 点跟上面的自检行对齐."""
+    rows = [{"label": "LAN2", "state": "OK", "detail": "192.0.2.5"},
+            {"label": "LAN1 / PXE", "state": "--", "detail": "STANDBY"}]
+    text, state = kc.selftest_verdict(rows, width=26)
+    assert state == "OK" and text.startswith("ALL UNITS ONLINE ..") and text.endswith(" 意念合一")
+    row = kc.selftest_line({"label": "LAN2", "state": "OK", "detail": ""}, width=26)
+    assert text.index("意念合一") == row.index("OK")                # 结果列对齐
+
+
+def test_selftest_verdict_warn_or_fail_keeps_old_text():
+    ok = {"label": "LAN2", "state": "OK", "detail": ""}
+    warn = {"label": "TAILSCALE", "state": "WARN", "detail": "OFFLINE"}
+    fail = {"label": "PXE SERVER", "state": "FAIL", "detail": "NOT RUNNING"}
+    assert kc.selftest_verdict([ok, warn]) == ("SYSTEM READY", "OK")
+    assert kc.selftest_verdict([ok, warn, fail]) == ("SELF CHECK FAILED", "FAIL")
+    assert kc.selftest_verdict([]) == ("SYSTEM READY", "OK")             # 没跑出行: 不出彩蛋
+
+
 def test_branding_defaults_and_override(tmp_path):
     assert kc.branding_read(str(tmp_path))["title"] == "OPS-CART"
     assert kc.branding_read(str(tmp_path))["logo"] is None

@@ -562,6 +562,20 @@ def selftest_line(row, width=24):
     return f"{row['label'] + ' ':.<{width}} {row['state']:<4} {row['detail']}".rstrip()
 
 
+ALL_ONLINE = ("ALL UNITS ONLINE", "意念合一")      # #29: 全绿时自检最后一行 (车机 / 副屏同一句)
+
+
+def selftest_verdict(rows, width=24):
+    """自检最后一行 (文字, "OK"/"FAIL"): 有 FAIL 照旧 SELF CHECK FAILED, 有 WARN 照旧 SYSTEM READY;
+    全绿 ("--" 没插不算问题) 写 ALL UNITS ONLINE, 按 selftest_line 排, 点和结果列跟上面对齐 (#29)."""
+    states = {r.get("state") for r in rows}
+    if "FAIL" in states:
+        return "SELF CHECK FAILED", "FAIL"
+    if not rows or "WARN" in states:
+        return "SYSTEM READY", "OK"
+    return selftest_line({"label": ALL_ONLINE[0], "state": ALL_ONLINE[1], "detail": ""}, width), "OK"
+
+
 STATE_TAG = {"OK": "ok", "WARN": "t_warn", "FAIL": "bad"}
 ON_TEMPS_BLOCK = {"cpu", "fan"}      # 状态板下面有温度/风扇明细, 自检行就不重复
 
