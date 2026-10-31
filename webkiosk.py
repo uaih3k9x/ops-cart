@@ -10,6 +10,8 @@
 - 键鼠只发给当前画面源绑定的那块 CH9329 (kvm_core), 没绑就只能看
 - Host 白名单 + POST 同源, 都在读请求体之前查
 - 审计: 登录 / 退出 / 开关 / 打字 (只记长度) / 画面和串口的开关 (只记字节数) 写 cartlog, PIN 不进日志
+- Agent 写串口 (#23): 只读看挂起和急停; 只能急停 / 拒绝 (投到 serial-req 目录, root 的 cart-serial-req 执行),
+  确认发送和解除急停只在车机上 (只认本机人)
 """
 
 import argparse
@@ -25,9 +27,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cartlog
 import ch9329
+import confirm_core as cc
 import kiosk_core as kc
 import kvm_broker
 import kvm_core as kvm
+import lamps_core
+import mcp_serial
 import serial_core as sc
 import web_core as wc
 
@@ -98,6 +103,8 @@ class App:
         self._send_locks = {}           # 同上 -> 发送锁 (同一条连接的按键按顺序进串口)
         self._serial_tx = {}            # 同上 -> 发出去的字节数 (审计用)
         self._streams = {}              # 会话令牌 -> {关闭函数}
+        # Agent 写串口 (#23): 状态只读 (CAP_DAC_READ_SEARCH), 急停 / 拒绝投请求文件
+        self.serial_peek, self.req_dir, self.clock_wall = mcp_serial.peek, mcp_serial.REQ_DIR, time.time
 
     # -------------------------------------------------------- 鉴权
 
@@ -240,6 +247,10 @@ class App:
             return self._serial_send(tok, req.get("cid"), req.get("data"))
         if (method, path) == ("POST", "/api/lan"):
             return self._lan(ip, tok, req.get("open"))
+        if (method, path) == ("GET", "/api/serial-write"):
+            return self._serial_write_view()
+        if method == "POST" and path.startswith("/api/serial-write/"):
+            return self._serial_write_op(path.rsplit("/", 1)[1], req, ip, tok)
         return _json(404, {"error": "no such api"})
 
     def _login(self, req, ip):
@@ -483,6 +494,40 @@ class App:
             if key in self._serial_tx:
                 self._serial_tx[key] += len(raw)
         return _json(200, {"ok": True})
+
+    # -------------------------------------------------------- Agent 写串口: 看 / 急停 / 拒绝 (#23)
+
+    def _serial_write_view(self):
+        view = self.serial_peek()
+        states = cc.slot_states(view)
+        try:
+            slots = lamps_core.slot_status(self.serial_dir())
+        except Exception:                   # noqa: BLE001  读不到操作头只少了波特率, 状态照给
+            slots = [{"dev": d, "present": True, "baud": None, "count": None} for d in lamps_core.SLOTS]
+        heads = [dict(cc.head_view(n, slots[n - 1], states[n], False, True), n=n) for n in states]
+        try:
+            cards = [cc.card(view, n) for n in states]
+        except (KeyError, TypeError, StopIteration):
+            cards = [cc.card(cc.stopped_view(), n) for n in states]
+        return _json(200, {"heads": heads, "cards": cards, "summary": cc.summary(states), "ops": list(cc.WEB_OPS),
+                           "note": "网页上只能急停和拒绝; 确认发送、解除急停要在推车车机上点"})
+
+    def _serial_write_op(self, op, req, ip, tok):
+        if op not in cc.WEB_OPS:
+            return _json(403, {"error": "确认发送和解除急停只能在推车车机上点 (网页只能急停 / 拒绝)"})
+        arg = req.get("slot") if op == "estop" else req.get("id")
+        by = f"web:{ip}/{wc.session_tag(tok)}"[:cc.BY_MAX]
+        try:
+            r = cc.make_request(op, arg, by, self.clock_wall())
+        except ValueError as e:
+            return _json(400, {"error": str(e)})
+        try:
+            mcp_serial.write_request(r, self.req_dir)
+        except OSError as e:
+            self.log("serial-" + op, ip, tok, arg=arg, result="unavailable")
+            return _json(503, {"error": f"急停通道不可用 ({e.strerror}), 请在推车车机上操作"})
+        self.log("serial-" + op, ip, tok, arg=arg, result="queued")
+        return _json(202, {"queued": True, "op": op, "arg": arg})
 
     # -------------------------------------------------------- 静态文件
 

@@ -43,6 +43,16 @@
   #login input { width:100%; font-size:22px; text-align:center; letter-spacing:6px; margin:10px 0; }
   #msg { min-height:20px; }
   .hidden { display:none !important; }
+  /* Agent 写串口 (#23): 方块配色由后端给 (和车机执行器条同一套), 黄 / 紫闪靠动画 */
+  .btn.estop { background:#da3633; color:#fff; font-weight:bold; }
+  .heads { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  .head { min-width:110px; padding:8px 12px; border-radius:6px; border-left:6px solid; white-space:pre-line; font-weight:bold; }
+  .head.blink { animation:blink .4s steps(1) infinite; }
+  @keyframes blink { 50% { background:#1f2633; color:#c9d1e0; } }   /* 动画盖得过行内样式 */
+  nav button.pend { background:#f59e0b; color:#0b0f17; animation:blink .4s steps(1) infinite; }
+  nav button.stop { background:#da3633; color:#fff; }
+  .want { font-size:18px; font-weight:bold; font-family:"Noto Sans Mono CJK SC", monospace; margin:6px 0 2px; word-break:break-all; }
+  .item { border-top:1px solid #2c3a52; padding:8px 0; }
 </style>
 </head>
 <body>
@@ -62,8 +72,10 @@
     <button data-p="status" class="on">状态</button>
     <button data-p="kvm">KVM</button>
     <button data-p="serial">串口</button>
+    <button data-p="agent" id="nav-agent">Agent</button>
     <button data-p="settings">设置</button>
   </nav>
+  <button class="btn estop" id="estop-all" title="撤销所有 Agent 的写租约、丢弃挂起的命令; 不往设备发任何东西">全部急停</button>
 </header>
 
 <main>
@@ -105,6 +117,12 @@
       <span class="dim" id="s-state">未连接</span>
     </div>
     <div id="term"></div>
+  </section>
+
+  <section id="p-agent" class="page">
+    <div class="bar"><b id="ag-summary">Agent 没有挂起的命令</b><span class="dim" id="ag-note"></span><span id="ag-msg"></span></div>
+    <div class="heads" id="ag-heads"></div>
+    <div class="grid" id="ag-cards"></div>
   </section>
 
   <section id="p-settings" class="page">
@@ -395,8 +413,47 @@ $("#lan").onchange = async () => {
 };
 $("#logout").onclick = async () => { await api("/api/logout", {}); location.reload(); };
 
+// ---------------------------------------------------------------- Agent 写串口 (#23): 看挂起 / 急停 / 拒绝
+// 网页只能往"停"的方向走; 确认发送和解除急停在推车车机上. 请求先排队, 推车执行后下一轮刷新就看得到
+function agentItem(it) {
+  return `<div class="item"><div class="want">${esc(it.head)}</div><div class="dim">${esc(it.meta)}</div>
+    <div>${esc(it.reason)}</div>${it.danger ? `<div class="bad">${esc(it.danger)}</div>` : ""}
+    <button class="btn danger" data-reject="${it.id}">拒绝</button></div>`;
+}
+function agentCard(c, n) {
+  const foot = c.stopped ? `<div class="bad">急停中 · 解除要在推车车机上点</div>`
+                         : `<button class="btn estop" data-estop="${n}">急停本路</button>`;
+  return `<div class="card"><h3>${esc(c.title)}</h3>${c.status.map((x) => `<div class="dim">${esc(x)}</div>`).join("")}
+    ${c.items.map(agentItem).join("")}<div style="margin-top:8px">${foot}</div></div>`;
+}
+async function agentRefresh() {
+  const v = await api("/api/serial-write");
+  $("#ag-heads").innerHTML = v.heads.map((h) => `<div class="head${h.blink ? " blink" : ""}"
+    style="background:${h.bg};color:${h.fg};border-color:${h.bar}">${esc(h.text)}</div>`).join("");
+  $("#ag-cards").innerHTML = v.cards.map((c, i) => agentCard(c, i + 1)).join("");
+  $("#ag-summary").textContent = v.summary ? v.summary.text : "Agent 没有挂起的命令";
+  $("#ag-note").textContent = v.note;
+  const nav = $("#nav-agent");
+  nav.classList.toggle("pend", !!v.summary && v.summary.level === "warn");
+  nav.classList.toggle("stop", !!v.summary && v.summary.level === "bad");
+}
+async function agentOp(op, body) {
+  const r = await fetch(`/api/serial-write/${op}`, { method: "POST", headers: { "Content-Type": "application/json" },
+                                                      body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  $("#ag-msg").className = r.status === 202 ? "ok" : "bad";
+  $("#ag-msg").textContent = r.status === 202 ? "已提交, 推车执行中…" : (d.error || `失败 ${r.status}`);
+  setTimeout(() => agentRefresh().catch(() => {}), 500);
+}
+$("#ag-cards").onclick = (e) => {
+  const t = e.target;
+  if (t.dataset.reject) agentOp("reject", { id: Number(t.dataset.reject) });
+  if (t.dataset.estop) agentOp("estop", { slot: Number(t.dataset.estop) });
+};
+$("#estop-all").onclick = () => agentOp("estop", {});
+
 // ---------------------------------------------------------------- 启动
-let timer = null;
+let timer = null, agentTimer = null;
 async function boot() {
   const w = await fetch("/api/whoami");
   if (w.status === 403) return denied(await w.text());
@@ -407,9 +464,11 @@ async function boot() {
   $("#lan").disabled = me.kind !== "trusted";
   $("#lan-note").textContent = me.kind === "trusted" ? "关闭后局域网的会话和画面 / 串口连接立即断开, tailnet 不受影响。未设 PIN 时局域网始终拒绝, 装机口 (LAN1) 来的连接无论开关都拒绝。"
                                                      : "你正通过局域网访问, 只能从 tailnet 或推车本机切换。";
-  await Promise.all([refresh(), loadVideos(), loadPorts()]);
+  await Promise.all([refresh(), loadVideos(), loadPorts(), agentRefresh().catch(() => {})]);
   clearInterval(timer);
   timer = setInterval(() => refresh().catch(() => {}), 3000);
+  clearInterval(agentTimer);
+  agentTimer = setInterval(() => agentRefresh().catch(() => {}), 1500);
 }
 boot();
 </script>
