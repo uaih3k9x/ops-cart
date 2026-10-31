@@ -70,6 +70,7 @@
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
 | [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19 只读部分 + #20 标签;写串口见下一行 #21):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;列执行绪时带写租约持有者。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
 | [`mcp_serial.py`](mcp_serial.py) · [`serial_write_core.py`](serial_write_core.py) | 串口写路径(#21):MCP 工具 `lease_acquire/renew/release`、`send_command`(只收一行可打印 ASCII)、`send_key`(回车 / 翻页空格 / Ctrl+C)、`pending_list`、`estop`。每槽位同时一个写入者,租约默认 60 秒要续、过期作废;闸门第 1 层:认得出厂商(华为提示符自动认,其余在 [`examples/serial_gate.example.json`](examples/serial_gate.example.json) 登记)、停在提示符上、过只读白名单才直发,带 save/reboot/reset/format/delete 等高危词的永远要人确认,其余一律挂起;Ctrl+C 要人确认。急停单条 / 全部:撤租约、丢挂起,不往设备发任何东西。状态 `/run/ops-cart/serial-write.json`(读不懂 = 全部急停),每槽位 JSONL 日志 `/var/log/ops-cart/serial-slot<N>.log`。车机上 `cart_mcp.py pending / confirm / reject / estop / resume`,确认和解除只认本机终端(不经 sshd / tailscaled) |
+| [`confirm_core.py`](confirm_core.py) · [`confirm_panel.py`](confirm_panel.py) | Agent 写串口确认 UI(#23):执行器条操作头急停红 / 待确认黄闪 / Agent 输入紫闪,点开确认框确认 / 拒绝 / 急停 / 解除(高危词再问一次),另有「Agent 全部急停」块;网页「Agent」页只能急停和拒绝(经 `/run/ops-cart/serial-req/` 投请求,root 的 `cart-serial-req.path` 执行),确认和解除只在车机;副屏操作头同色并写挂起数和急停。状态读不懂 = 全部急停 |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
 | [`mcp_label.py`](mcp_label.py) | MCP 标签工具(#20,挂在 `cart_mcp` 上):`label_preview` 查仅 ASCII、`cart_label.LIMITS` 长度、出界和对折,回检查结果 + SVG;`label_print` 校验不过或打印机开盖/缺纸/缺碳带就拒,**默认只打 1 张**,批量要带单张打样回的 `proof`(10 分钟、一次性、绑版面)和人确认的原话 `confirmed`,都进审计;`label_printer_status` 读 `ESC !?` 状态字节;`label_abbrev_propose` 只回缩写对照表 diff,不写回。对照表优先读推车本地 `/etc/ops-cart/label_abbrev.json` |
 | [`cart_label.py`](cart_label.py) | TSC 标签机 TSPL 生成器(只出字节流,打印由调用方 `cat > /dev/usb/lp0`):旗形线缆标签(上下对折、下半份旋转 180°)、推车线标、刻度尺、资产标签(PDF → pdftoppm → BITMAP);校准常量集中在文件头;缩写对照表校验见 [`examples/label_abbrev.json`](examples/label_abbrev.json) |
@@ -153,6 +154,8 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 #   sudo python3 /opt/pxe/cart_mcp.py pending          # 看挂起的
 #   sudo python3 /opt/pxe/cart_mcp.py confirm 3        # 敲 yes 才发
 #   sudo python3 /opt/pxe/cart_mcp.py estop            # 全部急停 (哪都能停); resume 1|all 只认本机
+# #23 起车机上点操作头方块确认; 网页急停 / 拒绝要开 (先建 ops-web 用户, tmpfiles 建 serial-req 目录):
+#   sudo systemctl enable --now cart-serial-req.path
 ```
 
 tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py --write-rescue`)。
