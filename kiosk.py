@@ -1066,9 +1066,14 @@ class Kiosk(tk.Tk):
                      fg=color, anchor="w", width=56).pack(anchor="w")
             self.after(300, lambda: self._boot_show(box, rows, i + 1))
             return
-        failed = any(r["state"] == "FAIL" for r in rows)
-        tk.Label(box, text="SELF CHECK FAILED" if failed else "SYSTEM READY", font=FONT_BIG,
-                 bg=th.BOOT_BG, fg=th.BOOT_FAIL if failed else th.BOOT_OK).pack(pady=(14, 0))
+        text, state = kc.selftest_verdict(rows, width=26)
+        failed = state == "FAIL"
+        if text.startswith(kc.ALL_ONLINE[0]):   # 全绿彩蛋 (#29): 跟自检行同字体同宽, 点对齐
+            tk.Label(box, text=text, font=FONT_MONO, bg=th.BOOT_BG, fg=th.BOOT_OK,
+                     anchor="w", width=56).pack(anchor="w", pady=(14, 0))
+        else:
+            tk.Label(box, text=text, font=FONT_BIG,
+                     bg=th.BOOT_BG, fg=th.BOOT_FAIL if failed else th.BOOT_OK).pack(pady=(14, 0))
         self.after(6000 if failed else 2000, self._boot_done)
 
     def _boot_done(self):

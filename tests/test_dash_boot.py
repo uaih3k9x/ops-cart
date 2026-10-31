@@ -245,3 +245,46 @@ def test_tracker_kiosk_alive_but_items_stuck_still_switches_after_late():
     stuck = _ready_snap(ups=None, kiosk={"pid": 2, "alive": True})
     assert t.view(stuck, NOW + 5)["boot"]                                      # UPS 还在等
     assert t.view(stuck, NOW + 31) is None                                     # 不能为一项卡死在自检页
+
+
+# ---- #29: 全绿最后一行 "ALL UNITS ONLINE ........ 意念合一"
+
+def _ln(state):
+    return {"label": "x", "state": state, "status": "", "detail": ""}
+
+
+def test_boot_verdict_only_when_all_green():
+    v = dc.boot_verdict([_ln("ok"), _ln("off"), _ln("ok")])
+    assert v == {"label": "ALL UNITS ONLINE", "status": "意念合一"}
+    for bad in ("wait", "late", "warn", "fail"):
+        assert dc.boot_verdict([_ln("ok"), _ln(bad)]) is None, bad
+    assert dc.boot_verdict([]) is None
+
+
+def test_boot_verdict_text_same_as_kiosk():
+    text, _ = kc_verdict()
+    v = dc.boot_verdict([_ln("ok")])
+    assert text.startswith(v["label"] + " ") and text.endswith(" " + v["status"])
+
+
+def kc_verdict():
+    import kiosk_core as kc
+    return kc.selftest_verdict([{"label": "LAN2", "state": "OK", "detail": ""}])
+
+
+def test_tracker_shows_verdict_only_after_every_line_is_green():
+    t = dc.BootTracker(step=0.5, late=60)
+    first = t.view(_ready_snap(), NOW)
+    assert first["verdict"] is None                                         # 还在逐行亮
+    alive = _ready_snap(kiosk={"pid": 2, "alive": True})
+    views = [v for v in (t.view(alive, NOW + 0.25 * i) for i in range(1, 60)) if v]
+    assert views[-1]["verdict"] == {"label": "ALL UNITS ONLINE", "status": "意念合一"}
+    assert all(v["verdict"] is None for v in views
+               if any(ln["state"] not in ("ok", "off") for ln in v["lines"]))
+
+
+def test_tracker_no_verdict_when_something_is_red():
+    t = dc.BootTracker(step=0.5, late=60)
+    bad = _ready_snap(rows=[{"label": "PXE SERVER", "state": "FAIL", "detail": "NOT RUNNING",
+                             "check": "service"}])
+    assert all(t.view(bad, NOW + 0.5 * i)["verdict"] is None for i in range(30))
