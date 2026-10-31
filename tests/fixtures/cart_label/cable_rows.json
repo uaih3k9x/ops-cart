@@ -2,16 +2,16 @@
  {
   "shortId": 1,
   "here": "SW-A Te0/0/1",
-  "there": "SW-B Te0/0/2"
+  "there": "SW-B Te0/2"
  },
  {
   "shortId": 42,
   "here": "RK01-U20 SRV-1 MGMT",
-  "there": "RK01-U40 SW-C Gi0/9"
+  "there": "RK01 SW-C G9"
  },
  {
   "shortId": 123456,
-  "here": "ABCDEFGHIJKLMNOPQRSTUVWXY",
-  "there": "ABCDEFGHIJKLMNOPQRSTUVW"
+  "here": "ABCDEFGHIJKLMNOPQRSTUVW",
+  "there": "ABCDEFGHIJKL"
  }
 ]

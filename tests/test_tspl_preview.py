@@ -29,7 +29,7 @@ def test_parse_cable_golden():
     kinds = [it["kind"] for it in lb["items"]]
     assert kinds.count("dmatrix") == 2 and kinds.count("text") == 6
     t = lb["items"][2]
-    assert (t["x"], t["y"], t["font"], t["rot"], t["s"]) == (520, 44, "2", 0, "E-00001")
+    assert (t["x"], t["y"], t["font"], t["rot"], t["s"]) == (496, 44, "2", 0, "E-00001")    # 10-31 X0 左挪 3mm
 
 
 def test_parse_quoted_comma():

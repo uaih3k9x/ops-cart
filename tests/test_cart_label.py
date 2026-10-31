@@ -3,6 +3,7 @@
 黄金输出 (tests/fixtures/cart_label/*.tspl) 是用 ops-cart 技能目录里实机确认过的原脚本
 (tsc_label.py 10/30 版 / tsc_asset_label.py 10/28 版) 对同样输入生成的, 搬过来必须逐字节一致.
 资产标签的 PGM 输入由下面的 _pgm() 现造, 生成黄金输出时用的是同一段代码.
+例外: cable.tspl 是 10-30 改版 (对端大字 / 本端 "@ ") 后用本模块生成的, 待实机确认; 预览看 tspl_preview.py.
 """
 
 import json
@@ -151,14 +152,39 @@ def test_text_wider_than_flag_raises():
         cl.text_pair("A", "1", cl.FL - 1, 4.0)            # 左边出界
 
 
-def test_cable_there_gets_prefix_so_max_is_23():
-    """'> ' 前缀占 2 字符: 对端最多 23 个字符 (本端 25)."""
-    ok = {"shortId": 1, "here": "H" * 25, "there": "T" * 23}
+def test_cable_big_there_max_12_here_max_23():
+    """大字 (font3) 写对端最多 12 字; 本端加 '@ ' 前缀, 最多 23 字."""
+    ok = {"shortId": 1, "here": "H" * 23, "there": "T" * 12}
     cl.cable_labels([ok])
     with pytest.raises(ValueError):
-        cl.cable_labels([dict(ok, here="H" * 26)])
+        cl.cable_labels([dict(ok, here="H" * 24)])
     with pytest.raises(ValueError):
-        cl.cable_labels([dict(ok, there="T" * 24)])
+        cl.cable_labels([dict(ok, there="T" * 13)])
+
+
+def test_cable_layout_big_there_small_here():
+    """版面: 短号 font2, 对端 font3 大字不加前缀, 本端 font1 带 '@ '; 各自有 180° 搭档."""
+    lines = cl.cable_labels([{"shortId": 7, "here": "SW-A Te0/0/1", "there": "SW-B Te0/2"}])
+    texts = [ln for ln in lines if ln.startswith("TEXT ")]
+    assert any(',"3",0,1,1,"SW-B Te0/2"' in t for t in texts)
+    assert any(',"3",180,1,1,"SW-B Te0/2"' in t for t in texts)
+    assert any(',"1",0,1,1,"@ SW-A Te0/0/1"' in t for t in texts)
+    assert any(',"2",0,1,1,"E-00007"' in t for t in texts)
+    assert not any('"> ' in t for t in texts)
+
+
+def test_cable_layout_passes_preview_check():
+    """拿预览器查: 不出旗子设计区, 对折对称, 三行不互相压."""
+    import tspl_preview as tp
+    rows = [{"shortId": 123456, "here": "H" * 23, "there": "W" * 12}]
+    labels = tp.parse(cl.to_tspl(cl.cable_labels(rows)).encode())
+    assert tp.check(labels, tp.cable_guides()) == []
+    upper = sorted((tp.box(it) for it in labels[0]["items"] if it["kind"] == "text" and it["rot"] == 0),
+                   key=lambda b: b[1])
+    for a, b in zip(upper, upper[1:]):
+        assert a[3] <= b[1], (a, b)                        # 上一行底 <= 下一行顶
+    fold = (cl.CY + cl.Y0) * cl.D
+    assert upper[-1][3] <= fold - 4                        # 最下一行离折痕至少 0.5mm
 
 
 def _xy(cmd):
@@ -193,7 +219,7 @@ def test_text_shifted_by_y0_but_ruler_not():
 
 def test_calibration_constants():
     """实机校准值, 改之前先看 CART-LOG."""
-    assert (cl.FL, cl.FR, cl.CY, cl.Y0) == (55.0, 90.5, 9.0, 5.0)
+    assert (cl.FL, cl.FR, cl.CY, cl.Y0, cl.X0) == (52.0, 87.5, 9.0, 5.0, -3.0)   # 10-31 实机: 整体左挪 3mm
     assert "SHIFT 18,39" in cl.HEAD and "SIZE 104 mm, 25 mm" in cl.HEAD
     assert cl.ASSET_HEADER == "SIZE 60 mm, 37.4 mm\r\nGAP 2 mm, 0 mm\r\nDENSITY 15\r\nDIRECTION 1\r\nSHIFT 34,-76\r\n"
 
@@ -222,11 +248,12 @@ def test_limits_match_example_table():
 def test_limits_match_flag_geometry():
     """限长和旗子宽度一致: 刚好放得下, 多一个字就超."""
     for kind, font, x, center in [("tag_big", "4", 0, True), ("tag_small", "2", 0, True),
-                                  ("cable_side", "1", cl.FL + 10, False)]:
+                                  ("cable_here", "1", cl.FL + 10, False), ("cable_there", "3", cl.FL + 10, False)]:
         n = cl.LIMITS[kind + "_max"]
-        cl.text_pair("W" * n, font, x, 1.0, center)
+        pre = "@ " if kind == "cable_here" else ""
+        cl.text_pair(pre + "W" * n, font, x, 1.0, center)
         with pytest.raises(ValueError):
-            cl.text_pair("W" * (n + 1), font, x, 1.0, center)
+            cl.text_pair(pre + "W" * (n + 1), font, x, 1.0, center)
 
 
 def test_check_text_length_and_ascii():
@@ -244,7 +271,7 @@ def test_abbreviate_longest_key_first():
     assert cl.abbreviate("华为 核心交换机", t) == "HW CORESW"
     assert cl.abbreviate("上联口", t) == "UP"                 # 不是 "U" + "联口"
     assert cl.abbreviate("主配线间", t) == "MDF"
-    assert cl.abbreviate("对端 锐捷交换机 管理口", t) == "> RGSW MGMT"
+    assert cl.abbreviate("对端 锐捷交换机 管理口", t) == "RGSW MGMT"         # 前缀由版面加, 表里只删词
     assert cl.abbreviate("  Huawei   TenGigabitEthernet1/0/1 ", t) == "HW Te1/0/1"
 
 
@@ -254,7 +281,7 @@ def test_abbreviate_checked_raises_when_still_too_long():
     with pytest.raises(ValueError, match="超长"):
         cl.abbreviate_checked("华为 核心交换机 TenGigabitEthernet1/0/1", "tag_big", t)
     with pytest.raises(ValueError, match="ASCII"):
-        cl.abbreviate_checked("未知设备", "cable_side", t)
+        cl.abbreviate_checked("未知设备", "cable_here", t)
 
 
 def test_table_values_are_valid_labels():

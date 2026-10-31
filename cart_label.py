@@ -22,9 +22,10 @@ import subprocess
 import sys
 import tempfile
 
-# ---- 线缆旗形标签: 10-26 实机校准 (人工确认"齐了"), 10-30 加 Y0 ----
+# ---- 线缆旗形标签: 10-26 实机校准 (人工确认"齐了"), 10-30 加 Y0, 10-31 加 X0 ----
 D = 8                                   # 203 dpi = 8 点/mm
-FL, FR = 55.0, 90.5                     # 旗子在打印头上的左右边 (mm)
+X0 = -3.0                               # 10-31 实机: 图案整体 (连折痕中心) 左挪 3mm; 再偏改这里
+FL, FR = 55.0 + X0, 90.5 + X0           # 旗子在打印头上的左右边 (mm), 10-26 校准值 + X0
 CX, CY = (FL + FR) / 2, 9.0             # 旗子中心横坐标; 10-26 校准时折痕在图案 y=9mm
 Y0 = 5.0                                # 10-30 走纸漂移: 图案整体 (连折痕) 下移 5mm; 再偏改这里, 别动 SHIFT
 HEAD = ["DENSITY 11", "SIZE 104 mm, 25 mm", "GAP 2.9 mm, 4.5 mm",
@@ -41,7 +42,7 @@ ASSET_MAX_ROWS = 299
 ASSET_HEADER = "SIZE 60 mm, 37.4 mm\r\nGAP 2 mm, 0 mm\r\nDENSITY 15\r\nDIRECTION 1\r\nSHIFT 34,-76\r\n"
 
 # ---- 缩写对照表的限长 (同 examples/label_abbrev.json 的 _limits) ----
-LIMITS = {"cable_side_max": 25, "tag_big_max": 11, "tag_small_max": 23}
+LIMITS = {"cable_here_max": 23, "cable_there_max": 12, "tag_big_max": 11, "tag_small_max": 23}
 
 
 # ======== 线缆旗形标签 ========
@@ -91,14 +92,15 @@ def text_labels(pairs):
 
 
 def cable_labels(rows):
-    """[{"shortId", "here", "there"}] -> TSPL 行. there 前面加 "> ", 所以最多 23 字符."""
+    """[{"shortId", "here", "there"}] -> TSPL 行.
+    标签挂在本端, 人要看的是这根线去哪: 对端用 font3 大字 (最多 12 字), 本端小字前加 "@ " (最多 23 字)."""
     out = list(HEAD)
     for r in rows:
         sid = short_id(r["shortId"])
         body = dmatrix_pair(sid, FL + 1.5, 1.0)
         body += text_pair(sid, "2", FL + 10, 0.5)
-        body += text_pair(r["here"], "1", FL + 10, 4.0)
-        body += text_pair("> " + r["there"], "1", FL + 10, 6.3)
+        body += text_pair(r["there"], "3", FL + 10, 3.2)
+        body += text_pair("@ " + r["here"], "1", FL + 10, 6.5)
         out += page(body)
     return out
 
@@ -222,7 +224,7 @@ def pdf_to_pgms(pdf):
 # ======== 缩写对照表 ========
 
 def check_text(s, kind, limits=None):
-    """按 kind (cable_side / tag_big / tag_small) 查 ASCII 和长度, 合格原样返回."""
+    """按 kind (cable_here / cable_there / tag_big / tag_small) 查 ASCII 和长度, 合格原样返回."""
     limits = limits or LIMITS
     key = kind + "_max"
     if key not in limits:
