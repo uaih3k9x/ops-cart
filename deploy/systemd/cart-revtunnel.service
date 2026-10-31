@@ -1,0 +1,28 @@
+[Unit]
+Description=ops-cart 备用远程通道 (tailnet 不通时: 推车主动 ssh -R 到跳板机, 见 docs/REMOTE_TUNNEL.md)
+# 默认不启用: 没有 /etc/ops-cart/revtunnel.env 就不起. 跳板机上只在本机回环 (localhost) 的 REMOTE_PORT 听,
+# 要先登上跳板机才能绕进推车, 推车的 ssh 认证照旧 (这条通道不放宽任何登录).
+ConditionPathExists=/etc/ops-cart/revtunnel.env
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+EnvironmentFile=/etc/ops-cart/revtunnel.env
+# 跳板机指纹事先写进 revtunnel_known_hosts (部署时人核对), 不认识就不连.
+ExecStart=/usr/bin/ssh -N -T \
+    -o BatchMode=yes -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/ops-cart/revtunnel_known_hosts \
+    -i /etc/ops-cart/revtunnel_ed25519 -p ${JUMP_PORT} \
+    -R localhost:${REMOTE_PORT}:localhost:22 \
+    ${JUMP_USER}@${JUMP_HOST}
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target

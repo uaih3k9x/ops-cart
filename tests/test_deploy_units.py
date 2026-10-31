@@ -108,3 +108,26 @@ def test_serial_req_units_only_stop_direction_from_web():
     assert f"d {mcp_serial.REQ_DIR} 0700 ops-web ops-web -" in tmp
     web = unit("webkiosk.service")
     assert f"ReadWritePaths=-{mcp_serial.REQ_DIR}" in web
+
+
+def test_revtunnel_unit_off_by_default_and_pinned():
+    """tailnet 被墙时的备用通道: 推车主动 ssh -R 到跳板机. 没配置文件就不起; 只在跳板机本地口听; 认死跳板机指纹."""
+    u = unit("cart-revtunnel.service")
+    body = "\n".join(l for l in u.splitlines() if not l.lstrip().startswith("#"))
+    assert "ConditionPathExists=/etc/ops-cart/revtunnel.env" in body
+    assert "EnvironmentFile=/etc/ops-cart/revtunnel.env" in body
+    for k in ("-R localhost:${REMOTE_PORT}:localhost:22", "ExitOnForwardFailure=yes", "BatchMode=yes",
+              "StrictHostKeyChecking=yes", "UserKnownHostsFile=/etc/ops-cart/revtunnel_known_hosts",
+              "-i /etc/ops-cart/revtunnel_ed25519", "ServerAliveInterval=", "Restart=always",
+              "NoNewPrivileges=yes", "ProtectSystem=strict"):
+        assert k in body, k
+    assert "0.0.0.0" not in body and "GatewayPorts" not in body
+
+
+def test_revtunnel_example_env_has_no_real_host():
+    """样例只放占位: 文档用的保留地址 / 名字, 不放真跳板机."""
+    p = UNITS.parent.parent / "examples" / "revtunnel.example.env"
+    kv = dict(l.split("=", 1) for l in p.read_text().splitlines() if l and not l.startswith("#"))
+    assert set(kv) == {"JUMP_HOST", "JUMP_PORT", "JUMP_USER", "REMOTE_PORT"}
+    assert kv["JUMP_HOST"].endswith(".example") or kv["JUMP_HOST"].startswith("192.0.2.")
+    assert 1024 < int(kv["REMOTE_PORT"]) < 65536

@@ -283,6 +283,7 @@ SYSTEM_FILES = {
     "/etc/systemd/system/cart-fan-curve.service": "deploy/systemd/cart-fan-curve.service",
     "/etc/systemd/system/cart-mcp.service": "deploy/systemd/cart-mcp.service",
     "/etc/systemd/system/cart-notify.service": "deploy/systemd/cart-notify.service",
+    "/etc/systemd/system/cart-revtunnel.service": "deploy/systemd/cart-revtunnel.service",
     "/etc/systemd/system/cart-notify.timer": "deploy/systemd/cart-notify.timer",
     "/etc/systemd/system/cart-serial-req.path": "deploy/systemd/cart-serial-req.path",
     "/etc/systemd/system/cart-serial-req.service": "deploy/systemd/cart-serial-req.service",
@@ -332,6 +333,7 @@ UNITS = {
     "cart-dream.timer": _u(None, None, "-"),
     "cart-dream.service": _u(None, None, "-", oneshot=True),
     "cart-fan-curve.service": _u(None, None, "-", oneshot=True),
+    "cart-revtunnel.service": _u(None, None, "-", note="备用远程通道; 没 revtunnel.env 就不起"),
 }
 SHOW_PROPS = "Id,LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainStatus,NeedDaemonReload"
 _ENABLED = ("enabled", "enabled-runtime", "alias", "linked", "linked-runtime")

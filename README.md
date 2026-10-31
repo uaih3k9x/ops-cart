@@ -99,7 +99,7 @@
 | [`fonts/`](fonts/) | 车机和副屏的界面字体 Unifont 16px 点阵(OTF + 授权原文),部署装到 `/usr/local/share/fonts/ops-cart/`;取不到车机退回 Noto,自检 `UI FONT` 一行变 WARN |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查,`cart_accept.py` 推车只读验收(逐项 PASS / FAIL / SKIP / 人工,纯逻辑在 `accept_core.py`);`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
-| [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md) |
+| [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md)、[备用远程通道](docs/REMOTE_TUNNEL.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
