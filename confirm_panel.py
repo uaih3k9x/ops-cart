@@ -9,13 +9,13 @@ import tkinter as tk
 from tkinter import messagebox
 
 import confirm_core as cc
+import theme as th
 
-FONT = ("Noto Sans CJK SC", 13)
-FONT_BIG = ("Noto Sans CJK SC", 15)
-FONT_CMD = ("Noto Sans Mono CJK SC", 20, "bold")
-BG, CARD, FG, DIM = "#161b26", "#1f2633", "#e8eaf0", "#8b93a7"
-BTN = {"go": ("#1f6f3f", "#e8ffe8"), "no": ("#47202a", "#ffb3bd"), "stop": ("#da3633", "#ffffff"),
-       "plain": ("#2a3347", "#e8eaf0")}
+FONT, FONT_BIG = th.FONT, th.FONT_BIG
+FONT_CMD = th.font(20, bold=True, mono=True)
+BG, CARD, FG, DIM = th.PANEL, th.LAMP_BODY, th.FG, th.DIM
+BTN = {"go": (th.GO_BG, th.GO_FG), "no": (th.DANGER_BG, th.DANGER_FG), "stop": (th.ALERT_BG, th.WHITE),
+       "plain": (th.BTN2, th.FG)}
 
 
 class ConfirmDialog(tk.Toplevel):
@@ -107,4 +107,4 @@ class ConfirmDialog(tk.Toplevel):
         self.on_action("confirm", it["id"])
 
     def say(self, text, ok=True):
-        self.msg.config(text=text, fg="#7ee787" if ok else "#ff7b72")
+        self.msg.config(text=text, fg=th.OK if ok else th.BAD)

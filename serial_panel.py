@@ -23,6 +23,7 @@ import tkinter as tk
 
 import kvm_core as kvm
 import survey_core
+import theme as th
 from serial_core import (  # noqa: F401  界面要用的 + 给老调用方的兼容名
     ALIAS_GLOB, BAUDS, BYID_DIR, HIDDEN_PORT, SERIAL_CONF, TermFeed, _CTRL, _conbroker_cmd, _run,
     alias_paths, broker_port, byid_paths, console_ports, data_dir, key_bytes, kvm_devices, match_service,
@@ -35,15 +36,14 @@ PASTE_LINE_S = 0.05         # 粘贴按行发, 行间停一下, 交换机 CLI �
 
 # ------------------------------------------------------------ UI
 
-BG, BG2, FG, DIM = "#161b26", "#10141c", "#e8eaf0", "#8b93a7"
-FONT = ("Noto Sans CJK SC", 12)
-FONT_MONO = ("Noto Sans Mono CJK SC", 13)
+BG, BG2, FG, DIM = th.PANEL, th.BG, th.FG, th.DIM
+FONT, FONT_MONO = th.FONT_SMALL, th.FONT_MONO
 CHAT_WIDTH = 340
 
 
-def _btn(parent, text, cmd, bg="#1f2a3d"):
+def _btn(parent, text, cmd, bg=th.BOX):
     return tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg, fg=FG,
-                     activebackground="#3a4560", relief="flat", cursor="hand2", padx=10)
+                     activebackground=th.ACTIVE, relief="flat", cursor="hand2", padx=10)
 
 
 class SerialPanel(tk.Frame):
@@ -71,16 +71,16 @@ class SerialPanel(tk.Frame):
     def _build(self):
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=12, pady=(10, 4))
-        tk.Label(bar, text="串口:", font=FONT, bg=BG, fg="#c8cede").pack(side="left")
+        tk.Label(bar, text="串口:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left")
         self.port_var = tk.StringVar()
         self.port_menu = tk.OptionMenu(bar, self.port_var, "(无)")
-        self.port_menu.config(font=FONT, bg="#1f2a3d", fg=FG, activebackground="#3a4560",
+        self.port_menu.config(font=FONT, bg=th.BOX, fg=FG, activebackground=th.ACTIVE,
                               relief="flat", cursor="hand2")
         self.port_menu.pack(side="left", padx=6)
-        tk.Label(bar, text="波特率:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(12, 0))
+        tk.Label(bar, text="波特率:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(12, 0))
         self.baud_var = tk.StringVar(value="9600")
         self.baud_menu = tk.OptionMenu(bar, self.baud_var, *BAUDS)
-        self.baud_menu.config(font=FONT, bg="#1f2a3d", fg=FG, activebackground="#3a4560",
+        self.baud_menu.config(font=FONT, bg=th.BOX, fg=FG, activebackground=th.ACTIVE,
                               relief="flat", cursor="hand2")
         self.baud_menu.pack(side="left", padx=6)
         for text, cmd in (("刷新", self.refresh_ports), ("开服务", self.start_serve),
@@ -98,11 +98,11 @@ class SerialPanel(tk.Frame):
         left = tk.Frame(pane, bg=BG)
         self.con_title = tk.Label(left, text="控制台 · 未连接", font=FONT, bg=BG, fg=DIM, anchor="w")
         self.con_title.pack(fill="x")
-        self.console = tk.Text(left, font=FONT_MONO, bg=BG2, fg="#c8cede", relief="flat",
+        self.console = tk.Text(left, font=FONT_MONO, bg=BG2, fg=th.TEXT, relief="flat",
                                insertbackground=FG, wrap="char", highlightthickness=2,
-                               highlightbackground=BG2, highlightcolor="#26577c")
+                               highlightbackground=BG2, highlightcolor=th.PRIMARY)
         self.console.pack(fill="both", expand=True)
-        self.console.tag_config("mark", foreground="#7ec8e3")
+        self.console.tag_config("mark", foreground=th.MARK)
         self.console.bind("<Key>", self._on_console_key)
         self.console.bind("<<Paste>>", self._on_paste)
         pane.add(left, stretch="always", minsize=400)
@@ -111,21 +111,21 @@ class SerialPanel(tk.Frame):
         right = tk.Frame(pane, bg=BG, width=CHAT_WIDTH)
         tk.Label(right, text="和 Claude 聊 · F2 切换", font=FONT, bg=BG, fg=DIM,
                  anchor="w").pack(fill="x")
-        self.chat_log = tk.Text(right, font=FONT, bg=BG2, fg="#c8cede", relief="flat",
+        self.chat_log = tk.Text(right, font=FONT, bg=BG2, fg=th.TEXT, relief="flat",
                                 wrap="word", state="disabled", padx=8, pady=6)
         self.chat_log.pack(fill="both", expand=True)
-        self.chat_log.tag_config("ts", foreground="#5c6578")
-        self.chat_log.tag_config("me", foreground="#7ee787")
-        self.chat_log.tag_config("them", foreground="#ffb86c")
+        self.chat_log.tag_config("ts", foreground=th.FAINTER)
+        self.chat_log.tag_config("me", foreground=th.OK)
+        self.chat_log.tag_config("them", foreground=th.NOTICE)
         row = tk.Frame(right, bg=BG)
         row.pack(fill="x", pady=(6, 0))
         self.chat_var = tk.StringVar()
         self.chat_entry = tk.Entry(row, textvariable=self.chat_var, font=FONT, bg=BG2, fg=FG,
                                    insertbackground=FG, relief="flat", highlightthickness=2,
-                                   highlightbackground=BG2, highlightcolor="#26577c")
+                                   highlightbackground=BG2, highlightcolor=th.PRIMARY)
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())
-        _btn(row, "发送", self.chat_send, bg="#26577c").pack(side="left", padx=(6, 0))
+        _btn(row, "发送", self.chat_send, bg=th.PRIMARY).pack(side="left", padx=(6, 0))
         pane.add(right, stretch="never", minsize=260, width=CHAT_WIDTH)
 
         for w in (self.console, self.chat_entry, self.chat_log):
@@ -196,12 +196,12 @@ class SerialPanel(tk.Frame):
             s.settimeout(None)
             s.sendall(b"HELLO human\n")
         except OSError as e:
-            self.con_title.config(text=f"控制台 · 连接失败: {e}", fg="#ff7b72")
+            self.con_title.config(text=f"控制台 · 连接失败: {e}", fg=th.BAD)
             return
         self.sock, self._reconnect = s, False
         self.term = TermFeed()
         self.con_title.config(text=f"控制台 · {dev} @ {self._serves.get(name, '?')} · 键盘直通串口",
-                              fg="#7ee787")
+                              fg=th.OK)
         threading.Thread(target=self._reader, args=(s,), daemon=True).start()
         if wake:
             self._tx(b"\r")

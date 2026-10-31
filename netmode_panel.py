@@ -18,6 +18,7 @@ import cartlog
 import netmode_core as nmc
 import netprof_core as npc
 from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, BridgePanel, WifiPanel, _run
+import theme as th
 
 UP_TIMEOUT = 90         # nmcli con up 等 DHCP 最长 45 秒左右, 留余量
 
@@ -39,47 +40,47 @@ class NetModePanel(BridgePanel):
     # ------------------------------------------------------------ UI
 
     def _entry(self, parent, text, var, width, on_change=None):
-        tk.Label(parent, text=text, font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
+        tk.Label(parent, text=text, font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
         var.trace_add("write", lambda *_: (on_change or self._form_changed)())
-        e = tk.Entry(parent, textvariable=var, width=width, font=FONT_MONO, bg="#10141c", fg=FG,
+        e = tk.Entry(parent, textvariable=var, width=width, font=FONT_MONO, bg=th.BG, fg=FG,
                      insertbackground=FG, relief="flat", disabledbackground=BOX)
         e.pack(side="left", padx=6, ipady=3)
         e.bind("<Return>", lambda _e: self.apply())
         return e
 
     def _radio(self, parent, var, value, text):
-        b = tk.Radiobutton(parent, text=text, value=value, variable=var, font=FONT, bg=BG, fg="#c8cede",
+        b = tk.Radiobutton(parent, text=text, value=value, variable=var, font=FONT, bg=BG, fg=th.TEXT,
                            selectcolor=BOX, activebackground=BG, activeforeground=FG,
-                           disabledforeground="#4b5368", command=self._form_changed)
+                           disabledforeground=th.DISABLED, command=self._form_changed)
         b.pack(side="left", padx=4)
         return b
 
     def _build(self):
         tk.Label(self, text="网口模式 · 每个口同一时间一个模式, 都能撤 · 无线不归这里管(留作后路)",
-                 font=FONT, bg=BG, fg="#8b93a7", anchor="w").pack(fill="x", padx=16, pady=(10, 4))
+                 font=FONT, bg=BG, fg=th.DIM, anchor="w").pack(fill="x", padx=16, pady=(10, 4))
         self.lb = tk.Listbox(self, font=FONT_MONO, bg=BOX, fg=FG, relief="flat", height=2,
-                             selectbackground="#3a4560", exportselection=False, activestyle="none")
+                             selectbackground=th.ACTIVE, exportselection=False, activestyle="none")
         self.lb.pack(fill="x", padx=16, pady=4)
         self.lb.bind("<<ListboxSelect>>", lambda _e: self._on_select())
-        self.drift_lbl = tk.Label(self, text="", font=FONT, bg=BG, fg="#f0b429", anchor="w", justify="left")
+        self.drift_lbl = tk.Label(self, text="", font=FONT, bg=BG, fg=th.WARN, anchor="w", justify="left")
         self.drift_lbl.pack(fill="x", padx=16)
 
-        self.box = tk.LabelFrame(self, text="", font=FONT, bg=BG, fg="#8b93a7", bd=1, relief="groove")
+        self.box = tk.LabelFrame(self, text="", font=FONT, bg=BG, fg=th.DIM, bd=1, relief="groove")
         self.box.pack(fill="x", padx=16, pady=(8, 4))
         row = tk.Frame(self.box, bg=BG)
         row.pack(fill="x", pady=4)
-        tk.Label(row, text="模式:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
+        tk.Label(row, text="模式:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
         self.mode_var = tk.StringVar(value="dhcp")
         self.mode_btns = {m: self._radio(row, self.mode_var, m, nmc.MODES[m]["title"]) for m in nmc.MODES}
 
         # 静态: 本机 地址/前缀 是主输入 (不猜掩码, #13); 对端可选, 只防撞址 / 按它预填; 模板 = 设备出厂地址
         row = tk.Frame(self.box, bg=BG)
         row.pack(fill="x", pady=4)
-        tk.Label(row, text="模板:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
+        tk.Label(row, text="模板:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
         self.tpl_var = tk.StringVar(value="手填")
         self.tpl_om = tk.OptionMenu(row, self.tpl_var, *(["手填"] + [t[0] for t in npc.STATIC_TEMPLATES]),
                                     command=lambda _v: self._use_template())
-        self.tpl_om.config(font=FONT, bg=BOX, fg=FG, activebackground="#3a4560", relief="flat",
+        self.tpl_om.config(font=FONT, bg=BOX, fg=FG, activebackground=th.ACTIVE, relief="flat",
                            highlightthickness=0)
         self.tpl_om["menu"].config(font=FONT, bg=BOX, fg=FG)
         self.tpl_om.pack(side="left", padx=6)
@@ -100,20 +101,20 @@ class NetModePanel(BridgePanel):
 
         row = tk.Frame(self.box, bg=BG)
         row.pack(fill="x", pady=4)
-        tk.Label(row, text="出口:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
+        tk.Label(row, text="出口:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
         self.egress_var = tk.StringVar(value="never")
         self.egress_btns = {k: self._radio(row, self.egress_var, k, t) for k, t in nmc.EGRESS.items()}
 
-        self.hint = tk.Label(self.box, text="", font=FONT, bg=BG, fg="#8b93a7", anchor="w", justify="left")
+        self.hint = tk.Label(self.box, text="", font=FONT, bg=BG, fg=th.DIM, anchor="w", justify="left")
         self.hint.pack(fill="x", padx=6, pady=(0, 4))
         bar = tk.Frame(self.box, bg=BG)
         bar.pack(fill="x", padx=2, pady=(0, 6))
-        self._btn(bar, "应用", self.apply, bg="#26577c")
-        self._btn(bar, "撤到干净状态", self.undo_clean, bg="#47202a")
+        self._btn(bar, "应用", self.apply, bg=th.PRIMARY)
+        self._btn(bar, "撤到干净状态", self.undo_clean, bg=th.DANGER_BG)
         self._btn(bar, "回到上一个", self.back)
         self._btn(bar, "刷新", self.reload)
 
-        self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg="#f0b429", anchor="w", justify="left")
+        self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg=th.WARN, anchor="w", justify="left")
         self.msg.pack(fill="x", padx=16, pady=(2, 10))
         self._form_changed()
 

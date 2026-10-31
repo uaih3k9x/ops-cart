@@ -9,14 +9,13 @@ refresh(view): kiosk 每次采样回来调; 换了申请 / 换了码才重建, �
 import tkinter as tk
 
 import pxe_req_core as pr
+import theme as th
 
-FONT = ("Noto Sans CJK SC", 13)
-FONT_BIG = ("Noto Sans CJK SC", 15)
-FONT_MONO = ("Noto Sans Mono CJK SC", 13)
-FONT_CODE = ("Noto Sans Mono CJK SC", 40, "bold")
-BG, CARD, FG, DIM, RED, AMBER = "#161b26", "#1f2a3d", "#e8eaf0", "#8b93a7", "#ff7b72", "#f0b429"
-EDGE = "#7a1f2b"            # 同手动解锁对话框: 解锁是危险操作
-BTN = {"go": ("#47202a", "#ffb3bd"), "no": ("#2a3347", "#ffb3bd"), "plain": ("#2a3347", "#e8eaf0")}
+FONT, FONT_BIG, FONT_MONO = th.FONT, th.FONT_BIG, th.FONT_MONO
+FONT_CODE = th.font(40, bold=True, mono=True)
+BG, CARD, FG, DIM, RED, AMBER = th.PANEL, th.BOX, th.FG, th.DIM, th.BAD, th.WARN
+EDGE = th.DANGER_EDGE            # 同手动解锁对话框: 解锁是危险操作
+BTN = {"go": (th.DANGER_BG, th.DANGER_FG), "no": (th.BTN2, th.DANGER_FG), "plain": (th.BTN2, th.FG)}
 
 
 class PxeRequestDialog(tk.Toplevel):
@@ -76,7 +75,7 @@ class PxeRequestDialog(tk.Toplevel):
                      fg=DIM).pack(pady=(4, 0))
         tk.Label(self.body, text="看过清单, 照抄确认码:", font=FONT, bg=BG, fg=DIM).pack(pady=(10, 0))
         tk.Label(self.body, text=c["code_text"], font=FONT_CODE, bg=BG, fg=AMBER).pack()
-        e = tk.Entry(self.body, font=("Noto Sans Mono CJK SC", 22), width=10, justify="center", bg=CARD, fg=FG,
+        e = tk.Entry(self.body, font=th.font(22, mono=True), width=10, justify="center", bg=CARD, fg=FG,
                      insertbackground=FG, relief="flat")
         e.pack(pady=6, ipady=6)
         e.bind("<Return>", lambda _e: self._confirm(c))
@@ -91,4 +90,4 @@ class PxeRequestDialog(tk.Toplevel):
         self.on_action("confirm", (c["id"], typed, c["digest"]))
 
     def say(self, text, ok=True):
-        self.msg.config(text=text, fg="#7ee787" if ok else RED)
+        self.msg.config(text=text, fg=th.OK if ok else RED)
