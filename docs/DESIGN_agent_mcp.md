@@ -87,3 +87,28 @@
 - **命名**：只认顶格的华为提示符（`?` 帮助是缩进的），子视图 `[名-GigabitEthernet0/0/1]` 优先对齐窗口里见过的 `<名>`，对不上再按视图关键字切；线拔了或没服务名字为空，不读旧日志。
 - **PXE 用途**：`pxe-mode.json` 不记用途，从那台 MAC 的菜单内容反推。
 - 写入者字段恒为空，等 #21 的写租约。审计 `/var/log/ops-cart/mcp-audit.log`（JSONL，`*.log` 现成 logrotate 管）。
+
+## 九、P2 落地记录（#21）
+
+- 代码：`serial_write_core.py`（纯逻辑：行校验、高危词、闸门第 1 层、写租约 / 挂起 / 在途 / 急停的 `Book`、日志行）+ `mcp_serial.py`（状态文件 flock、执行绪日志、conbroker send 封装、MCP 工具、车机命令行）。`cart_mcp` 只加注册行和子命令转发。
+- 工具：`lease_acquire` / `lease_renew` / `lease_release`、`send_command`（一行可打印 ASCII，不许控制字符 / 换行 / 全角 / 零宽，不许 `-` 开头）、`send_key`（`enter` / `space` 直发，`ctrl_c` 挂起等人）、`pending_list`（只读，不含令牌）、`estop`（单条或全部；Agent 能自停，**没有 resume 工具**）。
+- **写租约**：认令牌不认名字（两个 Agent 同一个 ssh 用户也分得开）；默认 60 秒，10–300 可选；`lease_renew` 续，过期不能续要重新申请；过期 / 释放 / 急停撤销时它挂着的命令一起作废；直发命令发完顺手续一个期限（Agent 等慢命令时自己续不了）。每槽位同时只有一条在途，上一条没回来不发下一条；发送进程死了，在途标记过"超时 + 90 秒"自动清掉并记 `status=unknown`。
+- **闸门第 1 层**：直发要同时满足——认得出厂商（规则文件登记了槽位，或最后一行是华为 `<名>` / `[名]`；思科 `名#` 和 Linux `bash-4.4#` 分不开，只能登记）、设备停在该厂商的提示符上（跳过 conbroker 自己的 `[时间 …]` 标记行；停在密码 / `[Y/N]` / 翻页 / 半截输出上都不算）、过 `survey_core.is_readonly`（规则文件只能给内置厂商加只读动词，如 `ping`）、不带高危词。高危词（save / reboot / reset / format / delete / write / copy / startup / shutdown …，含 VRP/IOS 式缩写 `sav` `wr` `del`）只增不减，永远要人确认。其余一律挂起。规则文件 `/etc/ops-cart/serial-gate.json`（样例 `examples/serial_gate.example.json`），坏了按内置默认。
+- **状态机**（每条命令一个条目，编号在一次开机内递增）：
+
+```
+send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send 返回)─► sent / refused / timeout / error
+                       │                    └─(发送进程死了, 超时+90s)─► unknown
+                       └─ 要人确认 ─► pending ─┬─ 人 confirm (租约仍有效、槽位没急停、没在途) ─► sending ─► …
+                                               ├─ 人 reject ─► rejected
+                                               └─ 急停 / 租约过期或释放 / 挂起超 15 分钟 ─► dropped
+槽位: 正常 ──estop(人或 Agent)──► 急停 (撤租约 + 丢挂起, 不发任何字节) ──resume(只认本机人)──► 正常 (租约不还)
+```
+
+- **确认通道**（#23 之前）：车机上"退出到终端"，`sudo python3 /opt/pxe/cart_mcp.py pending` 看，`confirm <编号>` 显示命令、来源、理由、高危词，敲 `yes` 才发，发的结果直接打印并进日志；`reject <编号>`、`estop [槽位]` 哪都能做；`confirm` 和 `resume <槽位|all>` 只认本机：环境里没有 `SSH_*`、stdin 是终端、祖先进程里没有 sshd / sshd-session / tailscaled / dropbear / mosh-server / cockpit，读不到 `/proc` 也不认。确认后由确认那个进程经 conbroker 发（屏幕上照样标"Claude 发送"）。
+- **急停**：状态在 `/run/ops-cart/serial-write.json`（root 0600，路径可注入）；状态文件读不懂 = 全部急停；重启推车 /run 清空 = 急停、租约、挂起都没了（挂起的命令不会在重启后冒出来）。急停事件记下被撤销的租约持有者、丢弃的编号、以及**当时在途的那条**——那条已经交给 conbroker，收不回来。
+- **已知缺口：conbroker 里排队的那条收不回**。人 3 秒内敲过键时，Agent 的字节已经进了 conbroker 的连接、在它的服务线程里等人停手；这时急停，等人停手 3 秒后它照样写进串口（我们的进程即使超时退出也一样）。要堵上得改 conbroker（另一个仓库）：服务端写串口前查一下 `/run/ops-cart/serial-write.json` 里该槽位的急停，急停就丢弃并标记。车上的判定只能保证"急停之后不再往 conbroker 交任何东西"。
+- **日志**：`/var/log/ops-cart/serial-slot<N>.log`，每槽位一份 JSONL（现成 logrotate `*.log` 规则管），每行 `t / slot / ev / src(agent|human|system) / who`，再加命令、闸门结果（verdict / layer / reason / danger / vendor）、设备回显摘要（超过 1000 字掐中间）、编号、确认人、名字。事件：`lease_acquire` `lease_release` `lease_expired` `pending` `confirm` `reject` `drop` `send` `refused` `estop` `resume`；续期不记。急停 / 解除 / 确认 / 拒绝另在 `events.log` 记 `[serial-write]` 一行摘要 + 日志路径（不写命令）。
+- **人优先**：人在车机 / 网页上敲键走 conbroker 的 human 通道，不经租约、不过闸门；人 3 秒内敲过键 Agent 排队（conbroker 原有）；人随时 estop / reject。
+- **留给 #22**：`serial_write_core.classify(cmd, vendor, at_prompt, rules)` 返回 `{verdict, layer, reason, danger, vendor}`；第 2 层接在"不在只读白名单里"那一支——模型判放行就 `verdict=pass, layer=2`，判拦或超时 / 报错保持 `confirm`；`danger` 非空的永远不许模型放行。`Book.begin` 只认 `verdict=pass`，调用方不用改。
+- **留给 #23**：车机 / 网页确认框直接用 `mcp_serial.Store().view()`（各槽位 `estop / writer / expires_in / inflight / pending`，挂起列表带 `danger` 和 `age_s`）和 `Store.run(lambda b, now: b.confirm(id, by, now))` → `conbroker_send` → `b.finish(...)`（照 `mcp_serial.cli` 的 confirm 分支）；急停 / 解除用 `b.estop(slot, by, "human", now)` / `b.resume(slot, by, now)`。webkiosk 以 `ops-web` 跑，读不了 root 0600 的状态文件，网页确认要经 root 进程转一道或调权限。指示灯黄闪 = 某槽位 `pending > 0`。

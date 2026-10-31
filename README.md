@@ -35,7 +35,8 @@
 - **副屏与 UPS**:USB 副屏常驻状态板(`cart-dash` 统一采集,车机和副屏读同一份快照);
   APC UPS 直读 hidraw 拿电量、负载、市电状态,放电到 15% 正常关机;顶栏一排虚拟指示灯,颜色看自检、闪烁看活动
 - **OCR 与屏幕配方**:截图识字带坐标;`recipe.py boot-pxe` 自动进启动菜单选网络启动
-- **Agent 接入**:MCP 服务把串口输出、截屏、推车状态开放给 Claude Code 等现成 Agent(第一版只读,写设备另行把关)
+- **Agent 接入**:MCP 服务把串口输出、截屏、推车状态开放给 Claude Code 等现成 Agent;写串口要拿有期限的写租约,
+  只读命令直发、其余挂起等人在推车上确认,Agent 和人都能一键急停(只停发送,不往设备插字节),解除只能人在本机
 - **机房辅助**:LLDP 显示网线对面的交换机和口;串口一键只读巡检并比对配置漂移;TSC 线缆/资产标签;关键事件推到手机;Clonezilla 整盘克隆(解锁 MAC + 目标盘显式匹配)
 
 ## 代码地图
@@ -63,7 +64,8 @@
 | [`kvm_broker.py`](kvm_broker.py) · [`kvm_broker_core.py`](kvm_broker_core.py) | 键鼠常驻代理(`kvm-broker.service`):统一持有 CH9329,车机 / 网页口 / 命令行 / 配方都经本地 socket `/run/ops-kvm/kvm.sock`(行式 JSON,0660 给 dialout)发键;人永远优先,人 3 秒内动过键鼠 agent 就暂停排队;急停只丢 agent 没发的、不插任何按键,解除要人;每次发键记来源到 `/var/log/ops-cart/kvm.log`。代理不在各客户端退回直开 + flock。纯逻辑(解析、拆步、仲裁、租约钩子、日志行)在 `_core` |
 | [`serial_panel.py`](serial_panel.py) · [`serial_core.py`](serial_core.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务。纯逻辑(读 `serial.conf`、conbroker 命令与输出解析、选口、终端字节)在 `serial_core`,不碰 Tk,无界面的服务都用它 |
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
-| [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19,只读):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;不写任何设备。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
+| [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19 只读部分;写串口见下一行 #21):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;列执行绪时带写租约持有者。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
+| [`mcp_serial.py`](mcp_serial.py) · [`serial_write_core.py`](serial_write_core.py) | 串口写路径(#21):MCP 工具 `lease_acquire/renew/release`、`send_command`(只收一行可打印 ASCII)、`send_key`(回车 / 翻页空格 / Ctrl+C)、`pending_list`、`estop`。每槽位同时一个写入者,租约默认 60 秒要续、过期作废;闸门第 1 层:认得出厂商(华为提示符自动认,其余在 [`examples/serial_gate.example.json`](examples/serial_gate.example.json) 登记)、停在提示符上、过只读白名单才直发,带 save/reboot/reset/format/delete 等高危词的永远要人确认,其余一律挂起;Ctrl+C 要人确认。急停单条 / 全部:撤租约、丢挂起,不往设备发任何东西。状态 `/run/ops-cart/serial-write.json`(读不懂 = 全部急停),每槽位 JSONL 日志 `/var/log/ops-cart/serial-slot<N>.log`。车机上 `cart_mcp.py pending / confirm / reject / estop / resume`,确认和解除只认本机终端(不经 sshd / tailscaled) |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
 | [`cart_label.py`](cart_label.py) | TSC 标签机 TSPL 生成器(只出字节流,打印由调用方 `cat > /dev/usb/lp0`):旗形线缆标签(上下对折、下半份旋转 180°)、推车线标、刻度尺、资产标签(PDF → pdftoppm → BITMAP);校准常量集中在文件头;缩写对照表校验见 [`examples/label_abbrev.json`](examples/label_abbrev.json) |
 | [`tspl_preview.py`](tspl_preview.py) | 不在打印机边上时把 TSPL 画成 HTML/SVG:旗面轮廓、折痕、对折后正反面;查出界和对折对称。开发机工具 |
@@ -139,6 +141,12 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 #   sudo install -m 0600 examples/mcp.example.json /etc/ops-cart/mcp.json   (改掉 CHANGE-ME)
 #   sudo systemctl enable --now cart-mcp.service
 #   claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio
+# 串口写闸门规则 (可选; 不放就是内置: 华为提示符自动认, 只放行 display / show):
+#   sudo install -m 644 examples/serial_gate.example.json /etc/ops-cart/serial-gate.json
+# Agent 挂起的写命令在车机上确认 (退出到终端; 经 ssh 不认):
+#   sudo python3 /opt/pxe/cart_mcp.py pending          # 看挂起的
+#   sudo python3 /opt/pxe/cart_mcp.py confirm 3        # 敲 yes 才发
+#   sudo python3 /opt/pxe/cart_mcp.py estop            # 全部急停 (哪都能停); resume 1|all 只认本机
 ```
 
 tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py --write-rescue`)。
@@ -146,7 +154,7 @@ tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py
 所以 Windows 脚本和手工放进 tftp 的自动装机菜单都装不了机,这是故意的。
 
 运行时状态都在 `/run/ops-cart/`(tmpfiles 建,重启推车清空):`pxe-guard.json` 是装机口守卫状态(`pxe-renew.json` 是车机给它的续期请求),
-`pin-gate.json` 是车机 PIN 输错计数,`mpv.sock` 给 `cart_snap.py` 用。
+`pin-gate.json` 是车机 PIN 输错计数,`mpv.sock` 给 `cart_snap.py` 用,`serial-write.json` 是串口写租约 / 挂起 / 急停(重启即全部清掉,挂起的命令不会在重启后冒出来)。
 `pxe-server` 发现装机口上有别的 DHCP 不再停服,转**代理模式**(`pxe-guard.json` 里 `"state": "proxy"`、`"leases": false`):
 67 口不发地址,只对 x86-64 UEFI 的 PXE 客户端回 yiaddr=0 的引导 OFFER,4011 / TFTP / HTTP 照常;
 LAN1 拔掉再插上会重新探测,没有别人就恢复自己发地址。探测出错或拿不准一律按代理模式。
