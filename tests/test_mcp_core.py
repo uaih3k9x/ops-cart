@@ -296,3 +296,104 @@ def test_audit_write_failure_swallowed(tmp_path):
     f = tmp_path / "file"
     f.write_text("")
     assert mc.Audit(str(f / "x.log")).write("{}") is False      # 父目录是个文件
+
+
+# ------------------------------------------------------------ HTTP: 只绑本机和 tailnet, 要令牌
+
+TS4, TS6 = "100.100.0.5", "fd7a:115c:a1e0::5"       # 编的 tailnet 地址  public-safe-ignore
+IP_JSON = json.dumps([
+    {"ifname": "lo", "addr_info": [{"family": "inet", "local": "127.0.0.1"},
+                                   {"family": "inet6", "local": "::1"}]},
+    {"ifname": "eno1", "addr_info": [{"family": "inet", "local": "192.0.2.1"},
+                                     {"family": "inet6", "local": "fe80::1"}]},
+    {"ifname": "tailscale0", "addr_info": [{"family": "inet", "local": TS4},
+                                           {"family": "inet6", "local": TS6}]},
+    {"ifname": "wlp4s0"},                                       # 没地址的口
+])
+
+
+def test_bind_addrs_only_loopback_and_tailnet():
+    assert mc.bind_addrs(IP_JSON) == ["127.0.0.1", "::1", TS4, TS6]
+
+
+@pytest.mark.parametrize("text", ["", "garbage", "{}", "[1, 2]"])
+def test_bind_addrs_falls_back_to_loopback(text):
+    assert mc.bind_addrs(text) == ["127.0.0.1"]
+
+
+TOK = "k" * 32
+TOKENS = {"claude-mac": TOK, "weak": "short", "blank": ""}
+
+
+def test_token_who():
+    assert mc.token_who(f"Bearer {TOK}", TOKENS) == "claude-mac"
+    assert mc.token_who(f"bearer {TOK}", TOKENS) == "claude-mac"
+    assert mc.token_who("Bearer short", TOKENS) is None             # 太短的令牌 (样例占位) 不认
+    assert mc.token_who("Bearer ", TOKENS) is None
+    assert mc.token_who(TOK, TOKENS) is None                        # 没有 Bearer
+    assert mc.token_who(None, TOKENS) is None
+    assert mc.token_who(f"Bearer {TOK}", None) is None
+
+
+def _hdr(**kw):
+    h = {"Host": f"{TS4}:8765", "Authorization": f"Bearer {TOK}"}
+    h.update(kw)
+    return {k: v for k, v in h.items() if v is not None}
+
+
+def test_http_check_passes_tailnet_with_token():
+    assert mc.http_check(TS4, _hdr(), TOKENS) == (None, f"claude-mac@{TS4}")
+    assert mc.http_check("127.0.0.1", _hdr(Host="localhost:8765"), TOKENS)[0] is None
+
+
+def test_http_check_rejects_lan_even_with_token():
+    code, why = mc.http_check("192.0.2.50", _hdr(), TOKENS)
+    assert code == 403 and "tailnet" in why
+
+
+def test_http_check_rejects_missing_or_wrong_token():
+    assert mc.http_check(TS4, _hdr(Authorization=None), TOKENS)[0] == 401
+    assert mc.http_check(TS4, _hdr(Authorization="Bearer " + "x" * 32), TOKENS)[0] == 401
+
+
+def test_http_check_rejects_rebinding_host_and_cross_origin():
+    assert mc.http_check(TS4, _hdr(Host="evil.example:8765"), TOKENS)[0] == 403
+    assert mc.http_check(TS4, _hdr(Origin="http://evil.example"), TOKENS)[0] == 403
+    assert mc.http_check(TS4, _hdr(Origin=f"http://{TS4}:8765"), TOKENS)[0] is None
+    assert mc.http_check(TS4, _hdr(Host="cart:8765"), TOKENS, hosts=["cart"])[0] is None
+
+
+def test_http_check_no_tokens_configured_rejects_all():
+    assert mc.http_check("127.0.0.1", _hdr(Host="localhost"), {})[0] == 401
+
+
+# ------------------------------------------------------------ PXE 状态 (只读)
+
+def test_menu_purpose():
+    import pxeserver as ps
+    assert mc.menu_purpose(ps.grub_menu("192.0.2.1", install=True)) == "rocky"
+    assert mc.menu_purpose(ps.grub_menu_winpe("192.0.2.1")) == "winpe"
+    assert mc.menu_purpose(ps.grub_menu_clone("192.0.2.1", "clone-save", ["ocs_live_run=x"])) == "clone-save"
+    assert mc.menu_purpose(ps.grub_menu_clone("192.0.2.1", "clone-restore", ["ocs_live_run=x"])) == "clone-restore"
+    assert mc.menu_purpose(ps.grub_menu("192.0.2.1")) is None       # 救援菜单不是解锁用途
+    assert mc.menu_purpose("") is None
+
+
+def test_pxe_view_rescue():
+    v = mc.pxe_view({"mode": "rescue"}, None, {}, now=100)
+    assert v == {"mode": "rescue", "purpose": None, "guard": {}}
+
+
+def test_pxe_view_armed():
+    mode = {"mode": "install", "mac": "02:00:00:00:00:01", "since": 0, "until": 1000}
+    guard = {"state": "proxy", "detail": "d", "leases": False, "offered": "192.0.2.77", "ip": "192.0.2.1"}
+    v = mc.pxe_view(mode, "inst.ks=http://x/ks.cfg", guard, now=400)
+    assert v["mode"] == "install" and v["mac"] == "02:00:00:00:00:01"
+    assert v["remaining_s"] == 600 and v["purpose"] == "rocky"
+    assert v["guard"] == {"state": "proxy", "detail": "d", "leases": False}
+
+
+def test_pxe_view_expired_has_no_remaining():
+    mode = {"mode": "expired", "mac": "02:00:00:00:00:01", "since": 0, "until": 10}
+    v = mc.pxe_view(mode, None, {}, now=400)
+    assert v["remaining_s"] == 0 and v["purpose"] is None

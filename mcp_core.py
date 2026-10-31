@@ -7,11 +7,15 @@
 """
 
 import base64
+import hmac
 import json
 import os
 import re
 import threading
 import time
+
+import pxeserver
+import web_core
 
 SLOTS = (1, 2, 3, 4)            # 操作头槽位, 对应 /dev/con-1~4 (lamps_core.SLOTS)
 
@@ -278,3 +282,82 @@ class Server:
         if err is not None:
             return _result(rid, {"content": [text_content(err)], "isError": True})
         return _result(rid, {"content": content, "isError": False})
+
+
+# ------------------------------------------------------------ HTTP: 只绑本机和 tailnet, 要令牌
+
+MIN_TOKEN = 24          # 短于这个的令牌 (样例里的占位、手抖填的) 一律不认
+
+
+def bind_addrs(ip_json):
+    """`ip -j addr` 的输出 -> 要监听的地址: 本机 + tailnet (web_core 认的可信段). 解析不了只听 127.0.0.1."""
+    out = ["127.0.0.1"]
+    try:
+        links = json.loads(ip_json)
+    except ValueError:
+        return out
+    for link in links if isinstance(links, list) else []:
+        for a in (link.get("addr_info") or []) if isinstance(link, dict) else []:
+            ip = a.get("local") if isinstance(a, dict) else None
+            if isinstance(ip, str) and web_core.client_kind(ip) == "trusted" and ip not in out:
+                out.append(ip)
+    return out
+
+
+def token_who(header, tokens):
+    """Authorization: Bearer <令牌> -> 令牌的名字 (审计里的 '谁'); 对不上返回 None. 逐个定长比较."""
+    scheme, _, tok = (header or "").strip().partition(" ")
+    tok = tok.strip()
+    if scheme.lower() != "bearer" or len(tok) < MIN_TOKEN:
+        return None
+    hit = None
+    for name, want in (tokens or {}).items():
+        if isinstance(want, str) and len(want) >= MIN_TOKEN and hmac.compare_digest(tok.encode(), want.encode()):
+            hit = name
+    return hit
+
+
+def http_check(ip, headers, tokens, hosts=()):
+    """一个 HTTP 请求能不能进 -> (None, 谁) 或 (状态码, 拒绝原因).
+    顺序: 来源 (本机/tailnet, 局域网开关在这里不算数) -> Host 白名单 (挡 DNS rebinding) ->
+    带了 Origin 就要同源 (挡浏览器跨站) -> 令牌."""
+    if web_core.client_kind(ip) != "trusted":
+        return 403, "只接受本机和 tailnet 来源"
+    why = web_core.request_reason("GET", headers, hosts)
+    if why is None and headers.get("Origin"):
+        why = web_core.request_reason("POST", headers, hosts)
+    if why:
+        return 403, why
+    who = token_who(headers.get("Authorization"), tokens)
+    if who is None:
+        return 401, "缺少或不认识的令牌 (Authorization: Bearer ...)"
+    return None, f"{who}@{ip}"
+
+
+# ------------------------------------------------------------ PXE 状态 (只读; 解锁见 #24)
+
+def menu_purpose(text):
+    """MAC 菜单内容 -> 解锁用途 (pxe-mode.json 里不记用途, 从车机写的菜单反推); 认不出 None."""
+    text = text or ""
+    for purpose, title in pxeserver.CLONE_TITLES.items():
+        if title in text:
+            return purpose
+    if pxeserver.WINPE_CHAIN in text:
+        return "winpe"
+    if "inst.ks=" in text:
+        return "rocky"
+    return None
+
+
+def pxe_view(mode, menu_text, guard, now=None):
+    """pxeserver.pxe_mode() + 那台 MAC 的菜单 + 守卫状态 -> 给 Agent 看的一份."""
+    now = time.time() if now is None else now
+    out = {"mode": mode.get("mode", "rescue")}
+    for k in ("mac", "macs", "since", "until"):
+        if k in mode:
+            out[k] = mode[k]
+    if "until" in mode:
+        out["remaining_s"] = max(0, int(mode["until"] - now))
+    out["purpose"] = menu_purpose(menu_text) if menu_text else None
+    out["guard"] = {k: guard[k] for k in ("state", "detail", "leases") if k in (guard or {})}
+    return out
