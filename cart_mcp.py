@@ -30,6 +30,7 @@ import dash_core
 import kiosk_core as kc
 import lamps_core
 import mcp_core as mc
+import mcp_label
 import serial_core
 
 MCP_CONF = "/etc/ops-cart/mcp.json"
@@ -182,7 +183,7 @@ def read_pxe(mode_path=kc.PXE_MODE, root=kc.TFTP_ROOT, guard_path=None, now=None
 
 def real_tools():
     return build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap,
-                       state=dash_core.read, pxe=read_pxe)
+                       state=dash_core.read, pxe=read_pxe) + mcp_label.real_label_tools()   # 标签 (#20)
 
 
 def version():
