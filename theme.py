@@ -299,8 +299,10 @@ def unreadable(top, floor=4.5):
         pairs = []
         if w.winfo_class() == "Text":
             pairs.append(("", "fg", w.cget("foreground"), bg))
-            pairs += [(f"tag {t}", "fg", w.tag_cget(t, "foreground"), bg) for t in w.tag_names()
-                      if w.tag_cget(t, "foreground")]
+            # tag 自带底色就拿它比 (Linux 的 sel 是黑字配浅灰选中底), 没有才用 Text 的底
+            pairs += [(f"tag {t}", "fg", w.tag_cget(t, "foreground"),
+                       hexc(w, w.tag_cget(t, "background")) if w.tag_cget(t, "background") else bg)
+                      for t in w.tag_names() if w.tag_cget(t, "foreground")]
         else:
             text = str(w.cget("text")) if "text" in keys else ""
             if not text.strip() or ("state" in keys and str(w.cget("state")) == "disabled"):

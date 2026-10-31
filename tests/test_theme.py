@@ -383,3 +383,22 @@ def test_unreadable_walks_widgets_and_text_tags():
                        ("tag dim", "fg")}
     finally:
         root.destroy()
+
+
+def test_unreadable_text_tag_uses_its_own_background():
+    """tag 自带底色 (比如 Linux Tk 的 sel: 黑字配浅灰选中底) 要拿 tag 的底比, 不是 Text 的底."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("没有显示")
+    try:
+        root.withdraw()
+        t = tk.Text(root, bg=th.PANEL, fg=th.TEXT)
+        t.tag_config("hl", foreground="#000000", background="#ffffff")   # 黑配白: 够
+        t.tag_config("low", foreground="#777777", background="#888888")  # 灰配灰: 不够
+        t.pack()
+        bad = {x[1] for x in th.unreadable(t)}
+        assert "tag hl" not in bad and "tag low" in bad
+    finally:
+        root.destroy()
