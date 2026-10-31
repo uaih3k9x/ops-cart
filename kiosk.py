@@ -87,6 +87,8 @@ class Kiosk(tk.Tk):
         self._net_view, self._lock_net = None, None     # 最近一次网络探测; 锁屏上的网络标
         self._ups, self._lock_ups, self._ups_path = None, None, None   # issue #4: UPS 状态
         self._ups_shutdown = False                     # 低电量关机只触发一次
+        self._ups_stage, self._ups_since, self._ups_ticking = ("normal", None), None, False   # #4 两段式
+        self._ups_note = None                          # 顶栏的预告/倒计时一行, 用到才建
         self._build()
         self.gate = kc.PinGate(kc.pin_conf_read(), state_path=kc.PIN_STATE)
         self._lock_win = None
@@ -308,7 +310,7 @@ class Kiosk(tk.Tk):
         conf = sc.serial_conf_read()
         on_bell = self._beeper.ring if conf.get("bell_beep") else None   # serial.conf 开了才响主板蜂鸣
         # 副屏 (cart-dash) 拿不到这两样: 锁屏看锁屏窗口在不在, 键鼠看入队计数. 只在变了时写盘
-        self._kiosk_report.update(self._lock_win is not None, self._kvm_count)
+        self._kiosk_report.update(self._lock_win is not None, self._kvm_count, ups_since=self._ups_since)
         return lc.sample(sc.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
 
     def _ups_sample(self):
@@ -319,36 +321,53 @@ class Kiosk(tk.Tk):
             return None
 
     def _ups_sampled(self, res):
-        """主线程: 收到 UPS 状态; 画顶栏灯、锁屏, 到阈值就正常关机一次."""
+        """主线程: 收到 UPS 状态; 画顶栏灯、锁屏, 走一步低电量两段式."""
         if isinstance(res, Exception):
             return
         if isinstance(res, dict):
             self._ups_path = res.get("path") or self._ups_path
-        prev, self._ups = self._ups, res
-        if self._ups or prev:
-            self._paint_ups()
-        if uc.low(res) and not self._ups_shutdown:
-            self._ups_shutdown = True
-            self._on_ups_low(res)
+        self._ups = res
+        self._ups_step()
 
-    def _on_ups_low(self, ups):
-        """低电量: 记日志 + 顶栏提示, 然后正常关机 (由确认流程决定是否真关)."""
-        msg = f"UPS 电量 {ups.get('percent')}% (阈值 {uc.LOW_PCT}%), 正常关机"
-        try:
-            with open("/var/log/ops-cart-ups.log", "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
-        except OSError:
-            pass
-        self.banner.config(text=msg)
-        if self._lock_win is not None:
-            self._lock_notice.config(text=msg, fg="#ff7b72")
+    def _ups_step(self):
+        """两段式 (#4): 判断全在 uc.shutdown_stage, 这里只记倒计时起点、写日志、画、到点关机.
+        倒计时中另起 1 秒一跳: 采样线程卡在 upower 上时倒计时照走 (读不到按仍在电池)."""
+        now = time.time()
+        if self._ups_since is not None and now < self._ups_since:
+            self._ups_since = now                       # 墙钟往回拨: 从头数, 别卡住不关
+        stage, left = uc.shutdown_stage(self._ups, self._ups_since, now)
+        msg = uc.stage_log(self._ups_stage[0], stage, self._ups)
+        if msg:
+            uc.log(msg)
+        if stage in ("countdown", "poweroff"):
+            self._ups_since = self._ups_since or now
+        else:
+            self._ups_since = None
+        self._ups_stage = (stage, left)
+        self._paint_ups()
+        if stage == "countdown" and not self._ups_ticking:
+            self._ups_ticking = True
+            self.after(1000, self._ups_tick)
+        if stage == "poweroff" and not self._ups_shutdown:
+            self._ups_shutdown = True
+            self._on_ups_low()
+
+    def _ups_tick(self):
+        self._ups_ticking = False
+        if self._ups_since is not None and not self._ups_shutdown:
+            self._ups_step()
+
+    def _on_ups_low(self):
+        """倒计时走完: 复位装机口, 正常关机. 日志已由 _ups_step 记过."""
         self._disarm_quietly()
-        self.after(3000, lambda: self.ui.run_bg(lambda: kc.power(True)))
+        self.ui.run_bg(lambda: kc.power(True))
 
     def _paint_ups(self):
-        """顶栏电池块和锁屏右上角那一行, 用同一份状态."""
+        """顶栏电池块和锁屏右上角那一行, 用同一份状态; 预告/倒计时另见 _paint_ups_alert."""
         ups = self._ups
         text, health = uc.label(ups), uc.health(ups)
+        alert = uc.alert(ups, *self._ups_stage)
+        self._paint_ups_alert(alert)
         lamp = self._lamps.get(uc.UPS_KEY)
         if lamp is not None:
             f, stripe, lab, last = lamp
@@ -360,8 +379,28 @@ class Kiosk(tk.Tk):
                 stripe.config(bg=v["bar"])
                 lab.config(text=text, bg=v["bg"], fg=v["fg"])
         label = self._lock_ups
-        if label is not None:
-            label.config(text=text, fg=self._ups_fg(health))
+        if label is not None:       # 锁屏只占右上角一行: 预告琥珀字, 倒计时红底白字加粗, 不铺满
+            if alert is None:
+                label.config(text=text, fg=self._ups_fg(health), bg="#10141c", font=FONT)
+            elif alert["level"] == "warn":
+                label.config(text=alert["short"], fg="#f0b429", bg="#10141c", font=FONT)
+            else:
+                label.config(text=alert["short"], fg="#ffffff", bg="#da3633", font=FONT_BIG + ("bold",))
+
+    def _paint_ups_alert(self, alert):
+        """顶栏标题右边一行: 预告琥珀字, 倒计时红底白字; 正常时收起. 不用 banner (别的提示会盖掉它)."""
+        if alert is None:
+            if self._ups_note is not None:
+                self._ups_note.pack_forget()
+            return
+        if self._ups_note is None:
+            self._ups_note = tk.Label(self.banner.master, font=FONT_BIG, padx=10)
+        if alert["level"] == "warn":
+            self._ups_note.config(text=alert["text"], fg="#f0b429", bg="#10141c")
+        else:
+            self._ups_note.config(text=alert["text"], fg="#ffffff", bg="#da3633")
+        if not self._ups_note.winfo_manager():          # 收起过才重新 pack
+            self._ups_note.pack(side="left", padx=(0, 12), after=self.banner)
 
     @staticmethod
     def _ups_tag(ups):
