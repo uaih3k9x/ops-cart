@@ -412,3 +412,22 @@ def test_conbroker_send_refuses_bad_line_without_subprocess():
         ms.conbroker_send("/dev/con-1", "save\rreboot", 5, run=run)
     with pytest.raises(sw.Refused):
         ms.conbroker_send("/dev/con-1", "\x03", 5, raw=True, run=run)   # raw 只收固定键
+
+
+# ---- 给 conbroker 的公开急停标记: 排队等人停手的那条, conbroker 写串口前看这个 (状态文件是 root 0600 它读不了)
+
+def test_estop_flag_file_tracks_stopped_slots(tmp_path):
+    import json
+    import stat
+    rig = Rig(tmp_path)
+    flag = os.path.join(os.path.dirname(rig.store.path), "serial-estop.json")
+    rig.store.run(lambda b, now: None)
+    assert json.load(open(flag)) == {"slots": [], "all": False}
+    assert stat.S_IMODE(os.stat(flag).st_mode) == 0o644
+    rig.store.run(lambda b, now: b.estop(2, "人", "human", now))
+    assert json.load(open(flag)) == {"slots": [2], "all": False}
+    rig.store.run(lambda b, now: b.estop(None, "人", "human", now))
+    assert json.load(open(flag)) == {"slots": [1, 2, 3, 4], "all": True}
+    rig.store.run(lambda b, now: b.resume(None, "人", now))
+    assert json.load(open(flag)) == {"slots": [], "all": False}
+    assert "token" not in open(flag).read()                             # 只写槽位, 不漏令牌和命令

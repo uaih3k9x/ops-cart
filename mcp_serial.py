@@ -38,6 +38,7 @@ import serial_core
 import serial_write_core as sw
 
 STATE_PATH = "/run/ops-cart/serial-write.json"
+ESTOP_FLAG = "serial-estop.json"   # 和状态文件同目录; conbroker 默认读 /run/ops-cart/serial-estop.json
 LOG_DIR = cartlog.LOG_DIR
 OUTPUT_MAX = 64 * 1024          # 回给 Agent 的设备输出上限
 TAIL_LINES = 8                  # 发前看几行认厂商 / 提示符 / 名字
@@ -86,7 +87,17 @@ class Store:
                 return fn(book, now)
             finally:
                 atomicfile.write_text(self.path, book.dumps(), mode=0o600)
+                self._flag(book)
                 self._log(book.events)
+
+    def _flag(self, book):
+        """给 conbroker 的公开急停标记 (0644, 只有槽位号): 排队等人停手的那条, 写串口前它看这个丢掉."""
+        stopped = [n for n in sw.SLOTS if book.stopped(n)]
+        doc = {"slots": stopped, "all": len(stopped) == len(sw.SLOTS)}
+        try:
+            atomicfile.write_text(os.path.join(os.path.dirname(self.path), ESTOP_FLAG), json.dumps(doc), mode=0o644)
+        except OSError:
+            pass
 
     def _log(self, events):
         for rec in events:
