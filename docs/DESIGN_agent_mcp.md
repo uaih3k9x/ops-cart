@@ -105,13 +105,13 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 槽位: 正常 ──estop(人或 Agent)──► 急停 (撤租约 + 丢挂起, 不发任何字节) ──resume(只认本机人)──► 正常 (租约不还)
 ```
 
-- **确认通道**（#23 之前）：车机上"退出到终端"，`sudo python3 /opt/pxe/cart_mcp.py pending` 看，`confirm <编号>` 显示命令、来源、理由、高危词，敲 `yes` 才发，发的结果直接打印并进日志；`reject <编号>`、`estop [槽位]` 哪都能做；`confirm` 和 `resume <槽位|all>` 只认本机：环境里没有 `SSH_*`、stdin 是终端、祖先进程里没有 sshd / sshd-session / tailscaled / dropbear / mosh-server / cockpit，读不到 `/proc` 也不认。确认后由确认那个进程经 conbroker 发（屏幕上照样标"Claude 发送"）。
+- **确认通道**（#23 之前；#23 之后见第十节）：车机上"退出到终端"，`sudo python3 /opt/pxe/cart_mcp.py pending` 看，`confirm <编号>` 显示命令、来源、理由、高危词，敲 `yes` 才发，发的结果直接打印并进日志；`reject <编号>`、`estop [槽位]` 哪都能做；`confirm` 和 `resume <槽位|all>` 只认本机：环境里没有 `SSH_*`、stdin 是终端、祖先进程里没有 sshd / sshd-session / tailscaled / dropbear / mosh-server / cockpit，读不到 `/proc` 也不认。确认后由确认那个进程经 conbroker 发（屏幕上照样标"Claude 发送"）。
 - **急停**：状态在 `/run/ops-cart/serial-write.json`（root 0600，路径可注入）；状态文件读不懂 = 全部急停；重启推车 /run 清空 = 急停、租约、挂起都没了（挂起的命令不会在重启后冒出来）。急停事件记下被撤销的租约持有者、丢弃的编号、以及**当时在途的那条**——那条已经交给 conbroker，收不回来。
 - **已知缺口：conbroker 里排队的那条收不回**。人 3 秒内敲过键时，Agent 的字节已经进了 conbroker 的连接、在它的服务线程里等人停手；这时急停，等人停手 3 秒后它照样写进串口（我们的进程即使超时退出也一样）。要堵上得改 conbroker（另一个仓库）：服务端写串口前查一下 `/run/ops-cart/serial-write.json` 里该槽位的急停，急停就丢弃并标记。车上的判定只能保证"急停之后不再往 conbroker 交任何东西"。
 - **日志**：`/var/log/ops-cart/serial-slot<N>.log`，每槽位一份 JSONL（现成 logrotate `*.log` 规则管），每行 `t / slot / ev / src(agent|human|system) / who`，再加命令、闸门结果（verdict / layer / reason / danger / vendor）、设备回显摘要（超过 1000 字掐中间）、编号、确认人、名字。事件：`lease_acquire` `lease_release` `lease_expired` `pending` `confirm` `reject` `drop` `send` `refused` `estop` `resume`；续期不记。急停 / 解除 / 确认 / 拒绝另在 `events.log` 记 `[serial-write]` 一行摘要 + 日志路径（不写命令）。
 - **人优先**：人在车机 / 网页上敲键走 conbroker 的 human 通道，不经租约、不过闸门；人 3 秒内敲过键 Agent 排队（conbroker 原有）；人随时 estop / reject。
 - **第 2 层**：见下一节（#22）。
-- **留给 #23**：车机 / 网页确认框直接用 `mcp_serial.Store().view()`（各槽位 `estop / writer / expires_in / inflight / pending`，挂起列表带 `danger` 和 `age_s`）和 `Store.run(lambda b, now: b.confirm(id, by, now))` → `conbroker_send` → `b.finish(...)`（照 `mcp_serial.cli` 的 confirm 分支）；急停 / 解除用 `b.estop(slot, by, "human", now)` / `b.resume(slot, by, now)`。webkiosk 以 `ops-web` 跑，读不了 root 0600 的状态文件，网页确认要经 root 进程转一道或调权限。指示灯黄闪 = 某槽位 `pending > 0`。
+- **确认 UI**：见第十一节（#23）。
 
 ## 十、P3 落地记录（#22）
 
@@ -121,4 +121,13 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 - **输出**：`claude -p --output-format json`，外壳 `subtype=success` 且 `is_error` 不为真，`result` 里是 `{"verdict": "allow"|"block", "reason": "…"}`（容许 Markdown 代码围栏）。空输出 / 非 JSON / 缺字段 / 类型或取值不对（`ALLOW`、`pass` 都不认）/ 预算超限（`error_max_budget_usd`）/ 非零退出 / 超时 / 起不来（`serial.conf` 没 user、没装 claude）→ 一律人确认。超时整个进程组 SIGKILL（`runuser` 不 exec，光杀它 claude 还在跑）。
 - **日志**：闸门结果整个进执行绪日志（`pending` / `send` 事件的 `gate`），多了 `gate.model`（`verdict / reason / cost_usd / ms`，出错是 `error / ms`）和 `gate.intent`；模型理由原样保留（超过 1000 字掐尾）。车机 `cart_mcp.py pending / confirm` 显示意图和模型理由。
 - **规则文件**（`/etc/ops-cart/serial-gate.json`）：`model: {enabled, timeout_s 5–120, budget_usd ≤ 1, context_chars ≤ 8000, model}`，默认 `enabled=false`；`vendors.<厂商>.model=false` 关某个厂商，`notes` 给模型的现场补充。厂商多了 `ruijie`（提示符同思科，子视图可带空格）和 `linux`（`用户@主机:路径$`、`[用户@主机 路径]#`、`bash-4.4#`、光秃秃的 `$` / `#`），都只能登记槽位、没有第 1 层白名单。样例里 `linux.model=false`。
+
+## 十一、P4 落地记录（#23）
+
+- 代码：`confirm_core.py`（纯逻辑：方块配色 / 文字、确认框内容、动作前置校验、网页请求格式）+ `confirm_panel.py`（车机确认框 Tk）；`mcp_serial` 加 `peek`（只读看状态，不加锁不写盘，读不了 / 读不懂 = 全部急停）、`send_confirmed`（车机和命令行共用的"确认→发→finish"）、`human_action`（车机按钮入口）、`write_request` / `process_requests`（网页请求）。
+- **执行绪方块**（车机执行器条、网页、副屏同一套，颜色就是 #2 的 OK 绿 / WARN 黄 / FAIL 红，只多一个 Agent 紫）：急停 = 实心红"急停" > 待确认 = 黄闪"待确认 N" > 响铃红闪 > 在途 = 紫闪"Agent 输入" > 持写租约 = 紫色带"N Agent" > 原样（在动绿闪 = 人或设备自己吐）。分不出人敲键和设备自己输出，只能分"有没有 Agent 在发"。
+- **车机**：点黄 / 红 / 紫的操作头弹确认框（命令、来源、几秒前、闸门理由、高危词），确认 / 拒绝 / 急停本路 / 全部急停 / 解除；高危词确认前再问一次；方块条上常驻"Agent 全部急停"，一点就停不问。车机进程是 root、在本机屏幕上，算"本机人"，确认和解除都给。状态由采样线程 peek，动作在后台线程，主线程不碰文件；锁屏时关掉确认框。
+- **网页**（"Agent"页 + 顶上"全部急停"）：只给急停（单路 / 全部）和拒绝，**确认发送和解除急停不给**（403，提示去车机）。webkiosk 以 `ops-web` 跑，状态文件靠已有的 `CAP_DAC_READ_SEARCH` 只读；改状态经 `/run/ops-cart/serial-req/`（tmpfiles 建，ops-web 0700）投请求文件，root 的 `cart-serial-req.path` → `cart-serial-req.service`（oneshot，`mcp_serial.py requests`）执行。理由：越权的方向只能是"停"——就算 ops-web 被拿下，最多能急停或拒绝，放行不了任何命令；不加常驻 root 进程，也不给 ops-web 写状态文件。请求只认 estop / reject、一分钟内、无多余字段；链接不跟（O_NOFOLLOW），读不懂删掉；先删后执行，不会反复执行。
+- **副屏**：快照多一项 `agent`（每槽位 estop / pending / 有没有写入者 / 在途，不带名字和命令，state.json 是 0644）；操作头方块同车机配色，"操作头"那行右边写"Agent 待确认 N · 急停 1、3"。读不懂 = 全部急停。
+- **待定**：网页确认要不要开（要的话得另设认证，比如车机屏幕上显示一次性码照抄）；锁屏上要不要露急停按钮（现在锁屏时只能网页或解锁后急停）。
 

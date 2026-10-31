@@ -93,9 +93,10 @@ def paragraphs(text):
     return [p for p in out if p]
 
 
-def _tile(d, box, label, health, active, label_font, sub=None, sub_font=None):
-    """一个 MA3 执行器方块: 顶部色条 = 健康, 在动整块点亮; health=None 是空槽 (暗)."""
-    look = lc.lamp_view(health, active, True)
+def _tile(d, box, label, health, active, label_font, sub=None, sub_font=None, look=None):
+    """一个 MA3 执行器方块: 顶部色条 = 健康, 在动整块点亮; health=None 是空槽 (暗).
+    look: 现成的配色 (操作头的急停 / 待确认 / Agent, #23), 给了就不按健康算."""
+    look = look or lc.lamp_view(health, active, True)
     x0, y0, x1, y1 = box
     d.rounded_rectangle(box, 14, fill=look["bg"])
     d.rounded_rectangle([x0, y0, x1, y0 + 12], 6, fill=look["bar"])
@@ -190,13 +191,17 @@ def render(view, size=(PANEL_W, PANEL_H)):
 
     # ---- 执行器: 上排操作头, 下排键鼠/PXE/网口, 再下面两行 LAN1 / LAN2 的 LLDP 对端
     d.text((M, 280), "操作头", font=_font(26), fill=DIM)
+    agent = view.get("agent")
+    if agent:       # Agent 写串口 (#23): 待确认几条 / 哪几路急停, 右对齐在"操作头"那行
+        d.text((W - M, 280), agent["text"], font=_font(26), anchor="ra",
+               fill=BAD if agent.get("level") == "bad" else WARN)
     heads = view.get("heads") or []
     gap, y0 = 20, 320
     tw = (W - 2 * M - gap * 3) // 4
     for i, h in enumerate(heads[:4]):
         x0 = M + i * (tw + gap)
         _tile(d, [x0, y0, x0 + tw, y0 + 170], str(h["n"]), h["health"], h["active"],
-              _font(96), h["text"], _font(30))
+              _font(96), h["text"], _font(30), look=h.get("look"))
     lower = view.get("lower") or []
     gap, y0 = 14, 506
     tw = (W - 2 * M - gap * 4) // 5

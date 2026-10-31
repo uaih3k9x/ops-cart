@@ -15,6 +15,7 @@ import re
 import time
 
 import atomicfile
+import confirm_core
 import lamps_core
 import lldp_core
 import pxeserver
@@ -71,6 +72,7 @@ def collect(ctx):
         "pxe": _pull(ctx, "pxe", {}),               # pxe-guard.json (守卫在跑才有), 自己发地址限时 #11
         "svcs": _pull(ctx, "svcs", {}),             # {"chronyd": (enabled, active), "kiosk": ...} 开机自检用 #26
         "version": _pull(ctx, "version", ""),       # "Ver 1.08.03   Build ..." 开机自检抬头
+        "agent": _pull(ctx, "agent", None),         # Agent 写串口每槽位 [{estop, pending, writer, sending}] #23
     }
     return snap
 
@@ -213,13 +215,45 @@ def _ups_line(ups, stage="normal"):
     return {"text": text, "level": "ok"}
 
 
-def _heads(slots, active):
-    """上排 4 个操作头: 文字同主屏执行器条 (波特率 / 空闲 / 未插)."""
+def agent_sample(path=None, clock=time.time):
+    """Agent 写串口每槽位 [{estop, pending, writer(有没有), sending}] (#23). 只读 serial-write.json, 不加锁;
+    读不懂 = 全部急停. 快照是 0644, 不带 Agent 名字和命令."""
+    try:
+        import mcp_serial
+        st = confirm_core.slot_states(mcp_serial.peek(path or mcp_serial.STATE_PATH, clock=clock))
+    except Exception:                       # noqa: BLE001  看不了也不能当没事: 按全部急停画
+        st = confirm_core.slot_states(None)
+    return [dict(st[n], writer=bool(st[n]["writer"])) for n in sorted(st)]
+
+
+def _agent_states(agent):
+    """快照里的 agent -> {槽位: 状态}; 没这项 (老快照) None; 格式不对 = 全部急停."""
+    if agent is None:
+        return None
+    keys = {"estop", "pending", "writer", "sending"}
+    if isinstance(agent, list) and len(agent) == len(lamps_core.SLOTS) and \
+            all(isinstance(a, dict) and keys <= set(a) for a in agent):
+        return confirm_core.slot_states({"slots": [{"slot": n, "estop": a["estop"], "pending": a["pending"],
+                                                    "writer": a["writer"], "inflight": a["sending"]}
+                                                   for n, a in enumerate(agent, 1)]})
+    return confirm_core.slot_states(None)
+
+
+def _heads(slots, active, agent=None):
+    """上排 4 个操作头: 文字同主屏执行器条 (波特率 / 空闲 / 未插); 有 Agent 状态时 (#23) 急停 / 待确认 /
+    Agent 输入的文字和配色 (look) 也同主屏, 副屏不闪 (2 fps), 待确认按亮着画."""
+    if agent is not None and not slots:
+        slots = [{"dev": d, "present": False, "baud": None, "count": None} for d in lamps_core.SLOTS]
     out = []
     for n, slot in enumerate(slots or [], 1):
         text, health = lamps_core.slot_view(n, slot)
+        look = None
+        if agent is not None and n in agent:
+            hv = confirm_core.head_view(n, slot, agent[n], "con-%d" % n in active, True)
+            text = hv["text"]
+            look = {"bg": hv["bg"], "fg": hv["fg"], "bar": hv["bar"]}
         out.append({"n": n, "text": text.split("\n", 1)[1], "health": health,
-                    "active": "con-%d" % n in active})
+                    "active": "con-%d" % n in active, "look": look})
     return out
 
 
@@ -267,6 +301,7 @@ def layout_view(snap, locked=False, active=(), now=None):
     now = time.time() if now is None else now
     t = time.localtime(now)
     ups_stage, ups_left = _ups_stage(snap.get("ups"), kiosk, now)
+    agent = _agent_states(snap.get("agent"))
     view = {
         "locked": locked,
         "clock": time.strftime("%H:%M", t),
@@ -278,7 +313,8 @@ def layout_view(snap, locked=False, active=(), now=None):
         "uptime": short_uptime(snap.get("uptime") or ""),
         "temps": snap.get("temps") or [],
         "fans": snap.get("fans") or [],
-        "heads": _heads(snap.get("slots"), active),
+        "heads": _heads(snap.get("slots"), active, agent),
+        "agent": confirm_core.summary(agent) if agent is not None else None,   # 挂起数 / 急停 (#23)
         "lower": _lower(rows, active),
         "checks": _checks(rows),
         "todo": [] if locked else (snap.get("todo") or []),
@@ -531,6 +567,7 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "ups": lambda: _ups_sample(),
         "lldp": lldp or (lambda: {}),
         "pxe": lambda: kc.pxe_guard_live(),
+        "agent": lambda: agent_sample(),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)

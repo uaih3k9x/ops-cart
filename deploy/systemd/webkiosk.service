@@ -12,6 +12,7 @@ Wants=network-online.target
 #   CH9329 串口 = dialout 组, 采集卡 = video 组;
 #   root 0600 的 PIN 文件和 conbroker 的状态/日志只读不写 = CAP_DAC_READ_SEARCH (只读能力, 不能写别人的文件);
 #   局域网开关写 /opt/pxe/web.conf 这一个文件 (目录只读, web_core 会原地写);
+#   串口写状态 /run/ops-cart/serial-write.json 只读 (同上), 急停 / 拒绝投到 /run/ops-cart/serial-req (#23);
 #   审计日志写 /var/log/ops-cart-web/audit.log (systemd 建目录), 写不进去时进 journald.
 User=ops-web
 Group=ops-web
@@ -25,6 +26,8 @@ LogsDirectory=ops-cart-web
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/opt/pxe/web.conf
+# 串口急停 / 拒绝 (#23): 只往这个目录投请求文件, root 的 cart-serial-req 执行; 目录不在 (没装) 就忽略
+ReadWritePaths=-/run/ops-cart/serial-req
 ProtectHome=read-only
 InaccessiblePaths=-/etc/shadow -/etc/gshadow -/root
 PrivateTmp=yes

@@ -230,3 +230,41 @@ def test_render_boot_stale_banner():
     from PIL import ImageColor
     img = r.render(dict(_boot_view(), stale=True))
     assert img.getpixel((4, r.PANEL_H - 30)) == ImageColor.getrgb(r.BAD)
+
+
+# ---- #23 Agent 写串口: 操作头方块变色 + "操作头"那行右边写挂起数 / 急停
+
+def _agent_snap(**over):
+    st = [{"estop": False, "pending": 0, "writer": False, "sending": False} for _ in range(4)]
+    for n, d in over.items():
+        st[int(n[1:]) - 1].update(d)
+    return _full_snap(agent=st)
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_render_agent_pending_and_estop_tiles(locked):
+    from PIL import ImageColor
+    img = r.render(dc.layout_view(_agent_snap(s1={"pending": 1, "writer": True}, s2={"estop": True}),
+                                  locked=locked))
+    tw = (r.PANEL_W - 2 * r.M - 20 * 3) // 4
+    mid = lambda i: (r.M + i * (tw + 20) + 8, 320 + 150)         # noqa: E731  方块左下角, 避开字
+    assert img.getpixel(mid(0)) == ImageColor.getrgb(confirm_core_color("PENDING"))
+    assert img.getpixel(mid(1)) == ImageColor.getrgb(confirm_core_color("ESTOP"))
+    plain = r.render(dc.layout_view(_full_snap(), locked=locked))
+    assert plain.getpixel(mid(0)) != img.getpixel(mid(0))
+
+
+def test_render_agent_summary_line_only_when_needed():
+    from PIL import ImageColor
+    box = (r.PANEL_W - r.M - 300, 280, r.PANEL_W - r.M, 310)
+
+    def has(img, color):
+        c = ImageColor.getrgb(color)
+        return any(img.getpixel((x, y)) == c for x in range(box[0], box[2]) for y in range(box[1], box[3]))
+    assert has(r.render(dc.layout_view(_agent_snap(s4={"estop": True}))), r.BAD)
+    assert not has(r.render(dc.layout_view(_full_snap())), r.BAD)
+
+
+def confirm_core_color(name):
+    import confirm_core
+    return getattr(confirm_core, name + "_COLOR")

@@ -3,6 +3,9 @@
 import json
 import time
 
+import pytest
+
+import confirm_core
 import dash_core as dc
 
 
@@ -415,3 +418,51 @@ def test_default_ctx_reads_live_guard(monkeypatch):
     _stub_kc(monkeypatch)
     monkeypatch.setattr(kc, "pxe_guard_live", lambda *a, **k: {"state": "expired"})
     assert dc.default_ctx()["pxe"]() == {"state": "expired"}
+
+
+# ---- #23 Agent 写串口: 副屏同步挂起数和急停 (状态读不懂 = 全部急停)
+
+def _agent(**over):
+    st = [{"estop": False, "pending": 0, "writer": False, "sending": False} for _ in range(4)]
+    for n, d in over.items():
+        st[int(n[1:]) - 1].update(d)
+    return st
+
+
+def test_heads_follow_agent_state_and_summary():
+    v = dc.layout_view(dict(_snap(), agent=_agent(s1={"pending": 2, "writer": True}, s3={"estop": True})))
+    h = v["heads"]
+    assert h[0]["text"] == "待确认 2" and h[0]["look"]["bg"] == confirm_core.PENDING_COLOR
+    assert h[2]["text"] == "急停" and h[2]["look"]["bg"] == confirm_core.ESTOP_COLOR
+    assert h[1]["look"] is None or h[1]["look"]["bar"] != confirm_core.AGENT_COLOR
+    assert v["agent"]["level"] == "bad" and "待确认 2" in v["agent"]["text"]
+
+
+def test_no_agent_key_keeps_old_heads():
+    v = dc.layout_view(_snap())
+    assert v["agent"] is None and all(h["look"] is None for h in v["heads"])
+
+
+@pytest.mark.parametrize("bad", ["x", [1, 2], [{"estop": False}] * 4, {"1": {}}])
+def test_unreadable_agent_state_shows_all_stopped(bad):
+    v = dc.layout_view(dict(_snap(), agent=bad))
+    assert all(h["text"] == "急停" for h in v["heads"]) and v["agent"]["text"] == "Agent 全部急停"
+
+
+def test_agent_sample_reads_state_and_hides_names(tmp_path):
+    import serial_write_core as sw
+    b = sw.Book.from_text(None, 1_700_000_000.0)
+    b.acquire(2, "stdio:ops@198.51.100.9", 1_700_000_000.0)
+    p = tmp_path / "s.json"
+    p.write_text(b.dumps())
+    st = dc.agent_sample(str(p), clock=lambda: 1_700_000_001.0)
+    assert st[1] == {"estop": False, "pending": 0, "writer": True, "sending": False}
+    assert "ops@" not in json.dumps(st)                              # 快照是 0644, 不带 Agent 名字
+    (tmp_path / "bad.json").write_text("{")
+    assert all(s["estop"] for s in dc.agent_sample(str(tmp_path / "bad.json")))
+
+
+def test_collect_carries_agent():
+    snap = dc.collect({"agent": lambda: _agent(s2={"estop": True})})
+    assert snap["agent"][1]["estop"]
+    assert dc.collect({})["agent"] is None
