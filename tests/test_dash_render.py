@@ -110,3 +110,21 @@ def test_render_serve_banner(locked, state, color):
     assert img.getpixel((4, 230)) == ImageColor.getrgb(color)          # 条的左边缘
     plain = r.render(dc.layout_view(_full_snap(), locked=locked))
     assert plain.getpixel((4, 230)) == r.BG
+
+
+# ---- 转电池那行不能压到大时钟 (10/31 放电演练实测压住了)
+
+@pytest.mark.parametrize("clock", ["23:58", "00:00", "--:--"])
+def test_ups_line_on_battery_never_overlaps_clock(clock):
+    ups = dc.layout_view({"ts": 0, "rows": [], "ups": {"state": "discharging", "percent": 100,
+                                                       "status": "OB DISCHRG", "runtime": 5940}})["ups"]
+    text, size = r.ups_fit(ups, clock)
+    right = r.PANEL_W - r.M
+    left = right - r._font(size).getlength(text)
+    assert left >= r.clock_right(clock) + r.UPS_GAP, (text, size)
+    assert size >= r.UPS_MIN_PX
+
+
+def test_ups_line_keeps_full_text_when_it_fits():
+    ups = {"text": "电池 100% · 负载 18%", "level": "ok"}
+    assert r.ups_fit(ups, "23:58") == ("电池 100% · 负载 18%", r.UPS_PX)

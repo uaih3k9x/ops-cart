@@ -271,7 +271,7 @@ def test_ups_line_on_battery_uses_hid_status_before_upower_catches_up():
     # upower 的 discharging 要滞后一两分钟; hidraw 的 OB 是即时的
     u = dc.layout_view(_snap(ups={"state": "fully-charged", "percent": 85, "status": "OB DISCHRG",
                                   "runtime": 1630}))["ups"]
-    assert u == {"text": "市电断开 · 电池 85% · 剩 27 分", "level": "warn"}
+    assert u == {"text": "市电断开 · 电池 85% · 剩 27 分", "short": "断电 · 85% · 剩 27 分", "level": "warn"}
 
 
 def test_ups_line_back_on_mains_trusts_hid_ol_over_lagging_upower():

@@ -112,6 +112,25 @@ def _temp_color(c):
     return ACCENT if c < 70 else WARN if c < 85 else BAD
 
 
+UPS_PX, UPS_MIN_PX, UPS_GAP = 28, 22, 16    # 头部 UPS 那行: 字号 / 最小字号 / 离大时钟至少留这么宽
+CLOCK_X, CLOCK_PX = M - 6, 150
+
+
+def clock_right(clock):
+    return CLOCK_X + _font(CLOCK_PX).getlength(clock or "--:--")
+
+
+def ups_fit(ups, clock, width=PANEL_W):
+    """UPS 那行右对齐在大时钟右边, 不许压到时钟: 全文放得下用全文, 否则换短写法, 还不行再缩字号."""
+    room = width - M - clock_right(clock) - UPS_GAP
+    texts = [t for t in (ups.get("text"), ups.get("short")) if t]
+    for size in range(UPS_PX, UPS_MIN_PX - 1, -2):
+        for t in texts:
+            if _font(size).getlength(t) <= room:
+                return t, size
+    return texts[-1], UPS_MIN_PX
+
+
 def render(view, size=(PANEL_W, PANEL_H)):
     """版面模型 → PIL Image (竖屏朝向). 纯函数, 方便测试和本地预览."""
     from PIL import Image, ImageDraw
@@ -120,7 +139,7 @@ def render(view, size=(PANEL_W, PANEL_H)):
     d = ImageDraw.Draw(img)
 
     # ---- 头部: 大时钟 / 日期 / 网络
-    d.text((M - 6, 22), view.get("clock") or "--:--", font=_font(150), fill=FG)
+    d.text((CLOCK_X, 22), view.get("clock") or "--:--", font=_font(CLOCK_PX), fill=FG)
     d.text((W - M, 52), view.get("date") or "", font=_font(38), fill=DIM, anchor="ra")
     tag, color = NET_TAG.get(view.get("net") or "down", NET_TAG["down"])
     tw = _font(38).getlength(tag)
@@ -128,7 +147,8 @@ def render(view, size=(PANEL_W, PANEL_H)):
     d.text((W - M, 112), tag, font=_font(38), fill=color, anchor="ra")
     ups = view.get("ups") or {}
     if ups.get("text"):
-        d.text((W - M, 168), ups["text"], font=_font(28), anchor="ra",
+        text, px = ups_fit(ups, view.get("clock"), W)
+        d.text((W - M, 168), text, font=_font(px), anchor="ra",
                fill={"ok": DIM, "warn": WARN, "bad": BAD}.get(ups.get("level"), DIM))
     info = " · ".join(x for x in ("LAN2 " + view["lan2"] if view.get("lan2") else "",
                                   "开机 " + view["uptime"] if view.get("uptime") else "") if x)

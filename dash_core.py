@@ -169,10 +169,10 @@ def _ups_line(ups):
         return {"text": "UPS 未连接", "level": "dim"}
     pct = ups.get("percent")
     if ups_core.on_battery(ups):
-        text = "市电断开 · 电池 %s%%" % pct
-        if ups.get("runtime"):
-            text += " · 剩 %d 分" % (int(ups["runtime"]) // 60)
-        return {"text": text, "level": "bad" if (pct or 0) <= UPS_LOW else "warn"}
+        left = " · 剩 %d 分" % (int(ups["runtime"]) // 60) if ups.get("runtime") else ""
+        # short: 头部右边放不下全文时用 (大时钟占了左边大半), 见 dash_render.ups_fit
+        return {"text": "市电断开 · 电池 %s%%" % pct + left, "short": "断电 · %s%%" % pct + left,
+                "level": "bad" if (pct or 0) <= UPS_LOW else "warn"}
     text = "电池 %s%%" % pct
     if ups.get("load") is not None:
         text += " · 负载 %s%%" % ups["load"]
