@@ -140,6 +140,9 @@ def open_dhcp_socket(sock, ip, port, iface=None, platform=sys.platform, sleep=ti
 # ---------------------------------------------------------------- 守卫: 别在别人的网段上发 DHCP
 
 GUARD_STATE = "/run/ops-cart/pxe-guard.json"
+RENEW_PATH = "/run/ops-cart/pxe-renew.json"     # 车机写 {"ts": ...} 请求续期, 守卫每轮 tick 看一眼
+SERVE_S = 30 * 60       # 自己发地址的限时 (--serve-minutes / pxe.env 的 PXE_SERVE_MINUTES 改); 0 = 不限时
+REPLUG_S = 60           # 拔线这么久再插 = 人换了地方接, 新开一段限时; iPXE 接管网卡只断几秒, 不算
 
 
 def read_carrier(iface):
@@ -177,16 +180,21 @@ def default_probe():
 
 class PxeGuard:
     """装机口守卫, 决定 67 口发不发地址 (#11: 探到别人的 DHCP 不再停服, 转代理模式):
-    - serving: 链路上没别的 DHCP, 自己发地址 (67 完整 DHCP) + 4011 proxyDHCP
+    - serving: 链路上没别的 DHCP, 自己发地址 (67 完整 DHCP) + 4011 proxyDHCP. 限时 serve_s 秒:
+               整个网段的机器都可能拿到推车的地址, 车机/副屏醒目倒计时, 人可以续期
+    - expired: 限时到了, 停发: 新机器一个地址都不给 (DISCOVER 只按代理模式回引导), 4011 照回;
+               已经拿到地址的机器 (多半装到一半) RENEWING/REBINDING 照常续租, 不让它中途断网
     - proxy:   链路上有别的 DHCP, 不发地址; 67 只对 PXEClient 的 DISCOVER 回 yiaddr=0 的引导 OFFER, 4011 照回
     - starting / probing / no-link / no-ip: 一个包都不回
+    限时从第一次进 serving 算起; 掉线又插上 (iPXE 接管网卡那几秒) 不重来, 拔线超过 REPLUG_S 再插才重新计时.
+    续期: 车机写 renew_path, 或调 renew(); 从当前起再给 serve_s 秒. 有别人的 DHCP 时续期也不发地址.
     别人的证据: 启动时和 carrier 从 0 变 1 时主动探测 (probe 广播 DISCOVER, 收别人的 OFFER),
     被动看到 server-id 不是自己的 OFFER/ACK, 或客户端 REQUEST 选了别的服务器.
     证据只在重新插线、重探时清掉; 探测报错/没有探测函数也按"有别人"处理. 拿不准就不发地址.
     网口上得真有 --ip. 状态写 state_path (JSON), 车机自检和排障时看."""
 
     def __init__(self, ip, iface, log, probe=None, carrier=None, addr=None, state_path=GUARD_STATE,
-                 event=cart_event, now=time.time, prefix=None):
+                 event=cart_event, now=time.time, prefix=None, serve_s=SERVE_S, renew_path=RENEW_PATH):
         self.ip, self.iface, self.log = ip, iface, log
         self.prefix = prefix        # 只写进状态文件, 车机拿它和 offered 比是不是同一网段
         self.probe = probe
@@ -197,14 +205,23 @@ class PxeGuard:
         self.other = None           # 别人 DHCP 的证据 {"server", "offered", "how"}; None = 没看到
         self._link = False
         self._lock = threading.RLock()
+        self.serve_s, self.renew_path = serve_s, renew_path
+        self.until = None           # 这段限时到什么时候; None = 还没开始发 (或不限时)
+        self._expired_told = False  # 这段限时的"到时"已经记过了
+        self._down_at = None        # 上次掉线的时刻, 判断是不是重新插线
+        self._renew_seen = now()    # 只认启动之后的续期请求, 上一次进程留下的不算
 
     def may_reply(self):
-        """67 口能不能发地址."""
-        return self.state == "serving"
+        """67 口能不能发地址. 限时到点就不发, 不等下一轮 tick 改状态."""
+        return self.state == "serving" and (self.until is None or self.now() < self.until)
 
     def may_proxy(self):
         """能不能回引导信息 (4011, 和代理模式下 67 口的 yiaddr=0 OFFER)."""
-        return self.state in ("serving", "proxy")
+        return self.state in ("serving", "expired", "proxy")
+
+    def may_renew(self):
+        """已经发出去的租约能不能续 (到时停发后也续, 别让装到一半的机器断网)."""
+        return self.state in ("serving", "expired")
 
     def foreign(self, server, how, offered=None):
         with self._lock:
@@ -218,9 +235,15 @@ class PxeGuard:
             if not self.iface:
                 self._set("serving", "没指定网卡, 不做探测")
                 return
+            self._poll_renew()
             link = self.carrier()
+            if not link and self._link:
+                self._down_at = self.now()
             if link and not self._link:
                 self.other = None           # 插到别处了: 旧证据作废, 以这次探测 + 探测期间的被动监听为准
+                if self._down_at is not None and self.now() - self._down_at >= REPLUG_S:
+                    self.until = None       # 人重新插的线: 新开一段限时
+                    self._down_at = None
                 self._set("probing", f"{self.iface} 刚接上, 探测有没有别的 DHCP")
         if link and not self._link and not self._run_probe():
             return                          # 探测不算数: 不记"已接上", 下一轮重探, 这期间不回包
@@ -233,7 +256,53 @@ class PxeGuard:
             elif self.other:
                 self._set_proxy()
             else:
-                self._set("serving", "")
+                self._serve()
+
+    def _serve(self):
+        """没有别人的 DHCP: 限时内自己发地址, 到时转 expired (停发)."""
+        if not self.serve_s:
+            self._set("serving", "")
+            return
+        now = self.now()
+        if self.until is None:
+            self.until, self._expired_told = now + self.serve_s, False
+            self.log.warning("装机口 %s 上没有别的 DHCP, 自己给整个网段发地址, 限时 %d 分钟",
+                             self.iface, self.serve_s // 60)
+            self.event(f"装机口 {self.iface} 上没有别的 DHCP, 推车开始给整个网段发地址, "
+                       f"限时 {self.serve_s // 60} 分钟 (到 {_hhmm(self.until)} 自动停, 车机上可续期)")
+        if now < self.until:
+            self._set("serving", f"自己给整个网段发地址, 到 {_hhmm(self.until)} 自动停")
+            return
+        self._set("expired", f"自己发地址 {self.serve_s // 60} 分钟到时, 已停发 (只续已发出的租约)")
+        if not self._expired_told:
+            self._expired_told = True
+            self.log.warning("装机口 %s %s", self.iface, self.detail)
+            self.event(f"装机口 {self.iface} 自己发地址 {self.serve_s // 60} 分钟到时, 已停发: "
+                       f"新机器不给地址, 已发出的租约照常续; 车机上可续期")
+
+    def renew(self, by="车机"):
+        """续期: 从现在起再发 serve_s 秒. 有别人的 DHCP / 没插线时只记下新的到期时间, 状态不变."""
+        with self._lock:
+            if not self.serve_s or not self.iface:
+                return
+            self.until, self._expired_told = self.now() + self.serve_s, False
+            self.log.info("装机口 %s 自己发地址续期 %d 分钟 (%s)", self.iface, self.serve_s // 60, by)
+            self.event(f"装机口 {self.iface} 自己发地址续期 {self.serve_s // 60} 分钟, "
+                       f"到 {_hhmm(self.until)} 自动停 ({by})")
+            if self.state in ("serving", "expired"):
+                self._serve()
+            self._write()
+
+    def _poll_renew(self):
+        """车机的续期请求 (renew_path 里的 ts 比上次认过的新才算); 没有/坏了就当没有."""
+        try:
+            with open(self.renew_path) as f:
+                ts = float(json.load(f)["ts"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return
+        if ts > self._renew_seen:
+            self._renew_seen = ts
+            self.renew()
 
     def _run_probe(self):
         """-> 探测算不算数. 结果未知 (None, 或 netprof_core.ProbeResult.unknown: 探测那一刻读不到插线)
@@ -275,11 +344,12 @@ class PxeGuard:
             self.log.warning("装机口 %s %s", self.iface, detail)
             self.event(f"装机口 {self.iface} {detail}")
         elif state == "serving" and was == "proxy":
-            self.event(f"装机口 {self.iface} 上没探到别的 DHCP, 恢复自己发地址")
+            self.event(f"装机口 {self.iface} 上没探到别的 DHCP, 恢复自己发地址 ({self.detail})")
 
     def _write(self):
         o = self.other or {}
         doc = {"state": self.state, "detail": self.detail, "leases": self.state == "serving",
+               "until": self.until if self.serve_s else None, "window": self.serve_s,
                "server": o.get("server"), "offered": o.get("offered"),
                "iface": self.iface, "ip": self.ip, "prefix": self.prefix, "since": self.now(), "pid": os.getpid()}
         tmp = f"{self.state_path}.tmp"
@@ -290,6 +360,35 @@ class PxeGuard:
             os.replace(tmp, self.state_path)
         except OSError as e:
             self.log.warning("守卫状态写不了 %s: %s", self.state_path, e)
+
+
+def _hhmm(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def serve_notice(doc, now):
+    """守卫状态 (pxe-guard.json) -> 车机/副屏上醒目的那一句; 不在自己发地址/刚到时停发就 None.
+    -> {"level": "serving" | "expired", "left": 剩几秒 (不限时 None), "window": 限时秒, "text"}"""
+    if not isinstance(doc, dict) or doc.get("state") not in ("serving", "expired"):
+        return None
+    until, window = doc.get("until"), doc.get("window")
+    timed = isinstance(until, (int, float)) and not isinstance(until, bool)
+    if doc["state"] == "serving" and not timed:
+        return {"level": "serving", "left": None, "window": window, "text": "正在给整个网段发地址 (不限时)"}
+    left = max(0, int(until - now)) if timed else 0
+    if doc["state"] == "expired" or left <= 0:
+        return {"level": "expired", "left": 0, "window": window, "text": "自己发地址已到时, 已停发"}
+    return {"level": "serving", "left": left, "window": window,
+            "text": f"正在给整个网段发地址 剩 {left // 60:02d}:{left % 60:02d}"}
+
+
+def request_renew(path=RENEW_PATH, now=None):
+    """车机请求续期: 写 {"ts": now}, 守卫下一轮 tick (2 秒内) 认. 写不了抛 OSError 给车机显示."""
+    tmp = f"{path}.tmp"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(tmp, "w") as f:
+        json.dump({"ts": time.time() if now is None else now}, f)
+    os.replace(tmp, path)
 
 
 def foreign_server(msg, my_ip):
@@ -365,8 +464,12 @@ class DhcpServer:
         return self.guard is None or self.guard.may_reply()
 
     def _booting(self):
-        """能回引导信息 (守卫 serving / proxy, 或不设防)."""
+        """能回引导信息 (守卫 serving / expired / proxy, 或不设防)."""
         return self.guard is None or self.guard.may_proxy()
+
+    def _renewing(self):
+        """不发新地址时, 还给不给已发出的租约续期 (守卫 expired)."""
+        return self.guard is not None and self.guard.may_renew()
 
     def watch_reply(self, msg):
         """收到的 BOOTREPLY: 别人的 OFFER/ACK 就报给守卫."""
@@ -433,11 +536,26 @@ class DhcpServer:
                 and sid != socket.inet_aton(self.ip):
             # SELECTING 时才带 server-id: 客户端在这个网段上收到过别人的 OFFER
             self.guard.foreign(socket.inet_ntoa(sid), "客户端选了")
-        if not self._leasing():
-            return self._proxy_offer(msg, parsed) if self._booting() else None
         now = time.time() if now is None else now
+        if not self._leasing():
+            if self._renewing() and parsed[2].get(53, b"")[0:1] == b"\x03" and msg[12:16] != bytes(4):
+                with self._lock:
+                    return self._renew_only(msg, parsed, now)
+            return self._proxy_offer(msg, parsed) if self._booting() else None
         with self._lock:
             return self._handle(msg, addr, parsed, now)
+
+    def _renew_only(self, msg, parsed, now):
+        """限时到了 (守卫 expired): 只给 RENEWING/REBINDING (ciaddr 就是它现有的、还没过期的租约) 续期,
+        别的一概不回 (不 NAK: 不是我们的事就不吭声). 新机器、INIT-REBOOT 都拿不到地址."""
+        _, mac, opts = parsed
+        ciaddr = socket.inet_ntoa(msg[12:16])
+        lease = self.leases.get(mac)
+        if not lease or lease[0] != ciaddr or lease[1] <= now:
+            return None
+        lease[1] = now + self.LEASE_S
+        self.log.info("DHCP REQUEST %s -> ACK %s (限时已到, 只续已发出的租约)", mac.hex(":", 1), ciaddr)
+        return self._reply(msg, b"\x05", ciaddr, opts)
 
     def _handle(self, msg, addr, parsed, now):
         xid, mac, opts = parsed
@@ -922,6 +1040,14 @@ class TftpServer:
 
 # ---------------------------------------------------------------- main
 
+def _env_minutes(default=SERVE_S // 60):
+    """pxe.env 里的 PXE_SERVE_MINUTES (单元的 EnvironmentFile 带进来); 没写/写坏了用默认."""
+    try:
+        return int(os.environ.get("PXE_SERVE_MINUTES") or default)
+    except ValueError:
+        return default
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -935,6 +1061,9 @@ def parse_args(argv):
     p.add_argument("--log", default=None)
     p.add_argument("--iface", default=None, help="装机口网卡名 (Linux 必填, 否则收不到 DHCP 广播)")
     p.add_argument("--guard-state", default=GUARD_STATE, help="守卫状态文件 (JSON)")
+    p.add_argument("--serve-minutes", type=int, default=_env_minutes(),
+                   help="网络里没别的 DHCP 时自己发地址的限时 (分钟, 0 = 不限时); 默认取 PXE_SERVE_MINUTES 或 30")
+    p.add_argument("--renew-file", default=RENEW_PATH, help="车机写续期请求的文件")
     p.add_argument("--pxe-mode", default=PXE_MODE, help="装机模式状态文件 (kiosk 解锁时写)")
     return ap.parse_args(argv)
 
@@ -948,8 +1077,8 @@ def main(argv=None):
                  ([logging.FileHandler(args.log, encoding="utf-8")] if args.log else []),
     )
     log = logging.getLogger("pxe")
-    log.info("PXE 服务启动 ip=%s/%d pool=%s tftp-root=%s", args.ip, args.prefix, args.pool,
-             args.tftp_root)
+    log.info("PXE 服务启动 ip=%s/%d pool=%s tftp-root=%s 自己发地址限时 %s", args.ip, args.prefix, args.pool,
+             args.tftp_root, f"{args.serve_minutes} 分钟" if args.serve_minutes > 0 else "不限")
 
     try:
         dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log,
@@ -961,7 +1090,8 @@ def main(argv=None):
     if linux and not args.iface:
         log.warning("Linux 上没给 --iface: DHCP 只绑 %s, 收不到客户端的广播 DISCOVER", args.ip)
     guard = PxeGuard(args.ip, args.iface if linux else None, log, probe=default_probe(),
-                     state_path=args.guard_state, prefix=args.prefix)
+                     state_path=args.guard_state, prefix=args.prefix,
+                     serve_s=max(0, args.serve_minutes) * 60, renew_path=args.renew_file)
     dhcp.guard = guard
     guard.tick()                    # 先探测: 探明之前一个包都不发, 有别人的 DHCP 就只当代理
     tftp = TftpServer(args.ip, args.tftp_root, log, pxe_mode_path=args.pxe_mode)

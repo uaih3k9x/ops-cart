@@ -1287,3 +1287,232 @@ def test_tftp_clone_batch_members_each_get_their_menu(tmp_path):
     assert "ocs_live_run" in _fetch(root, mode, "/" + ARMED_CFG)
     assert "ocs_live_run" in _fetch(root, mode, "/grub.cfg-01-02-00-00-00-00-02")
     assert "ocs_live_run" not in _fetch(root, mode, "/grub.cfg-01-02-00-00-00-00-03")
+
+
+# ---- #11: 自己发地址限时 (网络里没别的 DHCP 时), 到点停发, 车机可续期
+
+class Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def timed_guard(tmp_path, box=None, events=None, serve_s=1800, clock=None):
+    box = box or Box()
+    clock = clock or Clock()
+    g = PxeGuard("192.0.2.1", "eno1", FakeLog(), prefix=24, probe=box.probe, carrier=lambda: box.link,
+                 addr=lambda: box.addr, state_path=str(tmp_path / "pxe-guard.json"),
+                 event=(events.append if events is not None else lambda m: None), now=clock,
+                 serve_s=serve_s, renew_path=str(tmp_path / "pxe-renew.json"))
+    return g, box, clock
+
+
+def test_serving_window_starts_and_is_in_state_file(tmp_path):
+    events = []
+    g, _, clock = timed_guard(tmp_path, events=events)
+    g.tick()
+    st = guard_state(tmp_path)
+    assert g.state == "serving" and st["until"] == 1000 + 1800 and st["window"] == 1800
+    assert any("整个网段" in e and "30 分钟" in e for e in events)
+
+
+def test_serving_expires_to_safe_state(tmp_path):
+    events = []
+    g, _, clock = timed_guard(tmp_path, events=events)
+    g.tick()
+    clock.t += 1799
+    g.tick()
+    assert g.may_reply()
+    clock.t += 1
+    assert not g.may_reply()                 # 到点就不发地址, 不等下一轮 tick
+    g.tick()
+    st = guard_state(tmp_path)
+    assert g.state == "expired" and st["state"] == "expired" and st["leases"] is False
+    assert g.may_proxy() and g.may_renew()
+    assert any("到时" in e for e in events)
+
+
+def test_expired_sticks_across_short_link_flap(tmp_path):
+    """iPXE 接管网卡时 LAN1 断几秒: 不算重新插线, 计时不重来, 到时了也不恢复."""
+    g, box, clock = timed_guard(tmp_path)
+    g.tick()
+    clock.t += 1700
+    box.link = False
+    g.tick()
+    clock.t += 5
+    box.link = True
+    g.tick()
+    assert g.state == "serving" and guard_state(tmp_path)["until"] == 2800
+    clock.t += 200
+    g.tick()
+    box.link = False
+    g.tick()
+    clock.t += 5
+    box.link = True
+    g.tick()
+    assert g.state == "expired"
+
+
+def test_long_unplug_starts_fresh_window(tmp_path):
+    """拔线超过 REPLUG_S 再插 = 人换了地方接, 新开一段限时 (车机照样醒目提示)."""
+    g, box, clock = timed_guard(tmp_path)
+    g.tick()
+    clock.t += 1900
+    g.tick()
+    assert g.state == "expired"
+    box.link = False
+    g.tick()
+    clock.t += _px.REPLUG_S
+    box.link = True
+    g.tick()
+    assert g.state == "serving" and guard_state(tmp_path)["until"] == clock.t + 1800
+
+
+def test_renew_by_request_file(tmp_path):
+    events = []
+    g, _, clock = timed_guard(tmp_path, events=events)
+    g.tick()
+    clock.t += 1900
+    g.tick()
+    assert g.state == "expired"
+    clock.t += 10
+    _px.request_renew(str(tmp_path / "pxe-renew.json"), now=clock.t)
+    g.tick()
+    assert g.state == "serving" and g.may_reply()
+    assert guard_state(tmp_path)["until"] == clock.t + 1800
+    assert any("续期" in e for e in events)
+    n = len(events)
+    clock.t += 60
+    g.tick()                                  # 同一个续期请求只认一次
+    assert guard_state(tmp_path)["until"] == clock.t - 60 + 1800 and len(events) == n
+
+
+def test_renew_while_serving_extends_window(tmp_path):
+    g, _, clock = timed_guard(tmp_path)
+    g.tick()
+    clock.t += 1000
+    _px.request_renew(str(tmp_path / "pxe-renew.json"), now=clock.t)
+    g.tick()
+    assert g.state == "serving" and guard_state(tmp_path)["until"] == clock.t + 1800
+
+
+def test_stale_renew_request_from_before_start_is_ignored(tmp_path):
+    _px.request_renew(str(tmp_path / "pxe-renew.json"), now=500)
+    g, _, clock = timed_guard(tmp_path)
+    g.tick()
+    clock.t += 1900
+    g.tick()
+    assert g.state == "expired"
+
+
+def test_renew_never_overrides_foreign_dhcp(tmp_path):
+    g, box, clock = timed_guard(tmp_path, box=Box(found=[{"server": "198.51.100.1", "yiaddr": "198.51.100.5"}]))
+    g.tick()
+    _px.request_renew(str(tmp_path / "pxe-renew.json"), now=clock.t + 1)
+    clock.t += 1
+    g.tick()
+    assert g.state == "proxy" and not g.may_reply()
+
+
+def test_bad_renew_file_is_ignored(tmp_path):
+    g, _, clock = timed_guard(tmp_path)
+    (tmp_path / "pxe-renew.json").write_text("{坏")
+    g.tick()
+    assert g.state == "serving"
+
+
+def test_serve_s_zero_means_no_limit(tmp_path):
+    g, _, clock = timed_guard(tmp_path, serve_s=0)
+    g.tick()
+    clock.t += 10 ** 6
+    g.tick()
+    assert g.state == "serving" and guard_state(tmp_path)["until"] is None
+
+
+def test_no_iface_guard_has_no_limit(tmp_path):
+    clock = Clock()
+    g = PxeGuard("192.0.2.1", None, FakeLog(), state_path=str(tmp_path / "pxe-guard.json"), now=clock)
+    g.tick()
+    clock.t += 10 ** 6
+    g.tick()
+    assert g.may_reply()
+
+
+def _expired_dhcp(tmp_path):
+    g, _, clock = timed_guard(tmp_path)
+    g.tick()
+    d = dhcp_for_test()
+    d.guard = g
+    return d, g, clock
+
+
+def test_expired_renews_existing_lease_but_offers_nothing_new(tmp_path):
+    """到时后: 已经拿到地址的机器 (多半装到一半) 照常续租; 新机器一个地址都拿不到."""
+    d, g, clock = _expired_dhcp(tmp_path)
+    d.handle(make_discover(mac=M1), None, now=clock.t)
+    assert d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=clock.t)[242] == 5
+    clock.t += 1900
+    g.tick()
+    assert g.state == "expired"
+    renew = d.handle(_msg(M1, b"\x03", ciaddr="192.0.2.10"), None, now=clock.t)    # RENEWING
+    assert parse_dhcp(renew)[2][53] == b"\x05" and _yiaddr(renew) == "192.0.2.10"
+    assert d.leases[M1][1] == clock.t + DhcpServer.LEASE_S
+    assert d.handle(make_discover(mac=M2), None, now=clock.t) is None              # 新机器: 不 OFFER
+    assert _yiaddr(d.handle(make_pxe_discover(mac=M2), None, now=clock.t)) == "0.0.0.0"   # 只回引导
+    assert d.handle(_msg(M2, b"\x03", "192.0.2.11", "192.0.2.1"), None, now=clock.t) is None
+    assert d.handle(_msg(M1, b"\x03", "192.0.2.10"), None, now=clock.t) is None    # INIT-REBOOT 也不给
+    assert d.handle(_msg(M2, b"\x03", ciaddr="192.0.2.11"), None, now=clock.t) is None   # 没租给它
+    assert M2 not in d.leases
+
+
+def test_expired_does_not_revive_lapsed_lease(tmp_path):
+    d, g, clock = _expired_dhcp(tmp_path)
+    d.handle(make_discover(mac=M1), None, now=clock.t)
+    d.handle(_msg(M1, b"\x03", "192.0.2.10", "192.0.2.1"), None, now=clock.t)
+    clock.t += DhcpServer.LEASE_S + 1
+    g.tick()
+    assert d.handle(_msg(M1, b"\x03", ciaddr="192.0.2.10"), None, now=clock.t) is None
+
+
+def test_proxy_state_does_not_renew(tmp_path):
+    d, g = proxy_dhcp(tmp_path)
+    d.leases[M1] = ["192.0.2.10", 10 ** 12]
+    assert not g.may_renew()
+    assert d.handle(_msg(M1, b"\x03", ciaddr="192.0.2.10"), None) is None
+
+
+# 车机 / 副屏要显示的那一句 (两边共用)
+
+def test_serve_notice_serving_countdown():
+    n = _px.serve_notice({"state": "serving", "until": 1000 + 754, "window": 1800, "pid": 1}, 1000)
+    assert n == {"level": "serving", "left": 754, "window": 1800,
+                 "text": "正在给整个网段发地址 剩 12:34"}
+
+
+def test_serve_notice_serving_unlimited_and_expired():
+    assert _px.serve_notice({"state": "serving", "until": None}, 0)["text"] == "正在给整个网段发地址 (不限时)"
+    n = _px.serve_notice({"state": "serving", "until": 900, "window": 1800}, 1000)
+    assert n["level"] == "expired" and n["left"] == 0         # 守卫还没来得及改状态: 按到时显示
+    n = _px.serve_notice({"state": "expired", "until": 900, "window": 1800}, 1000)
+    assert n["level"] == "expired" and "到时" in n["text"] and "停发" in n["text"]
+
+
+@pytest.mark.parametrize("doc", [None, {}, {"state": "proxy"}, {"state": "no-link"}, "x"])
+def test_serve_notice_nothing_to_say(doc):
+    assert _px.serve_notice(doc, 0) is None
+
+
+def test_serve_notice_serving_with_bad_until_still_warns():
+    assert _px.serve_notice({"state": "serving", "until": "bad"}, 0)["level"] == "serving"
+
+
+def test_parse_args_serve_minutes(monkeypatch):
+    monkeypatch.delenv("PXE_SERVE_MINUTES", raising=False)
+    base = ["serve", "--ip", "192.0.2.1", "--pool", "192.0.2.10,192.0.2.20", "--tftp-root", "/x"]
+    assert _px.parse_args(base).serve_minutes == 30
+    assert _px.parse_args(base + ["--serve-minutes", "0"]).serve_minutes == 0
+    monkeypatch.setenv("PXE_SERVE_MINUTES", "45")             # pxe.env 里配, 单元不用改
+    assert _px.parse_args(base).serve_minutes == 45
+    assert _px.parse_args(base).renew_file == _px.RENEW_PATH
