@@ -338,3 +338,38 @@ def test_layout_peers_hidden_when_locked_or_missing():
 
 def test_peers_for_kiosk_board():
     assert dc.peers(None) == [] and dc.peers({"lldp": _lldp(LAN1="none")})[0]["name"] == "LAN1"
+
+
+# ---- #11: 推车自己给整个网段发地址时副屏也醒目显示 (读 pxe-guard.json, 不再自己采)
+
+def test_collect_includes_pxe_guard_and_survives_failure():
+    g = {"state": "serving", "until": 1754.0, "window": 1800}
+    assert dc.collect(_ctx(pxe=lambda: g))["pxe"] == g
+
+    def boom():
+        raise OSError("gone")
+    assert dc.collect(_ctx(pxe=boom))["pxe"] == {}
+    assert "pxe" in dc.PERIODS and dc.PERIODS["pxe"] <= 1
+
+
+def test_layout_serve_banner_counts_down_on_wall_clock():
+    snap = {"ts": 1000.0, "pxe": {"state": "serving", "until": 1754.0, "window": 1800}}
+    for locked in (False, True):                  # 锁屏当引导牌时也要看得见
+        v = dc.layout_view(snap, locked=locked, now=1000.0)
+        assert v["serve"] == {"text": "正在给整个网段发地址 剩 12:34", "level": "bad"}
+    assert dc.layout_view(snap, now=1100.0)["serve"]["text"].endswith("10:54")
+
+
+def test_layout_serve_banner_expired_and_hidden():
+    v = dc.layout_view({"ts": 0, "pxe": {"state": "expired", "until": 1, "window": 1800}}, now=10)
+    assert v["serve"]["level"] == "warn" and "到时" in v["serve"]["text"] and "续期" in v["serve"]["text"]
+    for pxe in ({}, {"state": "proxy"}, None):
+        assert dc.layout_view({"ts": 0, "pxe": pxe}, now=10)["serve"] is None
+    assert dc.layout_view({"ts": 0}, now=10)["serve"] is None      # 老快照没这项
+
+
+def test_default_ctx_reads_live_guard(monkeypatch):
+    import kiosk_core as kc
+    _stub_kc(monkeypatch)
+    monkeypatch.setattr(kc, "pxe_guard_live", lambda *a, **k: {"state": "expired"})
+    assert dc.default_ctx()["pxe"]() == {"state": "expired"}

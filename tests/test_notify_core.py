@@ -555,3 +555,18 @@ def test_make_sender_ntfy_unchanged():
 def test_feishu_example_conf_is_valid_and_placeholder():
     conf = nc.load_conf(str(EXAMPLE.parent / "notify.feishu.example.json"))
     assert conf["kind"] == "feishu-webhook" and conf["url"].endswith("/00000000-0000-0000-0000-000000000000")
+
+
+# ---------------------------------------------------------------- #11 自己发地址限时
+
+def test_guard_expired_is_pushed_with_renew_hint():
+    """自己发地址到时停发: 手机上要知道新机器拿不到地址了, 去车机续期; 续期回来再推一条."""
+    _, _, st = run(None, snap(), T0)
+    assert snap(guard="expired")["values"]["guard"] == "expired"
+    _, _, st = run(st, snap(guard="expired"), T0 + 30)
+    keys, ev, st = run(st, snap(guard="expired"), T0 + 30 + nc.RULES["guard"][0])
+    assert keys == ["guard"] and "到时" in ev[0]["text"] and "续期" in ev[0]["text"]
+    later = T0 + 30 + nc.RULES["guard"][1] + 60
+    _, _, st = run(st, snap(guard="serving"), later)
+    keys, ev, _ = run(st, snap(guard="serving"), later + nc.RULES["guard"][0])
+    assert keys == ["guard"] and "整个网段" in ev[0]["text"]

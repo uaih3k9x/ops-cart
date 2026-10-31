@@ -16,6 +16,7 @@ import time
 import atomicfile
 import lamps_core
 import lldp_core
+import pxeserver
 import ups_core
 
 STATE_PATH = "/run/ops-cart/state.json"
@@ -28,7 +29,7 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 自检要 ping/systemctl/v4l2-ctl, 每 200 ms 跑一遍既浪费又会在断网时拖过 STALE_S.
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
-           "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2}
+           "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2, "pxe": 1}
 UPS_LOW = 20            # 走电池且电量不高于这个: 副屏变红
 # LLDP 监听哪些口 (#14): 跟下排 LAN1 / LAN2 灯同一份配置, 网口名不另写
 LLDP_IFACES = [(name, key[4:]) for name, _label, key in lamps_core.LOWER
@@ -66,6 +67,7 @@ def collect(ctx):
         "todo": _pull(ctx, "todo", []),
         "dream": _pull(ctx, "dream", ""),
         "lldp": _pull(ctx, "lldp", {}),             # {"LAN1": {state, age, neighbor, error}} 见 lldp_core
+        "pxe": _pull(ctx, "pxe", {}),               # pxe-guard.json (守卫在跑才有), 自己发地址限时 #11
     }
     return snap
 
@@ -206,6 +208,16 @@ def peers(snap):
     return out
 
 
+def _serve(guard, now):
+    """推车自己给整个网段发地址 (#11): 头部一整条, 倒计时按墙上时间走; 别的状态 None."""
+    n = pxeserver.serve_notice(guard, now)
+    if n is None:
+        return None
+    if n["level"] == "expired":
+        return {"text": n["text"] + " · 车机上续期", "level": "warn"}
+    return {"text": n["text"], "level": "bad"}
+
+
 def layout_view(snap, locked=False, active=(), now=None):
     """快照 + 锁屏状态 + 正在动的计数器 → 版面模型. 渲染层只认这个结构.
 
@@ -237,6 +249,7 @@ def layout_view(snap, locked=False, active=(), now=None):
         "dream": "" if locked else (snap.get("dream") or ""),
         "notice": (snap.get("notice") or "") if locked else "",
         "peers": [] if locked else peers(snap),      # 锁屏是教室引导牌, 不露交换机名
+        "serve": _serve(snap.get("pxe"), now),       # 锁屏也显示: 发地址影响整个网段
         "stale": stale(snap, now),
     }
     return view
@@ -303,6 +316,7 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "dream": lambda: kc.dream_line(),
         "ups": lambda: _ups_sample(),
         "lldp": lldp or (lambda: {}),
+        "pxe": lambda: kc.pxe_guard_live(),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)

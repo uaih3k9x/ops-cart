@@ -2,6 +2,7 @@
 
 - UiBridge: 后台线程只往队列放回调, 主线程 after(50) 轮询执行 (Tk 不是线程安全的)
 - pxe_tick_decide: 装机模式定时器每轮该做什么
+- serve_bar_view: 自己给整个网段发地址时顶上那条醒目倒计时 (#11)
 - boot_rows_safe / Once: 开机自检兜底与幂等
 - LeftPane / PANES / MENU: 左侧面板状态机和右侧菜单
 - rel_split / rel_motion / abs_should_send / ChWorker: 键鼠透传
@@ -17,6 +18,7 @@ import threading
 import time
 
 import kiosk_core as kc
+import pxeserver
 
 
 # ---------------------------------------------------------------- 垃圾回收只在主线程
@@ -176,6 +178,31 @@ def pxe_button_texts(view):
     mmss = f"{left // 60:02d}:{left % 60:02d}"
     who = f"{view['count']} 台" if view.get("count", 1) > 1 else view["mac"][-8:]
     return f"警告: 装机已解锁 {who}  {mmss}", f"警告: 装机已解锁  {mmss}"
+
+
+# ---------------------------------------------------------------- 自己发地址限时 (#11): 顶上醒目条
+
+SERVE_BAR_BG = {"serving": "#b3261e", "expired": "#8a5a00"}     # 正在发: 红; 到时停发: 琥珀
+
+
+def serve_bar_view(guard, now):
+    """守卫状态 (kc.pxe_guard_live) -> 顶上那条 {text, short, bg, fg, renew}; 不在自己发地址/到时停发就 None.
+    short 不带"点此续期" (锁屏用, 锁着不能续); renew = 点这条能续期 (不限时就没有)."""
+    n = pxeserver.serve_notice(guard, now)
+    if n is None:
+        return None
+    window = n.get("window") or 0
+    renew = isinstance(window, int) and window > 0
+    text = n["text"]
+    if renew:
+        text += " · 点此续期" if n["level"] == "serving" else f" · 点此续期 {window // 60} 分钟"
+    return {"text": text, "short": n["text"], "bg": SERVE_BAR_BG[n["level"]], "fg": "#ffffff",
+            "renew": renew}
+
+
+def serve_renew_question(window):
+    return (f"续期后推车从现在起再给 LAN1 整个网段发地址 {window // 60} 分钟。\n"
+            "LAN1 接的是交换机时, 同网段的机器都可能拿到推车的地址。确定续期?")
 
 
 # ---------------------------------------------------------------- 开机自检兜底

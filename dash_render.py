@@ -132,7 +132,13 @@ def render(view, size=(PANEL_W, PANEL_H)):
                fill={"ok": DIM, "warn": WARN, "bad": BAD}.get(ups.get("level"), DIM))
     info = " · ".join(x for x in ("LAN2 " + view["lan2"] if view.get("lan2") else "",
                                   "开机 " + view["uptime"] if view.get("uptime") else "") if x)
-    d.text((M, 210), info, font=_font(30), fill=DIM)
+    serve = view.get("serve")
+    if serve:       # 推车自己给整个网段发地址 (#11): 盖住 LAN2/开机那行, 整条红 (到时停发琥珀)
+        d.rectangle([0, 202, W, 258], fill=BAD if serve.get("level") == "bad" else WARN)
+        line = wrap(serve.get("text") or "", _font(32), W - 2 * M, 1)
+        d.text((W // 2, 230), line[0] if line else "", font=_font(32), fill=lc.LIT_FG, anchor="mm")
+    else:
+        d.text((M, 210), info, font=_font(30), fill=DIM)
     d.line([M, 262, W - M, 262], fill=LINE, width=2)
 
     # ---- 执行器: 上排操作头, 下排键鼠/PXE/网口, 再下面两行 LAN1 / LAN2 的 LLDP 对端

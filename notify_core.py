@@ -3,7 +3,7 @@
 
 状态源 (只读, 不和 cart-dash 抢采集):
   /run/ops-cart/state.json             cart-dash 的快照, 取 UPS (OB/OL、电量、低电量阈值)
-  /run/ops-cart/pxe-guard.json         装机口守卫 serving / proxy / 停 (no-link、no-ip)
+  /run/ops-cart/pxe-guard.json         装机口守卫 serving / expired (限时到停发) / proxy / 停 (no-link、no-ip)
   /run/ops-cart/campus-auth-status.json 校园网认证结果 (ok 字段, 见 ruijie_portal.OK_STATES)
   systemctl is-active                  pxe-server / kiosk / cart-dash
   boot_id + cart-boot-success          上一次启动有没有走到 boot-success (开机 60 s kiosk 还活着)
@@ -39,11 +39,11 @@ RULES = {
 # 第一次见到时当作"上次是这样"的正常值; 没列出的 (守卫) 第一次见到就是基线, 不推
 NORMAL = {"ups.power": "OL", "ups.low": False, "auth": "ok", "svc": "up"}
 
-_GUARD = {"serving": "serving", "proxy": "proxy", "no-link": "stop", "no-ip": "stop"}
+_GUARD = {"serving": "serving", "expired": "expired", "proxy": "proxy", "no-link": "stop", "no-ip": "stop"}
 _GUARD_WHY = {"no-link": "没插线", "no-ip": "网口上没有装机地址"}
 _LABEL = {
     "ups.power": {"OB": "电池供电", "OL": "市电"},
-    "guard": {"serving": "自己发地址", "proxy": "代理模式", "stop": "停发"},
+    "guard": {"serving": "自己发地址", "expired": "限时到停发", "proxy": "代理模式", "stop": "停发"},
     "auth": {"ok": "在线", "fail": "认证失败"},
     "svc": {"up": "运行", "down": "停了"},
 }
@@ -134,7 +134,9 @@ def _text(key, old, new, info):
         if new == "proxy":
             return "装机口转代理模式：线上有别的 DHCP，推车不发地址"
         if new == "serving":
-            return "装机口恢复自己发地址"
+            return "装机口恢复自己发地址（给整个网段发，限时，车机上有倒计时）"
+        if new == "expired":
+            return "装机口自己发地址到时，已停发：新机器拿不到地址，要继续去车机上点续期"
         return f"装机口停发：{_GUARD_WHY.get(info.get('guard_state'), '守卫没在服务')}"
     if key == "auth":
         st = info.get("auth_state", "")

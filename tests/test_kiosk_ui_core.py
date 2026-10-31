@@ -617,3 +617,38 @@ def test_kiosk_arm_dialog_offers_clone_and_confirms_the_list():
         assert f'"{purpose}"' in src, purpose
     assert "kc.clone_plan(" in src and "cc.plan_lines(" in src
     assert "kc.pxe_retire(" in src and 'd.get("retire")' in src
+
+
+# ------------------------------------------------------------ #11 自己发地址限时: 顶上醒目条
+
+def test_serve_bar_counts_down_and_offers_renew():
+    v = ui.serve_bar_view({"state": "serving", "until": 1000 + 754, "window": 1800}, 1000)
+    assert v["text"].startswith("正在给整个网段发地址 剩 12:34") and "续期" in v["text"]
+    assert v["renew"] is True and v["bg"] == ui.SERVE_BAR_BG["serving"]
+    assert v["short"] == "正在给整个网段发地址 剩 12:34"         # 锁屏: 锁着不能续, 不提续期
+
+
+def test_serve_bar_expired_says_stopped_and_renew_minutes():
+    v = ui.serve_bar_view({"state": "expired", "until": 900, "window": 1800}, 1000)
+    assert "到时" in v["text"] and "续期 30 分钟" in v["text"]
+    assert v["renew"] is True and v["bg"] == ui.SERVE_BAR_BG["expired"]
+
+
+def test_serve_bar_unlimited_has_no_renew():
+    v = ui.serve_bar_view({"state": "serving", "until": None, "window": 0}, 0)
+    assert v["renew"] is False and "续期" not in v["text"] and v["bg"] == ui.SERVE_BAR_BG["serving"]
+
+
+@pytest.mark.parametrize("doc", [{}, {"state": "proxy"}, {"state": "no-link"}, None])
+def test_serve_bar_hidden_otherwise(doc):
+    assert ui.serve_bar_view(doc, 0) is None
+
+
+def test_serve_bar_texts_have_no_symbols():
+    for doc in ({"state": "serving", "until": 99, "window": 1800}, {"state": "expired", "window": 1800}):
+        assert not any(ui.is_symbol_char(c) for c in ui.serve_bar_view(doc, 0)["text"])
+
+
+def test_serve_renew_question_names_minutes_and_whole_segment():
+    q = ui.serve_renew_question(1800)
+    assert "30 分钟" in q and "整个网段" in q

@@ -107,6 +107,7 @@ class Kiosk(tk.Tk):
         self.bind_all("<KeyRelease>", lambda e: self.passthrough and self._on_key(e, False), add="+")
         self.after(5000, self._idle_tick)
         self.after(2000, self._pxe_tick)
+        self.after(1000, self._serve_tick)
         self.after(100, self.refresh)
         self.ui.repeat_bg(self._lamp_sample, self._lamp_sampled, every=lc.SAMPLE_MS / 1000)
         self.ui.repeat_bg(self._ups_sample, self._ups_sampled, every=1.0)
@@ -140,6 +141,11 @@ class Kiosk(tk.Tk):
         self.net_label.bind("<Button-1>", lambda _e: self.toggle_pane("wifi"))
         self.clock = tk.Label(top, font=FONT, bg="#10141c", fg="#8b93a7")
         self.clock.pack(side="right")
+        # 自己给整个网段发地址时 (#11) 顶栏下面一整条红: 倒计时, 点它续期; 平时不占地方
+        self._top = top
+        self._serve_view, self._lock_serve = None, None
+        self.serve_bar = tk.Label(self, text="", font=FONT_BIG, cursor="hand2", pady=6)
+        self.serve_bar.bind("<Button-1>", lambda _e: self.renew_serve())
         tk.Label(top, text=kc.version_string(), font=FONT, bg="#10141c",
                  fg="#5d6873").pack(side="right", padx=16)
         tk.Button(top, text="退出到终端", font=FONT, command=self.quit_kiosk,
@@ -969,6 +975,9 @@ class Kiosk(tk.Tk):
         self._lock_clock.place(relx=0.5, rely=0.13, anchor="center")
         self._lock_date = tk.Label(w, font=FONT_BIG, bg="#10141c", fg="#8b93a7")
         self._lock_date.place(relx=0.5, rely=0.23, anchor="center")
+        # 自己给整个网段发地址时 (#11) 锁屏上也要看得见; 续期得先解锁, 这里只显示. 平时空着看不见
+        self._lock_serve = tk.Label(w, text="", font=FONT_BIG, bg="#10141c", fg="#ffffff", padx=16)
+        self._lock_serve.place(relx=0.5, rely=0.31, anchor="center")
         self._lock_notice = tk.Label(w, font=("Noto Sans CJK SC", 28, "bold"), bg="#10141c", fg="#ffb86c",
                                      justify="center", wraplength=int(self.winfo_screenwidth() * 0.92))
         self._lock_notice.place(relx=0.5, rely=0.48, anchor="center")
@@ -1032,7 +1041,7 @@ class Kiosk(tk.Tk):
         r = self.gate.attempt(pin)
         if r == "ok":
             self._lock_win.destroy()
-            self._lock_win, self._lock_net, self._lock_ups = None, None, None
+            self._lock_win, self._lock_net, self._lock_ups, self._lock_serve = None, None, None, None
             self._last_input = time.time()
         elif r == "locked":
             left = max(1, int(self.gate.locked_until - time.time()))
@@ -1219,6 +1228,39 @@ class Kiosk(tk.Tk):
         finally:
             if reschedule:
                 self.after(2000, self._pxe_tick)
+
+    def _serve_tick(self):
+        """每秒看守卫状态: 自己发地址时顶上红条倒计时 (锁屏上也有一行), 到时停发变琥珀. 出错也排下一轮."""
+        try:
+            v = kui.serve_bar_view(kc.pxe_guard_live(), time.time())
+            self._serve_view = v
+            if v is None:
+                self.serve_bar.pack_forget()
+            else:
+                self.serve_bar.config(text=v["text"], bg=v["bg"], fg=v["fg"],
+                                      cursor="hand2" if v["renew"] else "")
+                if not self.serve_bar.winfo_ismapped():
+                    self.serve_bar.pack(fill="x", padx=12, pady=(0, 4), after=self._top)
+            if self._lock_win is not None and self._lock_serve is not None:
+                self._lock_serve.config(text=v["short"] if v else "", bg=v["bg"] if v else "#10141c")
+        except Exception as ex:                         # noqa: BLE001
+            print(f"_serve_tick: {ex!r}", file=sys.stderr)
+        finally:
+            self.after(1000, self._serve_tick)
+
+    def renew_serve(self):
+        """点红条续期: 问一句 (要说清是整个网段), 写续期请求, 守卫 2 秒内认."""
+        v = self._serve_view
+        if not v or not v["renew"]:
+            return
+        window = (kc.pxe_guard_live().get("window") or 0)
+        if not window or not messagebox.askyesno("续期自己发地址", kui.serve_renew_question(window)):
+            return
+        try:
+            kc.pxe_serve_renew()
+            self.banner.config(text=f"已请求续期 {window // 60} 分钟")
+        except OSError as ex:
+            messagebox.showerror("续期", f"续期请求写不了: {ex}")
 
     def _disarm_quietly(self):
         """装机模式上锁; 失败只记 stderr (开机/退出路径上不能因为它卡住). -> 是否成功."""
