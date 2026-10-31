@@ -7,5 +7,5 @@
   "restore_share": "clone-ro",
   "restore_user": "",
   "restore_password": "",
-  "local_dir": "/srv/data/clone"
+  "local_dir": "/srv/data/org/clone"
 }

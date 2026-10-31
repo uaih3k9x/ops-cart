@@ -1,0 +1,9 @@
+#!/bin/bash
+# /etc/NetworkManager/dispatcher.d/50-ops-cart-smb (#11)
+# smb.conf 是 bind interfaces only: LAN1 开机时没插线就没地址, smbd 没绑上. LAN1 一有地址就重启 smbd 绑上.
+# 只在 smbd 已经在跑时重启 (try-restart); 没装 Samba / 没挂数据盘时什么都不做.
+[ "$1" = "eno1" ] || exit 0
+case "$2" in
+    up|dhcp4-change) systemctl try-restart smb.service ;;
+esac
+exit 0

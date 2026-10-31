@@ -38,8 +38,8 @@ unzip -j clonezilla-live-*-amd64.zip live/vmlinuz live/initrd.img live/filesyste
 
 ## 镜像仓库
 
-镜像放推车数据盘（#11 的 `/srv/data`），比如 `/srv/data/clone/<镜像名>/`。**抓镜像只写推车，恢复只读挂**：
-导出两个共享，指向同一个目录。
+镜像放推车数据盘（#11 的 `/srv/data`，见 [DATA_DISK.md](DATA_DISK.md)）的 `/srv/data/org/clone/<镜像名>/`。
+`org/` 是"单位的数据"，交接/离开时整块拷走或清掉。**抓镜像只写推车，恢复只读挂**：导出两个共享，指向同一个目录。
 
 `/opt/pxe/clone.json`（不进仓库，样例 `examples/clone.example.json`）：
 
@@ -54,20 +54,11 @@ unzip -j clonezilla-live-*-amd64.zip live/vmlinuz live/initrd.img live/filesyste
 | `smb_version` | `smb3` 之类，不写用 `smb` |
 | `local_dir` | 推车上镜像目录的绝对路径，用来核对：抓镜像时镜像已存在就拒绝（不覆盖），恢复时不存在那台不放行 |
 
-Samba 例（推车上，按现场改）：
+Samba 不用手写：`scripts/setup-samba.sh` 照这份 `clone.json` 生成 `save_share` / `restore_share` 两个共享
+（路径 `local_dir`），建 `user` / `restore_user` 两个账号，密码就用这里写的，跟 Clonezilla 拿到的是同一份。
+没写 `restore_user` 时只读共享收访客（只有这一个共享收，装机共享照旧要账号）；写了就按账号。见 [DATA_DISK.md](DATA_DISK.md)。
 
-```
-[clone-rw]
-   path = /srv/data/clone
-   read only = no
-   valid users = clonesave
-[clone-ro]
-   path = /srv/data/clone
-   read only = yes
-   guest ok = yes
-```
-
-NFS 例：`/srv/data/clone <装机网段>(rw,no_root_squash)` 给抓镜像，另一个路径（bind mount）导出成 `ro` 给恢复。
+NFS 例：`/srv/data/org/clone <装机网段>(rw,no_root_squash)` 给抓镜像，另一个路径（bind mount）导出成 `ro` 给恢复。
 
 **账号密码会写进 GRUB 菜单（内核命令行）**：菜单只发给解锁的 MAC、上锁就删，但 LAN1 上能冒充那个 MAC 的
 机器拿得到。可写账号只给这一个共享的权限，别和别处共用。用户名密码只许字母数字和 `. _ -`（要进 URL 和命令行）。
@@ -137,7 +128,7 @@ lsblk -dbJ -o NAME,MODEL,SERIAL,SIZE,TYPE,TRAN,RM
 
 ## 实机验证（另记结果）
 
-1. **单播恢复一台**：先抓一台的镜像（抓镜像用途），确认 `/srv/data/clone/<镜像>/` 生成且被测机关机；
+1. **单播恢复一台**：先抓一台的镜像（抓镜像用途），确认 `/srv/data/org/clone/<镜像>/` 生成且被测机关机；
    再用另一台同型号机恢复。看：菜单里的 `SERIALNO=` 对、Clonezilla 认得 `SERIALNO=`（不认的老版本会报找不到盘并停）、
    只读共享真挂成只读、做完关机、上锁后再 PXE 只有救援菜单。故意把规则写成匹配两块盘，确认对话框不放行那台。
 2. **组播两台**（组播做完后）：两台同时 PXE，看等齐才开始、超时行为、限速。

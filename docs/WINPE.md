@@ -41,6 +41,19 @@
   整棵 tftp 树里这类菜单都会删掉。`boot.ipxe` 和 `win/` 不拦也不删：菜单一被取走就上锁，GRUB 那时还停在菜单上，
   再选 WinPE 还得取得到；PE 本身不动硬盘。
 
+## PE 里装系统（数据盘上的装机库）
+
+Windows ISO、驱动总裁、工具在推车数据盘上，经 Samba 给 PE 用，不再要 U 盘。怎么装数据盘、放 ISO、开共享见
+[DATA_DISK.md](DATA_DISK.md)。PE 里：
+
+```
+net use W: \\<推车装机地址>\win /user:winpe <密码>
+W:\win10\setup.exe                      (win11 同样: W:\win11\setup.exe)
+net use D: \\<推车装机地址>\drivers /user:winpe <密码>
+```
+
+共享一律账号登录：Win11 内核的 PE 默认拒绝来宾访问。PE 本身（`win/` 下那几个文件）仍在 `/opt/pxe/tftp/win/`，经 HTTP 发。
+
 ## 坑
 
 - **被测机必须关 Secure Boot**：iPXE、wimboot 都没签名，开着会在 chainloader 那一步被拒。
