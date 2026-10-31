@@ -9,6 +9,7 @@ import pytest
 
 import mcp_core as mc
 import mcp_serial as ms
+import serial_gate_model as gm
 import serial_write_core as sw
 
 T0 = 1_700_000_000.0
@@ -43,8 +44,25 @@ class Rig:
         self.reply = ("sent", "display version\nHuawei VRP\n<SW1>", None)
         self.rules = sw.load_rules(None)
         self.who = "stdio:ops@198.51.100.7"
+        self.model_out = None               # 第 2 层假模型回什么 (None = 没输出); model_exc 有就抛
+        self.model_exc = None
+        self.model_calls = []
+        self.tails = []
+
+    def model(self, on=True, verdict="allow", reason="进系统视图, 不改配置"):
+        self.rules = dict(self.rules, model=dict(self.rules["model"], enabled=on))
+        self.model_out = json.dumps({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01,
+                                     "result": json.dumps({"verdict": verdict, "reason": reason},
+                                                          ensure_ascii=False)})
+
+    def llm(self, instructions, data, conf):
+        self.model_calls.append((instructions, data, conf))
+        if self.model_exc:
+            raise self.model_exc
+        return self.model_out
 
     def tail(self, dev, n):
+        self.tails.append(n)
         if dev not in self.tail_text:
             raise mc.ToolError("conbroker tail 失败")
         return self.tail_text[dev]
@@ -55,7 +73,7 @@ class Rig:
 
     def tools(self):
         ts = ms.build_tools(self.store, slots=lambda: self.slots, tail=self.tail, send=self.send,
-                            rules=lambda: self.rules, who=lambda: self.who)
+                            rules=lambda: self.rules, who=lambda: self.who, llm=self.llm)
         return ms.Server(ts, version="t")
 
     def call(self, name, args=None, who=None):
@@ -105,6 +123,9 @@ def test_tool_names_and_hints(rig):
     assert "resume" not in json.dumps(list(specs))                   # 解除急停不给 agent
     assert set(specs["send_key"]["inputSchema"]["properties"]["key"]["enum"]) == {"enter", "space", "ctrl_c"}
     assert "slot" not in specs["estop"]["inputSchema"].get("required", [])
+    intent = specs["send_command"]["inputSchema"]["properties"]["intent"]
+    assert intent["type"] == "string" and intent["maxLength"] == ms.INTENT_MAX
+    assert "intent" not in specs["send_command"]["inputSchema"].get("required", [])
 
 
 # ------------------------------------------------------------ 租约
@@ -197,6 +218,84 @@ def test_conbroker_refusal_is_reported(rig):
     out = rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})
     assert out["status"] == "refused"
     assert rig.ok("pending_list")["history"][-1]["status"] == "refused"
+
+
+# ------------------------------------------------------------ 第 2 层决策模型 (#22)
+
+def test_model_off_is_unchanged(rig):
+    tok = rig.lease(1)
+    out = rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok, "intent": "看配置"})
+    assert out["status"] == "pending" and "没开" in out["reason"]
+    assert rig.model_calls == [] and rig.sent == []
+
+
+def test_model_allow_sends_directly_and_logs_reason(rig):
+    rig.model(verdict="allow", reason="进系统视图, 不改配置")
+    tok = rig.lease(1)
+    out = rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok,
+                                  "intent": "进系统视图看 VLAN 配置"})
+    assert out["status"] == "sent" and out["gate"]["layer"] == 2 and out["gate"]["verdict"] == "pass"
+    assert rig.sent == [("/dev/con-1", "system-view", False)]
+    ins, data, conf = rig.model_calls[0]
+    assert "进系统视图看 VLAN 配置" in data and "<SW1>" in data and conf["enabled"] is True
+    assert ms.CONTEXT_LINES in rig.tails
+    rec = [r for r in rig.log(1) if r["ev"] == "send"][-1]
+    assert rec["gate"]["model"]["reason"] == "进系统视图, 不改配置" and rec["gate"]["layer"] == 2
+    assert rec["gate"]["intent"] == "进系统视图看 VLAN 配置"
+
+
+def test_model_block_is_held_with_full_reason(rig):
+    rig.model(verdict="block", reason="undo ip address 会删掉管理口地址, 连接会断")
+    tok = rig.lease(1)
+    out = rig.ok("send_command", {"slot": 1, "command": "undo ip address", "lease": tok, "intent": "清地址"})
+    assert out["status"] == "pending" and "会删掉管理口地址" in out["reason"]
+    assert rig.sent == []
+    rec = rig.log(1)[-1]
+    assert rec["ev"] == "pending" and rec["gate"]["model"]["reason"] == "undo ip address 会删掉管理口地址, 连接会断"
+    assert rig.ok("pending_list")["pending"][0]["gate"]["intent"] == "清地址"
+
+
+@pytest.mark.parametrize("exc, out", [
+    (gm.subprocess.TimeoutExpired(["claude"], 30), None),
+    (RuntimeError("claude rc=1: 余额不足"), None),
+    (None, ""), (None, "不是 JSON"),
+    (None, json.dumps({"type": "result", "subtype": "error_max_budget_usd", "is_error": True})),
+    (None, json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                       "result": '{"verdict": "allow"}'})),
+])
+def test_model_failures_are_held(rig, exc, out):
+    rig.model()
+    rig.model_exc, rig.model_out = exc, out
+    tok = rig.lease(1)
+    res = rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok})
+    assert res["status"] == "pending" and rig.sent == []
+    assert rig.log(1)[-1]["gate"]["model"]["error"]
+
+
+def test_model_not_asked_for_readonly_danger_or_no_lease_or_estop(rig):
+    rig.model()
+    tok = rig.lease(1)
+    assert rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})["gate"]["layer"] == 1
+    assert rig.ok("send_command", {"slot": 1, "command": "save", "lease": tok})["status"] == "pending"
+    assert rig.err("send_command", {"slot": 2, "command": "system-view", "lease": tok})       # 没槽位 2 的租约
+    rig.ok("estop", {"slot": 1})
+    assert "急停" in rig.err("send_command", {"slot": 1, "command": "system-view", "lease": tok})
+    assert rig.model_calls == []                                       # 不白花钱
+
+
+def test_intent_without_model_still_logged(rig):
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok, "intent": "  改描述  "})
+    assert rig.log(1)[-1]["gate"]["intent"] == "改描述"
+    rig.ok("send_command", {"slot": 1, "command": "quit", "lease": tok, "intent": "   "})
+    assert "intent" not in rig.log(1)[-1]["gate"]
+
+
+def test_intent_too_long_refused(rig):
+    tok = rig.lease(1)
+    assert rig.err("send_command", {"slot": 1, "command": "system-view", "lease": tok,
+                                    "intent": "x" * (ms.INTENT_MAX + 1)})
+    assert rig.sent == []
 
 
 # ------------------------------------------------------------ 特殊键
@@ -309,6 +408,16 @@ def test_cli_confirm_sends_and_records(rig):
     assert hist["status"] == "sent" and hist["by"] == "human:ops@local"
     evs = [r["ev"] for r in rig.log(1)]
     assert evs[-2:] == ["confirm", "send"]
+
+
+def test_cli_confirm_shows_intent_and_model_reason(rig):
+    rig.model(verdict="block", reason="会断管理口")
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "undo ip address", "lease": tok, "intent": "清掉旧地址"})
+    rc, text = cli(rig, "pending")
+    assert "清掉旧地址" in text and "会断管理口" in text
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="n\n")
+    assert "清掉旧地址" in text and "会断管理口" in text
 
 
 def test_cli_confirm_key(rig):

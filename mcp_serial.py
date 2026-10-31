@@ -35,6 +35,7 @@ import cartlog
 import lamps_core
 import mcp_core as mc
 import serial_core
+import serial_gate_model as gm
 import serial_write_core as sw
 
 STATE_PATH = "/run/ops-cart/serial-write.json"
@@ -42,6 +43,8 @@ ESTOP_FLAG = "serial-estop.json"   # 和状态文件同目录; conbroker 默认�
 LOG_DIR = cartlog.LOG_DIR
 OUTPUT_MAX = 64 * 1024          # 回给 Agent 的设备输出上限
 TAIL_LINES = 8                  # 发前看几行认厂商 / 提示符 / 名字
+CONTEXT_LINES = 40              # 第 2 层: 给决策模型看几行最近输出 (再按规则文件 context_chars 掐尾)
+INTENT_MAX = 500                # Agent 声明的意图
 SEND_TIMEOUT = 30
 SEND_TIMEOUT_MAX = 300
 KEY_TIMEOUT = 10
@@ -188,9 +191,10 @@ SLOT = {"type": "integer", "minimum": 1, "maximum": 4, "required": True, "descri
 LEASE = {"type": "string", "maxLength": 64, "required": True, "description": "lease_acquire 给的令牌"}
 
 
-def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who):
+def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, llm=None):
     """slots() -> lamps_core.slot_status 那样的 4 项; tail(dev, n) -> 文本 (出错抛 mc.ToolError);
-    send(dev, text, timeout, raw) -> (status, 输出, 说明); rules() -> load_rules 的结果. 测试里全换成假的."""
+    send(dev, text, timeout, raw) -> (status, 输出, 说明); rules() -> load_rules 的结果;
+    llm(指令, 数据, model 配置) -> claude 输出 (第 2 层决策模型, None = serial_gate_model.claude_llm). 测试里全换成假的."""
 
     def _slot(n):
         s = slots()[n - 1]
@@ -256,18 +260,24 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who):
 
     def send_command(a):
         n, cmd = a["slot"], a["command"]
+        intent = (a.get("intent") or "").strip() or None
         s = _slot(n)
         try:
             sw.check_line(cmd)
         except sw.Refused as e:
             _run(lambda b, now: b.log_refused(n, who(), "line", cmd, e.code, str(e), now))
             raise mc.ToolError(str(e)) from None
+        _run(lambda b, now: b.writer(n, a["lease"], now), n, "line", cmd)    # 没租约 / 急停的不问模型, 不白花钱
         try:
             text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
             text = ""                   # 看不到设备现在停在哪: 认不出厂商 -> 挂起
-        vendor, at = sw.slot_vendor(n, rules(), text)
-        gate = sw.classify(cmd, vendor, at, rules())
+        r = rules()
+        vendor, at = sw.slot_vendor(n, r, text)
+        judge = gm.make_judge(r, lambda: tail(s["dev"], CONTEXT_LINES), intent, llm=llm)
+        gate = sw.classify(cmd, vendor, at, r, judge=judge)
+        if intent:
+            gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
                          cmd, False)
 
@@ -304,11 +314,14 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who):
              {"slot": SLOT, "lease": LEASE}, lease_release),
         Tool("send_command", "往某个槽位的串口发一行命令 (自动补回车, 只收一行可打印 ASCII, 不给原始字节). "
              "过闸门: 认得出厂商、设备停在提示符上的只读命令 (华为 display… / 思科 show…, 全称小写) 直接发, "
-             "返回设备输出; 其余一律挂起 (status=pending) 等人在推车上确认, 带 save/reboot/reset/format/delete "
-             "等高危词的永远要人确认. 人 3 秒内敲过键会排队. 要先 lease_acquire.",
+             "返回设备输出; 其余的若推车开了决策模型, 由模型按命令、设备最近输出和你给的 intent 判, 判放行直接发, "
+             "否则挂起 (status=pending) 等人在推车上确认; 带 save/reboot/reset/format/delete 等高危词的永远要人确认. "
+             "人 3 秒内敲过键会排队. 要先 lease_acquire.",
              {"slot": SLOT, "command": {"type": "string", "maxLength": sw.LINE_MAX, "required": True,
                                         "description": "一行命令, 不含换行"},
               "lease": LEASE,
+              "intent": {"type": "string", "maxLength": INTENT_MAX,
+                         "description": "这条命令要干什么、为什么 (一两句). 给决策模型和确认的人看, 进日志"},
               "timeout_s": {"type": "integer", "minimum": 1, "maximum": SEND_TIMEOUT_MAX, "default": SEND_TIMEOUT,
                             "description": "等提示符的秒数"}},
              send_command, destructive=True),
@@ -380,6 +393,11 @@ def local_human(env, pid, stat=read_stat, tty=False):
 CLI_CMDS = ("pending", "confirm", "reject", "estop", "resume")
 
 
+def _intent(item):
+    it = (item.get("gate") or {}).get("intent")
+    return f"\n      意图: {it}" if it else ""
+
+
 def _print_view(v, out):
     for s in v["slots"]:
         bits = [f"槽位 {s['slot']}:"]
@@ -392,7 +410,7 @@ def _print_view(v, out):
     for p in v["pending"]:
         warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"
-              f"\n      {p.get('reason')}", file=out)
+              f"\n      {p.get('reason')}{_intent(p)}", file=out)
     for h in v["history"][-5:]:
         print(f"  最近 #{h['id']} 槽位 {h['slot']} {h['cmd']!r} -> {h['status']}"
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)
@@ -457,7 +475,7 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         return 1
     warn = f"\n  !!! 高危词: {', '.join(item['danger'])}" if item.get("danger") else ""
     print(f"槽位 {item['slot']} ({item.get('name') or '名字未知'}) 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
-          f"\n  {item.get('reason')}{warn}\n确认发送? 输入 yes: ", end="", file=out)
+          f"\n  {item.get('reason')}{_intent(item).replace('      ', '  ')}{warn}\n确认发送? 输入 yes: ", end="", file=out)
     out.flush()
     if stdin.readline().strip() != "yes":
         print("没输 yes, 不发 (还挂着)", file=out)
