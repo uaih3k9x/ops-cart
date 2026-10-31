@@ -260,3 +260,47 @@ def test_mouse_chunks_shared_here():
     assert ch9329.mouse_chunks(0, 0, 0) == [(0, 0, 0)]
     big = ch9329.mouse_chunks(10 ** 9, 0, 0)
     assert len(big) == ch9329.MOUSE_MAX // 127 + 1
+
+
+# ------------------------------------------------------------ 命令行经键鼠代理 (#9)
+
+
+class _FakeCh:
+    def __init__(self, log):
+        self.log = log
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: self.log.append((name, a, kw)) or "ab cd"
+
+
+def _cli(monkeypatch, argv):
+    import kvm_broker
+    log, opened = [], []
+
+    def open_ch(port, src="agent", who="cli", baud=115200, sock_path=None):
+        opened.append((port, src, who, baud))
+        return _FakeCh(log)
+    monkeypatch.setattr(kvm_broker, "open_ch", open_ch)
+    ch9329.main(argv)
+    return opened, log
+
+
+def test_cli_goes_through_open_ch_as_agent_by_default(monkeypatch):
+    opened, log = _cli(monkeypatch, ["--port", "/dev/ttyACM1", "type", "hi"])
+    assert opened == [("/dev/ttyACM1", "agent", "cli", 115200)]
+    assert log[0][0] == "type_text" and log[0][1] == ("hi",) and log[-1][0] == "close"
+
+
+def test_cli_src_who_and_old_subcommands(monkeypatch):
+    opened, log = _cli(monkeypatch, ["--src", "human", "--who", "ops", "combo", "ctrl", "alt", "del"])
+    assert opened[0][1:3] == ("human", "ops")
+    assert log[0][:2] == ("send_keys", (["ctrl", "alt", "del"],))
+    _o, log = _cli(monkeypatch, ["hold", "500", "a"])
+    assert log[0] == ("send_keys", (["a"],), {"press_ms": 500})
+
+
+def test_cli_estop_and_resume(monkeypatch):
+    _o, log = _cli(monkeypatch, ["estop", "--all"])
+    assert log[0] == ("estop", (), {"all_devs": True})
+    _o, log = _cli(monkeypatch, ["--src", "human", "resume"])
+    assert log[0] == ("resume", (), {"all_devs": False})

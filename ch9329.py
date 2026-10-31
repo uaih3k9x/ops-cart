@@ -7,6 +7,11 @@
   python3 ch9329.py --port /dev/ttyACM0 key enter
   python3 ch9329.py --port /dev/ttyACM0 combo ctrl alt del
   python3 ch9329.py --port /dev/ttyACM0 hold 2000 a   # 按住 a 键 2000ms
+  python3 ch9329.py estop --all                        # 急停: 丢掉 agent 还没发的键 (要代理在跑)
+  python3 ch9329.py --src human resume --all           # 解除急停 (要人来)
+
+键鼠代理 (kvm_broker.py) 在跑时命令行经它发键, 默认算 agent (人最近 3 秒动过键鼠就排队);
+代理不在就跟以前一样直开串口.
 
 协议 (WCH CH9329): 帧 = 57 AB ADDR CMD LEN DATA... SUM
   SUM = 整帧(含 57 AB)求和 & 0xFF  (本机实测如此)
@@ -241,21 +246,32 @@ class Ch9329:
             self.send_keys(["enter"] if ch == "\n" else [ch], press_ms)
 
 
-def main():
+def main(argv=None):
+    """命令行. 键鼠代理 (kvm_broker) 在跑就经它发 (默认算 agent: 人刚动过键鼠就排队等), 不在就直开 + flock."""
+    import kvm_broker
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="/dev/ttyACM0")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--src", choices=("agent", "human"), default="agent", help="经代理时算谁 (默认 agent)")
+    ap.add_argument("--who", default="cli", help="经代理时日志里记的名字")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info")
     p = sub.add_parser("type"); p.add_argument("text")
     p = sub.add_parser("key"); p.add_argument("key")
     p = sub.add_parser("combo"); p.add_argument("keys", nargs="+")
     p = sub.add_parser("hold"); p.add_argument("ms", type=int); p.add_argument("key")
+    for name in ("estop", "resume"):        # 只有代理在跑才有; 解除急停要 --src human
+        p = sub.add_parser(name); p.add_argument("--all", action="store_true", help="全部键鼠")
 
-    args = ap.parse_args()
-    dev = Ch9329(args.port, args.baud)
+    args = ap.parse_args(argv)
+    dev = kvm_broker.open_ch(args.port, src=args.src, who=args.who, baud=args.baud)
     try:
-        if args.cmd == "info":
+        if args.cmd in ("estop", "resume"):
+            if not hasattr(dev, args.cmd):
+                raise SystemExit("键鼠代理没在跑, 没有急停可言")
+            getattr(dev, args.cmd)(all_devs=args.all)
+            print(f"已{'急停' if args.cmd == 'estop' else '解除急停'} {'全部' if args.all else args.port}")
+        elif args.cmd == "info":
             print("CH9329 应答:", dev.info() or "(无)")
         elif args.cmd == "type":
             dev.type_text(args.text)
