@@ -90,8 +90,10 @@ def collect(read):
         ups = None
     if isinstance(ups, dict) and isinstance(ups.get("percent"), (int, float)):
         values["ups.power"] = "OB" if ups_core.on_battery(ups) else "OL"
-        values["ups.low"] = bool(ups_core.low(ups))
+        # 两段式 (#4): 到 15% 只剩 30 秒倒计时, 来不及推; 预告阶段就推, 倒计时沿用同一项不重复推
+        values["ups.low"] = ups_core.shutdown_stage(ups, None, now)[0] != "normal"
         info["pct"] = int(ups["percent"])
+        info["left"] = ups_core.left_text(ups)
     else:
         values["ups.power"] = values["ups.low"] = None
 
@@ -129,7 +131,11 @@ def _text(key, old, new, info):
     if key == "ups.power":
         return f"推车转电池供电 {pct}%，市电断了" if new == "OB" else f"推车市电恢复，电池 {pct}%"
     if key == "ups.low":
-        return f"推车电池只剩 {pct}%，到关机阈值 {ups_core.LOW_PCT}%，赶紧接市电" if new else None
+        if not new:
+            return None
+        left = info.get("left")
+        head = f"推车电池{left}（{pct}%）" if left else f"推车电池只剩 {pct}%"
+        return f"{head}，到 {ups_core.LOW_PCT}% 自动关机，赶紧接市电"
     if key == "guard":
         if new == "proxy":
             return "装机口转代理模式：线上有别的 DHCP，推车不发地址"

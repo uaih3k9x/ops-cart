@@ -285,6 +285,48 @@ def test_ups_line_low_battery_is_bad_and_missing_ups_is_dim():
     assert dc.layout_view(_snap(ups=None))["ups"] == {"text": "UPS 未连接", "level": "dim"}
 
 
+# ---- 两段式低电量关机 (#4): 副屏跟车机同一个 ups_core.shutdown_stage, 倒计时起点由 kiosk 回写
+
+OB22 = {"state": "discharging", "percent": 22, "status": "OB DISCHRG", "runtime": 400}
+
+
+def test_kiosk_reporter_writes_ups_countdown_start(tmp_path):
+    p = str(tmp_path / "kiosk.json")
+    rep = dc.KioskReporter(p, pid=4242)
+    assert rep.update(locked=False, kvm=0, ups_since=1000.0) is True
+    assert dc.read_kiosk(p) == {"locked": False, "kvm": 0, "pid": 4242, "ups_since": 1000.0}
+    assert rep.update(locked=False, kvm=0, ups_since=1000.0) is False
+    assert rep.update(locked=False, kvm=0) is True                 # 取消倒计时: 键去掉
+    assert dc.read_kiosk(p) == {"locked": False, "kvm": 0, "pid": 4242}
+
+
+def test_ups_warn_is_amber_band_not_red():
+    v = dc.layout_view(_snap(ups=OB22), now=1000.0)
+    assert v["ups"]["level"] == "warn"                             # 20% 以下不再直接变红
+    assert v["ups_alert"] == {"text": "电池约剩 6 分钟，到 15% 自动关机，请插回市电",
+                              "short": "电池约剩 6 分钟 · 15% 自动关机", "level": "warn"}
+
+
+def test_ups_no_alert_on_mains_or_plenty_left():
+    assert dc.layout_view(_snap(ups=dict(OB22, percent=80, runtime=3000)))["ups_alert"] is None
+    assert dc.layout_view(_snap(ups=dict(OB22, status="OL CHRG")))["ups_alert"] is None
+    assert dc.layout_view(_snap(ups=None))["ups_alert"] is None
+
+
+def test_ups_countdown_uses_kiosk_start_and_wall_clock():
+    low = dict(OB22, percent=15)
+    v = dc.layout_view(_snap(ups=low, kiosk={"locked": True, "ups_since": 1000.0}), now=1012.0)
+    assert v["ups_alert"]["level"] == "bad"
+    assert v["ups_alert"]["text"] == "电量 15%，18 秒后自动关机 · 插回市电可取消"
+    assert v["ups"]["level"] == "bad"
+    # kiosk 没回写起点 (老 kiosk / 还没收到): 不编秒数
+    v = dc.layout_view(_snap(ups=low), now=1012.0)
+    assert v["ups_alert"]["text"] == "电量 15%，即将自动关机 · 插回市电可取消"
+    # 倒计时中插回市电: 副屏也立刻恢复
+    v = dc.layout_view(_snap(ups=dict(low, status="OL CHRG"), kiosk={"ups_since": 1000.0}), now=1012.0)
+    assert v["ups_alert"] is None and v["ups"]["level"] == "ok"
+
+
 # ---- LLDP 对端 (#14): 监听在 dash_service, 这里只管采集项和版面
 
 def _lldp(**states):

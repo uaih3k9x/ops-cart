@@ -208,3 +208,105 @@ def test_hidraw_nodes_ignores_other_vendors(tmp_path):
     import ups_core as uc
     root = _hidraw_tree(tmp_path, {"hidraw1": "0003:00001164:0000B29D"})
     assert uc.hidraw_nodes(root) == []
+
+
+# ---- 两段式低电量关机 (#4, 10/31 放电演练后定): 预告 -> 30 秒倒计时 -> 关机
+
+OB = {"state": "discharging", "percent": 60, "status": "OB DISCHRG"}
+T = 1_000_000.0
+
+
+def _ob(**kw):
+    return dict(OB, **kw)
+
+
+def test_stage_normal_on_mains_or_unknown():
+    assert uc.shutdown_stage({"state": "charging", "percent": 10, "status": "OL CHRG"}, None, T) == ("normal", None)
+    assert uc.shutdown_stage(None, None, T) == ("normal", None)
+    assert uc.shutdown_stage(_ob(percent=60, runtime=1500), None, T) == ("normal", None)
+
+
+def test_stage_warn_by_percent_or_runtime():
+    assert uc.shutdown_stage(_ob(percent=uc.WARN_PCT), None, T) == ("warn", None)
+    assert uc.shutdown_stage(_ob(percent=uc.WARN_PCT + 1), None, T) == ("normal", None)
+    # 电量还高但 UPS 估计剩不到 8 分钟 (开着装机负载大) 也预告
+    assert uc.shutdown_stage(_ob(percent=60, runtime=uc.WARN_RUNTIME_S - 1), None, T) == ("warn", None)
+    assert uc.shutdown_stage(_ob(percent=60, runtime=uc.WARN_RUNTIME_S), None, T) == ("normal", None)
+
+
+def test_stage_countdown_starts_at_low_pct_and_counts_by_injected_time():
+    assert uc.shutdown_stage(_ob(percent=uc.LOW_PCT), None, T) == ("countdown", uc.COUNTDOWN_S)
+    assert uc.shutdown_stage(_ob(percent=14), T, T + 10.2) == ("countdown", 20)
+    assert uc.shutdown_stage(_ob(percent=14), T, T + 29.5) == ("countdown", 1)
+    assert uc.shutdown_stage(_ob(percent=14), T, T + uc.COUNTDOWN_S) == ("poweroff", 0)
+    assert uc.shutdown_stage(_ob(percent=14), T, T + 999) == ("poweroff", 0)
+
+
+def test_countdown_never_shows_more_than_full_length():
+    # 起点在"未来" (墙钟被往回拨): 不显示几万秒, 最多整段 (调用方据此重设起点)
+    assert uc.shutdown_stage(_ob(percent=14), T + 3600, T) == ("countdown", uc.COUNTDOWN_S)
+
+
+def test_countdown_keeps_going_if_battery_bounces_back_above_threshold():
+    # 只有插回市电才取消; 电池电压回弹到 17% 不算
+    assert uc.shutdown_stage(_ob(percent=17), T, T + 5) == ("countdown", 25)
+
+
+def test_countdown_cancelled_only_by_mains():
+    assert uc.shutdown_stage({"state": "discharging", "percent": 15, "status": "OL CHRG"}, T, T + 5) == ("normal", None)
+    assert uc.shutdown_stage({"state": "charging", "percent": 15}, T, T + 5) == ("normal", None)
+    # 插回市电时电量还低: 回到"在市电"的正常态, 不是预告
+    assert uc.shutdown_stage({"state": "fully-charged", "percent": 15}, T, T + 5) == ("normal", None)
+
+
+def test_countdown_fail_safe_when_ups_unreadable():
+    # 倒计时中读不到 / 缺字段 = 当仍在电池, 继续关机
+    assert uc.shutdown_stage(None, T, T + 5) == ("countdown", 25)
+    assert uc.shutdown_stage({}, T, T + 31) == ("poweroff", 0)
+    assert uc.shutdown_stage({"state": "", "percent": 15}, T, T + 5) == ("countdown", 25)
+    assert uc.shutdown_stage({"state": "unknown", "status": ""}, T, T + 5) == ("countdown", 25)
+
+
+def test_alert_texts():
+    assert uc.alert(OB, "normal", None) is None
+    a = uc.alert(_ob(percent=22, runtime=400), "warn", None)
+    assert a["level"] == "warn"
+    assert a["text"] == "电池约剩 6 分钟，到 15% 自动关机，请插回市电"
+    assert a["short"] == "电池约剩 6 分钟 · 15% 自动关机"
+    # 没有 hidraw 的剩余时间: 说百分比, 不编分钟数
+    a = uc.alert(_ob(percent=22), "warn", None)
+    assert a["text"] == "电池剩 22%，到 15% 自动关机，请插回市电"
+    assert a["short"] == "电池剩 22% · 15% 自动关机"
+    assert uc.alert(_ob(percent=22, runtime=30), "warn", None)["text"].startswith("电池约剩不到 1 分钟")
+    c = uc.alert(_ob(percent=15), "countdown", 27)
+    assert c["level"] == "bad"
+    assert c["text"] == "电量 15%，27 秒后自动关机 · 插回市电可取消"
+    assert c["short"] == "27 秒后关机 · 插回市电取消"
+    assert uc.alert(None, "countdown", 3)["text"] == "电量 --，3 秒后自动关机 · 插回市电可取消"
+    assert uc.alert(_ob(percent=15), "countdown", None)["text"] == "电量 15%，即将自动关机 · 插回市电可取消"
+    assert uc.alert(_ob(percent=14), "poweroff", 0)["text"] == "电量 14%，正在关机"
+
+
+def test_stage_log_only_on_transitions():
+    ups = _ob(percent=22, runtime=400)
+    assert uc.stage_log(None, "normal", ups) is None
+    assert uc.stage_log("normal", "normal", ups) is None
+    assert uc.stage_log("warn", "warn", ups) is None
+    assert "预告" in uc.stage_log("normal", "warn", ups)
+    assert "30 秒" in uc.stage_log("warn", "countdown", _ob(percent=15))
+    assert uc.stage_log("countdown", "countdown", _ob(percent=15)) is None
+    msg = uc.stage_log("countdown", "normal", {"state": "charging", "percent": 15, "status": "OL"})
+    assert "市电恢复" in msg and "取消" in msg
+    assert "关机" in uc.stage_log("countdown", "poweroff", _ob(percent=14))
+    assert "解除" in uc.stage_log("warn", "normal", {"state": "charging", "percent": 22})
+    # 还在电池, 只是估计剩余时间随负载回升过了 8 分钟: 不能说"市电恢复"
+    assert uc.stage_log("warn", "normal", _ob(percent=40, runtime=600)) is None
+
+
+def test_log_goes_to_ops_cart_dir_and_events(tmp_path, monkeypatch):
+    assert uc.UPS_LOG == "/var/log/ops-cart/ups.log"
+    import cartlog
+    monkeypatch.setattr(cartlog, "EVENTS", str(tmp_path / "events.log"))
+    uc.log("倒计时开始", path=str(tmp_path / "ups.log"))
+    assert "[ups] 倒计时开始" in (tmp_path / "ups.log").read_text(encoding="utf-8")
+    assert "[ups] 倒计时开始" in (tmp_path / "events.log").read_text(encoding="utf-8")

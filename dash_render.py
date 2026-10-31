@@ -131,6 +131,29 @@ def ups_fit(ups, clock, width=PANEL_W):
     return texts[-1], UPS_MIN_PX
 
 
+BAND_PX, BAND_MIN_PX = 32, 24       # 头部横条 (发地址 #11 / 低电量 #4) 的字号
+
+
+def band_fit(item, width=PANEL_W):
+    """横条文字: 全文按 32 -> 24 号试, 放不下再用短写法, 最后截断."""
+    room = width - 2 * M
+    texts = [t for t in (item.get("text"), item.get("short")) if t]
+    for t in texts:
+        for size in range(BAND_PX, BAND_MIN_PX - 1, -2):
+            if _font(size).getlength(t) <= room:
+                return t, size
+    line = wrap(texts[-1] if texts else "", _font(BAND_MIN_PX), room, 1)
+    return (line[0] if line else ""), BAND_MIN_PX
+
+
+def _band(view):
+    """头部横条画哪一条: 关机倒计时 > 自己发地址 > 低电量预告. 都没有 None."""
+    alert, serve = view.get("ups_alert"), view.get("serve")
+    if alert and alert.get("level") == "bad":
+        return alert
+    return serve or alert
+
+
 def render(view, size=(PANEL_W, PANEL_H)):
     """版面模型 → PIL Image (竖屏朝向). 纯函数, 方便测试和本地预览."""
     from PIL import Image, ImageDraw
@@ -156,11 +179,11 @@ def render(view, size=(PANEL_W, PANEL_H)):
                fill={"ok": DIM, "warn": WARN, "bad": BAD}.get(ups.get("level"), DIM))
     info = " · ".join(x for x in ("LAN2 " + view["lan2"] if view.get("lan2") else "",
                                   "开机 " + view["uptime"] if view.get("uptime") else "") if x)
-    serve = view.get("serve")
-    if serve:       # 推车自己给整个网段发地址 (#11): 盖住 LAN2/开机那行, 整条红 (到时停发琥珀)
-        d.rectangle([0, 202, W, 258], fill=BAD if serve.get("level") == "bad" else WARN)
-        line = wrap(serve.get("text") or "", _font(32), W - 2 * M, 1)
-        d.text((W // 2, 230), line[0] if line else "", font=_font(32), fill=lc.LIT_FG, anchor="mm")
+    band = _band(view)
+    if band:        # 自己发地址 (#11) / 低电量 (#4): 盖住 LAN2/开机那行, 一整条红或琥珀, 不铺满
+        d.rectangle([0, 202, W, 258], fill=BAD if band.get("level") == "bad" else WARN)
+        line, px = band_fit(band, W)
+        d.text((W // 2, 230), line, font=_font(px), fill=lc.LIT_FG, anchor="mm")
     else:
         d.text((M, 210), info, font=_font(30), fill=DIM)
     d.line([M, 262, W - M, 262], fill=LINE, width=2)
