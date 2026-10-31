@@ -240,3 +240,14 @@ def test_idle_ch_close_closes_handle():
     ch.send_report(KEY_A)
     ch.close()
     assert op.devs[0].closed and not ch.is_open
+
+
+def test_kiosk_opener_goes_through_kvm_broker_as_human(monkeypatch):
+    """车机透传是人在操作: IdleCh 的 opener 经键鼠代理算 human (#9); 代理不在 open_ch 退回直开."""
+    import kvm_broker
+    got = []
+    monkeypatch.setattr(kvm_broker, "open_ch",
+                        lambda port, src="agent", who="cli", **kw: got.append((port, src, who)) or "ch")
+    op = kvm.human_opener("/dev/serial/by-id/x")
+    assert got == []                                        # 造 opener 不开口, 有输入才开
+    assert op() == "ch" and got == [("/dev/serial/by-id/x", "human", "kiosk")]

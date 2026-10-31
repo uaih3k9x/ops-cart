@@ -594,14 +594,13 @@ def test_chworker_with_idle_ch_busy_is_not_gone_and_reap_runs_in_worker():
 
 def test_kiosk_opens_ch9329_only_inside_idle_ch_opener():
     """#9: 车机主线程不直接开 CH9329 (开口 = 拿独占锁), 只把开法交给 IdleCh, 由 ChWorker 线程按需开关;
-    每秒排一次 reap 放空闲的锁; 退出透传走 IdleCh.release (放过锁就不为松开重开)."""
+    开法是 kvm.human_opener (经键鼠代理算 human, 代理不在才直开); 每秒排一次 reap 放空闲的锁;
+    退出透传走 IdleCh.release (放过锁就不为松开重开)."""
     tree = ast.parse(_src("kiosk.py"))
-    opens = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "Ch9329"]
-    in_opener = {id(lam.body) for n in ast.walk(tree)
-                 if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "IdleCh"
-                 for lam in n.args[:1] if isinstance(lam, ast.Lambda)}
-    assert opens and all(id(c) in in_opener for c in opens)
-    assert all(ast.unparse(c.args[0]) == "path" for c in opens)      # by-id 路径, 不是 realpath 后的 ttyACMn
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "Ch9329"]
+    openers = [n.args[0] for n in ast.walk(tree)
+               if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "IdleCh"]
+    assert openers and all(ast.unparse(o) == "kvm.human_opener(path)" for o in openers)  # by-id 路径, 不是 ttyACMn
     src = _src("kiosk.py")
     assert '"reap"' in src and "on_busy=" in src and '_ch_send("release"' in src
 

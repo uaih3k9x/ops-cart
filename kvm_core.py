@@ -5,6 +5,7 @@
 配置 /opt/pxe/kvm.json: {"names": {序列号: 名字}, "bind": {画面源 key: 序列号}}
 
 IdleCh: 车机用的 CH9329 句柄, 有输入才开, 空闲就关 (放掉 flock), 远程命令行在人没动的时候能发键 (#9).
+键鼠代理 (kvm_broker) 在跑时 IdleCh 开的是到代理的连接, 设备由代理统一持有, 仲裁在代理里做.
 """
 
 import json
@@ -21,6 +22,14 @@ IDLE_RELEASE_S = 3.0        # 键鼠空闲多久放锁, 同网页口 CH_IDLE_S
 HOLD_MAX_S = 30.0           # 按着键/鼠标键也算在用, 但超过这么久没新输入照样放 (多半是松开事件丢了)
 BUSY_NOTE_S = 1.0           # "键鼠被占用" 提示最多每秒一次
 _CH343 = re.compile(r"usb-1a86_.*_([0-9A-Za-z]+)-if00$")      # 序列号是 -if00 前最后一段
+
+
+def human_opener(path, who="kiosk"):
+    """车机透传给 IdleCh 的 opener: 经键鼠代理 (kvm_broker) 发, 算 human 不排队; 代理不在就直开 + flock."""
+    def opener():
+        import kvm_broker
+        return kvm_broker.open_ch(path, src="human", who=who)
+    return opener
 
 
 def ports_from_byid(names, byid_dir=BYID_DIR):
