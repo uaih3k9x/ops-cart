@@ -1,0 +1,41 @@
+[Unit]
+Description=ops-cart 键鼠代理 (CH9329 统一持有; 人优先, Agent 排队, 急停只丢不插, #9)
+# 不依赖 kiosk / webkiosk, 它们也不依赖这里: 代理不在, 客户端退回直开 + flock (旧行为)
+
+[Service]
+# root 但去掉全部能力: 只靠属主身份开 /dev/ttyACM* (root:dialout 0660)、写 /var/log/ops-cart/kvm.log.
+# socket /run/ops-kvm/kvm.sock = 0660 root:dialout —— 能直接写键鼠串口的 (dialout 组 / root), 才能经代理发键;
+# 网页口的 ops-web 本来就在 dialout, 车机是 root, 命令行用户要在 dialout (同以前直开的要求).
+# 来源 (human/agent) 是客户端自报的, 日志另记对端 uid.
+ExecStart=/usr/bin/python3 /opt/pxe/kvm_broker.py
+WorkingDirectory=/opt/pxe
+SupplementaryGroups=dialout
+RuntimeDirectory=ops-kvm
+RuntimeDirectoryMode=0755
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/ops-cart
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0027
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
