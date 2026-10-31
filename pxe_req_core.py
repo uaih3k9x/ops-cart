@@ -170,6 +170,10 @@ class Book:
         self.events.append(rec)
         return rec
 
+    def note(self, ev, now, **kw):
+        """调用方补一条日志 (如提前上锁做了什么)."""
+        return self._ev(ev, now, **kw)
+
     def _close(self, r, status, by, now, why=None):
         """挂起 -> 历史 (不带码和摘要)."""
         self.doc["reqs"].remove(r)

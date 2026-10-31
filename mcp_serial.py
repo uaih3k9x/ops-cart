@@ -69,11 +69,25 @@ def log_path(log_dir, slot):
 
 # ------------------------------------------------------------ 状态文件 + 执行绪日志
 
-class Store:
-    """run(fn): 加锁 -> 读状态 -> fn(book, now) -> 存 (fn 抛异常也存: tick 清掉的过期要落盘) -> 写日志."""
+_DEFAULT = object()
 
-    def __init__(self, path=STATE_PATH, log_dir=LOG_DIR, clock=time.time, event=cartlog.event):
+
+def _pxe_drop():
+    import mcp_pxe                      # 晚 import: mcp_pxe 也 import 本模块
+    return mcp_pxe.drop_on_estop
+
+
+class Store:
+    """run(fn): 加锁 -> 读状态 -> fn(book, now) -> 存 (fn 抛异常也存: tick 清掉的过期要落盘) -> 写日志.
+    on_estop_all(by): 这次操作之后全部槽位都急停了就调 (放锁之后, 出错吞掉); 默认只有真状态文件才挂
+    mcp_pxe.drop_on_estop (全部急停也作废 PXE 解锁申请, #24), 测试里的临时路径不挂."""
+
+    def __init__(self, path=STATE_PATH, log_dir=LOG_DIR, clock=time.time, event=cartlog.event,
+                 on_estop_all=_DEFAULT):
         self.path, self.log_dir, self.clock, self.event = path, log_dir, clock, event
+        if on_estop_all is _DEFAULT:
+            on_estop_all = _pxe_drop() if path == STATE_PATH else None
+        self.on_estop_all = on_estop_all
 
     @contextlib.contextmanager
     def _locked(self):
@@ -95,15 +109,29 @@ class Store:
             return "\0"                     # 在但读不了: 按坏了算 -> 全部急停
 
     def run(self, fn):
-        with self._locked():
-            now = self.clock()
-            book = sw.Book.from_text(self._read(), now)
-            try:
-                return fn(book, now)
-            finally:
-                atomicfile.write_text(self.path, book.dumps(), mode=0o600)
-                self._flag(book)
-                self._log(book.events)
+        book = None
+        try:
+            with self._locked():
+                now = self.clock()
+                book = sw.Book.from_text(self._read(), now)
+                try:
+                    return fn(book, now)
+                finally:
+                    atomicfile.write_text(self.path, book.dumps(), mode=0o600)
+                    self._flag(book)
+                    self._log(book.events)
+        finally:
+            if book is not None:
+                self._after(book)
+
+    def _after(self, book):
+        stops = [e for e in book.events if e["ev"] == "estop"]
+        if self.on_estop_all is None or not stops or not all(book.stopped(n) for n in sw.SLOTS):
+            return
+        try:
+            self.on_estop_all(stops[0].get("who") or "-")
+        except Exception:               # noqa: BLE001  PXE 那边出错不能让急停失败
+            pass
 
     def _flag(self, book):
         """给 conbroker 的公开急停标记 (0644, 只有槽位号): 排队等人停手的那条, 写串口前它看这个丢掉."""

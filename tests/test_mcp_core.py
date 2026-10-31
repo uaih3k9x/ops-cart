@@ -397,3 +397,11 @@ def test_pxe_view_expired_has_no_remaining():
     mode = {"mode": "expired", "mac": "02:00:00:00:00:01", "since": 0, "until": 10}
     v = mc.pxe_view(mode, None, {}, now=400)
     assert v["remaining_s"] == 0 and v["purpose"] is None
+
+
+def test_check_args_boolean():
+    params = {"batch": {"type": "boolean"}}
+    assert mc.check_args(params, {"batch": True}) == {"batch": True}
+    for bad in ("true", 1, 0, None, [True]):
+        with pytest.raises(mc.ArgError):
+            mc.check_args(params, {"batch": bad})

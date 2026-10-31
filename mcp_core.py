@@ -97,6 +97,9 @@ def _check_one(k, spec, v):
             raise ArgError(f"{k} 要整数, 给的是 {v!r}")
         if v < spec.get("minimum", v) or v > spec.get("maximum", v):
             raise ArgError(f"{k} 要在 {spec.get('minimum')}~{spec.get('maximum')} 之间, 给的是 {v}")
+    elif spec["type"] == "boolean":
+        if not isinstance(v, bool):
+            raise ArgError(f"{k} 要 true/false, 给的是 {v!r}")
     elif spec["type"] == "string":
         if not isinstance(v, str):
             raise ArgError(f"{k} 要字符串, 给的是 {v!r}")
