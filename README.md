@@ -135,12 +135,18 @@ tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py
 装机菜单只在车机上解锁装机模式时按 MAC 生成,TFTP / HTTP 两头都会核对装机模式;
 所以 Windows 脚本和手工放进 tftp 的自动装机菜单都装不了机,这是故意的。
 
-运行时状态都在 `/run/ops-cart/`(tmpfiles 建,重启推车清空):`pxe-guard.json` 是装机口守卫状态,
+运行时状态都在 `/run/ops-cart/`(tmpfiles 建,重启推车清空):`pxe-guard.json` 是装机口守卫状态(`pxe-renew.json` 是车机给它的续期请求),
 `pin-gate.json` 是车机 PIN 输错计数,`mpv.sock` 给 `cart_snap.py` 用。
 `pxe-server` 发现装机口上有别的 DHCP 不再停服,转**代理模式**(`pxe-guard.json` 里 `"state": "proxy"`、`"leases": false`):
 67 口不发地址,只对 x86-64 UEFI 的 PXE 客户端回 yiaddr=0 的引导 OFFER,4011 / TFTP / HTTP 照常;
 LAN1 拔掉再插上会重新探测,没有别人就恢复自己发地址。探测出错或拿不准一律按代理模式。
 代理模式要生效,推车的 `PXE_IP` 得在那个网段里(别人发的地址见 `pxe-guard.json` 的 `offered`)。
+网络里没有别的 DHCP、推车自己发地址时**限时**(默认 30 分钟,`pxe.env` 里 `PXE_SERVE_MINUTES` 改,0 = 不限时):
+车机顶栏下一整条红、锁屏和副屏头部都显示"正在给整个网段发地址 剩 mm:ss";到点转 `"state": "expired"`:
+新机器一个地址都不给(PXE 客户端只回引导,同代理模式),已经发出去且没过期的租约照常续,装到一半的机器不断网。
+点车机上那条续期(确认后写 `/run/ops-cart/pxe-renew.json`,守卫 2 秒内认),从当时起再给一段限时。
+限时从第一次自己发地址算起;iPXE 接管网卡那几秒掉线不重新计时,LAN1 拔掉超过 60 秒再插才重新计时,重启 `pxe-server` 也重新计时。
+开始 / 到时 / 续期都写 `events.log` 的 `[pxe]`,到时停发还会推手机(#16)。
 
 装机网段只在 `/etc/ops-cart/pxe.env` 里定(`pxe-*` 三个单元和车机生成的 grub 菜单共用),车机界面不再改 LAN1 地址;
 `pxe-server` 的 `--iface eno1` 写死在单元里。校园网认证配置在 `/etc/ops-cart/campus-auth.json`(要写 `ssid`)。
