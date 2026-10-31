@@ -1425,7 +1425,8 @@ def test_arm_clone_restore_writes_each_batch_mac_menu(tmp_path, monkeypatch):
     _carm(env)
     for mac, serial in ((MAC, "SN-EXAMPLE-1"), (CMAC2, "SN-EXAMPLE-2")):
         cfg = _menu(env, mac)
-        assert f"restoredisk lab-img SERIALNO={serial}" in default_entry(cfg)
+        assert f"restoredisk lab-img SERIALNO={serial}" in cfg.split("menuentry ")[1]
+        assert "inst.rescue" in default_entry(cfg)                       # 恢复要人手选, 倒计时落救援
         assert "inst.ks" not in cfg and "smb://192.0.2.1/clone-ro/" in cfg
         assert "clonesave" not in cfg                                     # 恢复不带可写账号
     rescue = (env["root"] / "grub.cfg").read_text()

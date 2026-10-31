@@ -1176,10 +1176,19 @@ CLONE_PARAMS = ["boot=live", "noprompt", 'ocs_live_run="ocs-sr -batch restoredis
                 'ocs_repository="smb://192.0.2.1/clone-ro/"']
 
 
-def test_grub_menu_clone_default_clone_then_rescue_no_ks():
+def test_grub_menu_clone_restore_defaults_to_rescue():
+    """恢复会写盘, 默认落到救援 (第 1 项), 要人在屏幕前手选恢复项; 抓镜像只读, 仍默认克隆."""
+    restore = _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS)
+    assert "set default=1" in restore and "set default=0" not in restore
+    assert "inst.rescue" in restore.split("menuentry ")[1:][1]
+    save = _px.grub_menu_clone("192.0.2.1", "clone-save", CLONE_PARAMS)
+    assert "set default=0" in save and "set timeout=15" in save
+
+
+def test_grub_menu_clone_entries_clone_then_rescue_no_ks():
     cfg = _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS)
     entries = cfg.split("menuentry ")[1:]
-    assert "set default=0" in cfg and "set timeout=15" in cfg
+    assert "set timeout=15" in cfg
     assert entries[0].startswith(f"'{_px.CLONE_TITLES['clone-restore']}'")
     assert "linux (http,192.0.2.1)/clonezilla/vmlinuz boot=live noprompt " in entries[0]
     assert 'ocs_live_run=\\"ocs-sr -batch restoredisk lab-img SERIALNO=SN-EXAMPLE-1\\"' in entries[0]

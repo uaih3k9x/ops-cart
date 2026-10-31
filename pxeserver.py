@@ -688,12 +688,14 @@ def _grub_arg(token):
 
 
 def grub_menu_clone(ip, purpose, params):
-    """解锁用途 clone-save / clone-restore 的 MAC 菜单: 第 0 项 (默认) Clonezilla, 后面救援, timeout 15,
-    不带任何自动装机项. params 是 clone_core.boot_params 的 token 列表; 只走 HTTP."""
+    """解锁用途 clone-save / clone-restore 的 MAC 菜单: 第 0 项 Clonezilla, 后面救援, timeout 15,
+    不带任何自动装机项. 抓镜像默认第 0 项; 恢复要写盘, 默认第 1 项救援, 人在屏幕前手选才写.
+    params 是 clone_core.boot_params 的 token 列表; 只走 HTTP."""
     if purpose not in CLONE_TITLES:
         raise ValueError(f"克隆用途不对: {purpose!r}")
     args = " ".join(_grub_arg(t) for t in params)
-    return (f"set default=0\nset timeout=15\n\n"
+    default = 1 if purpose == "clone-restore" else 0
+    return (f"set default={default}\nset timeout=15\n\n"
             f"menuentry '{CLONE_TITLES[purpose]}' {{\n"
             f"    linux (http,{ip})/{CLONE_KERNEL} {args} fetch=http://{ip}/{CLONE_DIR}/filesystem.squashfs\n"
             f"    initrd (http,{ip})/{CLONE_DIR}/initrd.img\n}}\n\n" +
