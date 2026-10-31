@@ -83,6 +83,23 @@ def test_services_status_systemctl_failure(monkeypatch):
     assert kc.services_status(("pxe-server",)) == {"pxe-server": (False, False)}
 
 
+def test_nics_status_reads_active_connection_not_fixed_name(monkeypatch, tmp_path):
+    """#12: 网口模式托管后生效的是 cart-<口>-<模式>; 状态板 / 网页要报实际生效那条, 不是写死的旧连接名."""
+    def fake_run(cmd, timeout=5):
+        if cmd[:2] == ["ip", "-4"]:
+            return 0, ""
+        if "GENERAL.CONNECTION" in cmd:
+            return 0, {"eno1": "cart-eno1-off", "enp3s0": ""}[cmd[-1]]
+        if cmd[:3] == ["nmcli", "-g", "ipv4.method"]:
+            assert cmd[-1] == "cart-eno1-off"
+            return 0, "disabled"
+        return 1, ""
+    monkeypatch.setattr(kc, "run", fake_run)
+    nics = kc.nics_status(sysfs=str(tmp_path))
+    assert nics[0]["con"] == "cart-eno1-off" and nics[0]["method"] == "disabled"
+    assert nics[1]["con"] == "-" and nics[1]["method"] == "-"          # 没有生效的连接
+
+
 def test_nics_status_reads_carrier_from_sysfs(monkeypatch, tmp_path):
     (tmp_path / "eno1").mkdir()
     (tmp_path / "eno1" / "carrier").write_text("1\n")       # enp3s0 没有文件 = 读不到 = 没插线

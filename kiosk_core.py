@@ -18,8 +18,7 @@ import cartlog
 import clone_core
 import pxeserver
 
-LAN1_CON = "Lan1-pxe"   # eno1, 装机口
-LAN2_CON = "enp3s0"     # 管理口
+LAN2_CON = "enp3s0"     # 管理口 (网口名; 实际生效的连接看 nics_status)
 
 # 装机网段只在部署时定 (systemd EnvironmentFile), 车机不改; 仓库里只放示例值
 PXE_ENV = "/etc/ops-cart/pxe.env"
@@ -87,15 +86,16 @@ SYS_NET = "/sys/class/net"
 
 
 def nics_status(sysfs=SYS_NET):
-    """[{name, con, ip, method, link}] 只看两个业务口. carrier 直接读 sysfs, 读不到 = 没插线."""
+    """[{name, con, ip, method, link}] 只看两个业务口. carrier 直接读 sysfs, 读不到 = 没插线.
+    con / method 读网口上实际生效的那条连接 (网口模式托管后是 cart-<口>-<模式>, #12), 没有就是 "-"."""
     result = []
-    for con, name, role in ((LAN1_CON, "eno1", "PXE 装机口"),
-                            (LAN2_CON, "enp3s0", "管理口")):
+    for name, role in (("eno1", "PXE 装机口"), ("enp3s0", "管理口")):
         _, ip = run(["ip", "-4", "-br", "addr", "show", name])
         ip = ip.split()[-1] if ip else "-"
-        _, method = run(["nmcli", "-g", "ipv4.method", "con", "show", con])
+        _, con = run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", name])
+        _, method = run(["nmcli", "-g", "ipv4.method", "con", "show", "id", con]) if con else (0, "")
         link = _read(f"{sysfs}/{name}/carrier") == "1"
-        result.append({"name": name, "con": con, "role": role, "ip": ip,
+        result.append({"name": name, "con": con or "-", "role": role, "ip": ip,
                        "method": method or "-", "link": link})
     return result
 
