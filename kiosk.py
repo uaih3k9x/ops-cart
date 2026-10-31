@@ -23,6 +23,7 @@ import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
 import lamps_core as lc
+import mcp_pxe
 import mcp_serial
 import ups_core as uc
 import serial_core as sc
@@ -32,6 +33,7 @@ from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
 from confirm_panel import ConfirmDialog
+from pxe_req_panel import PxeRequestDialog
 
 FONT = ("Noto Sans CJK SC", 13)
 FONT_BIG = ("Noto Sans CJK SC", 15)
@@ -82,6 +84,8 @@ class Kiosk(tk.Tk):
         self._kiosk_report = dc.KioskReporter()   # 回写锁屏/键鼠计数给副屏 (#10), 采样线程里用
         # Agent 写串口 (#23): 采样线程 peek 来的视图 (None = 还没采到), 确认框, 车机上人的动作经它改状态
         self._sw_view, self._confirm_win, self._sw_store = None, None, mcp_serial.Store()
+        # Agent PXE 解锁申请 (#24): 采样线程 peek 来的视图 (带确认码), 申请框, 弹过的编号 (人关掉了不再弹)
+        self._pxe_view, self._pxe_req_win, self._pxe_seen, self._pxe_store = None, None, set(), mcp_pxe.Store()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
 
         kc.kp_enter_as_return(self)
@@ -323,7 +327,9 @@ class Kiosk(tk.Tk):
         # 副屏 (cart-dash) 拿不到这两样: 锁屏看锁屏窗口在不在, 键鼠看入队计数. 只在变了时写盘
         self._kiosk_report.update(self._lock_win is not None, self._kvm_count, ups_since=self._ups_since)
         slots, counters = lc.sample(sc.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
-        return slots, counters, mcp_serial.peek()       # Agent 写串口 (#23): 只读, 读不懂 = 全部急停
+        sw_view = mcp_serial.peek()                     # Agent 写串口 (#23): 只读, 读不懂 = 全部急停
+        stopped = all(s["estop"] for s in cfc.slot_states(sw_view).values())
+        return slots, counters, sw_view, mcp_pxe.peek(stopped=lambda: stopped)   # PXE 申请 (#24) 跟全部急停走
 
     def _ups_sample(self):
         """后台线程: 每秒读一次 upower (命令行, 只读). 读不到就返回 None."""
@@ -430,9 +436,10 @@ class Kiosk(tk.Tk):
     def _lamp_sampled(self, res):
         if isinstance(res, Exception):
             return
-        self._lamp_slots, counters, self._sw_view = res
+        self._lamp_slots, counters, self._sw_view, pxe_view = res
         if self._confirm_win is not None and self._confirm_win.winfo_exists():
             self._confirm_win.refresh(self._sw_view)
+        self._pxe_req_update(pxe_view)
         now = time.time()
         bells = {k[5:]: v for k, v in counters.items() if k.startswith("bell:")}
         self._bell_active = self._bell_activity.update(bells, now)
@@ -521,6 +528,64 @@ class Kiosk(tk.Tk):
             self._serial_say("上一个操作还在处理中…", ok=False)
             return
         self._serial_say("发送中, 等设备回…" if op == "confirm" else "处理中…")
+
+    # ------------------------------------------------------------ Agent PXE 解锁申请 (#24)
+
+    def _pxe_req_update(self, view):
+        """采样回来 (主线程): 申请框开着就刷新; 有没弹过的新申请且没锁屏就弹. 车机进程是 root、在本机屏幕上,
+        确认在这里给 (照抄确认码); 网页不给."""
+        self._pxe_view = view
+        w = self._pxe_req_win
+        if w is not None and w.winfo_exists():
+            w.refresh(view)
+            return
+        ids = {p["id"] for p in view["pending"]}
+        self._pxe_seen &= ids
+        if ids - self._pxe_seen and self._lock_win is None and self._boot_win is None:    # 锁屏 / 自检页上不弹
+            self._pxe_seen |= ids
+            self._open_pxe_req()
+
+    def _open_pxe_req(self):
+        w = self._pxe_req_win
+        if w is not None and w.winfo_exists():
+            w.lift()
+            return
+
+        def manual():
+            self._close_pxe_req()
+            self._arm_dialog()
+        self._pxe_req_win = PxeRequestDialog(self, self._pxe_view, self._pxe_req_action, on_manual=manual)
+
+    def _close_pxe_req(self):
+        if self._pxe_req_win is not None and self._pxe_req_win.winfo_exists():
+            self._pxe_req_win.destroy()
+        self._pxe_req_win = None
+
+    def _pxe_req_say(self, text, ok=True):
+        w = self._pxe_req_win
+        if w is not None and w.winfo_exists():
+            w.say(text, ok)
+        self.banner.config(text=text)
+
+    def _pxe_req_action(self, op, arg):
+        """申请框的按钮: 到后台经 mcp_pxe 执行 (读写状态、重算清单、写 tftp 都不在主线程)."""
+        store = self._pxe_store
+        if op == "confirm":
+            iid, typed, digest = arg
+
+            def work():
+                return mcp_pxe.human_confirm(store, iid, typed, digest, cfc.BY_KIOSK)
+        else:
+            def work():
+                return mcp_pxe.human_reject(store, arg, cfc.BY_KIOSK)
+
+        def done(res):
+            ok = not isinstance(res, Exception)
+            self._pxe_req_say(str(res) if ok else f"不行: {res}", ok)
+        if not self.ui.run_bg(work, done, key="pxe-req"):
+            self._pxe_req_say("上一个操作还在处理中…", ok=False)
+            return
+        self._pxe_req_say("处理中…")
 
     def _render_net(self, state, text):
         """顶栏和锁屏的网络标用同一份探测结果, 锁着屏也照常刷新."""
@@ -1026,6 +1091,8 @@ class Kiosk(tk.Tk):
             return
         self._release_passthrough()
         self._close_confirm()                   # 确认框是置顶窗口, 别浮在锁屏上
+        self._close_pxe_req()
+        self._pxe_seen.clear()                  # 解锁后还在等的申请再弹一次
         w = tk.Toplevel(self, bg="#10141c")
         w.overrideredirect(True)
         w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
@@ -1142,6 +1209,9 @@ class Kiosk(tk.Tk):
                 if not self._disarm_quietly():
                     messagebox.showerror("装机模式", "上锁失败 (写不了 tftp 目录?), 请在终端检查")
                 self._pxe_tick(reschedule=False)
+            return
+        if self._pxe_view and self._pxe_view["pending"]:   # 有 Agent 申请在等 (#24): 先看申请, 框里可转手动
+            self._open_pxe_req()
             return
         self._arm_dialog()
 
