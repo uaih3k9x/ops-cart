@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cartlog
 import ch9329
 import kiosk_core as kc
+import kvm_broker
 import kvm_core as kvm
 import serial_core as sc
 import web_core as wc
@@ -54,9 +55,10 @@ def _text(status, msg):
 
 
 def _real_ch_open(path):
-    """按绑定解析出的 by-id 路径打开 CH9329; 打不开返回 None."""
+    """按绑定解析出的 by-id 路径打开 CH9329; 打不开返回 None.
+    键鼠代理在跑就经它发 (网页口是人在操作, 算 human 不排队), 不在就直开 (#9)."""
     try:
-        return ch9329.Ch9329(os.path.realpath(path), log=lambda *a: None)
+        return kvm_broker.open_ch(os.path.realpath(path), src="human", who="web")
     except OSError:                     # 含被占用 (Ch9329Busy) 和打不开
         return None
 

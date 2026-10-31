@@ -21,6 +21,7 @@ import tempfile
 import cart_ocr
 import cartlog
 import ch9329
+import kvm_broker
 import recipe_core
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,7 +46,9 @@ def make_snap(out_dir, dev=None):
 
 def make_send(port, baud):
     def send(key):
-        dev = ch9329.Ch9329(port, baud)         # 被占用抛 Ch9329Busy, 由 Runner 等待重试
+        # 经键鼠代理算 agent (人刚动过就排队, 急停抛 KvmStopped -> 停); 代理不在直开.
+        # 被占用 / 排队超时抛 Ch9329Busy, 由 Runner 等待重试
+        dev = kvm_broker.open_ch(port, src="agent", who="recipe", baud=baud)
         try:
             dev.send_keys([key])
         finally:

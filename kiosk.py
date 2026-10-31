@@ -26,7 +26,6 @@ import lamps_core as lc
 import netprof_core as npc
 import ups_core as uc
 import serial_core as sc
-from ch9329 import Ch9329
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
@@ -554,7 +553,8 @@ class Kiosk(tk.Tk):
             return "ok"
         self._close_ch()
         # 按 by-id 路径 (带序列号) 开, 不用 ttyACMn: 放锁期间拔了再插, ttyACMn 可能已经是别的键鼠
-        ich = kvm.IdleCh(lambda: Ch9329(path, log=lambda *a: None),
+        # 经键鼠代理算 human (人永远优先, 不排队); 代理不在就直开 (#9)
+        ich = kvm.IdleCh(kvm.human_opener(path),
                          on_busy=lambda: self.ui.post(self._ch_busy))
         self.chw = kui.ChWorker(ich, on_gone=lambda ex: self.ui.post(self._ch_gone, ex))
         self._ch_dev = dev

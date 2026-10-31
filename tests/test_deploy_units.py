@@ -77,3 +77,20 @@ def test_mcp_example_conf_token_is_not_usable():
     assert conf["port"] == 8765 and conf["tokens"]
     for tok in conf["tokens"].values():                 # 照抄样例上线也进不来
         assert mc.token_who(f"Bearer {tok}", conf["tokens"]) is None
+
+
+def test_kvm_broker_unit_socket_and_hardening():
+    """#9 键鼠代理: socket 路径和代码默认一致, 日志进 /var/log/ops-cart (logrotate 已覆盖), 去掉全部能力."""
+    import kvm_broker
+    u = unit("kvm-broker.service")
+    body = "\n".join(l for l in u.splitlines() if not l.lstrip().startswith("#"))
+    assert "ExecStart=/usr/bin/python3 /opt/pxe/kvm_broker.py" in body
+    assert kvm_broker.SOCK == "/run/ops-kvm/kvm.sock" and "RuntimeDirectory=ops-kvm" in body
+    assert kvm_broker.LOG.startswith("/var/log/ops-cart/") and "ReadWritePaths=/var/log/ops-cart" in body
+    for k in ("NoNewPrivileges=yes", "ProtectSystem=strict", "CapabilityBoundingSet=\n",
+              "SupplementaryGroups=dialout", "RestrictAddressFamilies=AF_UNIX\n", "IPAddressDeny=any",
+              "Restart=on-failure"):
+        assert k in body + "\n", k
+    assert "kiosk.service" not in body and "webkiosk.service" not in body     # 谁都不依赖谁, 代理不在客户端直开
+    rot = (UNITS.parent / "logrotate.d" / "ops-cart").read_text()
+    assert "/var/log/ops-cart/*.log" in rot and "copytruncate" in rot
