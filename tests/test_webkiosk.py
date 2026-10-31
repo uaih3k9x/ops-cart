@@ -2,6 +2,7 @@
 
 import json
 
+import ch9329
 import kiosk_core as kc
 import web_core as wc
 import webkiosk
@@ -1080,3 +1081,20 @@ def test_ch_reaper_keeps_running_after_errors(tmp_path):
             raise OSError("boom")
     webkiosk.ch_reaper(A(), sleep=lambda s: None, rounds=3)
     assert len(calls) == 3
+
+
+def test_real_ch_open_goes_through_kvm_broker_as_human(monkeypatch):
+    """网页口是人在操作: 经键鼠代理算 human, 不排队 (#9). 代理不在 open_ch 自己退回直开."""
+    got = []
+    monkeypatch.setattr(webkiosk.kvm_broker, "open_ch",
+                        lambda port, src="agent", who="cli", **kw: got.append((port, src, who)) or "ch")
+    monkeypatch.setattr(webkiosk.os.path, "realpath", lambda p: "/dev/ttyACM3")
+    assert webkiosk._real_ch_open("/dev/serial/by-id/x") == "ch"
+    assert got == [("/dev/ttyACM3", "human", "web")]
+
+
+def test_real_ch_open_errors_become_none(monkeypatch):
+    def boom(*a, **kw):
+        raise ch9329.Ch9329Busy("占着")
+    monkeypatch.setattr(webkiosk.kvm_broker, "open_ch", boom)
+    assert webkiosk._real_ch_open("/dev/ttyACM0") is None
