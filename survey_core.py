@@ -37,8 +37,10 @@ _FORBIDDEN = set(";&<>`$#!")                     # 拼接/重定向/命令替换
 MAX_LEN = 200
 
 
-def is_readonly(cmd, vendor):
+def is_readonly(cmd, vendor, extra_verbs=()):
     """这条命令能不能不经人确认直接发 (fail-closed: 拿不准一律 False).
+
+    extra_verbs: #21 写闸门的规则文件给内置厂商追加的只读动词 (如 ping); 只加动词, 别的规则照旧.
 
     规则 (只认规范写法, 不替设备猜):
       - 厂商得有内置规则 (huawei / cisco); 第一个词必须原样是 display (华为) / show (思科), 全小写.
@@ -63,7 +65,7 @@ def is_readonly(cmd, vendor):
     words = cmd.split(" ")
     if not all(_TOKEN.fullmatch(w) for w in words):       # 空词 = 前后空白或连续空格
         return False
-    if words[0] not in rules["verbs"] or len(words) < 2 or words[1] in rules["deny"]:
+    if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2 or words[1] in rules["deny"]:
         return False
     segs, cur = [], []
     for w in words[1:]:
