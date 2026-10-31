@@ -13,7 +13,8 @@ def _ctx(**over):
            "rows": lambda: [{"label": "LAN2", "state": "OK"}],
            "temps": lambda: [("CPU", 45)], "fans": lambda: [],
            "uptime": lambda: "1d", "lamps": lambda: {"con-1": 1},
-           "kiosk": lambda: {}, "todo": lambda: ["换线"], "dream": lambda: ""}
+           "kiosk": lambda: {"pid": 1, "alive": True},      # 车机已就绪; 没就绪画开机自检 (#26)
+           "todo": lambda: ["换线"], "dream": lambda: ""}
     ctx.update(over)
     return ctx
 
@@ -206,3 +207,29 @@ def test_loop_marks_moving_counters_active(tmp_path, monkeypatch):
         pass
     pxe = [next(x for x in v["lower"] if x["name"] == "PXE")["active"] for v in views]
     assert pxe[0] is False and pxe[-1] is True
+
+
+def test_loop_shows_boot_screen_until_kiosk_alive_and_again_when_it_dies(tmp_path, monkeypatch):
+    """#26: kiosk 没起来 → 自检版面; 起来了 → 工作页; 挂了 → 回自检."""
+    views, n = [], {"round": 0}
+    kiosk = [{}, {}, {"pid": 7, "alive": True}, {"pid": 7, "alive": True}, {"pid": 7, "alive": False}]
+
+    class Stop(Exception):
+        pass
+
+    def fake_sleep(_s):
+        n["round"] += 1
+        if n["round"] >= len(kiosk):
+            raise Stop()
+
+    t = {"v": time.time()}
+    monkeypatch.setattr(ds.time, "sleep", fake_sleep)
+    monkeypatch.setattr(ds.time, "time", lambda: t.__setitem__("v", t["v"] + 1) or t["v"])
+    try:
+        ds.run(state_path=str(tmp_path / "s.json"), out=io.StringIO(), preview=str(tmp_path / "p.jpg"),
+               ctx=_ctx(kiosk=lambda: kiosk[n["round"]], now=lambda: t["v"]),
+               render=lambda v: views.append(v) or b"x")
+    except Stop:
+        pass
+    assert [bool(v.get("boot")) for v in views] == [True, True, False, True]   # 第 4 轮版面没变不推
+    assert views[-1]["lines"][-1]["status"] == "未运行"

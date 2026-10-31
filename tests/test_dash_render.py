@@ -128,3 +128,68 @@ def test_ups_line_on_battery_never_overlaps_clock(clock):
 def test_ups_line_keeps_full_text_when_it_fits():
     ups = {"text": "电池 100% · 负载 18%", "level": "ok"}
     assert r.ups_fit(ups, "23:58") == ("电池 100% · 负载 18%", r.UPS_PX)
+
+
+# ---- #26: 开机自检版面
+
+def _boot_snap(**over):
+    import time as _t
+    snap = {"ts": _t.time(), "version": "Ver 1.08.03   Build 0042 (abc1234)",
+            "rows": [{"label": "PXE SERVER", "state": "FAIL", "detail": "NOT RUNNING", "check": "service"},
+                     {"label": "LAN2", "state": "OK", "detail": "192.0.2.5", "check": "lan"},
+                     {"label": "TAILSCALE", "state": "WARN", "detail": "OFFLINE", "check": "tailscale"},
+                     {"label": "CH9329", "state": "OK", "detail": "1 ONLINE", "check": "ch9329"}],
+            "ups": {"state": "fully-charged", "percent": 100, "status": "OL"},
+            "slots": [{"dev": "/dev/con-%d" % i, "present": i < 3, "baud": None, "count": None}
+                      for i in range(1, 5)],
+            "svcs": {"chronyd": [True, True], "kiosk": [True, True]}, "kiosk": {}}
+    snap.update(over)
+    return snap
+
+
+def _boot_view(late=30, **over):
+    """跑完逐行动画后的那一帧."""
+    snap = _boot_snap(**over)
+    t = dc.BootTracker(step=0.5, late=late)
+    for i in range(20):
+        v = t.view(snap, snap["ts"] + 0.5 * i)
+    return v
+
+
+def _has(img, box, color):
+    from PIL import ImageColor
+    want = ImageColor.getrgb(color)
+    return want in set(img.crop(box).getdata())
+
+
+def test_render_boot_screen_is_portrait_and_sends_landscape():
+    v = _boot_view()
+    assert v["boot"] and r.render(v).size == (r.PANEL_W, r.PANEL_H)
+    assert Image.open(io.BytesIO(r.make_frame(v))).size == (r.PANEL_H, r.PANEL_W)
+
+
+def test_render_boot_status_colors_follow_state():
+    v = _boot_view()
+    img = r.render(v)
+    states = [ln["state"] for ln in v["lines"]]
+    assert {"ok", "fail", "wait"} <= set(states)
+    for i, st in enumerate(states):
+        box = r.boot_status_box(i)
+        want = {"ok": r.ACCENT, "fail": r.BAD, "warn": r.WARN, "late": r.WARN}.get(st)
+        if want:
+            assert _has(img, box, want), (i, st)
+        else:                                       # 等待 / 没装: 灰, 不带红绿
+            assert not _has(img, box, r.BAD) and not _has(img, box, r.ACCENT), (i, st)
+
+
+def test_render_boot_late_lines_are_amber():
+    v = _boot_view(late=1, rows=[], ups=None, slots=[], svcs={})
+    assert all(ln["state"] == "late" for ln in v["lines"])
+    img = r.render(v)
+    assert all(_has(img, r.boot_status_box(i), r.WARN) for i in range(len(v["lines"])))
+
+
+def test_render_boot_stale_banner():
+    from PIL import ImageColor
+    img = r.render(dict(_boot_view(), stale=True))
+    assert img.getpixel((4, r.PANEL_H - 30)) == ImageColor.getrgb(r.BAD)

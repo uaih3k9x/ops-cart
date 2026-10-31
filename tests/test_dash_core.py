@@ -245,9 +245,9 @@ def test_default_ctx_reads_conbroker_dir_like_kiosk(monkeypatch):
 
 def test_kiosk_reporter_writes_only_on_change(tmp_path):
     p = str(tmp_path / "kiosk.json")
-    rep = dc.KioskReporter(p)
+    rep = dc.KioskReporter(p, pid=42)
     assert rep.update(locked=True, kvm=3) is True
-    assert dc.read_kiosk(p) == {"locked": True, "kvm": 3}
+    assert dc.read_kiosk(p) == {"locked": True, "kvm": 3, "pid": 42}
     assert rep.update(locked=True, kvm=3) is False         # 没变不写盘 (200 ms 一次的采样线程里调)
     assert rep.update(locked=False, kvm=3) is True
     assert dc.read_kiosk(p)["locked"] is False

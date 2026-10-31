@@ -10,6 +10,7 @@
 """
 
 import json
+import os
 import re
 import time
 
@@ -29,7 +30,8 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 自检要 ping/systemctl/v4l2-ctl, 每 200 ms 跑一遍既浪费又会在断网时拖过 STALE_S.
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
-           "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2, "pxe": 1}
+           "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2, "pxe": 1,
+           "svcs": 5, "version": 300}
 UPS_LOW = 20            # 走电池且电量不高于这个: 副屏变红
 # LLDP 监听哪些口 (#14): 跟下排 LAN1 / LAN2 灯同一份配置, 网口名不另写
 LLDP_IFACES = [(name, key[4:]) for name, _label, key in lamps_core.LOWER
@@ -68,6 +70,8 @@ def collect(ctx):
         "dream": _pull(ctx, "dream", ""),
         "lldp": _pull(ctx, "lldp", {}),             # {"LAN1": {state, age, neighbor, error}} 见 lldp_core
         "pxe": _pull(ctx, "pxe", {}),               # pxe-guard.json (守卫在跑才有), 自己发地址限时 #11
+        "svcs": _pull(ctx, "svcs", {}),             # {"chronyd": (enabled, active), "kiosk": ...} 开机自检用 #26
+        "version": _pull(ctx, "version", ""),       # "Ver 1.08.03   Build ..." 开机自检抬头
     }
     return snap
 
@@ -98,15 +102,32 @@ def read_kiosk(path=KIOSK_PATH):
     return d if isinstance(d, dict) else {}
 
 
-class KioskReporter:
-    """kiosk 回写 kiosk.json: 锁屏状态 + 键鼠计数. 在 kiosk 的采样线程里调,
-    只在值变了才落盘; 写失败吞掉 (/run 没建好也不能拖垮车机界面)."""
+def _pid_alive(pid):
+    return os.path.exists("/proc/%d" % pid)
 
-    def __init__(self, path=KIOSK_PATH):
+
+def kiosk_live(path=KIOSK_PATH, alive=_pid_alive):
+    """kiosk.json + "alive": 写它的 kiosk 进程还在不在 (#26).
+
+    kiosk.json 只在值变了才写, 可能半天不动, 不能按 mtime 判活; 改看里面的 pid.
+    没文件 = 还没起来 (/run 开机清空); 有文件但 pid 没了 = 挂了/在重启; 没 pid = 老版 kiosk, 也算没就绪."""
+    doc = read_kiosk(path)
+    pid = doc.get("pid")
+    return dict(doc, alive=isinstance(pid, int) and bool(alive(pid)))
+
+
+class KioskReporter:
+    """kiosk 回写 kiosk.json: 锁屏状态 + 键鼠计数 + pid. 在 kiosk 的采样线程里调,
+    只在值变了才落盘; 写失败吞掉 (/run 没建好也不能拖垮车机界面).
+
+    采样线程在界面建好后才跑, 所以第一次写出来 = kiosk 初始化完了; 副屏拿 pid 判活 (#26)."""
+
+    def __init__(self, path=KIOSK_PATH, pid=None):
         self.path, self._last = path, None
+        self.pid = os.getpid() if pid is None else pid
 
     def update(self, locked, kvm):
-        state = {"locked": bool(locked), "kvm": int(kvm)}
+        state = {"locked": bool(locked), "kvm": int(kvm), "pid": self.pid}
         if state == self._last:
             return False
         try:
@@ -255,6 +276,170 @@ def layout_view(snap, locked=False, active=(), now=None):
     return view
 
 
+# ---- 开机自检 (#26): kiosk 没就绪前副屏不画工作页/锁屏 (那些是旧的或残缺的), 改画逐行自检
+
+BOOT_UNITS = ("chronyd", "kiosk")       # 只多查这两个服务的 is-active, 别的全用快照里已有的
+BOOT_LATE_S = 45                        # 开机这么久还没好的项标琥珀
+BOOT_STEP_S = 0.5                       # 逐行出结果的间隔; 跟副屏推送上限 (2 fps) 一致, 不为动画加帧
+BOOT_STATES = ("ok", "warn", "fail", "off", "wait", "late")
+BOOT_STATUS = {"ok": "OK", "warn": "注意", "fail": "故障", "off": "--", "wait": "等待", "late": "未就绪"}
+TIME_SANE = 1735689600                  # 2025-01-01: 早于这个 = RTC 掉电回到 1970 了
+_ROW_STATE = {"OK": "ok", "FAIL": "fail", "WARN": "wait", "--": "off"}   # 开机时 WARN 多半是还没好
+_PART = {"OK": "OK", "WARN": "注意", "FAIL": "故障"}
+
+
+def _item(key, label, state, detail="", status=None):
+    return {"key": key, "label": label, "state": state, "detail": detail,
+            "status": status or BOOT_STATUS[state]}
+
+
+def _svc(snap, unit):
+    """(enabled, active); 快照里没有 (还没采到) 给 None."""
+    v = (snap.get("svcs") or {}).get(unit)
+    return (bool(v[0]), bool(v[1])) if isinstance(v, (list, tuple)) and len(v) == 2 else None
+
+
+def _row(rows, check=None, label=None):
+    return next((r for r in rows if (check and r.get("check") == check)
+                 or (label and r.get("label") == label)), None)
+
+
+def _row_item(key, label, rows, row):
+    if not rows:
+        return _item(key, label, "wait")                 # 自检还没跑完第一轮
+    if row is None:
+        return _item(key, label, "off", "不在自检计划里")
+    return _item(key, label, _ROW_STATE.get(row.get("state"), "wait"), row.get("detail", ""))
+
+
+def _worst(states):
+    for s in ("fail", "wait", "ok"):
+        if s in states:
+            return s
+    return "off"
+
+
+def _boot_time(snap, now):
+    label = "系统时间 / 时钟同步"
+    t = time.strftime("%m-%d %H:%M", time.localtime(now))
+    if now < TIME_SANE:
+        return _item("time", label, "fail", "时钟不对 (%s)" % time.strftime("%Y", time.localtime(now)))
+    svc = _svc(snap, "chronyd")
+    if svc is None:
+        return _item("time", label, "wait", t)
+    if svc[1]:
+        return _item("time", label, "ok", t + " · chronyd")
+    return _item("time", label, "wait" if svc[0] else "off", t + (" · 等 chronyd" if svc[0] else " · 没开对时"))
+
+
+def _boot_ups(snap):
+    ups = snap.get("ups")
+    if not ups:
+        return _item("ups", "UPS", "wait", "未连接")
+    if ups_core.on_battery(ups):
+        return _item("ups", "UPS", "warn", "市电断开 · 电池 %s%%" % ups.get("percent"))
+    return _item("ups", "UPS", "ok", "市电 %s%%" % ups.get("percent"))
+
+
+def _boot_net(rows):
+    label = "网口 LAN1 / LAN2 / Wi-Fi"
+    if not rows:
+        return _item("net", label, "wait")
+    healths = [lamps_core.health_of(rows, lab) for name, lab, _ in lamps_core.LOWER
+               if name in ("LAN1", "LAN2", "Wi-Fi")]
+    states = [{"OK": "ok", "WARN": "wait", "FAIL": "fail"}.get(h, "off") for h in healths]
+    return _item("net", label, _worst(states), " / ".join(_PART.get(h, "--") for h in healths))
+
+
+def _boot_heads(slots):
+    label = "串口操作头 1–4"
+    if not slots:
+        return _item("heads", label, "wait")
+    n = sum(1 for s in slots if s.get("present"))
+    return _item("heads", label, "ok" if n else "off", "" if n else "一根没插",
+                 status="%d/%d" % (n, len(slots)))
+
+
+def _boot_kvm(rows):
+    """采集卡 (selftest.json 里 check=signal 的行, 可能好几张) + 键鼠 CH9329 合一行."""
+    label = "采集卡 / 键鼠"
+    if not rows:
+        return _item("kvm", label, "wait")
+    caps = [r.get("state") for r in rows if r.get("check") == "signal"]
+    cap = "FAIL" if "FAIL" in caps else "OK" if "OK" in caps else "--"
+    kb = (_row(rows, check="ch9329", label="CH9329") or {}).get("state", "--")
+    parts = [cap, kb] if caps else [kb]
+    states = [{"OK": "ok", "FAIL": "fail"}.get(p, "off") for p in parts]
+    state = "fail" if "fail" in states else "ok" if "ok" in states else "off"
+    detail = ("采集 %s · " % _PART.get(cap, "--") if caps else "") + "键鼠 " + _PART.get(kb, "--")
+    return _item("kvm", label, state, detail)
+
+
+def _boot_kiosk(snap):
+    label = "车机 kiosk"
+    k = snap.get("kiosk") or {}
+    if k.get("alive"):
+        return _item("kiosk", label, "ok", "就绪")
+    if isinstance(k.get("pid"), int):                    # 写过 kiosk.json, 进程没了: 挂了或在重启
+        return _item("kiosk", label, "fail", "进程 %d 已退出" % k["pid"], status="未运行")
+    svc = _svc(snap, "kiosk")
+    detail = "" if svc is None else "服务已起, 等界面" if svc[1] else "等服务拉起"
+    return _item("kiosk", label, "wait", detail, status="启动中…")
+
+
+def boot_items(snap, now):
+    """开机自检各项 [{key, label, state, status, detail}], 只看快照. state 见 BOOT_STATES:
+    ok 绿 / warn 琥珀 (真有事, 如走电池) / fail 红 / off 没装没插 (灰, 不算问题) / wait 还没好."""
+    snap = snap or {}
+    rows = snap.get("rows") or []
+    return [_boot_time(snap, now),
+            _boot_ups(snap),
+            _boot_net(rows),
+            _row_item("tailscale", "tailscale", rows, _row(rows, check="tailscale", label="TAILSCALE")),
+            _row_item("pxe", "PXE 服务", rows, _row(rows, label="PXE SERVER")),
+            _boot_heads(snap.get("slots") or []),
+            _boot_kvm(rows),
+            _boot_kiosk(snap)]
+
+
+class BootTracker:
+    """副屏开机自检的状态机: kiosk 就绪 → view() 返回 None (照常画); 否则返回自检版面.
+
+    "逐行出结果": 每项第一次有结果时排一个亮相时刻, 和上一个亮相至少隔 step 秒, 排定就不再改
+    (后面的项先好、前面的项后好也不会让已出的行缩回去). 没到亮相时刻的行显示"等待".
+    红的 (fail) 不排队, 马上出. 自检开始 late 秒后还在等的标琥珀 (late).
+    kiosk 就绪后再掉线, 下次进自检从头再来一遍.
+    """
+
+    def __init__(self, late=BOOT_LATE_S, step=BOOT_STEP_S):
+        self.late, self.step = late, step
+        self.start = None
+
+    def view(self, snap, now):
+        snap = snap or {}
+        if (snap.get("kiosk") or {}).get("alive"):
+            self.start = None
+            return None
+        if self.start is None:
+            self.start, self._reveal, self._last = now, {}, now
+        lines = []
+        for it in boot_items(snap, now):
+            st, key = it["state"], it["key"]
+            if st != "wait" and key not in self._reveal:
+                at = now if st == "fail" else max(now, self._last + self.step)
+                self._reveal[key] = at
+                self._last = max(self._last, at)
+            shown = st != "wait" and (st == "fail" or now >= self._reveal[key])
+            if not shown and now - self.start >= self.late:
+                it = dict(it, state="late", status=BOOT_STATUS["late"])
+            elif not shown and st != "wait":               # 有结果了, 还没轮到它亮相
+                it = dict(it, state="wait", status=BOOT_STATUS["wait"], detail="")
+            lines.append({k: it[k] for k in ("label", "state", "status", "detail")})
+        t = time.localtime(now)
+        return {"boot": True, "title": "OPS-CART", "version": snap.get("version") or "",
+                "clock": time.strftime("%H:%M", t), "lines": lines, "stale": stale(snap, now)}
+
+
 def read_notice(path=NOTICE_PATH):
     try:
         with open(path) as f:
@@ -311,7 +496,9 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "lamps": lambda: lamps_core.sample(ddir, read_kiosk().get("kvm", 0))[1],
         "slots": lambda: lamps_core.slot_status(ddir),
         "notice": lambda: read_notice(),
-        "kiosk": lambda: read_kiosk(),
+        "kiosk": lambda: kiosk_live(),
+        "svcs": lambda: kc.services_status(BOOT_UNITS),
+        "version": lambda: kc.version_string(),
         "todo": lambda: read_todo(),
         "dream": lambda: kc.dream_line(),
         "ups": lambda: _ups_sample(),

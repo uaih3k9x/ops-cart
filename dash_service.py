@@ -6,6 +6,7 @@
   - 版面有变化 / 时钟跳分钟 才重画, 画完推一帧到 USB 副屏
   - 屏幕拔掉不退出: 继续写快照, 每 3 s 试着重连
   - LAN1 / LAN2 的 LLDP 监听线程归这里管 (#14): 起不来/没 root/网口没了都只是"不可用", 不退出
+  - 车机 kiosk 没就绪 (没写 kiosk.json / 写它的进程没了) 画开机自检, 不画旧的锁屏/工作页 (#26)
 
 用法:
   python3 dash_service.py                                  # 常驻
@@ -80,6 +81,7 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, r
     next_try = 0.0
     max_gap = 1.0 / max(fps, 0.1)
     moving = lamps_core.Activity()          # 计数器变了 → 那盏灯点亮 HOLD_S 秒
+    boot = dc.BootTracker()                 # 车机没就绪就画开机自检 (#26)
 
     while True:
         seq += 1
@@ -87,6 +89,7 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, r
         dc.write(state_path, snap)
         now = time.time()
         view = dc.layout_view(snap, active=moving.update(snap.get("lamps") or {}, now))
+        view = boot.view(snap, now) or view
         key = _view_key(view)
 
         want = (key != last_key or view.get("clock") != last_clock or view.get("stale"))

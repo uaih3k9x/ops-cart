@@ -137,6 +137,10 @@ def render(view, size=(PANEL_W, PANEL_H)):
     W, H = size
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
+    if view.get("boot"):
+        _boot_body(d, view, W, H)
+        _footer(d, view, W, H)
+        return img
 
     # ---- 头部: 大时钟 / 日期 / 网络
     d.text((CLOCK_X, 22), view.get("clock") or "--:--", font=_font(CLOCK_PX), fill=FG)
@@ -183,15 +187,71 @@ def render(view, size=(PANEL_W, PANEL_H)):
         _locked_body(d, view, W, H)
     else:
         _work_body(d, view, W, H)
+    _footer(d, view, W, H)
+    return img
 
-    # ---- 底部: 数据源停了就整条红, 否则一道绿线
+
+def _footer(d, view, W, H):
+    """底部: 数据源停了就整条红, 否则一道绿线."""
     if view.get("stale"):
         d.rectangle([0, H - 70, W, H], fill=BAD)
         d.text((W // 2, H - 35), "数据源停了 · 以上是旧数据", font=_font(32), fill=lc.LIT_FG,
                anchor="mm")
     else:
         d.rectangle([0, H - 8, W, H], fill=ACCENT)
-    return img
+
+
+# ---- 开机自检 (#26): 一行一项, "名称 ······ 结果", 下面一行灰字细节
+
+BOOT_Y0, BOOT_ROW = 236, 108            # 第一行顶 / 行距
+BOOT_STATUS_W = 240                     # 右边结果栏宽 (测试按这个框找颜色)
+BOOT_COLOR = {"ok": ACCENT, "warn": WARN, "late": WARN, "fail": BAD}   # wait / off 都是灰
+
+
+def boot_status_box(i, W=PANEL_W):
+    """第 i 行结果栏的框 (x0, y0, x1, y1)."""
+    y = BOOT_Y0 + i * BOOT_ROW
+    return (W - M - BOOT_STATUS_W, y, W - M, y + 56)
+
+
+def _dashes(d, y, W):
+    for x in range(M, W - M, 24):
+        d.line([x, y, min(x + 12, W - M), y], fill=DIM, width=2)
+
+
+def _boot_body(d, view, W, H):
+    """开机自检: 抬头 (名称/版本/时钟) + 逐行结果 + 底下一句说明. 没出结果的行灰字"等待"."""
+    d.text((M, 48), view.get("title") or "OPS-CART", font=_font(72), fill=FG)
+    d.text((W - M, 64), view.get("clock") or "--:--", font=_font(56), fill=DIM, anchor="ra")
+    d.text((M, 140), view.get("version") or "", font=_font(28), fill=DIM)
+    _dashes(d, 206, W)
+
+    lines = view.get("lines") or []
+    lf, sf, df = _font(36), _font(36), _font(26)
+    for i, ln in enumerate(lines):
+        x0, y, x1, _ = boot_status_box(i, W)
+        color = BOOT_COLOR.get(ln.get("state"), DIM)
+        status = ln.get("status") or ""
+        label = ln.get("label") or ""
+        d.text((M, y + 8), label, font=lf, fill=BAD if ln.get("state") == "fail" else FG)
+        d.text((x1, y + 8), status, font=sf, fill=color, anchor="ra")
+        dot_l = M + lf.getlength(label) + 14            # 名称和结果之间一串点, 开机自检的样子
+        dot_r = x1 - sf.getlength(status) - 14
+        n = int((dot_r - dot_l) // df.getlength("."))
+        if n > 2:
+            d.text((dot_l, y + 14), "." * n, font=df, fill=LINE if ln.get("state") == "wait" else DIM)
+        detail = wrap(ln.get("detail") or "", df, W - 2 * M - 20, 1)
+        if detail:
+            d.text((M + 20, y + 58), detail[0], font=df, fill=color if ln.get("state") == "late" else DIM)
+
+    y = BOOT_Y0 + len(lines) * BOOT_ROW + 10
+    _dashes(d, y, W)
+    states = [ln.get("state") for ln in lines]
+    summary = "  ".join(s for s in ("正常 %d" % states.count("ok"),
+                                    "等待 %d" % (states.count("wait") + states.count("late")),
+                                    "故障 %d" % states.count("fail") if "fail" in states else "") if s)
+    d.text((M, y + 24), summary, font=_font(30), fill=BAD if "fail" in states else FG)
+    d.text((M, y + 70), "车机就绪后自动切到状态板", font=_font(26), fill=DIM)
 
 
 def _peers(d, peers, y, W):
