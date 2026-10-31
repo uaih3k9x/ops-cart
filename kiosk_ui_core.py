@@ -241,7 +241,7 @@ PANES = {
     "serial": "串口会话 · conbroker (display 类只读命令可直接发, 改配置先问管理员)",
     "ks": "Kickstart 编辑 · 保存自动备份, 修改立即对下次装机生效",
     "wifi": "无线网络 · 优先级从上往下自动连, 再点一次按钮返回",
-    "netprof": "网口配置文件 · 切换 / 回退 / 新建, 再点一次按钮返回",
+    "netmode": "网口模式 · LAN1 / LAN2 各一个模式, 每个都能撤, 再点一次按钮返回",
     "wol": "网络唤醒 · 双击清单里的机器直接唤醒, 再点一次按钮返回",
 }
 
@@ -311,9 +311,8 @@ MENU = {
     ],
     "net": [
         _pane("无线网络", "wifi", attr="btn_wifi"),
-        _pane("网口配置文件", "netprof"),
+        _pane("网口模式", "netmode"),
         _pane("网络唤醒 (WOL)", "wol"),
-        _act("LAN2 管理口配置", "cfg_lan2", attr="btn_lan2"),
     ],
     "power": [
         _act("重启推车", "reboot", style="warn"),

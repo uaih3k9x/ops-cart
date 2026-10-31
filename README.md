@@ -31,7 +31,9 @@
   只认白名单里的 Host、POST 必须同源,输错冷却按来源 IP 分开;以专用用户跑,操作写审计日志(PIN、打字内容不记)
 - **联网**:有线优先、无线兜底(拔网线约 17 秒切换);内置无线管理面板,
   校园网锐捷 ePortal 无浏览器自动认证(认证页主机首次记住,之后跳到陌生主机不发账号);
-  改当前出口那条无线前先确认,换连接先建后删、新密码连不上自动回退
+  改当前出口那条无线前先确认,换连接先建后删、新密码连不上自动回退;
+  LAN1 / LAN2 按网口选模式(关闭 / DHCP / 静态一页填完,含网关、DNS、出口优先级),每次切换都能撤,
+  确认框直接列出要执行的命令和 undo 命令,切失败自动回到原来的
 - **副屏与 UPS**:USB 副屏常驻状态板(`cart-dash` 统一采集,车机和副屏读同一份快照);
   APC UPS 直读 hidraw 拿电量、负载、市电状态,放电到 15% 正常关机;顶栏一排虚拟指示灯,颜色看自检、闪烁看活动
 - **OCR 与屏幕配方**:截图识字带坐标;`recipe.py boot-pxe` 自动进启动菜单选网络启动
@@ -53,7 +55,8 @@
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
 | [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序;面板底部改校园网认证账号、立即认证、看最近结果 |
 | [`wifi_prefer.py`](wifi_prefer.py) | 定时让优先级真正生效:看得见更高优先级的已保存网络就切过去,失败冷却 30 分钟 |
-| [`netprof_panel.py`](netprof_panel.py) · [`netprof_core.py`](netprof_core.py) | 网口配置文件:LAN1/LAN2 切换、一键回退、静态地址模板;发地址只在 LAN1,启用前探测对面有没有 DHCP(没插线不探测,结果算"未知",不许启用) |
+| [`netmode_panel.py`](netmode_panel.py) · [`netmode_core.py`](netmode_core.py) | 网口模式(#12):LAN1 / LAN2 每个口一个模式(关闭 / DHCP / 静态 / 交还旧配置),切换 = undo 当前 → apply 新,失败撤新的、恢复原来的,再不行落到干净状态(LAN1 关闭、LAN2 DHCP);每个模式记下自己建的 `cart-` 连接(按 uuid)和改过的内核参数原值,状态写 `/var/lib/ops-cart/netmode.json`;旧连接只认不删;静态出口优先级和 Wi-Fi 的 metric 比(常量在 `wifi_core`,#7 共用),LAN1 不当出口;无线永远不碰。设计见 [`docs/NETMODE.md`](docs/NETMODE.md) |
+| [`netprof_core.py`](netprof_core.py) | 网口共用小件:认旧连接名、静态地址校验 `static_form` / 按对端预填(不猜 /24)、DHCP 探测(没插线不探测,结果算"未知";交还装机配置前和 pxeserver 守卫都用) |
 | [`wol_panel.py`](wol_panel.py) · [`wol_core.py`](wol_core.py) | 网络唤醒:常用目标清单 + 临时输 MAC,从选定网口广播魔术包 |
 | [`atomicfile.py`](atomicfile.py) | 防断电写文件:临时文件 → fsync → 改名,配置要么旧要么新 |
 | [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
@@ -88,7 +91,7 @@
 | [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查;`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
-| [`docs/`](docs/) | 优化方案、版本部署清单、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md) |
+| [`docs/`](docs/) | 优化方案、版本部署清单、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[网口模式](docs/NETMODE.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
@@ -157,6 +160,7 @@ tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py
 
 运行时状态都在 `/run/ops-cart/`(tmpfiles 建,重启推车清空):`pxe-guard.json` 是装机口守卫状态(`pxe-renew.json` 是车机给它的续期请求),
 `pin-gate.json` 是车机 PIN 输错计数,`mpv.sock` 给 `cart_snap.py` 用,`serial-write.json` 是串口写租约 / 挂起 / 急停(重启即全部清掉,挂起的命令不会在重启后冒出来)。
+要跨重启的放 `/var/lib/ops-cart/`:`netmode.json` 记每个网口的模式和占了什么(断电后照样知道怎么撤,见 [`docs/NETMODE.md`](docs/NETMODE.md))。
 `pxe-server` 发现装机口上有别的 DHCP 不再停服,转**代理模式**(`pxe-guard.json` 里 `"state": "proxy"`、`"leases": false`):
 67 口不发地址,只对 x86-64 UEFI 的 PXE 客户端回 yiaddr=0 的引导 OFFER,4011 / TFTP / HTTP 照常;
 LAN1 拔掉再插上会重新探测,没有别人就恢复自己发地址。探测出错或拿不准一律按代理模式。

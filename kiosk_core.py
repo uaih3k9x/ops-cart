@@ -2,7 +2,7 @@
 """kiosk_core: 推车 Kiosk 的可测核心层. UI(curses)之外的逻辑都在这.
 
 - 状态采集: systemd 服务 / 网卡 / tailscale / CH9329
-- 命令生成: nmcli 改地址 (纯函数, 测试不打真机)
+- 改网口地址不在这里: 归网口模式 netmode_core (#12)
 - 装机网段: 部署配置 /etc/ops-cart/pxe.env (pxe-* 单元和 grub 菜单共用同一份)
 """
 
@@ -18,8 +18,7 @@ import cartlog
 import clone_core
 import pxeserver
 
-LAN1_CON = "Lan1-pxe"   # eno1, 装机口
-LAN2_CON = "enp3s0"     # 管理口
+LAN2_CON = "enp3s0"     # 管理口 (网口名; 实际生效的连接看 nics_status)
 
 # 装机网段只在部署时定 (systemd EnvironmentFile), 车机不改; 仓库里只放示例值
 PXE_ENV = "/etc/ops-cart/pxe.env"
@@ -87,15 +86,16 @@ SYS_NET = "/sys/class/net"
 
 
 def nics_status(sysfs=SYS_NET):
-    """[{name, con, ip, method, link}] 只看两个业务口. carrier 直接读 sysfs, 读不到 = 没插线."""
+    """[{name, con, ip, method, link}] 只看两个业务口. carrier 直接读 sysfs, 读不到 = 没插线.
+    con / method 读网口上实际生效的那条连接 (网口模式托管后是 cart-<口>-<模式>, #12), 没有就是 "-"."""
     result = []
-    for con, name, role in ((LAN1_CON, "eno1", "PXE 装机口"),
-                            (LAN2_CON, "enp3s0", "管理口")):
+    for name, role in (("eno1", "PXE 装机口"), ("enp3s0", "管理口")):
         _, ip = run(["ip", "-4", "-br", "addr", "show", name])
         ip = ip.split()[-1] if ip else "-"
-        _, method = run(["nmcli", "-g", "ipv4.method", "con", "show", con])
+        _, con = run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", name])
+        _, method = run(["nmcli", "-g", "ipv4.method", "con", "show", "id", con]) if con else (0, "")
         link = _read(f"{sysfs}/{name}/carrier") == "1"
-        result.append({"name": name, "con": con, "role": role, "ip": ip,
+        result.append({"name": name, "con": con or "-", "role": role, "ip": ip,
                        "method": method or "-", "link": link})
     return result
 
@@ -733,22 +733,7 @@ def notice_font_px(text, width, height, lo=24, hi=220):
     return max(lo, min(hi, px))
 
 
-# ---------------------------------------------------------------- 命令生成 (纯函数)
-
-def nmcli_set_static(con, addr, gateway="", dns=""):
-    cmds = [["nmcli", "con", "mod", con,
-             "ipv4.method", "manual", "ipv4.addresses", addr]]
-    # 网关 / DNS 留空也要显式给 "", 否则 con mod 不动它, 旧值残留 (和确认框里写的"无"对不上)
-    cmds[0] += ["ipv4.gateway", gateway or "", "ipv4.dns", dns or ""]
-    cmds.append(["nmcli", "con", "up", con])
-    return cmds
-
-
-def nmcli_set_dhcp(con):
-    return [["nmcli", "con", "mod", con, "ipv4.method", "auto",
-             "ipv4.addresses", "", "ipv4.gateway", "", "ipv4.dns", ""],
-            ["nmcli", "con", "up", con]]
-
+# ---------------------------------------------------------------- 电源
 
 def power(off=True):
     run(["systemctl", "poweroff" if off else "reboot"], timeout=3)

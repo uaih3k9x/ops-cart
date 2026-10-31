@@ -6,6 +6,9 @@
 
 IFACE = "wlp4s0"
 WIFI_METRIC = 900
+# 有线出口和无线比大小 (#25 网口模式的出口优先级 / #7 Wi-Fi 与有线优先级共用, 只在这里定):
+WIRED_PRIMARY_METRIC = 100      # 小于无线: 默认路由走有线 (也是 NM 给以太网的默认值)
+WIRED_BACKUP_METRIC = 1000      # 大于无线: 无线断了才走有线
 
 
 def split_terse(line):

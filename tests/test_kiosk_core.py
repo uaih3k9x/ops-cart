@@ -43,30 +43,6 @@ def test_lan1_unit_rewrite_path_is_gone():
         assert not hasattr(kc, name)
 
 
-def test_nmcli_set_static_builds_correct_cmd():
-    cmds = kc.nmcli_set_static("Lan1-pxe", "192.0.2.5/24", "192.0.2.254", "198.51.100.53")
-    assert cmds[0][:6] == ["nmcli", "con", "mod", "Lan1-pxe", "ipv4.method", "manual"]
-    assert "192.0.2.5/24" in cmds[0]
-    assert cmds[0][-1] == "198.51.100.53"     # dns
-    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == "192.0.2.254"
-    assert cmds[1] == ["nmcli", "con", "up", "Lan1-pxe"]
-
-
-def test_nmcli_set_static_empty_gateway_dns():
-    cmds = kc.nmcli_set_static("x", "10.0.0.1/24")
-    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == ""
-    # DNS 留空 = 清掉; 不带 ipv4.dns 的话 nmcli con mod 会留着旧 DNS
-    assert cmds[0][cmds[0].index("ipv4.dns") + 1] == ""
-
-
-def test_nmcli_set_dhcp_clears_static():
-    cmds = kc.nmcli_set_dhcp("enp3s0")
-    m = cmds[0]
-    assert m[m.index("ipv4.method") + 1] == "auto"
-    assert m[m.index("ipv4.addresses") + 1] == ""
-    assert m[m.index("ipv4.gateway") + 1] == ""
-
-
 SHOW = """Id=pxe-server.service
 ActiveState=active
 UnitFileState=enabled
@@ -105,6 +81,23 @@ def test_parse_systemctl_show_matches_by_id_and_tolerates_junk():
 def test_services_status_systemctl_failure(monkeypatch):
     monkeypatch.setattr(kc, "run", lambda cmd, timeout=5: (127, ""))
     assert kc.services_status(("pxe-server",)) == {"pxe-server": (False, False)}
+
+
+def test_nics_status_reads_active_connection_not_fixed_name(monkeypatch, tmp_path):
+    """#12: 网口模式托管后生效的是 cart-<口>-<模式>; 状态板 / 网页要报实际生效那条, 不是写死的旧连接名."""
+    def fake_run(cmd, timeout=5):
+        if cmd[:2] == ["ip", "-4"]:
+            return 0, ""
+        if "GENERAL.CONNECTION" in cmd:
+            return 0, {"eno1": "cart-eno1-off", "enp3s0": ""}[cmd[-1]]
+        if cmd[:3] == ["nmcli", "-g", "ipv4.method"]:
+            assert cmd[-1] == "cart-eno1-off"
+            return 0, "disabled"
+        return 1, ""
+    monkeypatch.setattr(kc, "run", fake_run)
+    nics = kc.nics_status(sysfs=str(tmp_path))
+    assert nics[0]["con"] == "cart-eno1-off" and nics[0]["method"] == "disabled"
+    assert nics[1]["con"] == "-" and nics[1]["method"] == "-"          # 没有生效的连接
 
 
 def test_nics_status_reads_carrier_from_sysfs(monkeypatch, tmp_path):
