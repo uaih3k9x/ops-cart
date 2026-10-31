@@ -29,11 +29,9 @@ from ks_panel import KsPanel
 from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
+import theme as th
 
-FONT = ("Noto Sans CJK SC", 13)
-FONT_BIG = ("Noto Sans CJK SC", 15)
-FONT_MONO = ("Noto Sans Mono CJK SC", 13)
-BOOT_BG = "#ffffff"     # 开机自检页白底, 接 Plymouth 的白底
+FONT, FONT_BIG, FONT_MONO = th.FONT, th.FONT_BIG, th.FONT_MONO
 VIDEO_DEV = "/dev/video0"
 IDLE_SECONDS = 180
 CH_REAP_MS = 1000           # 每秒让 ChWorker 看一次键鼠空不空闲 (空闲 kvm.IDLE_RELEASE_S 秒放锁, #9)
@@ -50,7 +48,7 @@ class Kiosk(tk.Tk):
         # 无 WM 环境: overrideredirect + 手动铺满, 不依赖 -fullscreen
         self.overrideredirect(True)
         self._fill_screen()
-        self.configure(bg="#10141c", cursor="arrow")
+        self.configure(bg=th.BG, cursor="arrow")
         self.ui = kui.UiBridge(self)
         kui.main_thread_gc(self)            # 后台线程里不许触发 GC (会析构 Tk 对象等主线程 -> 死锁)
         self.ui.start()
@@ -121,11 +119,11 @@ class Kiosk(tk.Tk):
     # ------------------------------------------------------------ UI
 
     def _build(self):
-        top = tk.Frame(self, bg="#10141c")
+        top = tk.Frame(self, bg=th.BG)
         top.pack(fill="x", padx=12, pady=(10, 4))
         tk.Label(top, text="运维推车控制台", font=FONT_BIG,
-                 bg="#10141c", fg="#e8eaf0").pack(side="left")
-        self.banner = tk.Label(top, text="", font=FONT_BIG, bg="#10141c", fg="#ffb86c")
+                 bg=th.BG, fg=th.FG).pack(side="left")
+        self.banner = tk.Label(top, text="", font=FONT_BIG, bg=th.BG, fg=th.NOTICE)
         self.banner.pack(side="left", padx=20)
         # 网络标: 最右边常驻, 点一下开无线面板; 图标缺了就只显示文字
         self._net_imgs = {}
@@ -134,41 +132,41 @@ class Kiosk(tk.Tk):
                 self._net_imgs[state] = tk.PhotoImage(file=kc.net_icon(state))
             except tk.TclError:
                 pass
-        self.net_label = tk.Label(top, text="检查中", font=FONT, bg="#10141c", fg="#6b7489",
+        self.net_label = tk.Label(top, text="检查中", font=FONT, bg=th.BG, fg=th.FAINT,
                                   compound="left", padx=6, cursor="hand2")
         self.net_label.pack(side="right", padx=(12, 0))
         self.net_label.bind("<Button-1>", lambda _e: self.toggle_pane("wifi"))
-        self.clock = tk.Label(top, font=FONT, bg="#10141c", fg="#8b93a7")
+        self.clock = tk.Label(top, font=FONT, bg=th.BG, fg=th.DIM)
         self.clock.pack(side="right")
         # 自己给整个网段发地址时 (#11) 顶栏下面一整条红: 倒计时, 点它续期; 平时不占地方
         self._top = top
         self._serve_view, self._lock_serve = None, None
         self.serve_bar = tk.Label(self, text="", font=FONT_BIG, cursor="hand2", pady=6)
         self.serve_bar.bind("<Button-1>", lambda _e: self.renew_serve())
-        tk.Label(top, text=kc.version_string(), font=FONT, bg="#10141c",
-                 fg="#5d6873").pack(side="right", padx=16)
+        tk.Label(top, text=kc.version_string(), font=FONT, bg=th.BG,
+                 fg=th.FAINTER).pack(side="right", padx=16)
         tk.Button(top, text="退出到终端", font=FONT, command=self.quit_kiosk,
-                  bg="#2a3347", fg="#e8eaf0", activebackground="#3a4560",
+                  bg=th.BTN2, fg=th.FG, activebackground=th.ACTIVE,
                   relief="flat", padx=14, pady=4, cursor="hand2").pack(
                   side="right", padx=10)
 
         self._build_lamps()
 
-        body = tk.Frame(self, bg="#10141c")
+        body = tk.Frame(self, bg=th.BG)
         body.pack(fill="both", expand=True, padx=12, pady=6)
         self.body = body
 
         # 左: 状态板 (开了面板/预览就换成它, 同时只有一个, 见 kui.LeftPane)
-        self.status_wrap = tk.Frame(body, bg="#161b26")
+        self.status_wrap = tk.Frame(body, bg=th.PANEL)
         self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        tk.Label(self.status_wrap, text="状态", font=FONT_BIG, bg="#161b26",
-                 fg="#8b93a7", anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        self.status_text = tk.Text(self.status_wrap, font=FONT_MONO, bg="#161b26",
-                                   fg="#c8cede", relief="flat", wrap="word",
+        tk.Label(self.status_wrap, text="状态", font=FONT_BIG, bg=th.PANEL,
+                 fg=th.DIM, anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        self.status_text = tk.Text(self.status_wrap, font=FONT_MONO, bg=th.PANEL,
+                                   fg=th.TEXT, relief="flat", wrap="word",
                                    state="disabled", padx=12, pady=6)
         self.status_text.pack(fill="both", expand=True, padx=4, pady=(0, 10))
 
-        btns = tk.Frame(body, bg="#10141c")
+        btns = tk.Frame(body, bg=th.BG)
         btns.pack(side="right", fill="y")
         self._build_menu(btns)
         nodes = kc.video_nodes()            # 只读 sysfs; 挑有信号的那路要跑 v4l2-ctl, 推迟到自检线程
@@ -178,21 +176,21 @@ class Kiosk(tk.Tk):
 
     def _build_menu(self, btns):
         """右侧按钮按 kui.MENU 分页: 每页一个 Frame, 全部先建好, 切页只换显示哪一个."""
-        colors = {"warn": ("#4a3320", "#e8eaf0"), "danger": ("#47202a", "#ffb3bd")}
+        colors = {"warn": (th.WARN_BG, th.FG), "danger": (th.DANGER_BG, th.DANGER_FG)}
         self.btns_wrap, self.pages = btns, {}
 
-        def big(parent, text, cmd, bg="#1f2a3d", fg="#e8eaf0"):
+        def big(parent, text, cmd, bg=th.BOX, fg=th.FG):
             b = tk.Button(parent, text=text, font=FONT_BIG, command=cmd, bg=bg,
-                          fg=fg, activebackground="#3a4560", relief="flat",
+                          fg=fg, activebackground=th.ACTIVE, relief="flat",
                           cursor="hand2", padx=30, pady=14, width=18)    # 定宽: 切页时左侧不跟着抖
             b.pack(fill="x", pady=6)
             return b
 
         for name, items in kui.MENU.items():
-            page = tk.Frame(btns, bg="#10141c")
+            page = tk.Frame(btns, bg=th.BG)
             self.pages[name] = page
             if name != "main":
-                big(page, "返回主页", lambda: self.show_page("main"), bg="#2a3347", fg="#8b93a7")
+                big(page, "返回主页", lambda: self.show_page("main"), bg=th.BTN2, fg=th.DIM)
             for it in items:
                 if "page" in it:
                     cmd = lambda p=it["page"]: self.show_page(p)
@@ -262,7 +260,7 @@ class Kiosk(tk.Tk):
     def _build_lamps(self):
         """顶栏下一行 grandMA3 执行器风格的方块: 左边 4 个串口操作头, 右边键鼠/PXE/网口.
         左边色带 = 自检健康, 整块闪 = 计数器在动."""
-        bar = tk.Frame(self, bg="#10141c")
+        bar = tk.Frame(self, bg=th.BG)
         bar.pack(fill="x", padx=12, pady=(0, 4))
         self._lamps = {}
 
@@ -285,7 +283,7 @@ class Kiosk(tk.Tk):
 
         for n in range(1, len(lc.SLOTS) + 1):
             block(f"con-{n}", 8, "serial")
-        tk.Frame(bar, bg="#2a3347", width=2).pack(side="left", fill="y", padx=(4, 10))
+        tk.Frame(bar, bg=th.BTN2, width=2).pack(side="left", fill="y", padx=(4, 10))
         pane_of = {"kvm": "preview", "pxe": "ks", "net:eno1": "netmode", "net:enp3s0": "netmode",
                    "net:wlp4s0": "wifi"}
         for name, _label, key in lc.LOWER:
@@ -379,11 +377,11 @@ class Kiosk(tk.Tk):
         label = self._lock_ups
         if label is not None:       # 锁屏只占右上角一行: 预告琥珀字, 倒计时红底白字加粗, 不铺满
             if alert is None:
-                label.config(text=text, fg=self._ups_fg(health), bg="#10141c", font=FONT)
+                label.config(text=text, fg=self._ups_fg(health), bg=th.BG, font=FONT)
             elif alert["level"] == "warn":
-                label.config(text=alert["short"], fg="#f0b429", bg="#10141c", font=FONT)
+                label.config(text=alert["short"], fg=th.WARN, bg=th.BG, font=FONT)
             else:
-                label.config(text=alert["short"], fg="#ffffff", bg="#da3633", font=FONT_BIG + ("bold",))
+                label.config(text=alert["short"], fg=th.WHITE, bg=th.ALERT_BG, font=FONT_BIG + ("bold",))
 
     def _paint_ups_alert(self, alert):
         """顶栏标题右边一行: 预告琥珀字, 倒计时红底白字; 正常时收起. 不用 banner (别的提示会盖掉它)."""
@@ -394,9 +392,9 @@ class Kiosk(tk.Tk):
         if self._ups_note is None:
             self._ups_note = tk.Label(self.banner.master, font=FONT_BIG, padx=10)
         if alert["level"] == "warn":
-            self._ups_note.config(text=alert["text"], fg="#f0b429", bg="#10141c")
+            self._ups_note.config(text=alert["text"], fg=th.WARN, bg=th.BG)
         else:
-            self._ups_note.config(text=alert["text"], fg="#ffffff", bg="#da3633")
+            self._ups_note.config(text=alert["text"], fg=th.WHITE, bg=th.ALERT_BG)
         if not self._ups_note.winfo_manager():          # 收起过才重新 pack
             self._ups_note.pack(side="left", padx=(0, 12), after=self.banner)
 
@@ -406,7 +404,7 @@ class Kiosk(tk.Tk):
 
     @staticmethod
     def _ups_fg(health):
-        return {"OK": "#7ee787", "WARN": "#f0b429", "FAIL": "#ff7b72"}.get(health, "#6b7489")
+        return th.STATE.get(health, th.FAINT)
 
     def _lamp_tick(self):
         """采样在常驻线程里 (见 __init__), 这里只画; 每半个采样周期重画一次, 闪烁才跟得上."""
@@ -459,12 +457,12 @@ class Kiosk(tk.Tk):
             for text, tag in lines:
                 self.status_text.insert("end", text + "\n", tag)
             self.status_text.config(state="disabled")
-            self.status_text.tag_config("ok", foreground="#7ee787")
-            self.status_text.tag_config("bad", foreground="#ff7b72")
-            self.status_text.tag_config("t_ok", foreground="#9aa5b0")
-            self.status_text.tag_config("t_warn", foreground="#f0b429")
-            self.status_text.tag_config("t_hot", foreground="#ff7b72")
-            self.status_text.tag_config("dim", foreground="#6b7489")
+            self.status_text.tag_config("ok", foreground=th.OK)
+            self.status_text.tag_config("bad", foreground=th.BAD)
+            self.status_text.tag_config("t_ok", foreground=th.MUTED)
+            self.status_text.tag_config("t_warn", foreground=th.WARN)
+            self.status_text.tag_config("t_hot", foreground=th.BAD)
+            self.status_text.tag_config("dim", foreground=th.FAINT)
 
     # ------------------------------------------------------------ 左侧面板
 
@@ -537,7 +535,7 @@ class Kiosk(tk.Tk):
 
     def _start_preview(self):
         """只由 toggle_pane / switch_source 调. 分辨率 (v4l2-ctl) 后台读, 回来之前按 16:9 算."""
-        self.video_frame = tk.Frame(self.body, container=True, bg="#000000")
+        self.video_frame = tk.Frame(self.body, container=True, bg=th.BLACK)
         self.video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.video_frame.bind("<Button-1>", lambda e: self._engage_passthrough())
         self.update_idletasks()
@@ -863,29 +861,29 @@ class Kiosk(tk.Tk):
     def _boot_selftest(self):
         """全屏: Logo/标题 + 自检逐行出现; 完了进锁屏. 换皮见 /opt/pxe/branding/."""
         b = kc.branding_read()
-        w = tk.Toplevel(self, bg=BOOT_BG)
+        w = tk.Toplevel(self, bg=th.BOOT_BG)
         w.overrideredirect(True)
         w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
         w.attributes("-topmost", True)
         self._boot_win = w
-        top = tk.Frame(w, bg=BOOT_BG)
+        top = tk.Frame(w, bg=th.BOOT_BG)
         top.place(relx=0.5, rely=0.22, anchor="center")
         if b["logo"]:
             try:
                 img = tk.PhotoImage(file=b["logo"])
                 k = max(1, -(-img.width() // 320))     # 缩到 320 px 以内
                 self._boot_logo = img.subsample(k, k) if k > 1 else img
-                tk.Label(top, image=self._boot_logo, bg=BOOT_BG).pack(pady=(0, 10))
+                tk.Label(top, image=self._boot_logo, bg=th.BOOT_BG).pack(pady=(0, 10))
             except tk.TclError:
                 pass
-        tk.Label(top, text=b["title"], font=("Noto Sans CJK SC", 40, "bold"),
-                 bg=BOOT_BG, fg="#14161a").pack()
-        tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg=BOOT_BG, fg="#6b7280").pack()
-        tk.Label(top, text=kc.version_string(), font=FONT_MONO, bg=BOOT_BG, fg="#9ca3af").pack(pady=(6, 0))
-        box = tk.Frame(w, bg=BOOT_BG)
+        tk.Label(top, text=b["title"], font=th.font(40, bold=True),
+                 bg=th.BOOT_BG, fg=th.BOOT_FG).pack()
+        tk.Label(top, text=b["subtitle"], font=FONT_BIG, bg=th.BOOT_BG, fg=th.BOOT_SUB).pack()
+        tk.Label(top, text=kc.version_string(), font=FONT_MONO, bg=th.BOOT_BG, fg=th.BOOT_DIM).pack(pady=(6, 0))
+        box = tk.Frame(w, bg=th.BOOT_BG)
         box.place(relx=0.5, rely=0.43, anchor="n")     # 从标题下方往下排: 检查项多了也不盖住标题
-        tk.Label(box, text="Step 3/3   System check", font=FONT_BIG, bg=BOOT_BG,
-                 fg="#2a2e36", anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
+        tk.Label(box, text="Step 3/3   System check", font=FONT_BIG, bg=th.BOOT_BG,
+                 fg=th.BOOT_STEP, anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
 
         def work():
             rows = kui.boot_rows_safe(lambda: kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context()))
@@ -908,14 +906,14 @@ class Kiosk(tk.Tk):
             return
         if i < len(rows):
             r = rows[i]
-            color = {"OK": "#15803d", "WARN": "#b45309", "FAIL": "#dc2626"}.get(r["state"], "#9ca3af")
-            tk.Label(box, text=kc.selftest_line(r, width=26), font=FONT_MONO, bg=BOOT_BG,
+            color = th.BOOT_STATE.get(r["state"], th.BOOT_DIM)
+            tk.Label(box, text=kc.selftest_line(r, width=26), font=FONT_MONO, bg=th.BOOT_BG,
                      fg=color, anchor="w", width=56).pack(anchor="w")
             self.after(300, lambda: self._boot_show(box, rows, i + 1))
             return
         failed = any(r["state"] == "FAIL" for r in rows)
         tk.Label(box, text="SELF CHECK FAILED" if failed else "SYSTEM READY", font=FONT_BIG,
-                 bg=BOOT_BG, fg="#dc2626" if failed else "#15803d").pack(pady=(14, 0))
+                 bg=th.BOOT_BG, fg=th.BOOT_FAIL if failed else th.BOOT_OK).pack(pady=(14, 0))
         self.after(6000 if failed else 2000, self._boot_done)
 
     def _boot_done(self):
@@ -942,45 +940,45 @@ class Kiosk(tk.Tk):
             self._lock_win.lift()
             return
         self._release_passthrough()
-        w = tk.Toplevel(self, bg="#10141c")
+        w = tk.Toplevel(self, bg=th.BG)
         w.overrideredirect(True)
         w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
         w.attributes("-topmost", True)
         # 上: 时钟; 中: 公告牌(/opt/pxe/notice.txt, 推车客串引导牌); 下: PIN
-        self._lock_clock = tk.Label(w, font=("Noto Sans CJK SC", 64), bg="#10141c", fg="#e8eaf0")
+        self._lock_clock = tk.Label(w, font=th.font(64), bg=th.BG, fg=th.FG)
         self._lock_clock.place(relx=0.5, rely=0.13, anchor="center")
-        self._lock_date = tk.Label(w, font=FONT_BIG, bg="#10141c", fg="#8b93a7")
+        self._lock_date = tk.Label(w, font=FONT_BIG, bg=th.BG, fg=th.DIM)
         self._lock_date.place(relx=0.5, rely=0.23, anchor="center")
         # 自己给整个网段发地址时 (#11) 锁屏上也要看得见; 续期得先解锁, 这里只显示. 平时空着看不见
-        self._lock_serve = tk.Label(w, text="", font=FONT_BIG, bg="#10141c", fg="#ffffff", padx=16)
+        self._lock_serve = tk.Label(w, text="", font=FONT_BIG, bg=th.BG, fg=th.WHITE, padx=16)
         self._lock_serve.place(relx=0.5, rely=0.31, anchor="center")
-        self._lock_notice = tk.Label(w, font=("Noto Sans CJK SC", 28, "bold"), bg="#10141c", fg="#ffb86c",
+        self._lock_notice = tk.Label(w, font=th.font(28, bold=True), bg=th.BG, fg=th.NOTICE,
                                      justify="center", wraplength=int(self.winfo_screenwidth() * 0.92))
         self._lock_notice.place(relx=0.5, rely=0.48, anchor="center")
         # 右上角网络标 (#1): 只看不点, 锁着屏不开无线面板
-        self._lock_net = tk.Label(w, text="检查中", font=FONT, bg="#10141c", fg="#6b7489",
+        self._lock_net = tk.Label(w, text="检查中", font=FONT, bg=th.BG, fg=th.FAINT,
                                   compound="left", padx=6)
         self._lock_net.place(relx=0.985, rely=0.02, anchor="ne")
         # 右上角第二行: 电池 (#4) —— 断电时锁屏上也要看得见
-        self._lock_ups = tk.Label(w, text=uc.label(self._ups), font=FONT, bg="#10141c",
+        self._lock_ups = tk.Label(w, text=uc.label(self._ups), font=FONT, bg=th.BG,
                                   fg=self._ups_fg(uc.health(self._ups)))
         self._lock_ups.place(relx=0.985, rely=0.065, anchor="ne")
         # 底部一行: 昨夜整理 (cart_dream.py) 的标题
-        self._lock_dream = tk.Label(w, text="", font=FONT, bg="#10141c", fg="#6b7489")
+        self._lock_dream = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.FAINT)
         self._lock_dream.place(relx=0.5, rely=0.97, anchor="s")
         if self._net_view:
             self._paint_net(self._lock_net)
-        box = tk.Frame(w, bg="#10141c")
+        box = tk.Frame(w, bg=th.BG)
         box.place(relx=0.5, rely=0.8, anchor="center")
-        tk.Label(box, text="运维推车已锁定", font=FONT_BIG, bg="#10141c",
-                 fg="#e8eaf0").pack(pady=(0, 12))
+        tk.Label(box, text="运维推车已锁定", font=FONT_BIG, bg=th.BG,
+                 fg=th.FG).pack(pady=(0, 12))
         self._pin_var = tk.StringVar()
-        e = tk.Entry(box, textvariable=self._pin_var, show="*", font=("Noto Sans Mono CJK SC", 22),
-                     width=14, justify="center", bg="#1f2a3d", fg="#e8eaf0",
-                     insertbackground="#e8eaf0", relief="flat")
+        e = tk.Entry(box, textvariable=self._pin_var, show="*", font=th.font(22, mono=True),
+                     width=14, justify="center", bg=th.BOX, fg=th.FG,
+                     insertbackground=th.FG, relief="flat")
         e.pack(ipady=8)
         e.bind("<Return>", lambda _e: self._try_unlock())
-        self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg="#10141c", fg="#8b93a7")
+        self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg=th.BG, fg=th.DIM)
         self._lock_msg.pack(pady=12)
         self._lock_win = w
         self._lock_tick()
@@ -1005,7 +1003,7 @@ class Kiosk(tk.Tk):
         text = kc.notice_read()
         if text != self._lock_notice.cget("text"):     # 字号自适应: 时钟和 PIN 之间那块塞满
             px = kc.notice_font_px(text, self.winfo_screenwidth() * 0.9, self.winfo_screenheight() * 0.36)
-            self._lock_notice.config(text=text, font=("Noto Sans CJK SC", -px, "bold"))
+            self._lock_notice.config(text=text, font=th.font(-px, bold=True))
         dream = kc.dream_line()
         if dream != self._lock_dream.cget("text"):
             self._lock_dream.config(text=dream)
@@ -1021,9 +1019,9 @@ class Kiosk(tk.Tk):
             self._last_input = time.time()
         elif r == "locked":
             left = max(1, int(self.gate.locked_until - time.time()))
-            self._lock_msg.config(text=f"错误次数过多，{left} 秒后再试", fg="#ff7b72")
+            self._lock_msg.config(text=f"错误次数过多，{left} 秒后再试", fg=th.BAD)
         else:
-            self._lock_msg.config(text="PIN 不对", fg="#ff7b72")
+            self._lock_msg.config(text="PIN 不对", fg=th.BAD)
 
     def _confirm_pin(self, what):
         if not self.gate.required:
@@ -1069,41 +1067,41 @@ class Kiosk(tk.Tk):
             self._arm_win.focus_force()
             return
         self._code = kc.new_code()
-        w = tk.Toplevel(self, bg="#161b26", highlightthickness=3, highlightbackground="#7a1f2b")
+        w = tk.Toplevel(self, bg=th.PANEL, highlightthickness=3, highlightbackground=th.DANGER_EDGE)
         self._arm_win = w
         w.overrideredirect(True)
         W, H = 780, min(850, self.winfo_screenheight() - 20)
         w.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
         w.attributes("-topmost", True)
-        tk.Label(w, text="解锁装机模式", font=FONT_BIG, bg="#161b26", fg="#e8eaf0").pack(pady=(18, 4))
+        tk.Label(w, text="解锁装机模式", font=FONT_BIG, bg=th.PANEL, fg=th.FG).pack(pady=(18, 4))
         tk.Label(w, text="装 Rocky: 选定的机器下次 PXE 会自动安装并清空整块硬盘 (clearpart --all)。\n"
                          "进 WinPE: 菜单默认进 PE, 不自动装机 (被测机要关 Secure Boot)。\n"
                          "抓镜像: 选定的机器整盘存到推车; 恢复镜像: 下面清单里的一批整盘覆盖。\n"
                          "30 分钟或取走菜单后自动上锁。",
-                 font=FONT, bg="#161b26", fg="#ff7b72", justify="center").pack(pady=(0, 10))
+                 font=FONT, bg=th.PANEL, fg=th.BAD, justify="center").pack(pady=(0, 10))
         purpose_var = tk.StringVar(value="rocky")
-        prow = tk.Frame(w, bg="#161b26")
+        prow = tk.Frame(w, bg=th.PANEL)
         prow.pack(pady=(0, 10))
         for val, text in (("rocky", "装 Rocky"), ("winpe", "进 WinPE"),
                           ("clone-save", "抓镜像"), ("clone-restore", "恢复镜像")):
             tk.Radiobutton(prow, text=text, value=val, variable=purpose_var, indicatoron=False,
-                           font=FONT_BIG, width=8, bg="#2a3347", fg="#e8eaf0", selectcolor="#47202a",
-                           activebackground="#3a4560", activeforeground="#e8eaf0", command=lambda: refresh_plan(),
+                           font=FONT_BIG, width=8, bg=th.BTN2, fg=th.FG, selectcolor=th.DANGER_BG,
+                           activebackground=th.ACTIVE, activeforeground=th.FG, command=lambda: refresh_plan(),
                            relief="flat").pack(side="left", padx=6)
-        tk.Label(w, text="最近来要过地址的机器 (或在下面手填 MAC):", font=FONT, bg="#161b26",
-                 fg="#8b93a7").pack(anchor="w", padx=24)
-        lb = tk.Listbox(w, font=FONT_MONO, height=5, bg="#1f2a3d", fg="#e8eaf0", relief="flat",
-                        selectbackground="#3a4560", exportselection=False)
+        tk.Label(w, text="最近来要过地址的机器 (或在下面手填 MAC):", font=FONT, bg=th.PANEL,
+                 fg=th.DIM).pack(anchor="w", padx=24)
+        lb = tk.Listbox(w, font=FONT_MONO, height=5, bg=th.BOX, fg=th.FG, relief="flat",
+                        selectbackground=th.ACTIVE, exportselection=False)
         for mac in kc.recent_pxe_clients(self._pxe_log_tail()):
             lb.insert("end", mac)
         if lb.size():
             lb.selection_set(0)
         lb.pack(fill="x", padx=24)
         mac_var = tk.StringVar()
-        tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg="#1f2a3d", fg="#e8eaf0",
-                 insertbackground="#e8eaf0", relief="flat").pack(fill="x", padx=24, pady=(6, 6), ipady=4)
+        tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg=th.BOX, fg=th.FG,
+                 insertbackground=th.FG, relief="flat").pack(fill="x", padx=24, pady=(6, 6), ipady=4)
         # 克隆用途: 这一批放不放行的清单 (#18). 人看的就是要写的: 解锁时 pxe_arm 重算, digest 不同就拒绝
-        plan_lb = tk.Listbox(w, font=FONT_MONO, height=4, bg="#1f2a3d", fg="#f0b429", relief="flat",
+        plan_lb = tk.Listbox(w, font=FONT_MONO, height=4, bg=th.BOX, fg=th.WARN, relief="flat",
                              exportselection=False)
         plan_lb.pack(fill="x", padx=24, pady=(0, 8))
         plan = {"digest": None}
@@ -1125,15 +1123,15 @@ class Kiosk(tk.Tk):
 
         lb.bind("<<ListboxSelect>>", refresh_plan)
         mac_var.trace_add("write", lambda *_a: refresh_plan())
-        tk.Label(w, text="照抄验证码:", font=FONT, bg="#161b26", fg="#8b93a7").pack()
-        code_lbl = tk.Label(w, text=" ".join(self._code), font=("Noto Sans Mono CJK SC", 40, "bold"),
-                            bg="#161b26", fg="#f0b429")
+        tk.Label(w, text="照抄验证码:", font=FONT, bg=th.PANEL, fg=th.DIM).pack()
+        code_lbl = tk.Label(w, text=" ".join(self._code), font=th.font(40, bold=True, mono=True),
+                            bg=th.PANEL, fg=th.WARN)
         code_lbl.pack()
         code_var = tk.StringVar()
-        e = tk.Entry(w, textvariable=code_var, font=("Noto Sans Mono CJK SC", 22), width=10,
-                     justify="center", bg="#1f2a3d", fg="#e8eaf0", insertbackground="#e8eaf0", relief="flat")
+        e = tk.Entry(w, textvariable=code_var, font=th.font(22, mono=True), width=10,
+                     justify="center", bg=th.BOX, fg=th.FG, insertbackground=th.FG, relief="flat")
         e.pack(pady=8, ipady=6)
-        msg = tk.Label(w, text="", font=FONT, bg="#161b26", fg="#ff7b72")
+        msg = tk.Label(w, text="", font=FONT, bg=th.PANEL, fg=th.BAD)
         msg.pack()
 
         def close():
@@ -1159,11 +1157,11 @@ class Kiosk(tk.Tk):
             close()
             self._pxe_tick(reschedule=False)
 
-        row = tk.Frame(w, bg="#161b26")
+        row = tk.Frame(w, bg=th.PANEL)
         row.pack(pady=10)
-        tk.Button(row, text="解锁", font=FONT_BIG, command=ok, bg="#47202a", fg="#ffb3bd",
+        tk.Button(row, text="解锁", font=FONT_BIG, command=ok, bg=th.DANGER_BG, fg=th.DANGER_FG,
                   relief="flat", padx=24).pack(side="left", padx=8)
-        tk.Button(row, text="取消", font=FONT_BIG, command=close, bg="#2a3347", fg="#e8eaf0",
+        tk.Button(row, text="取消", font=FONT_BIG, command=close, bg=th.BTN2, fg=th.FG,
                   relief="flat", padx=24).pack(side="left", padx=8)
         e.bind("<Return>", ok)
         w.after(100, lambda: (w.focus_force(), e.focus_set()))
@@ -1196,7 +1194,7 @@ class Kiosk(tk.Tk):
                 self.banner.config(text=d["banner"])
             sub, main = kui.pxe_button_texts(d["view"])
             danger = d["view"]["mode"] == "install"     # 解锁是危险状态, 主页也得看得见
-            colors = {"bg": "#7a1f2b", "fg": "#ffffff"} if danger else {"bg": "#1f2a3d", "fg": "#e8eaf0"}
+            colors = {"bg": th.DANGER_EDGE, "fg": th.WHITE} if danger else {"bg": th.BOX, "fg": th.FG}
             self.btn_install.config(text=sub, **colors)
             self.btn_install_page.config(text=main, **colors)
         except Exception as ex:                         # noqa: BLE001
@@ -1218,7 +1216,7 @@ class Kiosk(tk.Tk):
                 if not self.serve_bar.winfo_ismapped():
                     self.serve_bar.pack(fill="x", padx=12, pady=(0, 4), after=self._top)
             if self._lock_win is not None and self._lock_serve is not None:
-                self._lock_serve.config(text=v["short"] if v else "", bg=v["bg"] if v else "#10141c")
+                self._lock_serve.config(text=v["short"] if v else "", bg=v["bg"] if v else th.BG)
         except Exception as ex:                         # noqa: BLE001
             print(f"_serve_tick: {ex!r}", file=sys.stderr)
         finally:

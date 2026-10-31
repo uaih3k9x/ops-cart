@@ -109,7 +109,7 @@ def test_render_serve_banner(locked, state, color):
     img = r.render(dc.layout_view(snap, locked=locked))
     assert img.getpixel((4, 230)) == ImageColor.getrgb(color)          # 条的左边缘
     plain = r.render(dc.layout_view(_full_snap(), locked=locked))
-    assert plain.getpixel((4, 230)) == r.BG
+    assert plain.getpixel((4, 230)) == ImageColor.getrgb(r.BG)
 
 
 # ---- 转电池那行不能压到大时钟 (10/31 放电演练实测压住了)

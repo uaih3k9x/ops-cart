@@ -12,14 +12,16 @@ import re
 import struct
 import time
 
+import theme as th
+
 SAMPLE_MS = 200
 HOLD_S = 1.0            # 计数器变了以后多久内算"在动"
 BELL_HOLD_S = 0.6       # 设备回 ^G 后操作头亮红多久
 BLINK_S = 0.2
 
-HEALTH_COLOR = {"OK": "#22c55e", "WARN": "#f59e0b", "FAIL": "#ef4444", None: "#4b5563"}
-BODY, EMPTY_BODY = "#1f2633", "#141821"
-FG, EMPTY_FG, LIT_FG = "#c9d1e0", "#4b5263", "#0b0f17"
+HEALTH_COLOR = th.LAMP
+BODY, EMPTY_BODY = th.LAMP_BODY, th.LAMP_EMPTY
+FG, EMPTY_FG, LIT_FG = th.LAMP_FG, th.LAMP_EMPTY_FG, th.LAMP_LIT_FG
 
 # 下排: (显示名, selftest.json 里那一行的 label, 计数器名)
 LOWER = [("键鼠", "CH9329", "kvm"), ("PXE", "PXE SERVER", "pxe"),

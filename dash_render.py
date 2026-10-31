@@ -11,6 +11,7 @@ import io
 import re
 
 import lamps_core as lc
+import theme as th
 
 PANEL_W = 800          # 竖屏宽 (= 横屏配置串里的高)
 PANEL_H = 1280         # 竖屏高 (= 横屏配置串里的宽)
@@ -23,10 +24,10 @@ FONTS = [("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc", 2),   # 0=JP 
          ("/System/Library/Fonts/PingFang.ttc", 0)]
 
 M = 40                          # 左右边距
-BG = (12, 15, 20)
+BG = th.DASH_BG
 FG = lc.FG
-DIM = "#7b8496"
-LINE = "#232a36"
+DIM = th.DASH_DIM
+LINE = th.DASH_LINE
 ACCENT = lc.HEALTH_COLOR["OK"]
 WARN = lc.HEALTH_COLOR["WARN"]
 BAD = lc.HEALTH_COLOR["FAIL"]

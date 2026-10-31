@@ -10,6 +10,7 @@ from tkinter import messagebox
 import cartlog
 import wol_core as wol
 from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, WifiPanel
+import theme as th
 
 
 class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命令, 不需要后台线程
@@ -25,36 +26,36 @@ class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命�
 
     def _build(self):
         tk.Label(self, text="网络唤醒 (WOL) · 魔术包从选定网口广播, 目标要在同一个二层里 · 目标 BIOS/网卡要开 WOL",
-                 font=FONT, bg=BG, fg="#8b93a7", anchor="w").pack(fill="x", padx=16, pady=(10, 4))
+                 font=FONT, bg=BG, fg=th.DIM, anchor="w").pack(fill="x", padx=16, pady=(10, 4))
         self.lb = tk.Listbox(self, font=FONT_MONO, bg=BOX, fg=FG, relief="flat", height=12,
-                             selectbackground="#3a4560", exportselection=False, activestyle="none")
+                             selectbackground=th.ACTIVE, exportselection=False, activestyle="none")
         self.lb.pack(fill="both", expand=True, padx=16, pady=4)
         self.lb.bind("<Double-Button-1>", lambda _e: self.wake_selected())
         self.lb.bind("<<ListboxSelect>>", lambda _e: self._pick())
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=12)
-        self._btn(bar, "唤醒", self.wake_selected, bg="#26577c")
-        self._btn(bar, "删除", self.delete, bg="#47202a")
+        self._btn(bar, "唤醒", self.wake_selected, bg=th.PRIMARY)
+        self._btn(bar, "删除", self.delete, bg=th.DANGER_BG)
 
-        form = tk.LabelFrame(self, text=" 临时唤醒 / 加入清单 ", font=FONT, bg=BG, fg="#8b93a7", bd=1, relief="groove")
+        form = tk.LabelFrame(self, text=" 临时唤醒 / 加入清单 ", font=FONT, bg=BG, fg=th.DIM, bd=1, relief="groove")
         form.pack(fill="x", padx=16, pady=(10, 4))
         row = tk.Frame(form, bg=BG)
         row.pack(fill="x", pady=6)
         self.name_var, self.mac_var = tk.StringVar(), tk.StringVar()
         for label, var, w in (("名字:", self.name_var, 14), ("MAC:", self.mac_var, 18)):
-            tk.Label(row, text=label, font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(6, 0))
-            e = tk.Entry(row, textvariable=var, width=w, font=FONT_MONO, bg="#10141c", fg=FG,
+            tk.Label(row, text=label, font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(6, 0))
+            e = tk.Entry(row, textvariable=var, width=w, font=FONT_MONO, bg=th.BG, fg=FG,
                          insertbackground=FG, relief="flat")
             e.pack(side="left", padx=6, ipady=3)
         e.bind("<Return>", lambda _e: self.wake_form())
         self.iface_var = tk.StringVar(value="enp3s0")
         for i, n in wol.IFACES.items():
-            tk.Radiobutton(row, text=n, value=i, variable=self.iface_var, font=FONT, bg=BG, fg="#c8cede",
+            tk.Radiobutton(row, text=n, value=i, variable=self.iface_var, font=FONT, bg=BG, fg=th.TEXT,
                            selectcolor=BOX, activebackground=BG, activeforeground=FG).pack(side="left", padx=2)
-        self._btn(row, "唤醒", self.wake_form, bg="#26577c")
+        self._btn(row, "唤醒", self.wake_form, bg=th.PRIMARY)
         self._btn(row, "加入清单", self.add)
 
-        self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg="#f0b429", anchor="w")
+        self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg=th.WARN, anchor="w")
         self.msg.pack(fill="x", padx=16, pady=(2, 10))
 
     def _render(self):

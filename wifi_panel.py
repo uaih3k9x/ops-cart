@@ -15,10 +15,10 @@ from tkinter import messagebox
 import ruijie_portal as rp
 import wifi_core as wc
 from kiosk_ui_core import UiBridge
+import theme as th
 
-FONT = ("Noto Sans CJK SC", 13)
-FONT_MONO = ("Noto Sans Mono CJK SC", 14)
-BG, FG, BOX = "#161b26", "#e8eaf0", "#1f2a3d"
+FONT, FONT_MONO = th.FONT, th.FONT_MONO_BIG
+BG, FG, BOX = th.PANEL, th.FG, th.BOX
 
 
 def _run(cmd, timeout=30):
@@ -69,16 +69,16 @@ class WifiPanel(BridgePanel):
 
     def _btn(self, parent, text, cmd, bg=BOX):
         b = tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg, fg=FG,
-                      activebackground="#3a4560", relief="flat", cursor="hand2", padx=12, pady=4)
+                      activebackground=th.ACTIVE, relief="flat", cursor="hand2", padx=12, pady=4)
         b.pack(side="left", padx=4)
         return b
 
     def _list(self, parent, title):
         col = tk.Frame(parent, bg=BG)
         col.pack(side="left", fill="both", expand=True, padx=8)
-        tk.Label(col, text=title, font=FONT, bg=BG, fg="#8b93a7", anchor="w").pack(fill="x")
+        tk.Label(col, text=title, font=FONT, bg=BG, fg=th.DIM, anchor="w").pack(fill="x")
         lb = tk.Listbox(col, font=FONT_MONO, bg=BOX, fg=FG, relief="flat", height=14,
-                        selectbackground="#3a4560", exportselection=False, activestyle="none")
+                        selectbackground=th.ACTIVE, exportselection=False, activestyle="none")
         lb.pack(fill="both", expand=True, pady=4)
         bar = tk.Frame(col, bg=BG)
         bar.pack(fill="x")
@@ -86,85 +86,85 @@ class WifiPanel(BridgePanel):
 
     def _build(self):
         tk.Label(self, text="无线网络 (wlp4s0) · 插着网线时永远走有线, 无线只当备胎",
-                 font=FONT, bg=BG, fg="#8b93a7", anchor="w").pack(fill="x", padx=16, pady=(10, 4))
+                 font=FONT, bg=BG, fg=th.DIM, anchor="w").pack(fill="x", padx=16, pady=(10, 4))
         cols = tk.Frame(self, bg=BG)
         cols.pack(fill="both", expand=True, padx=8)
 
         self.scan_lb, bar = self._list(cols, "附近的网络")
         self._btn(bar, "刷新扫描", lambda: self.reload(rescan=True))
-        self._btn(bar, "连接", self.connect_selected, bg="#26577c")
+        self._btn(bar, "连接", self.connect_selected, bg=th.PRIMARY)
         self.scan_lb.bind("<Double-Button-1>", lambda _e: self.connect_selected())
 
         self.saved_lb, bar = self._list(cols, "已保存 · 优先级从高到低 (自动连接时从上往下试)")
         self._btn(bar, "上移", lambda: self.move(-1))
         self._btn(bar, "下移", lambda: self.move(+1))
-        self._btn(bar, "连接", self.up_saved, bg="#26577c")
+        self._btn(bar, "连接", self.up_saved, bg=th.PRIMARY)
         self._btn(bar, "显示已存密码", self.load_psk)
-        self._btn(bar, "忘记", self.forget, bg="#47202a")
+        self._btn(bar, "忘记", self.forget, bg=th.DANGER_BG)
         self.saved_lb.bind("<<ListboxSelect>>", lambda _e: self._pick_saved())
 
         form = tk.Frame(self, bg=BG)
         form.pack(fill="x", padx=16, pady=(8, 4))
-        tk.Label(form, text="网络:", font=FONT, bg=BG, fg="#c8cede").pack(side="left")
+        tk.Label(form, text="网络:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left")
         self.ssid_var = tk.StringVar()
-        tk.Entry(form, textvariable=self.ssid_var, width=20, font=FONT_MONO, bg="#10141c", fg=FG,
+        tk.Entry(form, textvariable=self.ssid_var, width=20, font=FONT_MONO, bg=th.BG, fg=FG,
                  insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
-        tk.Label(form, text="密码:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(10, 0))
+        tk.Label(form, text="密码:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(10, 0))
         self.pw_var = tk.StringVar()
         self.pw_entry = tk.Entry(form, textvariable=self.pw_var, width=24, show="*", font=FONT_MONO,
-                                 bg="#10141c", fg=FG, insertbackground=FG, relief="flat")
+                                 bg=th.BG, fg=FG, insertbackground=FG, relief="flat")
         self.pw_entry.pack(side="left", padx=6, ipady=3)
         self.pw_entry.bind("<Return>", lambda _e: self.connect_form())
         self.show_var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text="显示密码", variable=self.show_var, command=self._toggle_show,
-                       font=FONT, bg=BG, fg="#c8cede", selectcolor=BOX, activebackground=BG,
+                       font=FONT, bg=BG, fg=th.TEXT, selectcolor=BOX, activebackground=BG,
                        activeforeground=FG).pack(side="left", padx=6)
-        self._btn(form, "连接并保存", self.connect_form, bg="#26577c")
+        self._btn(form, "连接并保存", self.connect_form, bg=th.PRIMARY)
         self._btn(form, "只改密码", self.change_psk)
 
-        self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg="#f0b429", anchor="w")
+        self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg=th.WARN, anchor="w")
         self.msg.pack(fill="x", padx=16, pady=(2, 10))
         self._build_auth()
 
     def _build_auth(self):
         conf = rp._read_json(rp.CONF) or {}
         title = f" 校园网认证 (只在连着 {conf.get('ssid') or '配置的无线'} 时自动跑, 每 2 分钟) "
-        box = tk.LabelFrame(self, text=title, font=FONT, bg=BG, fg="#8b93a7", bd=1, relief="groove")
+        box = tk.LabelFrame(self, text=title, font=FONT, bg=BG, fg=th.DIM, bd=1, relief="groove")
         box.pack(fill="x", padx=16, pady=(0, 10))
         row = tk.Frame(box, bg=BG)
         row.pack(fill="x", pady=4)
         self.auth_user = tk.StringVar(value=conf.get("user", ""))
         self.auth_pw = tk.StringVar(value=conf.get("password", ""))
-        tk.Label(row, text="账号:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
-        tk.Entry(row, textvariable=self.auth_user, width=16, font=FONT_MONO, bg="#10141c", fg=FG,
+        tk.Label(row, text="账号:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
+        tk.Entry(row, textvariable=self.auth_user, width=16, font=FONT_MONO, bg=th.BG, fg=FG,
                  insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
-        tk.Label(row, text="密码:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(10, 0))
+        tk.Label(row, text="密码:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(10, 0))
         self.auth_pw_entry = tk.Entry(row, textvariable=self.auth_pw, width=20, show="*", font=FONT_MONO,
-                                      bg="#10141c", fg=FG, insertbackground=FG, relief="flat")
+                                      bg=th.BG, fg=FG, insertbackground=FG, relief="flat")
         self.auth_pw_entry.pack(side="left", padx=6, ipady=3)
         self.auth_pw_entry.bind("<Return>", lambda _e: self.auth_save())
         self.auth_show = tk.BooleanVar(value=False)
-        tk.Checkbutton(row, text="显示", variable=self.auth_show, font=FONT, bg=BG, fg="#c8cede",
+        tk.Checkbutton(row, text="显示", variable=self.auth_show, font=FONT, bg=BG, fg=th.TEXT,
                        selectcolor=BOX, activebackground=BG, activeforeground=FG,
                        command=lambda: self.auth_pw_entry.config(show="" if self.auth_show.get() else "*")
                        ).pack(side="left", padx=4)
         self._btn(row, "保存", self.auth_save)
-        self._btn(row, "立即认证", self.auth_now, bg="#26577c")
-        self.auth_lbl = tk.Label(box, text="", font=FONT, bg=BG, fg="#8b93a7", anchor="w")
+        self._btn(row, "立即认证", self.auth_now, bg=th.PRIMARY)
+        self.auth_lbl = tk.Label(box, text="", font=FONT, bg=BG, fg=th.DIM, anchor="w")
         self.auth_lbl.pack(fill="x", padx=6, pady=(0, 6))
         self.auth_trust_row = tk.Frame(box, bg=BG)         # 认证页换了主机时才露出来
-        self.auth_trust_btn = self._btn(self.auth_trust_row, "", self.auth_trust, bg="#7c5a26")
+        self.auth_trust_btn = self._btn(self.auth_trust_row, "", self.auth_trust, bg=th.AMBER_BG)
         self._auth_render()
 
     def _auth_render(self):
         st = rp._read_json(rp.STATUS)
         if not st:
-            self.auth_lbl.config(text="最近一次: 还没跑过", fg="#8b93a7")
+            self.auth_lbl.config(text="最近一次: 还没跑过", fg=th.DIM)
             return
         when = time.strftime("%H:%M:%S", time.localtime(st.get("time", 0)))
         text = AUTH_STATES.get(st["state"], st["state"])
         self.auth_lbl.config(text=f"最近一次 {when}: {text} {st.get('message', '')}".rstrip(),
-                             fg="#7ee787" if st.get("ok") else "#ff7b72")
+                             fg=th.OK if st.get("ok") else th.BAD)
         host = rp.pending_host(st)
         if host:
             self.auth_trust_btn.config(text=f"信任认证页 {host}")
@@ -224,7 +224,7 @@ class WifiPanel(BridgePanel):
         self.pw_entry.config(show="" if self.show_var.get() else "*")
 
     def _say(self, text, ok=True):
-        self.msg.config(text=text, fg="#7ee787" if ok else "#ff7b72")
+        self.msg.config(text=text, fg=th.OK if ok else th.BAD)
 
     # ------------------------------------------------------------ 后台
 

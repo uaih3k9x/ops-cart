@@ -19,6 +19,7 @@ import time
 
 import kiosk_core as kc
 import pxeserver
+import theme as th
 
 
 # ---------------------------------------------------------------- 垃圾回收只在主线程
@@ -139,7 +140,7 @@ class UiBridge:
 
 # ---------------------------------------------------------------- 网络标
 
-NET_COLORS = {"on": "#7ee787", "warn": "#f0b429", "off": "#ff7b72"}
+NET_COLORS = {"on": th.OK, "warn": th.WARN, "off": th.BAD}
 
 
 def net_view(state, text):
@@ -182,7 +183,7 @@ def pxe_button_texts(view):
 
 # ---------------------------------------------------------------- 自己发地址限时 (#11): 顶上醒目条
 
-SERVE_BAR_BG = {"serving": "#b3261e", "expired": "#8a5a00"}     # 正在发: 红; 到时停发: 琥珀
+SERVE_BAR_BG = {"serving": th.SERVE_BG, "expired": th.SERVE_EXPIRED_BG}     # 正在发: 红; 到时停发: 琥珀
 
 
 def serve_bar_view(guard, now):
@@ -196,7 +197,7 @@ def serve_bar_view(guard, now):
     text = n["text"]
     if renew:
         text += " · 点此续期" if n["level"] == "serving" else f" · 点此续期 {window // 60} 分钟"
-    return {"text": text, "short": n["text"], "bg": SERVE_BAR_BG[n["level"]], "fg": "#ffffff",
+    return {"text": text, "short": n["text"], "bg": SERVE_BAR_BG[n["level"]], "fg": th.WHITE,
             "renew": renew}
 
 
