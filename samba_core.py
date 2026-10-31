@@ -7,7 +7,7 @@
 - 克隆 (#18): 共享名、目录、账号全照 /opt/pxe/clone.json, 跟 Clonezilla 内核命令行里用的是同一份.
   clone.json 没写 restore_user 时 #18 当访客挂只读共享 -> 只有那一个共享收访客 (Clonezilla 是 Linux,
   不受 Win11 拒来宾影响); 写了就按账号.
-网络: 只听 lo + LAN1 (eno1), hosts allow 只放装机网段, 只开 445 (不要 NetBIOS).
+网络: 只听 lo + LAN1 (eno1), hosts allow 只放装机网段, 只开 SMB_PORT (不要 NetBIOS).
 密码不进 smb.conf, 也不进仓库: 装机账号密码由部署脚本交互输入或读 /etc/ops-cart, 克隆账号密码在 clone.json.
 
 CLI (setup-samba.sh 用):
@@ -27,6 +27,7 @@ import sys
 import srv_data_core as sd
 
 LAN1 = "eno1"
+SMB_PORT = 445                  # SMB over TCP; public-safe-ignore
 INSTALL_USER = "winpe"
 INSTALL_SHARES = ("win", "drivers", "tools")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
@@ -51,7 +52,7 @@ def lan_net(ip, prefix):
 
 def firewall_rich_rule(ip, prefix):
     """只放装机网段来的 445."""
-    return f'rule family="ipv4" source address="{_net(ip, prefix)}" port port="445" protocol="tcp" accept'
+    return f'rule family="ipv4" source address="{_net(ip, prefix)}" port port="{SMB_PORT}" protocol="tcp" accept'
 
 
 def _clone(conf):
@@ -131,7 +132,7 @@ def smb_conf(ip, prefix, clone_conf):
    bind interfaces only = yes
    hosts allow = 127.0.0.1 {allow}
    hosts deny = ALL
-   smb ports = 445
+   smb ports = {SMB_PORT}
    disable netbios = yes
    map to guest = {'Bad User' if guest else 'Never'}
    load printers = no

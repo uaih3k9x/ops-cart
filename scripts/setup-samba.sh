@@ -64,7 +64,7 @@ install -m 644 "$SRC/deploy/srv-data/smb-ops-cart.conf" /etc/systemd/system/smb.
 install -m 755 "$SRC/deploy/srv-data/50-ops-cart-smb" /etc/NetworkManager/dispatcher.d/50-ops-cart-smb
 command -v restorecon >/dev/null && restorecon /etc/NetworkManager/dispatcher.d/50-ops-cart-smb || true
 
-echo "==> firewalld: 只放 LAN1 网段来的 445"
+echo "==> firewalld: 只放 LAN1 网段来的 SMB 端口"
 if systemctl is-active -q firewalld; then
     RULE=$(python3 "$CORE" rich-rule --env "$ENV")
     ZONE=$(firewall-cmd --get-zone-of-interface="$LAN1" 2>/dev/null || true)

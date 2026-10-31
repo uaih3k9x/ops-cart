@@ -54,7 +54,7 @@ def test_lan_net_rejects(ip, prefix):
 
 def test_firewall_rule_source_lan1_net_smb_only():
     r = sb.firewall_rich_rule(IP, PREFIX)
-    assert r == 'rule family="ipv4" source address="192.0.2.0/24" port port="445" protocol="tcp" accept'
+    assert r == 'rule family="ipv4" source address="192.0.2.0/24" port port="' + str(sb.SMB_PORT) + '" protocol="tcp" accept'
 
 
 # ---------------------------------------------------------------- 全局
@@ -63,7 +63,7 @@ def test_global_binds_lan1_only():
     g = sections(sb.smb_conf(IP, PREFIX, None))["global"]
     assert g["interfaces"] == "lo eno1" and g["bind interfaces only"] == "yes"
     assert g["hosts allow"] == "127.0.0.1 192.0.2.0/255.255.255.0" and g["hosts deny"] == "ALL"
-    assert g["smb ports"] == "445" and g["disable netbios"] == "yes"
+    assert g["smb ports"] == str(sb.SMB_PORT) and g["disable netbios"] == "yes"
     assert g["security"] == "user"
 
 

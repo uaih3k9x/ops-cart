@@ -113,7 +113,7 @@ sudo /tmp/ops-cart-11/scripts/setup-samba.sh
 - 会问**装机账号 `winpe` 的密码**（PE 里 `net use` 要敲，挑个好敲的）。不想每次重跑都问，就写进
   `/etc/ops-cart/smb-winpe.pass`（一行，`sudo chmod 600`），密码不进仓库。
 - 有 `/opt/pxe/clone.json`（`proto: smb`）就顺带生成克隆的两个共享、建克隆账号，密码照 `clone.json`。
-- firewalld：在 `eno1` 所在的区加一条规则，只放 LAN1 网段来的 445。
+- firewalld：在 `eno1` 所在的区加一条规则，只放 LAN1 网段来的 SMB 端口（TCP，号码见 `samba_core.SMB_PORT`）。
 
 ### 7. 验证
 
@@ -124,7 +124,7 @@ systemctl is-active srv-data.mount srv-data-layout smb pxe-server     # 都 acti
 testparm -s 2>/dev/null | grep -E 'hosts allow|interfaces'            # 只有 lo eno1 和装机网段
 smbclient -L //127.0.0.1 -U winpe                                     # 列出 win drivers tools (克隆的两个)
 sudo firewall-cmd --get-zone-of-interface=eno1
-sudo firewall-cmd --zone=<上面的区> --list-rich-rules                  # source address="<装机网段>" port 445
+sudo firewall-cmd --zone=<上面的区> --list-rich-rules                  # source address="<装机网段>" port <SMB 端口>
 ```
 
 在被测机 PE 里（命令提示符）：
@@ -135,7 +135,7 @@ W:\win10\setup.exe
 net use D: \\<推车装机地址>\drivers /user:winpe <密码>     # 驱动总裁直接从 D: 跑
 ```
 
-从 LAN2 / 无线连推车的 445 应该连不上（规则只放 LAN1 网段）。
+从 LAN2 / 无线连推车的 SMB 端口应该连不上（规则只放 LAN1 网段）。
 
 ### 8. （可选）没数据盘也照常
 
