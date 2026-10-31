@@ -12,9 +12,10 @@ import confirm_core as cc
 import theme as th
 
 FONT, FONT_BIG = th.FONT, th.FONT_BIG
-BG, CARD, FG, DIM = th.PANEL, th.BG, th.FG, th.DIM      # 条目凹进去 (按钮底上 DIM 不够 4.5)
-BTN = {"go": (th.GO_BG, th.GO_FG), "no": (th.DANGER_BG, th.DANGER_FG), "stop": (th.ALERT_BG, th.WHITE),
-       "plain": (th.BTN2, th.FG)}
+BG, CARD, FG, DIM, BTN = th.follow(                     # 条目凹进去 (按钮底上 DIM 不够 4.5)
+    globals(), BG="PANEL", CARD="BG", FG="FG", DIM="DIM",
+    BTN=lambda: {"go": (th.GO_BG, th.GO_FG), "no": (th.DANGER_BG, th.DANGER_FG),
+                 "stop": (th.ALERT_BG, th.WHITE), "plain": (th.BTN2, th.FG)})
 
 
 class ConfirmDialog(tk.Toplevel):

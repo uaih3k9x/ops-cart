@@ -12,9 +12,10 @@ import pxe_req_core as pr
 import theme as th
 
 FONT, FONT_BIG, FONT_MONO = th.FONT, th.FONT_BIG, th.FONT_MONO
-BG, CARD, FG, DIM, RED, AMBER = th.PANEL, th.BG, th.FG, th.DIM, th.BAD, th.WARN
-EDGE = th.DANGER_EDGE            # 同手动解锁对话框: 解锁是危险操作
-BTN = {"go": (th.DANGER_BG, th.DANGER_FG), "no": (th.BTN2, th.DANGER_FG), "plain": (th.BTN2, th.FG)}
+BG, CARD, FG, DIM, RED, AMBER, EDGE, BTN = th.follow(
+    globals(), BG="PANEL", CARD="BG", FG="FG", DIM="DIM", RED="BAD", AMBER="WARN",
+    EDGE="DANGER_EDGE",            # 同手动解锁对话框: 解锁是危险操作
+    BTN=lambda: {"go": (th.DANGER_BG, th.DANGER_FG), "no": (th.BTN2, th.DANGER_FG), "plain": (th.BTN2, th.FG)})
 
 
 class PxeRequestDialog(tk.Toplevel):

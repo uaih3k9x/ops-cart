@@ -18,7 +18,7 @@ from kiosk_ui_core import UiBridge
 import theme as th
 
 FONT, FONT_MONO = th.FONT, th.FONT_MONO_BIG
-BG, FG, BOX = th.PANEL, th.FG, th.BOX
+BG, FG, BOX = th.follow(globals(), BG="PANEL", FG="FG", BOX="BOX")
 
 
 def _run(cmd, timeout=30):

@@ -5,6 +5,7 @@
 名字按用途起, 不按颜色起: 换风格只改这里的值.
 
 #28 起是 CDE / Motif 深色: 控件凸 (raised)、输入区和面板凹 (sunken), 亮暗边 Tk 按底色自己算 (= Motif 的算法);
+#30 加了同名的 CDE 浅色 (LIGHT), use("light") / use("dark") 切换, 默认深色 (和 #28 一样);
 字体 Unifont 16px 点阵 (OTF, 随部署包带, 装到 /usr/local/share/fonts/ops-cart/), 取不到退回 Noto.
 """
 
@@ -71,73 +72,153 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
-# ---------------------------------------------------------------- 车机: 底和面
+# ---------------------------------------------------------------- 两套配色 (#30)
+# DARK / LIGHT 名字完全一样; 业务代码照旧只引用 th.名字, 不知道现在是哪套. 用哪套由 use() 定 (默认深色).
+# 浅色是 #27 对比图里的 C 版: CDE 经典浅灰蓝, 斜边同样交给 Tk 按底色算; 状态色在浅底上重新取值 (深一档).
 
-BG = "#262a35"               # 窗口底、输入框 / 列表 / 终端底 (凹)
-TOP = "#1e212a"              # 顶栏
-PANEL = "#2f3441"            # 状态板、左侧面板、对话框
-BOX = "#3a4050"              # 普通按钮、灯块、执行器条 (凸)
-BTN2 = "#4a5165"             # 次要按钮 (返回 / 取消)、分隔条
-ACTIVE = "#525a70"           # 按下 / 选中
-PRIMARY = "#3d5a80"          # 主操作按钮 (连接 / 应用 / 发送)、输入框焦点框
-TITLE = "#4a5f8a"            # 对话框标题条 (白字)
-INK = "#12151c"              # 最深: 亮灯上的字、副屏底
-BLACK = "#000000"            # 视频预览底
+DARK = {
+    # 车机: 底和面
+    "BG": "#262a35",               # 窗口底、输入框 / 列表 / 终端底 (凹)
+    "TOP": "#1e212a",              # 顶栏
+    "PANEL": "#2f3441",            # 状态板、左侧面板、对话框
+    "BOX": "#3a4050",              # 普通按钮、灯块、执行器条 (凸)
+    "BTN2": "#4a5165",             # 次要按钮 (返回 / 取消)、分隔条
+    "ACTIVE": "#525a70",           # 按下 / 选中
+    "PRIMARY": "#3d5a80",          # 主操作按钮 (连接 / 应用 / 发送)、输入框焦点框
+    "TITLE": "#4a5f8a",            # 对话框标题条 (白字)
+    "INK": "#12151c",              # 最深: 亮灯上的字、副屏底
+    "BLACK": "#000000",            # 视频预览底
+    # 车机: 字 (比 1.10.00 降一档, 正文仍 >= 4.5:1)
+    "FG": "#d0d4de",               # 标题、按钮字
+    "TEXT": "#bcc2ce",             # 正文、表单标签
+    "DIM": "#959cad",              # 次要说明; 面板 (PANEL) 上最淡只到这个, 按钮底 (BOX) 上不用
+    "FAINT": "#8b92a4",            # 很次要 (检查中、昨夜做梦、版本号); 只用在 BG / TOP 上, 面板上不够
+    "MUTED": "#a2abb8",            # 温度正常
+    "WHITE": "#ffffff",
+    # 车机: 状态
+    "OK": "#8fd694",
+    "WARN": "#e2b04a",
+    "BAD": "#f08f86",              # 红字不写在按钮底 (BOX) 上: 不够 4.5
+    "NOTICE": "#eab07a",           # 顶栏横幅、锁屏通知、聊天里对方
+    "MARK": "#7ec8e3",             # 串口控制台里的标记行
+    "WARN_BG": "#5c4424",          # 警告类按钮 (重启)
+    "AMBER_BG": "#6b4f22",         # 需要拍板的按钮 (信任认证页)
+    "DANGER_BG": "#5a2a2e",        # 危险按钮 (关机 / 删除 / 解锁)、高危提示条
+    "DANGER_FG": "#ffd0d4",
+    "DANGER_EDGE": "#7a1f2b",      # 危险弹窗的边框、锁屏上的危险提示条、已解锁的装机按钮
+    "ALERT_BG": "#c62d2a",         # UPS 倒计时
+    "SERVE_BG": "#b3261e",         # 自己发地址中 (#11)
+    "SERVE_EXPIRED_BG": "#8a5a00",
+    "GO_BG": "#2b6a45",            # 确认发送 (#23 确认框)
+    "GO_FG": "#e2f5e6",
+    "AGENT": "#a78bfa",            # Agent 在发 / 持写租约 (#23 执行绪方块紫)
+    # 指示灯 (#2) / 副屏 (#6)
+    "LAMP_OK": "#22c55e",
+    "LAMP_WARN": "#f59e0b",
+    "LAMP_FAIL": "#ef4444",
+    "LAMP_LIT_FG": "#12151c",      # 亮灯 (绿 / 黄 / 红 / 紫) 上一律深字: 红灯上白字只有 3.8
+    "DASH_BG": "#12151c",          # 副屏比车机深一档: 红黄绿灯色直接当字色用, 要够 4.5
+    "DASH_DIM": "#8088a0",
+}
 
-# ---------------------------------------------------------------- 车机: 字 (比 1.10.00 降一档, 正文仍 >= 4.5:1)
+LIGHT = {
+    "BG": "#e4e6ec",
+    "TOP": "#c4c8d4",
+    "PANEL": "#cfd3dd",
+    "BOX": "#bcc1cf",
+    "BTN2": "#a9afc0",
+    "ACTIVE": "#979eb3",
+    "PRIMARY": "#a9bedf",          # 浅底上主按钮也是浅蓝 + 深字 (白字在浅蓝上不够)
+    "TITLE": "#3d5a80",
+    "INK": "#0e1118",
+    "BLACK": "#000000",
+    "FG": "#14171f",
+    "TEXT": "#232733",
+    "DIM": "#3c4252",
+    "FAINT": "#4a5163",
+    "MUTED": "#2f4a3a",
+    "WHITE": "#ffffff",
+    "OK": "#17602a",
+    "WARN": "#6e4a00",
+    "BAD": "#9c1f17",
+    "NOTICE": "#7c3f0c",
+    "MARK": "#145a7a",
+    "WARN_BG": "#e3c487",
+    "AMBER_BG": "#d9ad5b",
+    "DANGER_BG": "#eab6b9",
+    "DANGER_FG": "#5e0d16",
+    "DANGER_EDGE": "#7a1f2b",
+    "ALERT_BG": "#c62d2a",
+    "SERVE_BG": "#b3261e",
+    "SERVE_EXPIRED_BG": "#8a5a00",
+    "GO_BG": "#b5dcbf",
+    "GO_FG": "#0f3a1c",
+    "AGENT": "#6d28d9",
+    "LAMP_OK": "#15803d",          # 浅底上灯色加深: 副屏直接当字色用, 亮灯上改写白字
+    "LAMP_WARN": "#9a5b06",
+    "LAMP_FAIL": "#b91c1c",
+    "LAMP_LIT_FG": "#ffffff",
+    "DASH_BG": "#f3f4f7",
+    "DASH_DIM": "#555c6e",
+}
 
-FG = "#d0d4de"               # 标题、按钮字
-TEXT = "#bcc2ce"             # 正文、表单标签
-DIM = "#959cad"              # 次要说明; 面板 (PANEL) 上最淡只到这个, 按钮底 (BOX) 上不用
-FAINT = "#8b92a4"            # 很次要 (检查中、昨夜做梦、版本号); 只用在 BG / TOP 上, 面板上不够
-MUTED = "#a2abb8"            # 温度正常
-DISABLED = BTN2              # 不可点的字、空灯的色带
-WHITE = "#ffffff"
 
-# ---------------------------------------------------------------- 车机: 状态
+def _derive(p):
+    """两套共用的别名: 开机自检页 / 指示灯 / 副屏引用车机的哪个名字, 两套一样."""
+    return dict(p,
+                DISABLED=p["BTN2"],            # 不可点的字、空灯的色带
+                # 开机自检页 (#28 起跟着车机; 深浅按开机那一刻的模式, #32)
+                BOOT_BG=p["BG"], BOOT_FG=p["FG"], BOOT_SUB=p["DIM"], BOOT_DIM=p["FAINT"], BOOT_STEP=p["TEXT"],
+                BOOT_OK=p["OK"], BOOT_WARN=p["WARN"], BOOT_FAIL=p["BAD"],
+                LAMP_BODY=p["BOX"], LAMP_EMPTY=p["PANEL"], LAMP_FG=p["TEXT"], LAMP_EMPTY_FG=p["DIM"],
+                DASH_LINE=p["BOX"])
 
-OK = "#8fd694"
-WARN = "#e2b04a"
-BAD = "#f08f86"              # 红字不写在按钮底 (BOX) 上: 不够 4.5
-NOTICE = "#eab07a"           # 顶栏横幅、锁屏通知、聊天里对方
-MARK = "#7ec8e3"             # 串口控制台里的标记行
-STATE = {"OK": OK, "WARN": WARN, "FAIL": BAD}
 
-WARN_BG = "#5c4424"          # 警告类按钮 (重启)
-AMBER_BG = "#6b4f22"         # 需要拍板的按钮 (信任认证页)
-DANGER_BG = "#5a2a2e"        # 危险按钮 (关机 / 删除 / 解锁)、高危提示条
-DANGER_FG = "#ffd0d4"
-DANGER_EDGE = "#7a1f2b"      # 危险弹窗的边框、锁屏上的危险提示条、已解锁的装机按钮
-ALERT_BG = "#c62d2a"         # UPS 倒计时
-SERVE_BG = "#b3261e"         # 自己发地址中 (#11)
-SERVE_EXPIRED_BG = "#8a5a00"
-GO_BG = "#2b6a45"            # 确认发送 (#23 确认框)
-GO_FG = "#e2f5e6"
-AGENT = "#a78bfa"            # Agent 在发 / 持写租约 (#23 执行绪方块紫)
+DARK, LIGHT = _derive(DARK), _derive(LIGHT)
+MODES = ("dark", "light")
+MODE = "dark"
+_followers = []                  # [(模块的 globals(), {别名: theme 名字 或 现算函数})]
 
-# ---------------------------------------------------------------- 开机自检页 (#28 起跟着深色; 深浅随模式走见 #32)
 
-BOOT_BG = BG
-BOOT_FG = FG
-BOOT_SUB = DIM
-BOOT_DIM = FAINT
-BOOT_STEP = TEXT
-BOOT_OK, BOOT_WARN, BOOT_FAIL = OK, WARN, BAD
-BOOT_STATE = {"OK": BOOT_OK, "WARN": BOOT_WARN, "FAIL": BOOT_FAIL}
+def _palette():
+    return LIGHT if MODE == "light" else DARK
 
-# ---------------------------------------------------------------- 指示灯 (#2) / 副屏 (#6)
 
-LAMP = {"OK": "#22c55e", "WARN": "#f59e0b", "FAIL": "#ef4444", None: DISABLED}
-LAMP_OK, LAMP_WARN, LAMP_FAIL = LAMP["OK"], LAMP["WARN"], LAMP["FAIL"]
-LAMP_BODY = BOX
-LAMP_EMPTY = PANEL
-LAMP_FG = TEXT
-LAMP_EMPTY_FG = DIM
-LAMP_LIT_FG = INK            # 亮灯 (绿 / 黄 / 红 / 紫) 上一律深字: 红灯上白字只有 3.8
+def _resolve(spec):
+    return spec() if callable(spec) else globals()[spec]
 
-DASH_BG = INK                # 副屏比车机深一档: 红黄绿灯色直接当字色用, 要够 4.5
-DASH_DIM = "#8088a0"
-DASH_LINE = LAMP_BODY
+
+def use(mode):
+    """切到 mode 那套 ("dark" / "light"; 别的一律深色), 返回实际用上的. 只改 th.名字 和 follow() 登记的别名;
+    已经建好的 Tk 控件不会变 -- 车机是锁屏时整个重建 (#32), 重建前再调 setup() 重设 Tk 默认控件."""
+    global MODE, STATE, BOOT_STATE, LAMP
+    MODE = mode if mode in MODES else "dark"
+    c = _palette()
+    globals().update(c)
+    STATE = {"OK": c["OK"], "WARN": c["WARN"], "FAIL": c["BAD"]}
+    BOOT_STATE = {"OK": c["BOOT_OK"], "WARN": c["BOOT_WARN"], "FAIL": c["BOOT_FAIL"]}
+    LAMP = {"OK": c["LAMP_OK"], "WARN": c["LAMP_WARN"], "FAIL": c["LAMP_FAIL"], None: c["DISABLED"]}
+    for ns, names in _followers:
+        ns.update({k: _resolve(v) for k, v in names.items()})
+    return MODE
+
+
+def follow(ns, **names):
+    """模块级别名跟着配色走: BG, BTN = th.follow(globals(), BG="PANEL", BTN=lambda: {...}).
+    现在设一次 (按参数顺序返回, 左边照写一遍让静态检查看得见), 以后每次 use() 再设.
+    名字写错在导入时就 KeyError, 不会等到切浅色才炸."""
+    values = {k: _resolve(v) for k, v in names.items()}
+    ns.update(values)
+    _followers.append((ns, names))
+    return tuple(values.values())
+
+
+def unfollow(ns):
+    _followers[:] = [f for f in _followers if f[0] is not ns]
+
+
+use("dark")
+
 
 # ---------------------------------------------------------------- 斜边 (Tk 按底色自己算亮暗边)
 
@@ -150,23 +231,24 @@ FLAT = {"relief": "flat", "bd": 0}           # 凹框里面再套的文字区
 
 def tk_options():
     """Tk 默认控件 (messagebox 的底 / OptionMenu / 滚动条 / 勾选框 / 单选框 / 分组框 ...) 的 option 数据库.
-    显式写了的选项照旧优先; 这里只管没写的. #30 换配色时重设这一组."""
-    return [("*Background", PANEL), ("*Foreground", FG), ("*Font", FONT),
-            ("*activeBackground", ACTIVE), ("*activeForeground", FG),
-            ("*selectBackground", PRIMARY), ("*selectForeground", FG), ("*selectColor", BG),
-            ("*troughColor", BG), ("*insertBackground", FG), ("*disabledForeground", DIM),
+    显式写了的选项照旧优先; 这里只管没写的. 按当前配色出 (#30: use() 之后再 setup() 就重设)."""
+    c = _palette()
+    return [("*Background", c["PANEL"]), ("*Foreground", c["FG"]), ("*Font", FONT),
+            ("*activeBackground", c["ACTIVE"]), ("*activeForeground", c["FG"]),
+            ("*selectBackground", c["PRIMARY"]), ("*selectForeground", c["FG"]), ("*selectColor", c["BG"]),
+            ("*troughColor", c["BG"]), ("*insertBackground", c["FG"]), ("*disabledForeground", c["DIM"]),
             ("*highlightThickness", 0),
             # 斜边宽只给有斜边的控件; 全局 *borderWidth 会给每个 Frame 都加一圈
-            *((f"*{c}.borderWidth", 2) for c in ("Button", "Menubutton", "Menu", "Entry", "Listbox", "Text",
+            *((f"*{w}.borderWidth", 2) for w in ("Button", "Menubutton", "Menu", "Entry", "Listbox", "Text",
                                                   "Scrollbar", "Labelframe", "Radiobutton", "Checkbutton")),
             ("*Dialog.relief", "raised"), ("*Dialog.borderWidth", 3),     # messagebox: 没有窗口管理器, 自己凸出来
-            ("*Button.background", BOX), ("*Button.relief", "raised"),
-            ("*Menubutton.background", BOX), ("*Menubutton.relief", "raised"),
-            ("*Menu.background", BOX), ("*Menu.relief", "raised"), ("*Menu.activeBorderWidth", 2),
-            ("*Scrollbar.background", BOX), ("*Labelframe.relief", "groove"),
-            ("*Entry.background", BG), ("*Entry.relief", "sunken"),
-            ("*Listbox.background", BG), ("*Listbox.relief", "sunken"),
-            ("*Text.background", BG), ("*Text.relief", "sunken"),
+            ("*Button.background", c["BOX"]), ("*Button.relief", "raised"),
+            ("*Menubutton.background", c["BOX"]), ("*Menubutton.relief", "raised"),
+            ("*Menu.background", c["BOX"]), ("*Menu.relief", "raised"), ("*Menu.activeBorderWidth", 2),
+            ("*Scrollbar.background", c["BOX"]), ("*Labelframe.relief", "groove"),
+            ("*Entry.background", c["BG"]), ("*Entry.relief", "sunken"),
+            ("*Listbox.background", c["BG"]), ("*Listbox.relief", "sunken"),
+            ("*Text.background", c["BG"]), ("*Text.relief", "sunken"),
             ("*Dialog.msg.font", FONT), ("*Dialog.dtl.font", FONT)]
 
 
@@ -188,12 +270,13 @@ def setup(root, families=None):
             _named[name] = tkfont.Font(root, name=name, family=family, size=size)
     for pattern, value in tk_options():
         root.option_add(pattern, value)
+    c = _palette()
     s = ttk.Style(root)
     s.theme_use("default")
-    s.configure(".", background=PANEL, foreground=FG, font=FONT, troughcolor=BG, fieldbackground=BG,
-                selectbackground=PRIMARY, selectforeground=FG, insertcolor=FG)
-    s.configure("TButton", background=BOX, relief="raised", borderwidth=2, padding=(14, 4))
-    s.map("TButton", background=[("pressed", BTN2), ("active", ACTIVE)], relief=[("pressed", "sunken")])
+    s.configure(".", background=c["PANEL"], foreground=c["FG"], font=FONT, troughcolor=c["BG"],
+                fieldbackground=c["BG"], selectbackground=c["PRIMARY"], selectforeground=c["FG"], insertcolor=c["FG"])
+    s.configure("TButton", background=c["BOX"], relief="raised", borderwidth=2, padding=(14, 4))
+    s.map("TButton", background=[("pressed", c["BTN2"]), ("active", c["ACTIVE"])], relief=[("pressed", "sunken")])
     return fam
 
 

@@ -26,17 +26,13 @@ FONTS = [(path, 0, True) for path in th.UNIFONT_PATHS] + [
     ("/System/Library/Fonts/PingFang.ttc", 0, False)]
 
 M = 40                          # 左右边距
-BG = th.DASH_BG
-FG = lc.FG
-DIM = th.DASH_DIM
-LINE = th.DASH_LINE
-ACCENT = lc.HEALTH_COLOR["OK"]
-WARN = lc.HEALTH_COLOR["WARN"]
-BAD = lc.HEALTH_COLOR["FAIL"]
-
-NET_TAG = {"on": ("网络 通", ACCENT), "warn": ("无外网", WARN), "off": ("网络断开", BAD),
-           "down": ("网络断开", BAD)}
-MARK = {"FAIL": ("×", BAD), "WARN": ("▲", WARN)}   # ✕ 不少中文字体没有
+# 配色跟着 th.use() 走 (#32: cart-dash 每帧按快照里的模式切, 下一帧就换)
+BG, FG, DIM, LINE, ACCENT, WARN, BAD, NET_TAG, MARK = th.follow(
+    globals(), BG="DASH_BG", FG="LAMP_FG", DIM="DASH_DIM", LINE="DASH_LINE",
+    ACCENT="LAMP_OK", WARN="LAMP_WARN", BAD="LAMP_FAIL",
+    NET_TAG=lambda: {"on": ("网络 通", th.LAMP_OK), "warn": ("无外网", th.LAMP_WARN),
+                     "off": ("网络断开", th.LAMP_FAIL), "down": ("网络断开", th.LAMP_FAIL)},
+    MARK=lambda: {"FAIL": ("×", th.LAMP_FAIL), "WARN": ("▲", th.LAMP_WARN)})   # ✕ 不少中文字体没有
 
 
 _font_cache = {}
@@ -239,7 +235,8 @@ def _footer(d, view, W, H):
 
 BOOT_Y0, BOOT_ROW = 236, 108            # 第一行顶 / 行距
 BOOT_STATUS_W = 240                     # 右边结果栏宽 (测试按这个框找颜色)
-BOOT_COLOR = {"ok": ACCENT, "warn": WARN, "late": WARN, "fail": BAD}   # wait / off 都是灰
+BOOT_COLOR, = th.follow(globals(), BOOT_COLOR=lambda: {      # wait / off 都是灰
+    "ok": th.LAMP_OK, "warn": th.LAMP_WARN, "late": th.LAMP_WARN, "fail": th.LAMP_FAIL})
 
 
 def boot_status_box(i, W=PANEL_W):

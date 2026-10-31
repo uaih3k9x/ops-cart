@@ -140,7 +140,7 @@ class UiBridge:
 
 # ---------------------------------------------------------------- 网络标
 
-NET_COLORS = {"on": th.OK, "warn": th.WARN, "off": th.BAD}
+NET_COLORS, = th.follow(globals(), NET_COLORS=lambda: {"on": th.OK, "warn": th.WARN, "off": th.BAD})
 
 
 def net_view(state, text):
@@ -183,7 +183,8 @@ def pxe_button_texts(view):
 
 # ---------------------------------------------------------------- 自己发地址限时 (#11): 顶上醒目条
 
-SERVE_BAR_BG = {"serving": th.SERVE_BG, "expired": th.SERVE_EXPIRED_BG}     # 正在发: 红; 到时停发: 琥珀
+SERVE_BAR_BG, = th.follow(globals(),               # 正在发: 红; 到时停发: 琥珀
+                          SERVE_BAR_BG=lambda: {"serving": th.SERVE_BG, "expired": th.SERVE_EXPIRED_BG})
 
 
 def serve_bar_view(guard, now):

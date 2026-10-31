@@ -109,12 +109,17 @@ def test_message_line(root):
     assert "确认码不对" in _labels(d)
 
 
+@pytest.mark.parametrize("mode", ["dark", "light"])
 @pytest.mark.parametrize("n", [0, 2])
-def test_every_text_readable(root, n):
-    """#28 深色: 申请框里所有字 (含按钮按下、红字警告、清单、确认码) 对底都 >= 4.5."""
+def test_every_text_readable(root, n, mode):
+    """#28 深色 / #30 浅色: 申请框里所有字 (含按钮按下、红字警告、清单、确认码) 对底都 >= 4.5."""
     import theme as th
+    th.use(mode)
     th.setup(root)
     d, _acts = _dlg(root, _view(codes=("111111", "222222"), n=n) if n else _view(n=0))
     d.say("不行: 码不对", ok=False)
     d.update_idletasks()
-    assert not th.unreadable(d)
+    try:
+        assert not th.unreadable(d)
+    finally:
+        th.use("dark")

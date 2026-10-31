@@ -17,9 +17,10 @@ from tkinter import messagebox
 import cartlog
 import netmode_core as nmc
 import netprof_core as npc
-from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, BridgePanel, WifiPanel, _run
+from wifi_panel import FONT, FONT_MONO, BridgePanel, WifiPanel, _run
 import theme as th
 
+BG, FG, BOX = th.follow(globals(), BG="PANEL", FG="FG", BOX="BOX")      # 同无线面板 (#30 跟着配色走)
 UP_TIMEOUT = 90         # nmcli con up 等 DHCP 最长 45 秒左右, 留余量
 
 

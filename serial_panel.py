@@ -36,13 +36,13 @@ PASTE_LINE_S = 0.05         # 粘贴按行发, 行间停一下, 交换机 CLI �
 
 # ------------------------------------------------------------ UI
 
-BG, BG2, FG, DIM = th.PANEL, th.BG, th.FG, th.DIM
+BG, BG2, FG, DIM = th.follow(globals(), BG="PANEL", BG2="BG", FG="FG", DIM="DIM")
 FONT, FONT_MONO = th.FONT_SMALL, th.FONT_MONO
 CHAT_WIDTH = 340
 
 
-def _btn(parent, text, cmd, bg=th.BOX):
-    return tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg, fg=FG,
+def _btn(parent, text, cmd, bg=None):
+    return tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg or th.BOX, fg=FG,
                      activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=10)
 
 
