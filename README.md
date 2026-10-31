@@ -58,7 +58,8 @@
 | [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版远程管理口(标准库 http.server + xterm.js);单独的 `webkiosk.service`,专用用户 `ops-web`,默认不开机自启 |
 | [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着配置里写的那个 SSID 时跑(配置没写 SSID 就不跑);认证页主机白名单 `portal_hosts`(空时首次成功自动记住);结果写 `/run/ops-cart/campus-auth-status.json` 给面板和状态板 |
 | [`kvm_core.py`](kvm_core.py) | 画面源 ↔ 键鼠绑定:CH9329 按 CH343 序列号认身份;没绑或不在线 = 只看不操作,绝不退回随便一块 |
-| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈(独占打开,被占用报 `Ch9329Busy`、拔线报 `Ch9329Gone`),也可当命令行工具用 |
+| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈(独占打开,被占用报 `Ch9329Busy`、拔线报 `Ch9329Gone`),也可当命令行工具用;键鼠代理在跑时命令行经代理发(默认算 agent),不在就直开 |
+| [`kvm_broker.py`](kvm_broker.py) · [`kvm_broker_core.py`](kvm_broker_core.py) | 键鼠常驻代理(`kvm-broker.service`):统一持有 CH9329,车机 / 网页口 / 命令行 / 配方都经本地 socket `/run/ops-kvm/kvm.sock`(行式 JSON,0660 给 dialout)发键;人永远优先,人 3 秒内动过键鼠 agent 就暂停排队;急停只丢 agent 没发的、不插任何按键,解除要人;每次发键记来源到 `/var/log/ops-cart/kvm.log`。代理不在各客户端退回直开 + flock。纯逻辑(解析、拆步、仲裁、租约钩子、日志行)在 `_core` |
 | [`serial_panel.py`](serial_panel.py) · [`serial_core.py`](serial_core.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务。纯逻辑(读 `serial.conf`、conbroker 命令与输出解析、选口、终端字节)在 `serial_core`,不碰 Tk,无界面的服务都用它 |
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
@@ -96,6 +97,8 @@ python3 -m pytest -q
 # CH9329 注入
 python3 ch9329.py --port /dev/ttyACM0 type "hello from cart"
 python3 ch9329.py --port /dev/ttyACM0 combo ctrl alt delete
+python3 ch9329.py estop --all                  # 键鼠代理在跑时: 急停 agent 的键鼠输入
+python3 ch9329.py --src human resume --all     # 解除急停 (要人来)
 
 # PXE 服务端(地址是示例;推车上由 /etc/ops-cart/pxe.env 给出)
 python3 pxeserver.py serve --ip 192.0.2.1 --prefix 24 \
@@ -125,6 +128,7 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
 sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk
 sudo cp deploy/bin/kiosk-setpin /usr/local/bin/ && sudo kiosk-setpin
 sudo systemctl enable --now kiosk.service cart-boot-success.timer campus-auth.timer wifi-prefer.timer
+sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, 各客户端退回直开 (#9)
 # 网页管理口按需 (专用用户 + 预建 web.conf, 见单元注释):
 #   sudo useradd -r -s /sbin/nologin ops-web
 #   sudo install -o ops-web -g ops-web -m 0600 /dev/null /opt/pxe/web.conf
