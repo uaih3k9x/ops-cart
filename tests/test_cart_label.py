@@ -219,7 +219,7 @@ def test_text_shifted_by_y0_but_ruler_not():
 
 def test_calibration_constants():
     """实机校准值, 改之前先看 CART-LOG."""
-    assert (cl.FL, cl.FR, cl.CY, cl.Y0) == (55.0, 90.5, 9.0, 5.0)
+    assert (cl.FL, cl.FR, cl.CY, cl.Y0, cl.X0) == (52.0, 87.5, 9.0, 5.0, -3.0)   # 10-31 实机: 整体左挪 3mm
     assert "SHIFT 18,39" in cl.HEAD and "SIZE 104 mm, 25 mm" in cl.HEAD
     assert cl.ASSET_HEADER == "SIZE 60 mm, 37.4 mm\r\nGAP 2 mm, 0 mm\r\nDENSITY 15\r\nDIRECTION 1\r\nSHIFT 34,-76\r\n"
 
