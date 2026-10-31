@@ -69,7 +69,7 @@
 | [`serial_panel.py`](serial_panel.py) · [`serial_core.py`](serial_core.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务。纯逻辑(读 `serial.conf`、conbroker 命令与输出解析、选口、终端字节)在 `serial_core`,不碰 Tk,无界面的服务都用它 |
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
 | [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19 只读部分 + #20 标签;写串口见下一行 #21):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;列执行绪时带写租约持有者。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
-| [`mcp_serial.py`](mcp_serial.py) · [`serial_write_core.py`](serial_write_core.py) | 串口写路径(#21):MCP 工具 `lease_acquire/renew/release`、`send_command`(只收一行可打印 ASCII)、`send_key`(回车 / 翻页空格 / Ctrl+C)、`pending_list`、`estop`。每槽位同时一个写入者,租约默认 60 秒要续、过期作废;闸门第 1 层:认得出厂商(华为提示符自动认,其余在 [`examples/serial_gate.example.json`](examples/serial_gate.example.json) 登记)、停在提示符上、过只读白名单才直发,带 save/reboot/reset/format/delete 等高危词的永远要人确认,其余一律挂起;Ctrl+C 要人确认。急停单条 / 全部:撤租约、丢挂起,不往设备发任何东西。状态 `/run/ops-cart/serial-write.json`(读不懂 = 全部急停),每槽位 JSONL 日志 `/var/log/ops-cart/serial-slot<N>.log`。车机上 `cart_mcp.py pending / confirm / reject / estop / resume`,确认和解除只认本机终端(不经 sshd / tailscaled) |
+| [`mcp_serial.py`](mcp_serial.py) · [`serial_write_core.py`](serial_write_core.py) | 串口写路径(#21):MCP 工具 `lease_acquire/renew/release`、`send_command`(只收一行可打印 ASCII)、`send_key`(回车 / 翻页空格 / Ctrl+C)、`pending_list`、`estop`。每槽位同时一个写入者,租约默认 60 秒要续、过期作废;闸门第 1 层:认得出厂商(华为提示符自动认,思科 / 锐捷 / Linux 在 [`examples/serial_gate.example.json`](examples/serial_gate.example.json) 登记)、停在提示符上、过只读白名单才直发,带 save/reboot/reset/format/delete 等高危词的永远要人确认;第 2 层(#22,[`serial_gate_model.py`](serial_gate_model.py),规则文件 `model.enabled` 打开,默认关):其余命令交决策模型按命令 + 设备最近输出 + Agent 声明的 `intent` 判,放行直发,判拦 / 超时 / 报错 / 格式不对 / 预算超限一律挂起等人确认,理由进日志;Ctrl+C 要人确认。急停单条 / 全部:撤租约、丢挂起,不往设备发任何东西。状态 `/run/ops-cart/serial-write.json`(读不懂 = 全部急停),每槽位 JSONL 日志 `/var/log/ops-cart/serial-slot<N>.log`。车机上 `cart_mcp.py pending / confirm / reject / estop / resume`,确认和解除只认本机终端(不经 sshd / tailscaled) |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
 | [`mcp_label.py`](mcp_label.py) | MCP 标签工具(#20,挂在 `cart_mcp` 上):`label_preview` 查仅 ASCII、`cart_label.LIMITS` 长度、出界和对折,回检查结果 + SVG;`label_print` 校验不过或打印机开盖/缺纸/缺碳带就拒,**默认只打 1 张**,批量要带单张打样回的 `proof`(10 分钟、一次性、绑版面)和人确认的原话 `confirmed`,都进审计;`label_printer_status` 读 `ESC !?` 状态字节;`label_abbrev_propose` 只回缩写对照表 diff,不写回。对照表优先读推车本地 `/etc/ops-cart/label_abbrev.json` |
 | [`cart_label.py`](cart_label.py) | TSC 标签机 TSPL 生成器(只出字节流,打印由调用方 `cat > /dev/usb/lp0`):旗形线缆标签(上下对折、下半份旋转 180°)、推车线标、刻度尺、资产标签(PDF → pdftoppm → BITMAP);校准常量集中在文件头;缩写对照表校验见 [`examples/label_abbrev.json`](examples/label_abbrev.json) |
@@ -147,7 +147,8 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 #   sudo systemctl enable --now cart-mcp.service
 #   claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio
 # 标签工具 (#20) 要缩写对照表: sudo install -m 0644 examples/label_abbrev.json /etc/ops-cart/   (真实资产名的缩写只加在这份里)
-# 串口写闸门规则 (可选; 不放就是内置: 华为提示符自动认, 只放行 display / show):
+# 串口写闸门规则 (可选; 不放就是内置: 华为提示符自动认, 只放行 display / show, 决策模型不开;
+#   开第 2 层把 model.enabled 改 true, 模型走 serial.conf 那个 user 的 ~/.claude 线路, 同 cart-dream):
 #   sudo install -m 644 examples/serial_gate.example.json /etc/ops-cart/serial-gate.json
 # Agent 挂起的写命令在车机上确认 (退出到终端; 经 ssh 不认):
 #   sudo python3 /opt/pxe/cart_mcp.py pending          # 看挂起的

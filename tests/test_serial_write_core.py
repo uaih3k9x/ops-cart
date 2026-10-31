@@ -101,6 +101,7 @@ def test_example_rules_file_loads():
     assert "ping" in r["vendors"]["huawei"]["extra_verbs"]
     assert set(r["vendors"]) >= {"huawei", "cisco", "ruijie", "linux"}
     assert r["model"]["enabled"] is False               # 样例默认不开模型: 装上不会凭空多出一层判断
+    assert r["vendors"]["linux"]["model"] is False      # root shell 开了模型也先不交它判
 
 
 def test_load_rules_model_defaults_off():

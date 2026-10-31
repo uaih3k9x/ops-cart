@@ -1,11 +1,16 @@
 {
-  "_说明": "串口写闸门第 1 层规则 (#21, serial_write_core.load_rules). 拷到 /etc/ops-cart/serial-gate.json (root 0644) 生效, 每条命令都重读, 改了不用重启. 只能加不能放松: 只读白名单的语法规则 (全称、小写、禁 ; & < > ` $ # !、管道只许 include/exclude/...) 写死在 survey_core 里; 这里只能给内置厂商 (huawei / cisco) 追加只读动词、追加高危词、给槽位登记厂商. 高危词内置的删不掉 (save reboot reset format delete ...). 文件坏了 = 内置默认.",
-  "_slots": "槽位 -> 厂商. 没登记的槽位: auto_huawei=true 时最后一行是华为 <名>/[名] 提示符才按华为算; 思科式 名# 和 Linux 的 bash# 分不开, 要用就在这里登记. 登记了的槽位也得停在该厂商的提示符上才放行.",
+  "_说明": "串口写闸门规则 (#21 第 1 层 / #22 第 2 层, serial_write_core.load_rules). 拷到 /etc/ops-cart/serial-gate.json (root 0644) 生效, 每条命令都重读, 改了不用重启. 只能加不能放松: 只读白名单的语法规则 (全称、小写、禁 ; & < > ` $ # !、管道只许 include/exclude/...) 写死在 survey_core 里; 这里只能给内置厂商 (huawei / cisco) 追加只读动词、追加高危词、给槽位登记厂商. 高危词内置的删不掉 (save reboot reset format delete ...). 文件坏了 = 内置默认 (模型不开).",
+  "_slots": "槽位 -> 厂商 (huawei / cisco / ruijie / linux). 没登记的槽位: auto_huawei=true 时最后一行是华为 <名>/[名] 提示符才按华为算; 思科 / 锐捷式 名# 和 Linux 的 bash# 分不开, 要用就在这里登记. 登记了的槽位也得停在该厂商的提示符上才放行. ruijie / linux 没有第 1 层只读白名单, 只走第 2 层或人确认.",
   "slots": {},
   "auto_huawei": true,
+  "_vendors": "extra_verbs: 第 1 层追加只读动词 (只认 huawei / cisco). model: false 关掉这个厂商的第 2 层. notes: 给决策模型的现场补充说明 (最多 500 字).",
   "vendors": {
     "huawei": {"extra_verbs": ["ping", "tracert"]},
-    "cisco": {"extra_verbs": ["ping", "traceroute"]}
+    "cisco": {"extra_verbs": ["ping", "traceroute"]},
+    "ruijie": {},
+    "linux": {"model": false}
   },
-  "danger": ["license", "patch"]
+  "danger": ["license", "patch"],
+  "_model": "第 2 层决策模型 (#22): 第 1 层不放行、又不带高危词的命令交模型判, 判放行直接发, 判拦 / 超时 / 报错 / 格式不对 / 预算超限一律人确认. 以 serial.conf 的 user 身份跑它 ~/.claude 配的线路 (同 cart_dream). enabled 默认 false = 第 1 层之外全人确认. timeout_s 5-120; budget_usd 单次花费上限 (美元, 最多 1); context_chars 给模型看的设备最近输出字数 (最多 8000); model 可选, 传给 claude --model.",
+  "model": {"enabled": false, "timeout_s": 30, "budget_usd": "0.2", "context_chars": 3000}
 }
