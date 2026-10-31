@@ -51,7 +51,7 @@ def lan_net(ip, prefix):
 
 
 def firewall_rich_rule(ip, prefix):
-    """只放装机网段来的 445."""
+    """只放装机网段来的 SMB_PORT."""
     return f'rule family="ipv4" source address="{_net(ip, prefix)}" port port="{SMB_PORT}" protocol="tcp" accept'
 
 
