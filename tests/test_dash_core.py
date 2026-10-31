@@ -452,7 +452,7 @@ def test_unreadable_agent_state_shows_all_stopped(bad):
 def test_agent_sample_reads_state_and_hides_names(tmp_path):
     import serial_write_core as sw
     b = sw.Book.from_text(None, 1_700_000_000.0)
-    b.acquire(2, "stdio:ops@100.64.0.9", 1_700_000_000.0)
+    b.acquire(2, "stdio:ops@198.51.100.9", 1_700_000_000.0)
     p = tmp_path / "s.json"
     p.write_text(b.dumps())
     st = dc.agent_sample(str(p), clock=lambda: 1_700_000_001.0)

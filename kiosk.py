@@ -17,11 +17,13 @@ from tkinter import messagebox, simpledialog
 
 import cartlog
 import clone_core as cc
+import confirm_core as cfc
 import dash_core as dc
 import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
 import lamps_core as lc
+import mcp_serial
 import ups_core as uc
 import serial_core as sc
 from serial_panel import SerialPanel
@@ -29,6 +31,7 @@ from ks_panel import KsPanel
 from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
+from confirm_panel import ConfirmDialog
 
 FONT = ("Noto Sans CJK SC", 13)
 FONT_BIG = ("Noto Sans CJK SC", 15)
@@ -77,6 +80,8 @@ class Kiosk(tk.Tk):
         self._bell_activity, self._bell_active = lc.Activity(hold=lc.BELL_HOLD_S), set()
         self._bells, self._beeper = lc.BellTail(), lc.Beeper()   # 只在采样线程里用
         self._kiosk_report = dc.KioskReporter()   # 回写锁屏/键鼠计数给副屏 (#10), 采样线程里用
+        # Agent 写串口 (#23): 采样线程 peek 来的视图 (None = 还没采到), 确认框, 车机上人的动作经它改状态
+        self._sw_view, self._confirm_win, self._sw_store = None, None, mcp_serial.Store()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
 
         kc.kp_enter_as_return(self)
@@ -278,13 +283,21 @@ class Kiosk(tk.Tk):
                 self._lamps[key] = (f, stripe, lab, [None])
                 return
             for w in (f, lab):
-                # 操作头带上自己那一路 (issue #5); LAN1/LAN2 灯带上网口 (#12); 其余面板不带
-                slot = lc.slot_for_lamp(key) if key.startswith("con-") else key[4:] if pane == "netmode" else None
+                if key.startswith("con-"):      # 操作头: 有 Agent 的事 (#23) 开确认框, 没有开串口面板 (#5)
+                    w.bind("<Button-1>", lambda _e, n=int(key[4:]): self._head_click(n))
+                    continue
+                # LAN1/LAN2 灯带上网口 (#12); 其余面板不带
+                slot = key[4:] if pane == "netmode" else None
                 w.bind("<Button-1>", lambda _e, p=pane, s=slot: self._open_pane(p, s))
             self._lamps[key] = (f, stripe, lab, [None])
 
         for n in range(1, len(lc.SLOTS) + 1):
             block(f"con-{n}", 8, "serial")
+        # Agent 全部急停 (#23): 一点就停, 不问; 解除在确认框里
+        stop = tk.Label(bar, text="Agent\n全部急停", font=FONT, height=2, padx=10, cursor="hand2",
+                        bg=cfc.ESTOP_COLOR, fg="#ffffff")
+        stop.pack(side="left", padx=(0, 6))
+        stop.bind("<Button-1>", lambda _e: self._serial_action("estop", None))
         tk.Frame(bar, bg="#2a3347", width=2).pack(side="left", fill="y", padx=(4, 10))
         pane_of = {"kvm": "preview", "pxe": "ks", "net:eno1": "netmode", "net:enp3s0": "netmode",
                    "net:wlp4s0": "wifi"}
@@ -309,7 +322,8 @@ class Kiosk(tk.Tk):
         on_bell = self._beeper.ring if conf.get("bell_beep") else None   # serial.conf 开了才响主板蜂鸣
         # 副屏 (cart-dash) 拿不到这两样: 锁屏看锁屏窗口在不在, 键鼠看入队计数. 只在变了时写盘
         self._kiosk_report.update(self._lock_win is not None, self._kvm_count, ups_since=self._ups_since)
-        return lc.sample(sc.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
+        slots, counters = lc.sample(sc.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
+        return slots, counters, mcp_serial.peek()       # Agent 写串口 (#23): 只读, 读不懂 = 全部急停
 
     def _ups_sample(self):
         """后台线程: 每秒读一次 upower (命令行, 只读). 读不到就返回 None."""
@@ -416,7 +430,9 @@ class Kiosk(tk.Tk):
     def _lamp_sampled(self, res):
         if isinstance(res, Exception):
             return
-        self._lamp_slots, counters = res
+        self._lamp_slots, counters, self._sw_view = res
+        if self._confirm_win is not None and self._confirm_win.winfo_exists():
+            self._confirm_win.refresh(self._sw_view)
         now = time.time()
         bells = {k[5:]: v for k, v in counters.items() if k.startswith("bell:")}
         self._bell_active = self._bell_activity.update(bells, now)
@@ -425,12 +441,24 @@ class Kiosk(tk.Tk):
 
     def _lamp_paint(self):
         on = lc.blink_on(time.time())
-        views = {f"con-{i + 1}": lc.slot_view(i + 1, slot) for i, slot in enumerate(self._lamp_slots or [])}
+        views = {}
+        states = cfc.slot_states(self._sw_view) if self._sw_view is not None else None
+        for i, slot in enumerate(self._lamp_slots or []):
+            key = f"con-{i + 1}"
+            if states is None:
+                text, health = lc.slot_view(i + 1, slot)
+                views[key] = dict(lc.lamp_view(health, key in self._active, on, bell=key in self._bell_active),
+                                  text=text)
+            else:           # 急停红 / 待确认黄闪 / Agent 输入紫闪 (#23), 其余同 #2
+                views[key] = cfc.head_view(i + 1, slot, states[i + 1], key in self._active, on,
+                                           bell=key in self._bell_active)
         for name, label, key in lc.LOWER:
-            views[key] = (name, lc.health_of(self._check_rows, label))
-        for key, (text, health) in views.items():
+            health = lc.health_of(self._check_rows, label)
+            views[key] = dict(lc.lamp_view(health, key in self._active, on, bell=key in self._bell_active),
+                              text=name)
+        for key, v in views.items():
             f, stripe, lab, last = self._lamps[key]
-            v = lc.lamp_view(health, key in self._active, on, bell=key in self._bell_active)
+            text = v["text"]
             state = (text, v["bg"], v["fg"], v["bar"])
             if state == last[0]:
                 continue
@@ -438,6 +466,61 @@ class Kiosk(tk.Tk):
             f.config(bg=v["bg"])
             stripe.config(bg=v["bar"])
             lab.config(text=text, bg=v["bg"], fg=v["fg"])
+
+    # ------------------------------------------------------------ Agent 写串口: 确认框 / 急停 (#23)
+
+    def _head_click(self, n):
+        """操作头: 有急停 / 待确认 / Agent 持写租约 -> 确认框; 都没有 -> 串口面板选中这一路 (#5)."""
+        st = cfc.slot_states(self._sw_view)[n] if self._sw_view is not None else None
+        if st and (st["estop"] or st["pending"] or st["writer"]):
+            self._open_confirm(n)
+        else:
+            self._open_pane("serial", lc.slot_for_lamp(f"con-{n}"))
+
+    def _open_confirm(self, n):
+        w = self._confirm_win
+        if w is not None and w.winfo_exists():
+            if w.n == n:
+                w.lift()
+                return
+            w.destroy()
+
+        def serial():
+            self._close_confirm()
+            self._open_pane("serial", lc.slot_for_lamp(f"con-{n}"))
+        self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial)
+
+    def _close_confirm(self):
+        if self._confirm_win is not None and self._confirm_win.winfo_exists():
+            self._confirm_win.destroy()
+        self._confirm_win = None
+
+    def _serial_say(self, text, ok=True):
+        w = self._confirm_win
+        if w is not None and w.winfo_exists():
+            w.say(text, ok)
+        self.banner.config(text=text)
+
+    def _serial_action(self, op, arg):
+        """确认框和全部急停的按钮: 先按最近的视图看一眼 (不行就说为什么), 再到后台经 Store 执行.
+        车机进程就是本机人, 确认 / 解除在这里允许; 确认会等到 conbroker 发完, 所以一定在后台."""
+        why = cfc.check(self._sw_view if self._sw_view is not None else cfc.stopped_view(), op, arg)
+        if why:
+            self._serial_say(why, ok=False)
+            return
+        store = self._sw_store
+
+        def work():
+            return mcp_serial.human_action(store, op, arg, cfc.BY_KIOSK, mcp_serial.real_slots,
+                                           mcp_serial.conbroker_send)
+
+        def done(res):
+            ok = not isinstance(res, Exception)
+            self._serial_say(str(res) if ok else f"不行: {res}", ok)
+        if not self.ui.run_bg(work, done, key="serial-write"):
+            self._serial_say("上一个操作还在处理中…", ok=False)
+            return
+        self._serial_say("发送中, 等设备回…" if op == "confirm" else "处理中…")
 
     def _render_net(self, state, text):
         """顶栏和锁屏的网络标用同一份探测结果, 锁着屏也照常刷新."""
@@ -942,6 +1025,7 @@ class Kiosk(tk.Tk):
             self._lock_win.lift()
             return
         self._release_passthrough()
+        self._close_confirm()                   # 确认框是置顶窗口, 别浮在锁屏上
         w = tk.Toplevel(self, bg="#10141c")
         w.overrideredirect(True)
         w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")

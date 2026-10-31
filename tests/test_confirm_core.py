@@ -192,7 +192,7 @@ def test_check_reject_estop_resume():
 
 def test_request_roundtrip_estop_and_reject():
     for op, arg in (("estop", None), ("estop", 3), ("reject", 7)):
-        req = cc.make_request(op, arg, "web:100.64.0.2", T0)
+        req = cc.make_request(op, arg, "web:198.51.100.2", T0)
         got = cc.parse_request(json.dumps(req), T0 + 1)
         assert got == req
 
