@@ -69,13 +69,14 @@ def split_output(text):
     return head[:HEADLINE_MAX], "\n".join(lines[1:]).strip()
 
 
-def claude_cmd(claude=None, user=None):
+def claude_cmd(claude=None, user=None, prompt=PROMPT, budget=BUDGET_USD, extra=()):
+    """prompt / budget / extra: 串口写闸门第 2 层 (serial_gate_model) 也用这套, 换提示词和预算."""
     user = user or serial_conf_read()["user"]
     claude = claude or f"/home/{user}/.local/bin/claude"
     return ["runuser", "-u", user, "--", "env", f"HOME=/home/{user}",
             f"PATH=/home/{user}/.local/bin:/usr/bin:/bin",
-            claude, "-p", PROMPT, "--tools", "", "--strict-mcp-config",
-            "--no-session-persistence", "--max-budget-usd", BUDGET_USD]
+            claude, "-p", prompt, "--tools", "", "--strict-mcp-config",
+            "--no-session-persistence", "--max-budget-usd", str(budget)] + list(extra)
 
 
 def claude_llm(prompt, text):

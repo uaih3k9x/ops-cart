@@ -40,6 +40,16 @@ def test_claude_cmd_has_no_tools_and_budget():
     assert "--max-budget-usd" in cmd
 
 
+def test_claude_cmd_custom_prompt_budget_extra():
+    """闸门第 2 层 (#22) 复用: 换提示词、预算, 追加参数; 不给工具这几条不变."""
+    cmd = cd.claude_cmd("/c", "u", prompt="判一下", budget="0.2", extra=["--output-format", "json"])
+    assert cmd[cmd.index("-p") + 1] == "判一下"
+    assert cmd[cmd.index("--max-budget-usd") + 1] == "0.2"
+    assert cmd[-2:] == ["--output-format", "json"]
+    assert cmd[cmd.index("--tools") + 1] == "" and "--strict-mcp-config" in cmd
+    assert cd.claude_cmd("/c", "u")[cd.claude_cmd("/c", "u").index("-p") + 1] == cd.PROMPT
+
+
 def test_run_writes_dream_and_latest(tmp_path):
     log = tmp_path / "CART-LOG.md"
     log.write_text("| 2026-10-27 | Claude | 修了冻屏 | 回滚 |\n")
