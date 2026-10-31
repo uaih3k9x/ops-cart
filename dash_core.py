@@ -296,6 +296,8 @@ def layout_view(snap, locked=False, active=(), now=None):
 BOOT_UNITS = ("chronyd", "kiosk")       # 只多查这两个服务的 is-active, 别的全用快照里已有的
 BOOT_LATE_S = 45                        # 开机这么久还没好的项标琥珀
 BOOT_STEP_S = 0.5                       # 逐行出结果的间隔; 跟副屏推送上限 (2 fps) 一致, 不为动画加帧
+BOOT_MIN_S = 4                          # 进了自检至少停这么久: kiosk 重启不到 1 秒就回写, 不然自检页只闪一下 (10/31)
+BOOT_HOLD_S = 1.5                       # 最后一行 / "车机 kiosk OK" 亮出后再停这么久才切状态板
 BOOT_STATES = ("ok", "warn", "fail", "off", "wait", "late")
 BOOT_STATUS = {"ok": "OK", "warn": "注意", "fail": "故障", "off": "--", "wait": "等待", "late": "未就绪"}
 TIME_SANE = 1735689600                  # 2025-01-01: 早于这个 = RTC 掉电回到 1970 了
@@ -432,12 +434,16 @@ class BootTracker:
 
     def view(self, snap, now):
         snap = snap or {}
-        if (snap.get("kiosk") or {}).get("alive"):
-            self.start = None
-            return None
+        alive = bool((snap.get("kiosk") or {}).get("alive"))
         if self.start is None:
-            self.start, self._reveal, self._last = now, {}, now
-        lines = []
+            if alive:                       # 没在自检 (比如只重启了 cart-dash): 照常画
+                return None
+            self.start, self._reveal, self._last, self._alive_at = now, {}, now, None
+        if not alive:
+            self._alive_at = None
+        elif self._alive_at is None:
+            self._alive_at = now
+        lines, pending = [], False
         for it in boot_items(snap, now):
             st, key = it["state"], it["key"]
             if st != "wait" and key not in self._reveal:
@@ -445,11 +451,17 @@ class BootTracker:
                 self._reveal[key] = at
                 self._last = max(self._last, at)
             shown = st != "wait" and (st == "fail" or now >= self._reveal[key])
+            pending = pending or not shown
             if not shown and now - self.start >= self.late:
                 it = dict(it, state="late", status=BOOT_STATUS["late"])
             elif not shown and st != "wait":               # 有结果了, 还没轮到它亮相
                 it = dict(it, state="wait", status=BOOT_STATUS["wait"], detail="")
             lines.append({k: it[k] for k in ("label", "state", "status", "detail")})
+        if alive and now >= self._alive_at + BOOT_HOLD_S and (
+                now - self.start >= self.late or not pending and now >= max(self.start + BOOT_MIN_S,
+                                                                            self._last + BOOT_HOLD_S)):
+            self.start = None               # 每行都亮完、kiosk OK 也让人看见了 (或者等太久了): 切状态板
+            return None
         t = time.localtime(now)
         return {"boot": True, "title": "OPS-CART", "version": snap.get("version") or "",
                 "clock": time.strftime("%H:%M", t), "lines": lines, "stale": stale(snap, now)}

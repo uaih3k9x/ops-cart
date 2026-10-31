@@ -212,7 +212,7 @@ def test_loop_marks_moving_counters_active(tmp_path, monkeypatch):
 def test_loop_shows_boot_screen_until_kiosk_alive_and_again_when_it_dies(tmp_path, monkeypatch):
     """#26: kiosk 没起来 → 自检版面; 起来了 → 工作页; 挂了 → 回自检."""
     views, n = [], {"round": 0}
-    kiosk = [{}, {}, {"pid": 7, "alive": True}, {"pid": 7, "alive": True}, {"pid": 7, "alive": False}]
+    kiosk = [{}, {}] + [{"pid": 7, "alive": True}] * 60 + [{"pid": 7, "alive": False}]   # 起来后自检页还停几秒
 
     class Stop(Exception):
         pass
@@ -231,5 +231,7 @@ def test_loop_shows_boot_screen_until_kiosk_alive_and_again_when_it_dies(tmp_pat
                render=lambda v: views.append(v) or b"x")
     except Stop:
         pass
-    assert [bool(v.get("boot")) for v in views] == [True, True, False, True]   # 第 4 轮版面没变不推
+    flags = [bool(v.get("boot")) for v in views]
+    runs = [f for i, f in enumerate(flags) if i == 0 or f != flags[i - 1]]
+    assert runs == [True, False, True]                     # 自检 → 工作页 → 挂了回自检
     assert views[-1]["lines"][-1]["status"] == "未运行"

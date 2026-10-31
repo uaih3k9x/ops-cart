@@ -206,7 +206,8 @@ def test_tracker_restarts_when_kiosk_dies_again():
     t = dc.BootTracker(step=0.5, late=30)
     t.view(_ready_snap(), NOW)
     t.view(_ready_snap(), NOW + 40)
-    assert t.view(_ready_snap(kiosk={"pid": 1, "alive": True}), NOW + 50) is None
+    assert t.view(_ready_snap(kiosk={"pid": 1, "alive": True}), NOW + 50)["boot"]   # kiosk 那行亮完再切
+    assert t.view(_ready_snap(kiosk={"pid": 1, "alive": True}), NOW + 50 + dc.BOOT_HOLD_S + 0.6) is None
     v = t.view(_ready_snap(kiosk={"pid": 1, "alive": False}), NOW + 100)       # 车机挂了
     assert v["lines"][7]["state"] == "fail"                 # 红的马上出, 不用等动画, 也不算超时
     assert all(ln["state"] in ("wait", "fail") for ln in v["lines"])          # 重新逐行出
@@ -220,3 +221,27 @@ def test_tracker_view_is_stable_between_reveals():
         t.view(_ready_snap(), NOW + 0.25 * i)
     a, b = t.view(_ready_snap(), NOW + 6), t.view(_ready_snap(), NOW + 6.2)
     assert a["lines"] == b["lines"]
+
+
+def test_tracker_holds_boot_screen_when_kiosk_comes_up_fast():
+    """10/31 实测: kiosk 重启不到 1 秒就回写 pid, 自检页只闪 0.8 秒, 副屏 2 fps 根本看不到.
+    进了自检就要把每一行亮完, 最后一行亮出后再停 BOOT_HOLD_S, 总共至少 BOOT_MIN_S, 才切回状态板."""
+    t = dc.BootTracker(step=0.5, late=60)
+    assert t.view(_ready_snap(), NOW)["boot"]                                  # kiosk 刚停
+    alive = _ready_snap(kiosk={"pid": 2, "alive": True})
+    views = [(dt, t.view(alive, NOW + dt)) for dt in [0.8 + 0.25 * i for i in range(60)]]
+    shown = [dt for dt, v in views if v is not None]
+    assert shown[0] == 0.8 and max(shown) >= dc.BOOT_MIN_S                     # 起得再快也至少停这么久
+    last = [v for dt, v in views if v is not None][-1]
+    assert all(ln["state"] == "ok" for ln in last["lines"]) or all(ln["state"] != "wait" for ln in last["lines"])
+    assert last["lines"][7]["state"] == "ok"                                   # 切走前看得到"车机 kiosk OK"
+    gone = [dt for dt, v in views if v is None]
+    assert gone and gone[0] > max(shown) and all(v is None for dt, v in views if dt >= gone[0])
+
+
+def test_tracker_kiosk_alive_but_items_stuck_still_switches_after_late():
+    t = dc.BootTracker(step=0.5, late=30)
+    t.view(_ready_snap(ups=None), NOW)
+    stuck = _ready_snap(ups=None, kiosk={"pid": 2, "alive": True})
+    assert t.view(stuck, NOW + 5)["boot"]                                      # UPS 还在等
+    assert t.view(stuck, NOW + 31) is None                                     # 不能为一项卡死在自检页
