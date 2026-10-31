@@ -482,6 +482,17 @@ def test_collect_theme_default_is_dark():
     assert dc.collect(_ctx(theme=lambda: {"mode": "light"}))["theme"] == {"mode": "light"}
 
 
+def test_theme_mode_reads_fresh_snapshot_only():
+    """车机按快照里的模式切 (#32): 快照新鲜且模式认得才算; 过期 / 没有 / 读不懂 -> None (保持现状, 不切)."""
+    now = 1000.0
+    assert dc.theme_mode({"ts": now, "theme": {"mode": "light"}}, now) == "light"
+    assert dc.theme_mode({"ts": now, "theme": {"mode": "dark"}}, now) == "dark"
+    assert dc.theme_mode({"ts": now - 60, "theme": {"mode": "light"}}, now) is None
+    for snap in (None, {}, {"ts": now}, {"ts": now, "theme": None}, {"ts": now, "theme": {"mode": "night"}},
+                 {"ts": now, "theme": "light"}):
+        assert dc.theme_mode(snap, now) is None
+
+
 def _theme_conf(tmp_path, **conf):
     p = tmp_path / "theme.json"
     p.write_text(json.dumps(conf))

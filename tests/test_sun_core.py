@@ -222,6 +222,43 @@ def test_example_conf_is_valid():
     assert conf and conf["mode"] == "auto" and conf["lat"] is not None
 
 
+# ---------------------------------------------------------------- 车机设置里的三档开关 (#32)
+
+def test_next_setting_cycles_auto_dark_light():
+    assert [sc.next_setting(m) for m in ("auto", "dark", "light")] == ["dark", "light", "auto"]
+    assert sc.next_setting(None) == "auto"            # 配置读不懂时点一下: 先回自动
+
+
+def test_write_setting_keeps_location_and_buffer(tmp_path):
+    p = tmp_path / "theme.json"
+    p.write_text(json.dumps({"mode": "auto", "lat": 23.1, "lon": 113.3, "buffer_min": 20, "note": "x"}))
+    assert sc.write_setting("light", str(p)) == "light"
+    assert json.loads(p.read_text()) == {"mode": "light", "lat": 23.1, "lon": 113.3, "buffer_min": 20, "note": "x"}
+    assert sc.read_conf(str(p))["mode"] == "light"
+
+
+def test_write_setting_creates_missing_file(tmp_path):
+    p = tmp_path / "sub" / "theme.json"
+    sc.write_setting("dark", str(p))
+    assert json.loads(p.read_text()) == {"mode": "dark"}
+
+
+@pytest.mark.parametrize("text", ["{坏", "[1, 2]"])
+def test_write_setting_refuses_to_clobber_unreadable_file(tmp_path, text):
+    """配置坏了不覆盖 (经纬度可能就在里面), 抛 ValueError 让界面说出来; 文件原样不动."""
+    p = tmp_path / "theme.json"
+    p.write_text(text)
+    with pytest.raises(ValueError):
+        sc.write_setting("dark", str(p))
+    assert p.read_text() == text
+
+
+def test_write_setting_rejects_unknown_mode(tmp_path):
+    with pytest.raises(ValueError):
+        sc.write_setting("purple", str(tmp_path / "theme.json"))
+    assert not (tmp_path / "theme.json").exists()
+
+
 # 参考值生成 (开发机上, pip install ephem==4.2.1; 不进仓库依赖):
 #   o = ephem.Observer(); o.lat, o.lon = "51.508", "-0.126"; o.pressure = 0; o.horizon = "-0:34"
 #   o.date = <当地正午的 UTC>; o.previous_rising(ephem.Sun()), o.next_setting(ephem.Sun())

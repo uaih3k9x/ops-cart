@@ -5,6 +5,7 @@
   want_mode(now, conf, last)      -> "dark" / "light"; 档位 auto / dark / light, auto 下日出日落前后留缓冲
   next_switch(now, conf, mode)    auto 下下次切换的时刻 (时间戳), 算不出 / 固定档 -> None
   read_conf(path)                 读 /etc/ops-cart/theme.json; 没文件 -> {}, 读不懂 -> None (按深色)
+  next_setting / write_setting    车机设置里"界面: 自动 / 深 / 浅"三档 (#32): 只改档位, 经纬度等原样留着
 
 只判断"现在该用哪套", 不碰界面. 判断用绝对时间 (时间戳), 不需要配时区; tz 只给 sun_times
 出当地钟点 (对表、显示用). 结果由 cart-dash 并进快照 (dash_core.theme_sampler).
@@ -13,6 +14,8 @@
 import datetime as dt
 import json
 import math
+
+import atomicfile
 
 CONF_PATH = "/etc/ops-cart/theme.json"
 MODES = ("auto", "dark", "light")
@@ -176,3 +179,27 @@ def read_conf(path=CONF_PATH):
     if conf["lat"] is not None and not (_num(conf["lat"], -90, 90) and _num(conf["lon"], -180, 180)):
         return None
     return conf
+
+
+def next_setting(cur):
+    """车机设置里点一下换下一档: 自动 -> 深 -> 浅 -> 自动. 认不得 (配置读不懂) -> 自动."""
+    return MODES[(MODES.index(cur) + 1) % len(MODES)] if cur in MODES else "auto"
+
+
+def write_setting(mode, path=CONF_PATH):
+    """只改 theme.json 的档位 (经纬度、缓冲、别的键原样留着), 防断电写. 没文件就新建只含档位的.
+    档位不认识、文件读不懂 (坏 json / 不是对象) -> ValueError, 文件不动 (经纬度可能就在里面, 不能覆盖)."""
+    if mode not in MODES:
+        raise ValueError(f"档位只能是 {' / '.join(MODES)}: {mode!r}")
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raw = {}
+    except ValueError as ex:
+        raise ValueError(f"{path} 读不懂, 不覆盖: {ex}") from None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} 不是 JSON 对象, 不覆盖")
+    raw["mode"] = mode
+    atomicfile.write_json(path, raw, indent=2)
+    return mode
