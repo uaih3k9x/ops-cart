@@ -15,7 +15,6 @@ import pytest
 
 import cart_mcp as cm
 import kiosk_core as kc
-import mcp_core as mc
 import mcp_label as ml
 import mcp_pxe as mp
 import mcp_serial as ms
