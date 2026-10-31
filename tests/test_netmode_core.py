@@ -107,6 +107,32 @@ def test_static_params_reuses_static_form_checks():
         nm.static_params("enp3s0", "192.0.2.5/24", egress="sideways")
 
 
+def test_target_from_form():
+    olds = nm.port_views(nm.empty_state(), CONS, IP_BR, ROUTES, LINK)[0]["legacy"]
+    assert nm.target("eno1", {"mode": "off"}) == nm.rec("off", "eno1")
+    assert nm.target("eno1", {"mode": "legacy", "legacy": "Lan1-pxe"}, olds) == \
+        nm.legacy("eno1", "a737-4", "Lan1-pxe")
+    with pytest.raises(ValueError, match="旧配置"):
+        nm.target("eno1", {"mode": "legacy", "legacy": ""}, olds)
+    r = nm.target("enp3s0", {"mode": "static", "addr": " 192.0.2.5/25 ", "gateway": "192.0.2.1",
+                             "dns": "", "egress": "backup", "peer": "192.0.2.9"})
+    assert r["params"] == {"addr": "192.0.2.5/25", "gateway": "192.0.2.1", "dns": "", "egress": "backup"}
+    with pytest.raises(ValueError, match="对端"):
+        nm.target("enp3s0", {"mode": "static", "addr": "192.0.2.9/24", "peer": "192.0.2.9"})
+
+
+def test_form_hint_by_mode():
+    assert "DHCP" in nm.form_hint("enp3s0", "dhcp", {})
+    assert "不当出口" in nm.form_hint("eno1", "dhcp", {})
+    assert "不配地址" in nm.form_hint("eno1", "off", {})
+    assert "不会删" in nm.form_hint("eno1", "legacy", {})
+    assert "地址/前缀" in nm.form_hint("enp3s0", "static", {"addr": ""})
+    h = nm.form_hint("enp3s0", "static", {"addr": "192.0.2.5/25", "gateway": "192.0.2.1", "egress": "backup"})
+    assert "192.0.2.0/25" in h and "1000" in h and "900" in h
+    assert "前缀" in nm.form_hint("enp3s0", "static", {"addr": "192.0.2.5"})          # 报错, 不猜
+    assert "网关" in nm.form_hint("enp3s0", "static", {"addr": "192.0.2.5/24", "egress": "primary"})
+
+
 def test_form_state_greys_out_what_does_not_apply():
     s = nm.form_state("eno1", "static", "never")
     assert s["addr"] and not s["gateway"] and s["egress"] == {"never": True, "backup": False, "primary": False}

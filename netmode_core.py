@@ -10,6 +10,7 @@
 - 跨两个口的模式 (共享上网 / 透明桥, 后续批次) 的 ports 写两个口, 占用期间另一个口不能单独切.
 """
 
+import ipaddress
 import json
 import shlex
 import time
@@ -102,6 +103,47 @@ def form_state(iface, mode, egress):
     st = mode == "static"
     return {"addr": st, "gateway": st and egress != "never",
             "egress": {k: st and (k == "never" or iface not in NO_EGRESS) for k in EGRESS}}
+
+
+def target(iface, form, olds=()):
+    """面板表单 {mode, addr, peer, gateway, dns, egress, legacy} -> 要切成的记录; 不对就 ValueError(人话).
+    olds = 这个口可交还的旧连接 (port_views 的 legacy)."""
+    mode = form.get("mode")
+    if mode == LEGACY:
+        c = next((c for c in olds if c["name"] == form.get("legacy")), None)
+        if not c:
+            raise ValueError("先选一个要交还的旧配置")
+        return legacy(iface, c["uuid"], c["name"])
+    if mode == "static":
+        return rec("static", iface, static_params(iface, form.get("addr"), form.get("gateway"), form.get("dns"),
+                                                  form.get("egress") or "never", avoid=form.get("peer") or ""))
+    return rec(mode, iface)
+
+
+def form_hint(iface, mode, form):
+    """表单下方的小灰字: 这个模式会怎样; 静态就当场校验, 有错直接说错在哪."""
+    if mode == "off":
+        return "关闭: 不配地址, 推车自己建一条不带地址的连接占住这个口"
+    if mode == "dhcp":
+        return "DHCP 客户端: 插上就自动拿地址" + (" · 装机口不当出口" if iface in NO_EGRESS else "")
+    if mode == LEGACY:
+        return "交还旧配置: 撤掉推车托管的, 把选中的旧连接 up 起来; 旧连接推车不会删"
+    if not (form.get("addr") or "").strip():
+        return npc.static_hint("")
+    egress = form.get("egress") or "never"
+    try:
+        p = static_params(iface, form.get("addr"), form.get("gateway"), form.get("dns"), egress,
+                          avoid=form.get("peer") or "")
+    except ValueError as ex:
+        return str(ex)
+    net = ipaddress.ip_interface(p["addr"]).network
+    if egress == "never":
+        how = "不当出口: 只连同网段, 网关不写"
+    else:
+        rel = "大于" if egress == "backup" else "小于"
+        how = (f"{EGRESS[egress]}: metric {EGRESS_METRIC[egress]} {rel}无线的 {wc.WIFI_METRIC}, "
+               + ("无线断了才走它" if egress == "backup" else "默认路由走这个口"))
+    return f"推车用 {p['addr']} (网段 {net}) · {how}; 切之前还会确认"
 
 
 # ------------------------------------------------------------ apply / undo 命令清单
