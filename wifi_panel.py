@@ -69,7 +69,7 @@ class WifiPanel(BridgePanel):
 
     def _btn(self, parent, text, cmd, bg=BOX):
         b = tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg, fg=FG,
-                      activebackground=th.ACTIVE, relief="flat", cursor="hand2", padx=12, pady=4)
+                      activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=12, pady=4)
         b.pack(side="left", padx=4)
         return b
 
@@ -77,7 +77,7 @@ class WifiPanel(BridgePanel):
         col = tk.Frame(parent, bg=BG)
         col.pack(side="left", fill="both", expand=True, padx=8)
         tk.Label(col, text=title, font=FONT, bg=BG, fg=th.DIM, anchor="w").pack(fill="x")
-        lb = tk.Listbox(col, font=FONT_MONO, bg=BOX, fg=FG, relief="flat", height=14,
+        lb = tk.Listbox(col, font=FONT_MONO, bg=th.BG, fg=FG, **th.SUNKEN, height=14,
                         selectbackground=th.ACTIVE, exportselection=False, activestyle="none")
         lb.pack(fill="both", expand=True, pady=4)
         bar = tk.Frame(col, bg=BG)
@@ -108,11 +108,11 @@ class WifiPanel(BridgePanel):
         tk.Label(form, text="网络:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left")
         self.ssid_var = tk.StringVar()
         tk.Entry(form, textvariable=self.ssid_var, width=20, font=FONT_MONO, bg=th.BG, fg=FG,
-                 insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
+                 insertbackground=FG, **th.SUNKEN).pack(side="left", padx=6, ipady=3)
         tk.Label(form, text="密码:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(10, 0))
         self.pw_var = tk.StringVar()
         self.pw_entry = tk.Entry(form, textvariable=self.pw_var, width=24, show="*", font=FONT_MONO,
-                                 bg=th.BG, fg=FG, insertbackground=FG, relief="flat")
+                                 bg=th.BG, fg=FG, insertbackground=FG, **th.SUNKEN)
         self.pw_entry.pack(side="left", padx=6, ipady=3)
         self.pw_entry.bind("<Return>", lambda _e: self.connect_form())
         self.show_var = tk.BooleanVar(value=False)
@@ -129,7 +129,7 @@ class WifiPanel(BridgePanel):
     def _build_auth(self):
         conf = rp._read_json(rp.CONF) or {}
         title = f" 校园网认证 (只在连着 {conf.get('ssid') or '配置的无线'} 时自动跑, 每 2 分钟) "
-        box = tk.LabelFrame(self, text=title, font=FONT, bg=BG, fg=th.DIM, bd=1, relief="groove")
+        box = tk.LabelFrame(self, text=title, font=FONT, bg=BG, fg=th.DIM, **th.GROOVE)
         box.pack(fill="x", padx=16, pady=(0, 10))
         row = tk.Frame(box, bg=BG)
         row.pack(fill="x", pady=4)
@@ -137,10 +137,10 @@ class WifiPanel(BridgePanel):
         self.auth_pw = tk.StringVar(value=conf.get("password", ""))
         tk.Label(row, text="账号:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
         tk.Entry(row, textvariable=self.auth_user, width=16, font=FONT_MONO, bg=th.BG, fg=FG,
-                 insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
+                 insertbackground=FG, **th.SUNKEN).pack(side="left", padx=6, ipady=3)
         tk.Label(row, text="密码:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(10, 0))
         self.auth_pw_entry = tk.Entry(row, textvariable=self.auth_pw, width=20, show="*", font=FONT_MONO,
-                                      bg=th.BG, fg=FG, insertbackground=FG, relief="flat")
+                                      bg=th.BG, fg=FG, insertbackground=FG, **th.SUNKEN)
         self.auth_pw_entry.pack(side="left", padx=6, ipady=3)
         self.auth_pw_entry.bind("<Return>", lambda _e: self.auth_save())
         self.auth_show = tk.BooleanVar(value=False)

@@ -43,7 +43,7 @@ CHAT_WIDTH = 340
 
 def _btn(parent, text, cmd, bg=th.BOX):
     return tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg, fg=FG,
-                     activebackground=th.ACTIVE, relief="flat", cursor="hand2", padx=10)
+                     activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=10)
 
 
 class SerialPanel(tk.Frame):
@@ -75,13 +75,13 @@ class SerialPanel(tk.Frame):
         self.port_var = tk.StringVar()
         self.port_menu = tk.OptionMenu(bar, self.port_var, "(无)")
         self.port_menu.config(font=FONT, bg=th.BOX, fg=FG, activebackground=th.ACTIVE,
-                              relief="flat", cursor="hand2")
+                              **th.RAISED, cursor="hand2")
         self.port_menu.pack(side="left", padx=6)
         tk.Label(bar, text="波特率:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(12, 0))
         self.baud_var = tk.StringVar(value="9600")
         self.baud_menu = tk.OptionMenu(bar, self.baud_var, *BAUDS)
         self.baud_menu.config(font=FONT, bg=th.BOX, fg=FG, activebackground=th.ACTIVE,
-                              relief="flat", cursor="hand2")
+                              **th.RAISED, cursor="hand2")
         self.baud_menu.pack(side="left", padx=6)
         for text, cmd in (("刷新", self.refresh_ports), ("开服务", self.start_serve),
                           ("停服务", self.stop_serve), ("唤醒(回车)", lambda: self._tx(b"\r")),
@@ -98,7 +98,7 @@ class SerialPanel(tk.Frame):
         left = tk.Frame(pane, bg=BG)
         self.con_title = tk.Label(left, text="控制台 · 未连接", font=FONT, bg=BG, fg=DIM, anchor="w")
         self.con_title.pack(fill="x")
-        self.console = tk.Text(left, font=FONT_MONO, bg=BG2, fg=th.TEXT, relief="flat",
+        self.console = tk.Text(left, font=FONT_MONO, bg=BG2, fg=th.TEXT, **th.SUNKEN,
                                insertbackground=FG, wrap="char", highlightthickness=2,
                                highlightbackground=BG2, highlightcolor=th.PRIMARY)
         self.console.pack(fill="both", expand=True)
@@ -111,17 +111,17 @@ class SerialPanel(tk.Frame):
         right = tk.Frame(pane, bg=BG, width=CHAT_WIDTH)
         tk.Label(right, text="和 Claude 聊 · F2 切换", font=FONT, bg=BG, fg=DIM,
                  anchor="w").pack(fill="x")
-        self.chat_log = tk.Text(right, font=FONT, bg=BG2, fg=th.TEXT, relief="flat",
+        self.chat_log = tk.Text(right, font=FONT, bg=BG2, fg=th.TEXT, **th.SUNKEN,
                                 wrap="word", state="disabled", padx=8, pady=6)
         self.chat_log.pack(fill="both", expand=True)
-        self.chat_log.tag_config("ts", foreground=th.FAINTER)
+        self.chat_log.tag_config("ts", foreground=th.FAINT)
         self.chat_log.tag_config("me", foreground=th.OK)
         self.chat_log.tag_config("them", foreground=th.NOTICE)
         row = tk.Frame(right, bg=BG)
         row.pack(fill="x", pady=(6, 0))
         self.chat_var = tk.StringVar()
         self.chat_entry = tk.Entry(row, textvariable=self.chat_var, font=FONT, bg=BG2, fg=FG,
-                                   insertbackground=FG, relief="flat", highlightthickness=2,
+                                   insertbackground=FG, **th.SUNKEN, highlightthickness=2,
                                    highlightbackground=BG2, highlightcolor=th.PRIMARY)
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())

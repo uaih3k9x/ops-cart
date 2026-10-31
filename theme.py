@@ -155,7 +155,11 @@ def tk_options():
             ("*activeBackground", ACTIVE), ("*activeForeground", FG),
             ("*selectBackground", PRIMARY), ("*selectForeground", FG), ("*selectColor", BG),
             ("*troughColor", BG), ("*insertBackground", FG), ("*disabledForeground", DIM),
-            ("*highlightThickness", 0), ("*borderWidth", 2),
+            ("*highlightThickness", 0),
+            # 斜边宽只给有斜边的控件; 全局 *borderWidth 会给每个 Frame 都加一圈
+            *((f"*{c}.borderWidth", 2) for c in ("Button", "Menubutton", "Menu", "Entry", "Listbox", "Text",
+                                                  "Scrollbar", "Labelframe", "Radiobutton", "Checkbutton")),
+            ("*Dialog.relief", "raised"), ("*Dialog.borderWidth", 3),     # messagebox: 没有窗口管理器, 自己凸出来
             ("*Button.background", BOX), ("*Button.relief", "raised"),
             ("*Menubutton.background", BOX), ("*Menubutton.relief", "raised"),
             ("*Menu.background", BOX), ("*Menu.relief", "raised"), ("*Menu.activeBorderWidth", 2),
@@ -191,3 +195,41 @@ def setup(root, families=None):
     s.configure("TButton", background=BOX, relief="raised", borderwidth=2, padding=(14, 4))
     s.map("TButton", background=[("pressed", BTN2), ("active", ACTIVE)], relief=[("pressed", "sunken")])
     return fam
+
+
+def unreadable(top, floor=4.5):
+    """一棵 Tk 控件树里字和底不够 floor 的: [(控件路径, 字, 哪一对, 对比度)]. 给面板测试和本机检查用.
+    查: 字 / 底; 按钮按下 (active); 不带圆点的单选按钮选中 (select); Text 里各 tag 的字色 (记成 "tag 名字").
+    没字的 (图标)、灰掉的不查."""
+    def hexc(w, color):
+        r, g, b = (v // 257 for v in w.winfo_rgb(color))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    out, stack = [], [top]
+    while stack:
+        w = stack.pop()
+        stack.extend(w.winfo_children())
+        keys = w.keys()
+        if "foreground" not in keys or "background" not in keys:
+            continue
+        bg = hexc(w, w.cget("background"))
+        pairs = []
+        if w.winfo_class() == "Text":
+            pairs.append(("", "fg", w.cget("foreground"), bg))
+            pairs += [(f"tag {t}", "fg", w.tag_cget(t, "foreground"), bg) for t in w.tag_names()
+                      if w.tag_cget(t, "foreground")]
+        else:
+            text = str(w.cget("text")) if "text" in keys else ""
+            if not text.strip() or ("state" in keys and str(w.cget("state")) == "disabled"):
+                continue
+            pairs.append((text, "fg", w.cget("foreground"), bg))
+            if "activebackground" in keys and w.winfo_class() in ("Button", "Radiobutton", "Checkbutton",
+                                                                 "Menubutton"):
+                pairs.append((text, "active", w.cget("activeforeground"), hexc(w, w.cget("activebackground"))))
+            if "indicatoron" in keys and not int(w.cget("indicatoron")) and w.cget("selectcolor"):
+                pairs.append((text, "select", w.cget("foreground"), hexc(w, w.cget("selectcolor"))))
+        for text, kind, fg, b in pairs:
+            ratio = contrast(hexc(w, fg), b)
+            if ratio < floor:
+                out.append((str(w), text, kind, round(ratio, 2)))
+    return out

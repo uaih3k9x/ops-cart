@@ -10,6 +10,7 @@ import theme as th
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEX = re.compile(r"""["']#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?["']""")
+RELIEF = re.compile(r"""\brelief\s*=\s*["']""")
 FONT_FAMILY = re.compile(r"""["'](?:Noto Sans(?: Mono)? CJK SC|Unifont)["']""")
 # tspl_preview 产出的是给浏览器看的 HTML/SVG 预览, 有自己的浅色/深色 CSS, 不归车机主题管
 EXEMPT = {"theme.py", "tspl_preview.py"}
@@ -148,8 +149,11 @@ def test_tk_options_only_use_theme_values():
               "*selectBackground", "*insertBackground", "*disabledForeground"):
         assert opts[k] in colors, k
     assert opts["*Font"] == th.FONT
-    assert opts["*borderWidth"] == 2
     assert opts["*highlightThickness"] == 0
+    assert "*borderWidth" not in opts                 # 不给所有 Frame 加 2 像素边, 只管有斜边的控件
+    assert all(opts[f"*{c}.borderWidth"] == 2 for c in ("Button", "Menubutton", "Entry", "Listbox", "Text",
+                                                         "Scrollbar", "Labelframe", "Radiobutton", "Checkbutton"))
+    assert (opts["*Dialog.relief"], opts["*Dialog.borderWidth"]) == ("raised", 3)   # messagebox 没有窗口管理器的边框
 
 
 def test_setup_applies_fonts_and_options(family):
@@ -188,3 +192,43 @@ def test_ui_code_has_no_color_literals():
 def test_ui_code_has_no_font_family_literals():
     assert not _hits(FONT_FAMILY), "字体用 th.FONT* 或 th.font(), 别再写字体名"
 
+
+
+def test_ui_code_has_no_relief_literals():
+    """斜边用 th.RAISED / th.SUNKEN / th.DIALOG / th.FLAT / th.GROOVE, 别再各写各的 relief="flat"."""
+    assert not _hits(RELIEF), "relief 用 **th.RAISED 之类"
+
+
+def test_ui_code_only_uses_names_theme_has():
+    """改名 / 删名 (如 #28 并掉的 FAINTER) 时, 引用了旧名字的地方要跟着改, 不然开到那个面板才炸."""
+    missing = [h for h in _hits(re.compile(r"\bth\.[A-Z]")) for n in re.findall(r"\bth\.([A-Z][A-Z0-9_]*)", h)
+               if not hasattr(th, n)]
+    assert not missing
+
+
+def test_unreadable_walks_widgets_and_text_tags():
+    """th.unreadable(w): 把一棵控件树里字和底不够 4.5 的都找出来 (字 / 按下 / 选中 / Text 的 tag), 给面板测试用."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("没有显示")
+    try:
+        root.withdraw()
+        f = tk.Frame(root, bg=th.PANEL)
+        tk.Label(f, text="够", bg=th.PANEL, fg=th.DIM).pack()
+        tk.Label(f, text="面板上的很次要", bg=th.PANEL, fg=th.FAINT).pack()
+        tk.Label(f, image="", text="", bg=th.PANEL, fg=th.PANEL).pack()               # 没字不算
+        tk.Button(f, text="按钮底红字", bg=th.BOX, fg=th.BAD, activebackground=th.ACTIVE, activeforeground=th.FG).pack()
+        tk.Button(f, text="按下看不清", bg=th.BOX, fg=th.FG, activebackground=th.FG, activeforeground=th.FG).pack()
+        tk.Button(f, text="灰掉的", bg=th.BOX, fg=th.FG, state="disabled", disabledforeground=th.DISABLED).pack()
+        tk.Radiobutton(f, text="选中", indicatoron=False, bg=th.BTN2, fg=th.FG, selectcolor=th.FG).pack()
+        t = tk.Text(f, bg=th.PANEL, fg=th.TEXT)
+        t.tag_config("dim", foreground=th.FAINT)
+        t.tag_config("ok", foreground=th.OK)
+        t.pack()
+        bad = {(x[1], x[2]) for x in th.unreadable(f)}
+        assert bad == {("面板上的很次要", "fg"), ("按钮底红字", "fg"), ("按下看不清", "active"), ("选中", "select"),
+                       ("tag dim", "fg")}
+    finally:
+        root.destroy()

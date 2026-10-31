@@ -38,7 +38,7 @@ class KsPanel(tk.Frame):
                           ("保存(自动备份)", self.save),
                           ("恢复最近备份", self.restore_backup)):
             tk.Button(bar, text=text, font=FONT, command=cmd, bg=th.BOX,
-                      fg=th.FG, activebackground=th.ACTIVE, relief="flat",
+                      fg=th.FG, activebackground=th.ACTIVE, **th.RAISED,
                       cursor="hand2", padx=12).pack(side="left", padx=4)
         self.path_label = tk.Label(bar, text="", font=FONT, bg=th.PANEL, fg=th.DIM)
         self.path_label.pack(side="right")
@@ -51,20 +51,20 @@ class KsPanel(tk.Frame):
         self.host_var = tk.StringVar()
         tk.Entry(row, textvariable=self.host_var, width=18, font=FONT_MONO,
                  bg=th.BG, fg=th.FG, insertbackground=th.FG,
-                 relief="flat").pack(side="left", padx=4)
+                 **th.SUNKEN).pack(side="left", padx=4)
         tk.Button(row, text="改主机名", font=FONT, command=self.apply_hostname,
                   bg=th.PRIMARY, fg=th.FG, activebackground=th.ACTIVE,
-                  relief="flat", cursor="hand2", padx=10).pack(side="left", padx=4)
+                  **th.RAISED, cursor="hand2", padx=10).pack(side="left", padx=4)
 
         tk.Label(row, text="  root 密码:", font=FONT, bg=th.PANEL,
                  fg=th.TEXT).pack(side="left")
         self.pw_var = tk.StringVar()
         tk.Entry(row, textvariable=self.pw_var, width=18, show="*", font=FONT_MONO,
                  bg=th.BG, fg=th.FG, insertbackground=th.FG,
-                 relief="flat").pack(side="left", padx=4)
+                 **th.SUNKEN).pack(side="left", padx=4)
         tk.Button(row, text="设密码(hash)", font=FONT, command=self.apply_password,
                   bg=th.PRIMARY, fg=th.FG, activebackground=th.ACTIVE,
-                  relief="flat", cursor="hand2", padx=10).pack(side="left", padx=4)
+                  **th.RAISED, cursor="hand2", padx=10).pack(side="left", padx=4)
 
         # 警告条
         self.warn = tk.Label(self, text="", font=FONT, bg=th.PANEL,
@@ -75,7 +75,7 @@ class KsPanel(tk.Frame):
         wrap = tk.Frame(self, bg=th.PANEL)
         wrap.pack(fill="both", expand=True, padx=12, pady=(2, 10))
         self.text = tk.Text(wrap, font=FONT_MONO, bg=th.BG, fg=th.TEXT,
-                            insertbackground=th.FG, relief="flat",
+                            insertbackground=th.FG, **th.SUNKEN,
                             wrap="none", undo=True)
         ysb = tk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=ysb.set)

@@ -27,7 +27,7 @@ class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命�
     def _build(self):
         tk.Label(self, text="网络唤醒 (WOL) · 魔术包从选定网口广播, 目标要在同一个二层里 · 目标 BIOS/网卡要开 WOL",
                  font=FONT, bg=BG, fg=th.DIM, anchor="w").pack(fill="x", padx=16, pady=(10, 4))
-        self.lb = tk.Listbox(self, font=FONT_MONO, bg=BOX, fg=FG, relief="flat", height=12,
+        self.lb = tk.Listbox(self, font=FONT_MONO, bg=th.BG, fg=FG, **th.SUNKEN, height=12,
                              selectbackground=th.ACTIVE, exportselection=False, activestyle="none")
         self.lb.pack(fill="both", expand=True, padx=16, pady=4)
         self.lb.bind("<Double-Button-1>", lambda _e: self.wake_selected())
@@ -37,7 +37,7 @@ class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命�
         self._btn(bar, "唤醒", self.wake_selected, bg=th.PRIMARY)
         self._btn(bar, "删除", self.delete, bg=th.DANGER_BG)
 
-        form = tk.LabelFrame(self, text=" 临时唤醒 / 加入清单 ", font=FONT, bg=BG, fg=th.DIM, bd=1, relief="groove")
+        form = tk.LabelFrame(self, text=" 临时唤醒 / 加入清单 ", font=FONT, bg=BG, fg=th.DIM, **th.GROOVE)
         form.pack(fill="x", padx=16, pady=(10, 4))
         row = tk.Frame(form, bg=BG)
         row.pack(fill="x", pady=6)
@@ -45,7 +45,7 @@ class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命�
         for label, var, w in (("名字:", self.name_var, 14), ("MAC:", self.mac_var, 18)):
             tk.Label(row, text=label, font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(6, 0))
             e = tk.Entry(row, textvariable=var, width=w, font=FONT_MONO, bg=th.BG, fg=FG,
-                         insertbackground=FG, relief="flat")
+                         insertbackground=FG, **th.SUNKEN)
             e.pack(side="left", padx=6, ipady=3)
         e.bind("<Return>", lambda _e: self.wake_form())
         self.iface_var = tk.StringVar(value="enp3s0")

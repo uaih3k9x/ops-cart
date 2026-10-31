@@ -43,7 +43,7 @@ class NetModePanel(BridgePanel):
         tk.Label(parent, text=text, font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
         var.trace_add("write", lambda *_: (on_change or self._form_changed)())
         e = tk.Entry(parent, textvariable=var, width=width, font=FONT_MONO, bg=th.BG, fg=FG,
-                     insertbackground=FG, relief="flat", disabledbackground=BOX)
+                     insertbackground=FG, **th.SUNKEN, disabledbackground=BOX)
         e.pack(side="left", padx=6, ipady=3)
         e.bind("<Return>", lambda _e: self.apply())
         return e
@@ -58,14 +58,14 @@ class NetModePanel(BridgePanel):
     def _build(self):
         tk.Label(self, text="网口模式 · 每个口同一时间一个模式, 都能撤 · 无线不归这里管(留作后路)",
                  font=FONT, bg=BG, fg=th.DIM, anchor="w").pack(fill="x", padx=16, pady=(10, 4))
-        self.lb = tk.Listbox(self, font=FONT_MONO, bg=BOX, fg=FG, relief="flat", height=2,
+        self.lb = tk.Listbox(self, font=FONT_MONO, bg=th.BG, fg=FG, **th.SUNKEN, height=2,
                              selectbackground=th.ACTIVE, exportselection=False, activestyle="none")
         self.lb.pack(fill="x", padx=16, pady=4)
         self.lb.bind("<<ListboxSelect>>", lambda _e: self._on_select())
         self.drift_lbl = tk.Label(self, text="", font=FONT, bg=BG, fg=th.WARN, anchor="w", justify="left")
         self.drift_lbl.pack(fill="x", padx=16)
 
-        self.box = tk.LabelFrame(self, text="", font=FONT, bg=BG, fg=th.DIM, bd=1, relief="groove")
+        self.box = tk.LabelFrame(self, text="", font=FONT, bg=BG, fg=th.DIM, **th.GROOVE)
         self.box.pack(fill="x", padx=16, pady=(8, 4))
         row = tk.Frame(self.box, bg=BG)
         row.pack(fill="x", pady=4)
@@ -80,7 +80,7 @@ class NetModePanel(BridgePanel):
         self.tpl_var = tk.StringVar(value="手填")
         self.tpl_om = tk.OptionMenu(row, self.tpl_var, *(["手填"] + [t[0] for t in npc.STATIC_TEMPLATES]),
                                     command=lambda _v: self._use_template())
-        self.tpl_om.config(font=FONT, bg=BOX, fg=FG, activebackground=th.ACTIVE, relief="flat",
+        self.tpl_om.config(font=FONT, bg=BOX, fg=FG, activebackground=th.ACTIVE, **th.RAISED,
                            highlightthickness=0)
         self.tpl_om["menu"].config(font=FONT, bg=BOX, fg=FG)
         self.tpl_om.pack(side="left", padx=6)

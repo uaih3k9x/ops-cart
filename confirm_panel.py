@@ -12,22 +12,22 @@ import confirm_core as cc
 import theme as th
 
 FONT, FONT_BIG = th.FONT, th.FONT_BIG
-BG, CARD, FG, DIM = th.PANEL, th.LAMP_BODY, th.FG, th.DIM
+BG, CARD, FG, DIM = th.PANEL, th.BG, th.FG, th.DIM      # 条目凹进去 (按钮底上 DIM 不够 4.5)
 BTN = {"go": (th.GO_BG, th.GO_FG), "no": (th.DANGER_BG, th.DANGER_FG), "stop": (th.ALERT_BG, th.WHITE),
        "plain": (th.BTN2, th.FG)}
 
 
 class ConfirmDialog(tk.Toplevel):
     def __init__(self, master, n, view, on_action, on_serial=None, ask=None):
-        super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=cc.PENDING_COLOR)
+        super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=cc.PENDING_COLOR, **th.DIALOG)
         self.n, self.on_action, self.on_serial = n, on_action, on_serial
         self.ask = ask or (lambda title, msg: messagebox.askyesno(title, msg, parent=self))
         self.overrideredirect(True)
         W, H = 760, min(720, self.winfo_screenheight() - 40)
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
         self.attributes("-topmost", True)
-        self.title_lbl = tk.Label(self, font=FONT_BIG, bg=BG, fg=FG)
-        self.title_lbl.pack(pady=(14, 2))
+        self.title_lbl = tk.Label(self, font=FONT_BIG, bg=th.TITLE, fg=th.WHITE, anchor="w", padx=12, pady=4)
+        self.title_lbl.pack(fill="x", pady=(0, 8))     # CDE 对话框标题条
         self.status_lbl = tk.Label(self, font=FONT, bg=BG, fg=DIM, justify="center")
         self.status_lbl.pack()
         self.body = tk.Frame(self, bg=BG)
@@ -44,7 +44,7 @@ class ConfirmDialog(tk.Toplevel):
     def _btn(self, parent, text, kind, cmd, name=None):
         bg, fg = BTN[kind]
         b = tk.Button(parent, text=text, font=FONT_BIG, command=cmd, bg=bg, fg=fg, activebackground=bg,
-                      relief="flat", padx=16, pady=4, cursor="hand2", name=name)
+                      activeforeground=fg, **th.RAISED, padx=16, pady=4, cursor="hand2", name=name)
         b.pack(side="left", padx=6)
         return b
 
@@ -57,7 +57,7 @@ class ConfirmDialog(tk.Toplevel):
             view = cc.stopped_view()
             c, states = cc.card(view, self.n), cc.slot_states(view)
         self.title_lbl.config(text=c["title"])
-        self.status_lbl.config(text="\n".join(c["status"]), fg=cc.ESTOP_COLOR if c["stopped"] else DIM)
+        self.status_lbl.config(text="\n".join(c["status"]), fg=th.BAD if c["stopped"] else DIM)
         self.config(highlightbackground=cc.ESTOP_COLOR if c["stopped"] else cc.PENDING_COLOR)
         any_stop = any(s["estop"] for s in states.values())
         key = (c["stopped"], any_stop, tuple(it["id"] for it in c["items"]))
@@ -85,7 +85,7 @@ class ConfirmDialog(tk.Toplevel):
         self._btn(self.foot, "关闭", "plain", self.destroy)
 
     def _item(self, it):
-        f = tk.Frame(self.body, bg=CARD, padx=12, pady=8)
+        f = tk.Frame(self.body, bg=CARD, padx=12, pady=8, **th.SUNKEN)
         f.pack(fill="x", pady=4)
         tk.Label(f, text=it["head"], font=th.font(20, bold=True, mono=True), bg=CARD, fg=FG, anchor="w", justify="left",
                  wraplength=680).pack(fill="x")
@@ -94,7 +94,7 @@ class ConfirmDialog(tk.Toplevel):
         tk.Label(f, text=it["reason"], font=FONT, bg=CARD, fg=FG, anchor="w", justify="left",
                  wraplength=680).pack(fill="x")
         if it["danger"]:
-            tk.Label(f, text=it["danger"], font=FONT_BIG, bg=CARD, fg=cc.ESTOP_COLOR, anchor="w").pack(fill="x")
+            tk.Label(f, text=it["danger"], font=FONT_BIG, bg=CARD, fg=th.BAD, anchor="w").pack(fill="x")
         row = tk.Frame(f, bg=CARD)
         row.pack(anchor="e", pady=(4, 0))
         self._btn(row, "确认发送", "go", lambda: self._confirm(it), name=f"confirm-{it['id']}")

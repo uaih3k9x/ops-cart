@@ -12,19 +12,21 @@ import pxe_req_core as pr
 import theme as th
 
 FONT, FONT_BIG, FONT_MONO = th.FONT, th.FONT_BIG, th.FONT_MONO
-BG, CARD, FG, DIM, RED, AMBER = th.PANEL, th.BOX, th.FG, th.DIM, th.BAD, th.WARN
+BG, CARD, FG, DIM, RED, AMBER = th.PANEL, th.BG, th.FG, th.DIM, th.BAD, th.WARN
 EDGE = th.DANGER_EDGE            # 同手动解锁对话框: 解锁是危险操作
 BTN = {"go": (th.DANGER_BG, th.DANGER_FG), "no": (th.BTN2, th.DANGER_FG), "plain": (th.BTN2, th.FG)}
 
 
 class PxeRequestDialog(tk.Toplevel):
     def __init__(self, master, view, on_action, on_manual=None):
-        super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=EDGE)
+        super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=EDGE, **th.DIALOG)
         self.on_action, self.on_manual = on_action, on_manual
         self.overrideredirect(True)
         W, H = 780, min(720, self.winfo_screenheight() - 40)
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
         self.attributes("-topmost", True)
+        tk.Label(self, text="Agent PXE 解锁申请", font=FONT_BIG, bg=th.TITLE, fg=th.WHITE, anchor="w", padx=12,
+                 pady=4).pack(fill="x")         # CDE 对话框标题条
         self.body = tk.Frame(self, bg=BG)
         self.body.pack(fill="both", expand=True, padx=20, pady=12)
         self.msg = tk.Label(self, text="", font=FONT, bg=BG, fg=RED, wraplength=W - 40)
@@ -37,7 +39,7 @@ class PxeRequestDialog(tk.Toplevel):
     def _btn(self, parent, text, kind, cmd):
         bg, fg = BTN[kind]
         b = tk.Button(parent, text=text, font=FONT_BIG, command=cmd, bg=bg, fg=fg, activebackground=bg,
-                      relief="flat", padx=20, pady=4, cursor="hand2")
+                      activeforeground=fg, **th.RAISED, padx=20, pady=4, cursor="hand2")
         b.pack(side="left", padx=6)
         return b
 
@@ -65,7 +67,7 @@ class PxeRequestDialog(tk.Toplevel):
         self._meta = tk.Label(self.body, text=c["meta"], font=FONT, bg=BG, fg=DIM)
         self._meta.pack()
         tk.Label(self.body, text=c["warn"], font=FONT, bg=BG, fg=RED, wraplength=720).pack(pady=(6, 6))
-        box = tk.Frame(self.body, bg=CARD, padx=10, pady=6)
+        box = tk.Frame(self.body, bg=CARD, padx=10, pady=6, **th.SUNKEN)
         box.pack(fill="x")
         for line in c["lines"]:
             tk.Label(box, text=line, font=FONT_MONO, bg=CARD, fg=AMBER, anchor="w").pack(fill="x")
@@ -75,7 +77,7 @@ class PxeRequestDialog(tk.Toplevel):
         tk.Label(self.body, text="看过清单, 照抄确认码:", font=FONT, bg=BG, fg=DIM).pack(pady=(10, 0))
         tk.Label(self.body, text=c["code_text"], font=th.font(40, bold=True, mono=True), bg=BG, fg=AMBER).pack()
         e = tk.Entry(self.body, font=th.font(22, mono=True), width=10, justify="center", bg=CARD, fg=FG,
-                     insertbackground=FG, relief="flat")
+                     insertbackground=FG, **th.SUNKEN)
         e.pack(pady=6, ipady=6)
         e.bind("<Return>", lambda _e: self._confirm(c))
         self._entry = e
