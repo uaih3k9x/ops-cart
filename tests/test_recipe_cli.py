@@ -61,3 +61,22 @@ def test_failed_step_exit_1(fake_hw):
     path = write(tmp_path, {"name": "x", "timeout": 2, "steps": [
         {"do": "wait_text", "patterns": ["Network Boot"], "timeout": 1, "poll": 0.1}]})
     assert recipe.main([path, "--dry-run"]) == 1
+
+
+def test_send_goes_through_kvm_broker_as_agent(monkeypatch):
+    """配方是自动化, 经键鼠代理时算 agent: 人刚动过键鼠就等人停手 (#9)."""
+    opened, sent = [], []
+
+    class Dev:
+        def send_keys(self, keys):
+            sent.append(keys)
+
+        def close(self):
+            sent.append("close")
+
+    def open_ch(port, src="agent", who="cli", baud=115200, sock_path=None):
+        opened.append((port, src, who, baud))
+        return Dev()
+    monkeypatch.setattr(recipe.kvm_broker, "open_ch", open_ch)
+    recipe.make_send("/dev/ttyACM0", 115200)("f12")
+    assert opened == [("/dev/ttyACM0", "agent", "recipe", 115200)] and sent == [["f12"], "close"]
