@@ -172,7 +172,8 @@ def form_hint(iface, mode, form):
     if mode == "off":
         return "关闭: 不配地址, 推车自己建一条不带地址的连接占住这个口"
     if mode == "dhcp":
-        return "DHCP 客户端: 插上就自动拿地址" + (" · 装机口不当出口" if iface in NO_EGRESS else "")
+        return "DHCP 客户端: 插上就自动拿地址" + (" · 装机口不当出口" if iface in NO_EGRESS else
+                                                  f" · 备用出口: metric {EGRESS_METRIC['backup']} 排在无线后面, 无线断了才走它")
     if not (form.get("addr") or "").strip():
         return ("写成 地址/前缀, 比如 192.0.2.5/24, 掩码按你填的来; "
                 "对端地址可选: 填了只防撞址, 也可点「按对端预填」(对端也要带前缀)")
@@ -225,9 +226,9 @@ def _settings(iface, r):
     mode, p = r["mode"], r["params"]
     if mode == "off":
         return ["ipv4.method", "disabled", "ipv6.method", "disabled"]
-    if mode == "dhcp":
-        return ["ipv4.method", "auto", "ipv6.method", "auto"] + (
-            _egress_settings(iface, "never") if iface in NO_EGRESS else [])
+    if mode == "dhcp":      # DHCP 会给网关: 装机口不当出口, LAN2 当备用出口 (无线是唯一主出口, 10/31)
+        return ["ipv4.method", "auto", "ipv6.method", "auto"] + _egress_settings(
+            iface, "never" if iface in NO_EGRESS else "backup")
     # static: 网关 / 路由 / DNS 留空也显式写 "", 不留旧值.
     # never-default 和 ipv4.gateway 不同时写: LAN2 老记录的「不当出口 + 网关」按备用出口建;
     # LAN1 的网关只进 ipv4.routes (经网关去的网段), 不进默认路由.

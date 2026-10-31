@@ -287,11 +287,14 @@ def test_off_disables_both_families():
     assert cmds[-1] == ["nmcli", "con", "up", "uuid", "u1"] and res[0]["con"] == "u1"
 
 
-def test_lan2_dhcp_is_plain_dhcp():
+def test_lan2_dhcp_is_backup_egress_behind_wifi():
+    """10/31 现场: LAN2 DHCP 用了 NM 默认 metric (101), 抢在无线 (900) 前面当了主出口. 无线是唯一主出口."""
     cmds, _ = nm.apply_steps(nm.rec("dhcp", "enp3s0"), uuids())
     assert len(cmds) == 2 and "systemctl" not in flat(cmds)[0]
     kv = kv_of(cmds[0])
-    assert kv["ipv4.method"] == "auto" and "ipv4.never-default" not in kv
+    assert kv["ipv4.method"] == "auto" and kv["ipv4.never-default"] == "no"
+    assert int(kv["ipv4.route-metric"]) == nm.EGRESS_METRIC["backup"] > nm.wc.WIFI_METRIC
+    assert int(kv["ipv6.route-metric"]) == nm.EGRESS_METRIC["backup"]
 
 
 def test_legacy_restore_only_brings_it_up_and_owns_nothing():
