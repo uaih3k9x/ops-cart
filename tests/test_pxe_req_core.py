@@ -267,3 +267,21 @@ def test_code_ok():
         assert not pr.code_ok(typed, "123456")
     assert not pr.code_ok("", "")
     assert len(pr.new_code()) == pr.CODE_DIGITS and pr.new_code().isdigit()
+
+
+# ------------------------------------------------------------ 车机申请框内容
+
+def test_card():
+    assert pr.card(None) is None and pr.card({"pending": []}) is None and pr.card({}) is None
+    b = _book()
+    _submit(b, who="stdio:ops@198.51.100.7")
+    _submit(b, purpose="clone-restore", mac=None, batch=True, plan=_clone_plan(), now=T0 + 1)
+    c = pr.card(b.view(T0 + 65, secret=True))
+    assert c["id"] == 1 and c["code"] == "111111" and c["code_text"] == "1 1 1 1 1 1"
+    assert c["digest"] == b.view(T0, secret=True)["pending"][0]["digest"]
+    assert c["title"] == "Agent 申请 PXE 解锁 #1" and "stdio:ops@198.51.100.7" in c["meta"]
+    assert "剩 8:55" in c["meta"] and "清空整块硬盘" in c["warn"] and c["more"] == 1
+    assert c["lines"] == [f"{MAC}  {pr.WHAT['rocky']}"]
+    c2 = pr.card({"pending": b.view(T0, secret=True)["pending"][1:]})
+    assert c2["id"] == 2 and "覆盖" in c2["warn"] and c2["more"] == 0
+    assert pr.card({"pending": [{"id": 1}]}) is None          # 缺字段 = 当没有

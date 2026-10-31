@@ -83,6 +83,26 @@ def plan_lines(p):
     return [f"{r['mac']}  {WHAT[p['purpose']]}" for r in p["rows"]]
 
 
+WARN = {"rocky": "批准后这台机器下次 PXE 会自动安装 Rocky 并清空整块硬盘 (clearpart --all)",
+        "winpe": "批准后这台机器下次 PXE 菜单默认进 WinPE (不自动装机)",
+        "clone-save": "批准后这台机器下次 PXE 会整盘抓镜像存到推车",
+        "clone-restore": "批准后下面每台下次 PXE 都会被镜像整盘覆盖"}
+
+
+def card(view):
+    """车机申请框: 最早那条在等的申请 -> {id, digest, code, code_text, title, meta, warn, lines, more}; 没有 None.
+    视图读不懂 (缺字段) 也当没有, 不给确认."""
+    try:
+        p, rest = view["pending"][0], len(view["pending"]) - 1
+        left = int(p["expires_in"])
+        return {"id": p["id"], "digest": p["digest"], "code": p["code"], "code_text": " ".join(p["code"]),
+                "title": f"Agent 申请 PXE 解锁 #{p['id']}",
+                "meta": f"来自 {p['who']} · {WHAT[p['purpose']]} · 剩 {left // 60}:{left % 60:02d}",
+                "warn": WARN[p["purpose"]], "lines": list(p["lines"]), "more": rest}
+    except (KeyError, TypeError, IndexError, ValueError):
+        return None
+
+
 def new_code():
     return f"{secrets.randbelow(10 ** CODE_DIGITS):0{CODE_DIGITS}d}"
 
