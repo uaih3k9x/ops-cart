@@ -390,6 +390,27 @@ def send_confirmed(store, iid, by, slots, send):
     return it, status, output, note
 
 
+def human_action(store, op, arg, by, slots, send):
+    """车机上人的按钮 (#23) -> 一句结果: confirm (arg = 编号, 会阻塞到发完) / reject (编号) / estop / resume
+    (槽位, None = 全部). Book 不让抛 sw.Refused. 调用方保证是本机人 (车机进程), 放后台线程调."""
+    if op == "confirm":
+        it, status, output, note = send_confirmed(store, arg, by, slots, send)
+        tail = sw.echo_summary(output).strip().splitlines()[-1:] if output else []
+        return f"#{it['id']} {it['cmd']} -> {status}" + (f" ({note})" if note else "") + \
+            (f": {tail[0]}" if tail and not note else "")
+    where = "全部槽位" if arg is None else f"槽位 {arg}"
+    if op == "reject":
+        store.run(lambda b, now: b.reject(arg, by, now, why="车机上拒绝"))
+        return f"已拒绝 #{arg}"
+    if op == "estop":
+        dropped = store.run(lambda b, now: b.estop(arg, by, "human", now))
+        return f"已急停 {where}; 丢弃挂起 {[d['id'] for d in dropped]}; 没往设备发任何东西"
+    if op == "resume":
+        store.run(lambda b, now: b.resume(arg, by, now))
+        return f"已解除 {where} 的急停; Agent 要重新申请租约"
+    raise ValueError(f"不认识的动作 {op}")
+
+
 def write_request(req, req_dir=None):
     """网页 (ops-web) 投一个请求 (confirm_core.make_request 的结果): 新文件 O_EXCL、不跟链接、一次 write 写完."""
     path = os.path.join(req_dir or REQ_DIR, f"{time.time_ns()}-{secrets.token_hex(4)}.json")

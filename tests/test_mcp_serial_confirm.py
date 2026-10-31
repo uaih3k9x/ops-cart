@@ -194,3 +194,29 @@ def test_cli_requests_subcommand(rig, tmp_path, monkeypatch):
     rc, text = cli(rig, "requests", local=False)          # 不要求本机: 只有停的方向
     assert rc == 0 and "已急停" in text
     assert all(s["estop"] for s in rig.store.view()["slots"])
+
+
+# ------------------------------------------------------------ 车机按钮: 一个入口, 后台线程里调
+
+def test_human_action_confirm_reject_estop_resume(rig):
+    _tok, p = _held(rig)
+    act = lambda op, arg: ms.human_action(rig.store, op, arg, cc.BY_KIOSK, lambda: rig.slots, rig.send)  # noqa: E731
+    assert "sent" in act("confirm", p["id"]) and rig.sent
+    _tok2, p2 = _held(rig, slot=2, cmd="reboot")
+    assert "拒绝" in act("reject", p2["id"])
+    assert rig.store.view()["history"][-1]["by"] == cc.BY_KIOSK
+    assert "急停" in act("estop", 2) and rig.store.view()["slots"][1]["estop"]["src"] == "human"
+    assert "全部" in act("estop", None)
+    assert "解除" in act("resume", 2) and rig.store.view()["slots"][1]["estop"] is None
+    assert "全部" in act("resume", None) and not any(s["estop"] for s in rig.store.view()["slots"])
+    with pytest.raises(ms.sw.Refused):
+        act("reject", 999)
+    with pytest.raises(ValueError):
+        act("nope", 1)
+
+
+def test_human_action_confirm_failure_reported(rig):
+    _tok, p = _held(rig)
+    rig.reply = ("refused", "[conbroker: 拒绝发送, 密码]", "[conbroker: 拒绝发送, 密码]")
+    msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send)
+    assert "refused" in msg and "密码" in msg
