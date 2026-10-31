@@ -97,9 +97,13 @@ def check_label(label):
 
 
 def pick_self(peer):
-    """对端地址 (可带前缀, 默认 /24) -> 推车自己用的地址: 同网段, 从 .250 往下避开对端."""
+    """对端 地址/前缀 -> 推车自己用的地址 (只做预填): 同网段, 从 .250 往下避开对端.
+    #13: 必须写明前缀, 不再默认 /24 —— 猜错了网段和边界全错."""
+    peer = (peer or "").strip()
+    if "/" not in peer:
+        raise ValueError(f"对端也要写前缀, 比如 {peer or '192.0.2.1'}/24, 不替你猜掩码")
     try:
-        iface = ipaddress.ip_interface(peer if "/" in peer else peer + "/24")
+        iface = ipaddress.ip_interface(peer)
     except ValueError as ex:
         raise ValueError(f"地址不对: {peer}") from ex
     net = iface.network
@@ -164,6 +168,20 @@ def static_form(addr, gateway="", dns="", avoid=""):
     except ValueError as ex:
         raise ValueError(f"DNS 不对: {ex}") from ex
     return {"addr": f"{ip}/{prefix}", "gateway": gateway, "dns": dns}
+
+
+def static_hint(addr, peer=""):
+    """面板静态地址下方的小灰字 (#13): 主输入是本机 地址/前缀, 对端可选 (填了只防撞址)."""
+    addr = (addr or "").strip()
+    if not addr:
+        return ("写成 地址/前缀, 比如 192.0.2.5/24, 掩码按你填的来; "
+                "对端地址可选: 填了只防撞址, 也可点「按对端预填」(对端也要带前缀)")
+    try:
+        form = static_form(addr, avoid=(peer or "").strip())
+    except ValueError as ex:
+        return str(ex)
+    net = ipaddress.ip_interface(form["addr"]).network
+    return f"推车用 {form['addr']} (网段 {net}, 不抢默认路由), 建的时候还会确认"
 
 
 # ------------------------------------------------------------ nmcli 命令

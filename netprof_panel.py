@@ -5,6 +5,7 @@
 LAN1 切到别的配置时先停 PXE 服务. 每次切换记 events.log. nmcli 放后台线程, 同 wifi_panel.
 LAN1 没插线时探测不算数 (收不到 OFFER 不代表对面没有 DHCP), 不启用发地址.
 静态地址由人填 (建议值只做预填); LAN1/LAN2 切换前都弹确认框, 写明原来/改为/回滚方式 (#8).
+静态模式主输入是推车自己的 地址/前缀, 掩码按人填的来; 对端地址可选, 只防撞址和预填 (#13).
 """
 
 import tkinter as tk
@@ -88,13 +89,22 @@ class NetProfPanel(BridgePanel):
         self.label_var = tk.StringVar()
         tk.Entry(row, textvariable=self.label_var, width=14, font=FONT_MONO, bg="#10141c", fg=FG,
                  insertbackground=FG, relief="flat").pack(side="left", padx=6, ipady=3)
-        tk.Label(row, text="对端地址:", font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(10, 0))
+
+        # #13: 主输入是推车自己的 地址/前缀 (不替人猜掩码); 对端可选, 只防撞址 / 按它预填
+        row = tk.Frame(form, bg=BG)
+        row.pack(fill="x", pady=4)
+        self.self_var = tk.StringVar()
         self.peer_var = tk.StringVar()
-        self.peer_var.trace_add("write", lambda *_: self._form_changed())
-        self.peer_entry = tk.Entry(row, textvariable=self.peer_var, width=18, font=FONT_MONO, bg="#10141c",
-                                   fg=FG, insertbackground=FG, relief="flat")
-        self.peer_entry.pack(side="left", padx=6, ipady=3)
-        self.peer_entry.bind("<Return>", lambda _e: self.create())
+        self.addr_entries = []
+        for text, var, width in (("本机 地址/前缀:", self.self_var, 18), ("对端地址(可选):", self.peer_var, 18)):
+            tk.Label(row, text=text, font=FONT, bg=BG, fg="#c8cede").pack(side="left", padx=(4, 0))
+            var.trace_add("write", lambda *_: self._form_changed())
+            e = tk.Entry(row, textvariable=var, width=width, font=FONT_MONO, bg="#10141c",
+                         fg=FG, insertbackground=FG, relief="flat")
+            e.pack(side="left", padx=6, ipady=3)
+            e.bind("<Return>", lambda _e: self.create())
+            self.addr_entries.append(e)
+        self._btn(row, "按对端预填", self.prefill)
         self._btn(row, "建好并切换", self.create, bg="#26577c")
         self.self_lbl = tk.Label(form, text="", font=FONT, bg=BG, fg="#8b93a7", anchor="w")
         self.self_lbl.pack(fill="x", padx=6, pady=(0, 6))
@@ -109,24 +119,27 @@ class NetProfPanel(BridgePanel):
         return v["warning"] if v["conflict"] else ""
 
     def _use_template(self):
+        """模板 = 设备出厂管理地址: 填进对端, 再按它预填本机 (预填仍可改)."""
         hit = dict(npc.STATIC_TEMPLATES).get(self.tpl_var.get())
         if hit:
             self.kind_var.set("static")
             self.label_var.set(self.tpl_var.get())
             self.peer_var.set(hit)
+            self.prefill()
+
+    def prefill(self):
+        """#13: 按对端算一个同网段空地址填进本机; 对端必须带前缀, 不猜 /24."""
+        try:
+            self.self_var.set(npc.pick_self(self.peer_var.get()))
+        except ValueError as ex:
+            self._say(str(ex), ok=False)
 
     def _form_changed(self):
-        if self.kind_var.get() != "static":
-            self.peer_entry.config(state="disabled")
-            self.self_lbl.config(text="DHCP 客户端: 插上就自动拿地址")
-            return
-        self.peer_entry.config(state="normal")
-        peer = self.peer_var.get().strip()
-        try:
-            self.self_lbl.config(text=f"建议推车用 {npc.pick_self(peer)} (不抢默认路由), 建的时候由你确认或改" if peer
-                                 else "填对端设备的地址, 比如交换机出厂管理地址; 也可以空着, 建的时候自己填推车地址")
-        except ValueError as ex:
-            self.self_lbl.config(text=str(ex))
+        static = self.kind_var.get() == "static"
+        for e in self.addr_entries:
+            e.config(state="normal" if static else "disabled")
+        self.self_lbl.config(text=npc.static_hint(self.self_var.get(), self.peer_var.get()) if static
+                             else "DHCP 客户端: 插上就自动拿地址")
 
     # ------------------------------------------------------------ 列表
 
@@ -215,7 +228,6 @@ class NetProfPanel(BridgePanel):
 
     def create(self):
         iface, kind, label = self.iface_var.get(), self.kind_var.get(), self.label_var.get().strip()
-        peer = self.peer_var.get().strip()
         name = npc.con_name(iface, kind, label)
         try:
             why = npc.check(iface, kind) or npc.check_label(label)
@@ -225,12 +237,8 @@ class NetProfPanel(BridgePanel):
                 raise ValueError("同名配置已存在, 换个名字")
             addr = None
             if kind == "static":
-                # #8: 地址由人填; 按对端算出的空地址只做预填, 人可以改, 校验过了还要再确认一次
-                form = ask_valid(self, "推车自己的地址", f"{npc.IFACES[iface]} ({iface}) 用的 地址/前缀:",
-                                 npc.pick_self(peer) if peer else "", lambda t: npc.static_form(t, avoid=peer))
-                if form is None:
-                    return self._say("没填地址, 未写入", ok=False)
-                addr = form["addr"]
+                # #8/#13: 地址由人在表单里填 地址/前缀 (预填也只是起点); 对端填了只防撞址; 校验过了还要再确认一次
+                addr = npc.static_form(self.self_var.get(), avoid=self.peer_var.get().strip())["addr"]
                 if not messagebox.askyesno(
                         "新建静态地址",
                         f"将在 {iface} 上新建配置「{label}」\n地址: {addr}（不抢默认路由）\n\n"

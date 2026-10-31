@@ -55,7 +55,8 @@ def test_nmcli_set_static_builds_correct_cmd():
 def test_nmcli_set_static_empty_gateway_dns():
     cmds = kc.nmcli_set_static("x", "10.0.0.1/24")
     assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == ""
-    assert "ipv4.dns" not in cmds[0]
+    # DNS 留空 = 清掉; 不带 ipv4.dns 的话 nmcli con mod 会留着旧 DNS
+    assert cmds[0][cmds[0].index("ipv4.dns") + 1] == ""
 
 
 def test_nmcli_set_dhcp_clears_static():

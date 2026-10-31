@@ -65,7 +65,25 @@ def test_pick_self_avoids_peer():
     assert np_.pick_self("192.168.1.253/24") == "192.168.1.250/24"
     assert np_.pick_self("192.168.1.250/24") == "192.168.1.249/24"
     assert np_.pick_self("10.0.0.1/30") == "10.0.0.2/30"   # 小网段只剩一个能用
-    assert np_.pick_self("192.168.0.233") == "192.168.0.250/24"   # 不写前缀按 /24
+
+
+@pytest.mark.parametrize("peer, want", [
+    ("172.16.5.1/16", "172.16.0.250/16"),        # 非 /24: 网段和边界按人写的前缀算 (#13)
+    ("192.0.2.9/23", "192.0.2.250/23"),
+    ("192.0.2.130/25", "192.0.2.254/25"),      # 上半段: 网络号 .128 + 126
+    ("192.0.2.1/25", "192.0.2.126/25"),          # /25 下半段, 不能越过广播
+    ("192.0.2.5/30", "192.0.2.6/30"),
+])
+def test_pick_self_follows_given_prefix(peer, want):
+    assert np_.pick_self(peer) == want
+
+
+def test_pick_self_needs_prefix_never_guesses_24():
+    """#13: 对端不带前缀直接报错, 不再默认 /24."""
+    with pytest.raises(ValueError, match="前缀"):
+        np_.pick_self("192.168.0.233")
+    with pytest.raises(ValueError, match="前缀"):
+        np_.pick_self("")
 
 
 def test_pick_self_rejects_bad_input():
@@ -447,3 +465,24 @@ def test_switch_confirm_lan2_keeps_remote_warning():
     t = np_.switch_confirm_text(CUR, NEW, plan, ip="192.0.2.5/24")
     assert "LAN2 (enp3s0)" in t and "远程连接会断" in t
     assert plan["rollback_text"] in t
+
+
+# ------------------------------------------------- 面板主输入 = 本机 地址/前缀 (#13)
+
+def test_static_hint_empty_tells_format():
+    hint = np_.static_hint("", "")
+    assert "地址/前缀" in hint and "192.0.2.5/24" in hint
+    assert "对端" in hint and "可选" in hint
+
+
+@pytest.mark.parametrize("addr", ["198.51.100.7/16", "192.0.2.7/23", "192.0.2.7/25", "192.0.2.6/30"])
+def test_static_hint_shows_net_as_typed(addr):
+    import ipaddress
+    hint = np_.static_hint(addr, "")
+    assert addr in hint and str(ipaddress.ip_interface(addr).network) in hint
+
+
+def test_static_hint_reports_errors_instead_of_guessing():
+    assert "前缀" in np_.static_hint("192.0.2.5", "")
+    assert "对端" in np_.static_hint("192.0.2.1/24", "192.0.2.1")
+    assert "对端" in np_.static_hint("192.0.2.1/24", "192.0.2.1/25")
