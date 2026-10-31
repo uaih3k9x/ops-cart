@@ -200,7 +200,7 @@ def _hammer(cart, rounds=1):
         loot = _loot(cart)
         for tool in tools:
             for args in _combos(tool, loot):
-                for who in ("stdio:agent@198.51.100.7", "tok@100.64.0.5"):
+                for who in ("stdio:agent@198.51.100.7", "tok@198.51.100.8"):
                     cart.call(tool["name"], args, who)
                     n += 1
         for name in ("pxe_arm", "pxe_confirm", "confirm", "resume", "human_confirm", "arm"):
