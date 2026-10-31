@@ -98,7 +98,7 @@ def shutdown_stage(ups, since=None, now=0.0):
     if since is not None:
         if _on_mains(ups):
             return "normal", None
-        left = COUNTDOWN_S - (now - since)
+        left = min(COUNTDOWN_S, COUNTDOWN_S - (now - since))     # 墙钟往回拨: 最多整段
         if left <= 0:
             return "poweroff", 0
         return "countdown", int(-(-left // 1))        # 向上取整: 还剩 0.5 秒显示 1, 到 0 才关

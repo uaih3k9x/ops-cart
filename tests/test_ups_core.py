@@ -242,6 +242,11 @@ def test_stage_countdown_starts_at_low_pct_and_counts_by_injected_time():
     assert uc.shutdown_stage(_ob(percent=14), T, T + 999) == ("poweroff", 0)
 
 
+def test_countdown_never_shows_more_than_full_length():
+    # 起点在"未来" (墙钟被往回拨): 不显示几万秒, 最多整段 (调用方据此重设起点)
+    assert uc.shutdown_stage(_ob(percent=14), T + 3600, T) == ("countdown", uc.COUNTDOWN_S)
+
+
 def test_countdown_keeps_going_if_battery_bounces_back_above_threshold():
     # 只有插回市电才取消; 电池电压回弹到 17% 不算
     assert uc.shutdown_stage(_ob(percent=17), T, T + 5) == ("countdown", 25)
