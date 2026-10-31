@@ -413,6 +413,30 @@ def test_run_switch_handback_to_legacy_leaves_port_unmanaged():
     assert nm.owner(new, "enp3s0") is None and new["prev"]["enp3s0"]["mode"] == "static"
 
 
+def test_run_switch_undo_that_fails_is_kept_for_next_time():
+    """undo 没撤掉的 (NM 忙之类) 留进 stale, 下次切换再撤, 不能就此忘了."""
+    st = _managed_static_state()
+    plan = nm.plan_switch(st, nm.rec("dhcp", "enp3s0"), CONS, uuids())
+    box = Box("con delete uuid u0")
+    ok, new, _ = nm.run_switch(plan, st, box.run, box.save, box.log)
+    rec = nm.owner(new, "enp3s0")
+    assert ok and rec["mode"] == "dhcp" and [x["con"] for x in rec["stale"]] == ["u0"]
+    plan = nm.plan_switch(new, nm.rec("static", "enp3s0", static()["params"]), CONS, uuids())
+    assert ["nmcli", "con", "delete", "uuid", "u0"] in plan["undo"]
+
+
+def test_run_switch_failed_rollback_leftover_survives_legacy_restore():
+    st = nm.empty_state()
+    plan = nm.plan_switch(st, nm.rec("dhcp", "enp3s0"), CONS, uuids())
+    box = Box("con up uuid u1", "con delete uuid u1")
+    ok, new, _ = nm.run_switch(plan, st, box.run, box.save, box.log)
+    assert not ok and box.ran[-1] == "nmcli con up uuid 1603-3"
+    rec = nm.owner(new, "enp3s0")                                     # 回到旧连接, 但记着 u1 没删掉
+    assert rec["mode"] == "legacy" and [x["con"] for x in rec["stale"]] == ["u1"]
+    lan2 = nm.port_views(new, CONS, IP_BR, ROUTES, LINK)[1]
+    assert not lan2["managed"] and "旧配置「enp3s0」" in lan2["title"] and "没撤掉" in lan2["drift"]
+
+
 def test_run_switch_cannot_write_state_touches_nothing():
     st = nm.empty_state()
     plan = nm.plan_switch(st, nm.rec("off", "eno1"), CONS, uuids())

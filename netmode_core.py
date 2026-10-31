@@ -227,9 +227,13 @@ def _undo_one(res):
     raise ValueError(f"不认识的占用 {res}, 状态文件可能是新版本写的")
 
 
+def _undo_order(r):
+    return list(reversed(r.get("res", []))) + list(reversed(r.get("stale", [])))
+
+
 def undo_steps(r):
     """按 apply 的反序撤; stale = 上次没撤完的 (断电/出错), 一起撤. 旧连接本身没有占用, 不归推车删."""
-    return [_undo_one(x) for x in list(reversed(r.get("res", []))) + list(reversed(r.get("stale", [])))]
+    return [_undo_one(x) for x in _undo_order(r)]
 
 
 # ------------------------------------------------------------ 状态文件
@@ -325,9 +329,9 @@ def plan_switch(st, new, cons_text, new_uuid, links=None):
 
 # ------------------------------------------------------------ 执行器
 
-def _run_all(cmds, run):
-    """尽力而为 (undo 用): 每条都跑, 返回失败的条数. 连接早就没了这类失败不拦路."""
-    return sum(1 for c in cmds if run(c)[0])
+def _undo_run(recs, run):
+    """尽力而为: 每条都跑, 失败不拦路; 返回没撤掉的占用, 留进 stale 下次再撤 (早就没了的再撤一次也无妨)."""
+    return [x for r in recs for x in _undo_order(r) if run(_undo_one(x))[0]]
 
 
 def _run_until_fail(cmds, run):
@@ -355,15 +359,19 @@ def run_switch(plan, st, run, save, log=None, now=time.time):
     except OSError as ex:
         return False, st, f"状态文件写不了 ({ex}), 网口没动"
     before = " / ".join(describe(r) for r in plan["cur"])
-    bad = _run_all(plan["undo"], run)
+    left = _undo_run(plan["cur"], run)
     log(f"undo {where} {before}: " + ("不用撤 (旧连接不归推车删)" if not plan["undo"] else
-                                      "成功" if not bad else f"{bad} 条没成 (多半是早就没了)"))
+                                      "成功" if not left else f"{len(left)} 条没撤掉, 记着下次再撤"))
     ok, why = _run_until_fail(plan["apply"], run)
     t = int(now())
 
     def done(recs, prev, status="ok"):
-        new_st = dict(base, modes=others + [dict(r, status=status, since=t) for r in recs if r["mode"] != LEGACY],
-                      prev=prev)
+        """落最终状态; 没撤掉的挂在第一条记录的 stale 上. 旧连接没有遗留就不留记录 (= 未托管)."""
+        recs = [dict(r, status=status, since=t) for r in recs]
+        if left and recs:
+            recs[0]["stale"] = list(left)
+        recs = [r for r in recs if r["mode"] != LEGACY or r.get("stale")]
+        new_st = dict(base, modes=others + recs, prev=prev)
         try:
             save(new_st)
         except OSError as ex:
@@ -380,15 +388,14 @@ def run_switch(plan, st, run, save, log=None, now=time.time):
         return True, done([plan["new"]], prev), f"{where} 切换成功: {describe(plan['new'])}{later}"
 
     log(f"apply {where} {describe(plan['new'])}: 失败 {why}")
-    _run_all(plan["rollback"], run)
+    left += _undo_run([plan["new"]], run)
     log(f"undo {where} {describe(plan['new'])}: apply 失败自动撤 ({_sh(plan['rollback'])})")
     prev = st.get("prev", {})
     ok, why2 = _run_until_fail(plan["restore"], run)
     if ok:
         log(f"apply {where} 恢复原来的 {before}: 成功")
         return False, done(plan["restore_recs"], prev), f"切换失败 ({why}), 已回到原来的 {before}"
-    for r in plan["restore_recs"]:
-        _run_all(undo_steps(r), run)
+    left += _undo_run(plan["restore_recs"], run)
     ok, why3 = _run_until_fail(plan["clean"], run)
     clean = " / ".join(describe(r) for r in plan["clean_recs"])
     log(f"apply {where} 恢复原来的失败 ({why2}), 落到干净状态 {clean}: " + ("成功" if ok else f"失败 {why3}"))
@@ -423,7 +430,7 @@ def _drift(r, active):
         return "上次切换失败, 连干净状态都没起来: 车边终端看 nmcli dev status"
     mine = {x["con"] for x in r.get("res", []) if "con" in x}
     if not mine or (active and active["uuid"] in mine):
-        return ""
+        return f"有 {len(r['stale'])} 条推车建的东西上次没撤掉, 下次切换会再撤" if r.get("stale") else ""
     return f"记录是「{describe(r)}」, 但网口上实际生效的是「{active['name']}」" if active else \
         f"记录是「{describe(r)}」, 但网口上现在没有生效的连接"
 
