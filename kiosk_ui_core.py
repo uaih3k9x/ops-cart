@@ -9,6 +9,7 @@
 - kp_digits_as_digits: 小键盘数字不看 NumLock
 - ks_save / read_text: Kickstart 保存与恢复
 - net_view: 顶栏和锁屏网络标怎么画
+- boot_theme / rebuild_due / theme_button_text: 深浅切换 (#32) 什么时候重建、开机用哪套
 """
 
 import gc
@@ -17,8 +18,10 @@ import sys
 import threading
 import time
 
+import dash_core as dc
 import kiosk_core as kc
 import pxeserver
+import sun_core
 import theme as th
 
 
@@ -58,6 +61,10 @@ class UiBridge:
 
     def busy(self, key):
         return key in self._busy
+
+    def busy_any(self, ignore=()):
+        """除了 ignore 里的, 还有没回来的后台动作吗 (#32 重建界面前要等它们: 回调会碰旧按钮)."""
+        return bool(self._busy - set(ignore))
 
     def run_bg(self, work, done=None, key=None):
         if key is not None:
@@ -140,7 +147,7 @@ class UiBridge:
 
 # ---------------------------------------------------------------- 网络标
 
-NET_COLORS = {"on": th.OK, "warn": th.WARN, "off": th.BAD}
+NET_COLORS, = th.follow(globals(), NET_COLORS=lambda: {"on": th.OK, "warn": th.WARN, "off": th.BAD})
 
 
 def net_view(state, text):
@@ -183,7 +190,8 @@ def pxe_button_texts(view):
 
 # ---------------------------------------------------------------- 自己发地址限时 (#11): 顶上醒目条
 
-SERVE_BAR_BG = {"serving": th.SERVE_BG, "expired": th.SERVE_EXPIRED_BG}     # 正在发: 红; 到时停发: 琥珀
+SERVE_BAR_BG, = th.follow(globals(),               # 正在发: 红; 到时停发: 琥珀
+                          SERVE_BAR_BG=lambda: {"serving": th.SERVE_BG, "expired": th.SERVE_EXPIRED_BG})
 
 
 def serve_bar_view(guard, now):
@@ -225,6 +233,30 @@ def boot_rows_safe(run):
         return run()
     except Exception as ex:                  # noqa: BLE001
         return fail_rows(ex)
+
+
+# ---------------------------------------------------------------- 深浅切换 (#32)
+# Tk 控件的颜色是建的时候写死的, 逐个重配容易漏: 模式变了先记下, 等锁屏且一阵没人碰时整个主界面重建.
+
+THEME_QUIET_S = 30          # 锁屏上这么久没人碰 (没在输 PIN) 才重建; 闲置自动锁屏时早就满足了
+THEME_TEXT = {"auto": "自动 (日出日落)", "dark": "深色", "light": "浅色"}
+
+
+def boot_theme(snap, conf, now):
+    """开机那一刻用哪套 (主界面和自检页都按它建): 快照新鲜就用快照里的 (和副屏同一份);
+    开机时 cart-dash 可能还没写出快照, 就按同一份配置自己算一次. 配置没有 / 读不懂 -> 深色."""
+    return dc.theme_mode(snap, now) or sun_core.want_mode(now, conf)
+
+
+def rebuild_due(want, shown, locked, quiet_s, busy):
+    """该不该现在重建主界面换配色: 快照说要换 (want 不是 None 且和现在不一样), 锁着屏, 锁屏上一阵没人碰,
+    也没有不能打断的东西 (串口会话 / 预览 / 对话框 / 后台动作, busy 由界面判断). 有人在用绝不重建."""
+    return want in th.MODES and want != shown and locked and quiet_s >= THEME_QUIET_S and not busy
+
+
+def theme_button_text(setting):
+    """车机设置里那颗按钮: 显示 theme.json 的档位; None = 配置读不懂."""
+    return "界面:  " + THEME_TEXT.get(setting, "配置读不懂")
 
 
 class Once:
@@ -311,6 +343,7 @@ MENU = {
         _act("画面源", "switch_source", attr="btn_src"),
         _act("鼠标:  绝对 (点哪是哪)", "toggle_mouse_mode", attr="btn_mouse"),
         _act("键鼠绑定:  不绑定", "cycle_kvm", attr="btn_kvm"),
+        _act("界面:  自动 (日出日落)", "cycle_theme", attr="btn_theme"),      # 深浅三档 (#32)
     ],
     "install": [
         _act("PXE 装机服务:  开 / 关", "toggle_pxe", attr="btn_pxe"),

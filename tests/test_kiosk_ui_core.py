@@ -113,6 +113,17 @@ def test_bridge_busy_key_guards_until_done_runs():
     assert b.run_bg(lambda: 3, got.append, key="pxe") is True
 
 
+def test_bridge_busy_any_ignores_given_keys():
+    b = ui.UiBridge(FakeRoot(), spawn=_sync_spawn)
+    assert not b.busy_any()
+    b.run_bg(lambda: 1, None, key="board")
+    assert b.busy_any() and not b.busy_any(ignore=("board",))
+    b.run_bg(lambda: 1, None, key="pxe")
+    assert b.busy_any(ignore=("board",))
+    b.drain()
+    assert not b.busy_any()
+
+
 def test_bridge_drain_limit_leaves_rest_for_next_tick():
     b = ui.UiBridge(FakeRoot(), spawn=_sync_spawn)
     got = []
@@ -257,7 +268,7 @@ def test_menu_pages_reachable_and_actions_unique():
 def test_menu_keeps_every_action_and_panes_are_parameterized():
     acts = set(_actions(ui.MENU))
     assert {a for a, _ in acts} == {"toggle_pane", "switch_source", "toggle_mouse_mode", "cycle_kvm",
-                                    "toggle_pxe", "toggle_install_mode", "lock_now",
+                                    "toggle_pxe", "toggle_install_mode", "lock_now", "cycle_theme",
                                     "reboot", "poweroff"}
     assert {arg for a, arg in acts if a == "toggle_pane"} == set(ui.PANES)
 
@@ -524,7 +535,7 @@ def test_lock_screen_shows_net_indicator():
     src = open(os.path.join(ROOT, "kiosk.py"), encoding="utf-8").read()
     lock = src[src.index("    def lock(self):"):src.index("    def lock_now(self):")]
     assert "_lock_net" in lock
-    render = src[src.index("    def _render_net(self"):src.index("    def _render(self, lines)")]
+    render = src[src.index("    def _render_net(self"):src.index("    def _render(self, res)")]
     assert "_lock_net" in render and "kui.net_view" in render
 
 
@@ -668,3 +679,51 @@ def test_font_row_reports_unifont_or_fallback():
     assert ui.font_row(th.UNIFONT) == {"label": "UI FONT", "state": "OK", "detail": "UNIFONT 16PX", "check": "uifont"}
     row = ui.font_row(th.NOTO)
     assert row["state"] == "WARN" and row["detail"] == "FALLBACK NOTO" and row["label"] == "UI FONT"
+
+
+# ---------------------------------------------------------------- 深浅切换 (#32)
+
+LONDON_NOON = 1782043200.0          # 2026-06-21 12:00 UTC: 伦敦白天
+LONDON = {"mode": "auto", "lat": 51.508, "lon": -0.126, "buffer_min": 20}
+
+
+def test_boot_theme_prefers_fresh_snapshot():
+    """开机自检页按开机那一刻的模式: 快照新鲜就用快照里的 (和副屏同一份)."""
+    snap = {"ts": LONDON_NOON, "theme": {"mode": "dark"}}
+    assert ui.boot_theme(snap, LONDON, LONDON_NOON) == "dark"
+
+
+def test_boot_theme_without_snapshot_works_it_out():
+    """开机时 cart-dash 可能还没写出快照: 自己按同一份配置算一次, 不干等."""
+    assert ui.boot_theme(None, LONDON, LONDON_NOON) == "light"
+    assert ui.boot_theme({"ts": LONDON_NOON - 600, "theme": {"mode": "dark"}}, LONDON, LONDON_NOON) == "light"
+    assert ui.boot_theme(None, {"mode": "dark"}, LONDON_NOON) == "dark"
+    assert ui.boot_theme(None, None, LONDON_NOON) == "dark"           # 配置读不懂: 深色 (现状)
+    assert ui.boot_theme(None, {}, LONDON_NOON) == "dark"             # 没配置: 深色
+
+
+def _due(**kw):
+    args = dict(want="light", shown="dark", locked=True, quiet_s=ui.THEME_QUIET_S, busy=False)
+    args.update(kw)
+    return ui.rebuild_due(**args)
+
+
+def test_rebuild_due_only_when_locked_quiet_and_free():
+    assert _due()
+    assert not _due(want="dark")                     # 没有要换的
+    assert not _due(want=None)                       # 快照过期 / 读不懂: 不动
+    assert not _due(locked=False)                    # 有人在用 (没锁): 绝不重建
+    assert not _due(quiet_s=ui.THEME_QUIET_S - 1)    # 锁屏上有人在输 PIN
+    assert not _due(busy=True)                       # 串口面板 / 预览 / 对话框 / 后台动作还开着
+
+
+def test_theme_button_text_names_setting():
+    assert ui.theme_button_text("auto") == "界面:  自动 (日出日落)"
+    assert ui.theme_button_text("dark") == "界面:  深色"
+    assert ui.theme_button_text("light") == "界面:  浅色"
+    assert ui.theme_button_text(None) == "界面:  配置读不懂"
+
+
+def test_menu_has_theme_switch_in_screen_settings():
+    items = [it for it in ui.MENU["video"] if it.get("do") == "cycle_theme"]
+    assert items and items[0]["attr"] == "btn_theme"

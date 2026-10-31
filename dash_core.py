@@ -590,6 +590,15 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
     return ctx
 
 
+def theme_mode(snap, now=None):
+    """车机 / 副屏该用哪套 (#32): 快照新鲜且模式认得 -> "dark" / "light"; 过期 / 没有 / 读不懂 -> None (保持现状)."""
+    if stale(snap, now):
+        return None
+    t = snap.get("theme")
+    mode = t.get("mode") if isinstance(t, dict) else None
+    return mode if mode in ("dark", "light") else None
+
+
 def theme_sampler(conf_path=sun_core.CONF_PATH, state_path=STATE_PATH, clock=time.time):
     """深浅模式采集 (#31): 每次重读 theme.json (改了不用重启), last 用上一轮的结果;
     cart-dash 刚起来时从上一份快照接上, 重启不在日出日落缓冲里来回跳.

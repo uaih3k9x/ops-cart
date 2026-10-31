@@ -9,8 +9,10 @@ from tkinter import messagebox
 
 import cartlog
 import wol_core as wol
-from wifi_panel import BG, BOX, FG, FONT, FONT_MONO, WifiPanel
+from wifi_panel import FONT, FONT_MONO, WifiPanel
 import theme as th
+
+BG, FG, BOX = th.follow(globals(), BG="PANEL", FG="FG", BOX="BOX")      # 同无线面板 (#30 跟着配色走)
 
 
 class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命令, 不需要后台线程

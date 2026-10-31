@@ -115,12 +115,17 @@ def test_message_line(root):
     assert "已拒绝 #2" in _labels(d)
 
 
+@pytest.mark.parametrize("mode", ["dark", "light"])
 @pytest.mark.parametrize("stop", [False, True])
-def test_every_text_readable(root, stop):
-    """#28 深色: 确认框里所有字 (含按钮按下、高危提示、急停状态、提示行) 对底都 >= 4.5."""
+def test_every_text_readable(root, stop, mode):
+    """#28 深色 / #30 浅色: 确认框里所有字 (含按钮按下、高危提示、急停状态、提示行) 对底都 >= 4.5."""
     import theme as th
+    th.use(mode)
     th.setup(root)
     d, _acts, _asked = _dlg(root, _view(stop=stop))
     d.say("不行: 急停中", ok=False)
     d.update_idletasks()
-    assert not th.unreadable(d)
+    try:
+        assert not th.unreadable(d)
+    finally:
+        th.use("dark")

@@ -16,9 +16,8 @@ import lamps_core as lc
 import serial_write_core as sw
 import theme as th
 
-PENDING_COLOR = lc.HEALTH_COLOR["WARN"]
-ESTOP_COLOR = lc.HEALTH_COLOR["FAIL"]
-AGENT_COLOR = th.AGENT
+PENDING_COLOR, ESTOP_COLOR, AGENT_COLOR = th.follow(
+    globals(), PENDING_COLOR="LAMP_WARN", ESTOP_COLOR="LAMP_FAIL", AGENT_COLOR="AGENT")
 KEY_LABEL = {"ctrl_c": "Ctrl+C", "enter": "回车", "space": "空格"}
 BY_KIOSK = "human:kiosk@local"
 

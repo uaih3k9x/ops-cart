@@ -39,20 +39,148 @@ def _colors():
     return {k: v for k, v in vars(th).items() if k.isupper() and isinstance(v, str) and v.startswith("#")}
 
 
+@pytest.fixture(params=th.MODES)
+def mode(request):
+    """护栏两套都跑 (#30): 切到这一套, 测完回深色 (默认), 别影响别的测试."""
+    th.use(request.param)
+    yield request.param
+    th.use("dark")
+
+
+# #28 定下的深色, 一个值都不许变 (#30 验收: 默认外观和 #28 完全一样)
+DARK_28 = {
+    'BG': '#262a35', 'TOP': '#1e212a', 'PANEL': '#2f3441', 'BOX': '#3a4050', 'BTN2': '#4a5165',
+    'ACTIVE': '#525a70', 'PRIMARY': '#3d5a80', 'TITLE': '#4a5f8a', 'INK': '#12151c', 'BLACK': '#000000',
+    'FG': '#d0d4de', 'TEXT': '#bcc2ce', 'DIM': '#959cad', 'FAINT': '#8b92a4', 'MUTED': '#a2abb8',
+    'DISABLED': '#4a5165', 'WHITE': '#ffffff', 'OK': '#8fd694', 'WARN': '#e2b04a', 'BAD': '#f08f86',
+    'NOTICE': '#eab07a', 'MARK': '#7ec8e3', 'WARN_BG': '#5c4424', 'AMBER_BG': '#6b4f22', 'DANGER_BG': '#5a2a2e',
+    'DANGER_FG': '#ffd0d4', 'DANGER_EDGE': '#7a1f2b', 'ALERT_BG': '#c62d2a', 'SERVE_BG': '#b3261e',
+    'SERVE_EXPIRED_BG': '#8a5a00', 'GO_BG': '#2b6a45', 'GO_FG': '#e2f5e6', 'AGENT': '#a78bfa',
+    'BOOT_BG': '#262a35', 'BOOT_FG': '#d0d4de', 'BOOT_SUB': '#959cad', 'BOOT_DIM': '#8b92a4',
+    'BOOT_STEP': '#bcc2ce', 'BOOT_OK': '#8fd694', 'BOOT_WARN': '#e2b04a', 'BOOT_FAIL': '#f08f86',
+    'LAMP_OK': '#22c55e', 'LAMP_WARN': '#f59e0b', 'LAMP_FAIL': '#ef4444', 'LAMP_BODY': '#3a4050',
+    'LAMP_EMPTY': '#2f3441', 'LAMP_FG': '#bcc2ce', 'LAMP_EMPTY_FG': '#959cad', 'LAMP_LIT_FG': '#12151c',
+    'DASH_BG': '#12151c', 'DASH_DIM': '#8088a0', 'DASH_LINE': '#3a4050'}
+
+
+def test_default_is_dark_exactly_as_28():
+    """不切换时: 深色, 每个颜色和 #28 一样; 状态表也一样."""
+    assert th.MODE == "dark"
+    assert _colors() == DARK_28 == th.DARK
+    assert th.STATE == {"OK": "#8fd694", "WARN": "#e2b04a", "FAIL": "#f08f86"} == th.BOOT_STATE
+    assert th.LAMP == {"OK": "#22c55e", "WARN": "#f59e0b", "FAIL": "#ef4444", None: "#4a5165"}
+
+
+def test_two_palettes_have_the_same_names():
+    """业务代码只认名字: 两套必须一个不多一个不少, 不然切过去某个面板才炸."""
+    assert set(th.DARK) == set(th.LIGHT)
+    assert th.MODES == ("dark", "light")
+
+
+def test_use_switches_every_name_and_back(mode):
+    pal = th.DARK if mode == "dark" else th.LIGHT
+    assert th.MODE == mode
+    assert _colors() == pal
+    assert th.STATE == {"OK": th.OK, "WARN": th.WARN, "FAIL": th.BAD}
+    assert th.BOOT_STATE == {"OK": th.BOOT_OK, "WARN": th.BOOT_WARN, "FAIL": th.BOOT_FAIL}
+    assert th.LAMP == {"OK": th.LAMP_OK, "WARN": th.LAMP_WARN, "FAIL": th.LAMP_FAIL, None: th.DISABLED}
+
+
+def test_light_is_really_light():
+    """浅色: 底比字亮 (不是把深色换了个名字)."""
+    lum = th.contrast  # 只比亮度高低: 用和白色的对比度, 越小越亮
+    assert lum(th.LIGHT["BG"], "#ffffff") < lum(th.LIGHT["FG"], "#ffffff")
+    assert lum(th.LIGHT["DASH_BG"], "#ffffff") < lum(th.LIGHT["LAMP_FG"], "#ffffff")
+
+
+@pytest.mark.parametrize("bad", [None, "", "auto", "LIGHT", 3])
+def test_use_unknown_mode_means_dark(bad):
+    """读不懂的模式一律深色 (现状), 不抛."""
+    try:
+        assert th.use(bad) == "dark"
+        assert th.MODE == "dark" and th.BG == DARK_28["BG"]
+    finally:
+        th.use("dark")
+
+
+def test_follow_keeps_module_aliases_in_step():
+    """模块里的别名 (BG = th.PANEL 之类) 在 use() 时跟着换; 也能给一个现算的 (字典之类)."""
+    ns = {}
+    assert th.follow(ns, BG="PANEL", PAIR=lambda: (th.OK, th.BAD)) == (th.DARK["PANEL"], (th.DARK["OK"], th.DARK["BAD"]))
+    try:
+        assert ns == {"BG": th.DARK["PANEL"], "PAIR": (th.DARK["OK"], th.DARK["BAD"])}
+        th.use("light")
+        assert ns == {"BG": th.LIGHT["PANEL"], "PAIR": (th.LIGHT["OK"], th.LIGHT["BAD"])}
+    finally:
+        th.use("dark")
+        th.unfollow(ns)
+    assert ns["BG"] == th.DARK["PANEL"]
+
+
+def _deep_strs(v):
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from _deep_strs(x)
+    elif isinstance(v, (tuple, list)):
+        for x in v:
+            yield from _deep_strs(x)
+
+
+def test_no_module_keeps_dark_colors_after_switch():
+    """切到浅色后, 业务模块的模块级常量 (BG = th.PANEL / 字典 / 元组) 和函数默认参数里不许还留着只有深色才有的值:
+    那样车机重建后那一块还是深的. 要别名就用 th.follow()."""
+    import importlib
+    mods = [f[:-3] for f in _tracked_py() if "/" not in f and "import theme as th" in open(os.path.join(ROOT, f),
+                                                                                          encoding="utf-8").read()]
+    assert {"lamps_core", "confirm_core", "kiosk_ui_core", "dash_render", "serial_panel"} <= set(mods)
+    mods = [importlib.import_module(m) for m in mods]          # 先在深色下导入 (= 车机启动时)
+    dark_only = set(th.DARK.values()) - set(th.LIGHT.values())
+    th.use("light")
+    try:
+        stale = [(m.__name__, k) for m in mods for k, v in vars(m).items()
+                 if k.isupper() and set(_deep_strs(v)) & dark_only]
+        stale += [(m.__name__, name) for m in mods for name, f in _functions(m)
+                  if set(_deep_strs(list(f.__defaults__ or ()) + list((f.__kwdefaults__ or {}).values())))
+                  & dark_only]
+    finally:
+        th.use("dark")
+    assert not stale, "默认参数 bg=th.BOX 是定义时取的值: 改成 bg=None, 用的时候再取"
+
+
+def _functions(mod):
+    """模块里定义的函数和类方法 (默认参数在定义时就取值, 切配色不会变)."""
+    import inspect
+    for name, obj in vars(mod).items():
+        if inspect.isfunction(obj) and obj.__module__ == mod.__name__:
+            yield name, obj
+        elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
+            for mname, meth in vars(obj).items():
+                f = getattr(meth, "__func__", meth)
+                if inspect.isfunction(f):
+                    yield f"{name}.{mname}", f
+
+
+def test_follow_unknown_name_fails_at_import():
+    with pytest.raises(KeyError):
+        th.follow({}, BG="NO_SUCH_COLOR")
+
+
 def test_contrast_ratio_matches_wcag():
     assert th.contrast("#ffffff", "#000000") == pytest.approx(21.0)
     assert th.contrast("#777777", "#777777") == pytest.approx(1.0)
     assert th.contrast("#000000", "#ffffff") == th.contrast("#ffffff", "#000000")
 
 
-def test_every_color_is_six_digit_lowercase_hex():
+def test_every_color_is_six_digit_lowercase_hex(mode):
     colors = _colors()
     assert colors, "theme 里一个颜色都没有"
     bad = {k: v for k, v in colors.items() if not re.fullmatch(r"#[0-9a-f]{6}", v)}
     assert not bad
 
 
-def test_no_two_names_for_almost_the_same_color():
+def test_no_two_names_for_almost_the_same_color(mode):
     """每个通道都差不到 7 的两个值肉眼分不出, 算同一个颜色起了两个名; 要同色就直接引用同一个名字."""
     items = sorted(_colors().items())
     dup = []
@@ -63,7 +191,7 @@ def test_no_two_names_for_almost_the_same_color():
     assert not dup
 
 
-def test_health_colors_cover_every_state():
+def test_health_colors_cover_every_state(mode):
     for table in (th.STATE, th.LAMP, th.BOOT_STATE):
         assert set(table) >= {"OK", "WARN", "FAIL"}
     assert None in th.LAMP
@@ -86,7 +214,7 @@ def test_health_colors_cover_every_state():
     ("LAMP_FG", "DASH_BG"), ("DASH_DIM", "DASH_BG"),
     ("LAMP_OK", "DASH_BG"), ("LAMP_WARN", "DASH_BG"), ("LAMP_FAIL", "DASH_BG"),
 ])
-def test_text_pairs_readable(fg, bg):
+def test_text_pairs_readable(fg, bg, mode):
     """正文配色 >= 4.5:1 (WCAG AA). 推车常在亮堂的教室里用, 只会往高里调.
     亮着的灯 (绿 / 黄 / 红 / 紫) 上一律写深字; 副屏的红黄绿直接当字色用."""
     assert th.contrast(getattr(th, fg), getattr(th, bg)) >= 4.5
@@ -141,7 +269,7 @@ def test_pixel_px_snaps_to_16():
     assert [th.pixel_px(x) for x in (1, 16, 23, 24, 26, 38, 56, 72, 150)] == [16, 16, 16, 32, 32, 32, 64, 64, 144]
 
 
-def test_tk_options_only_use_theme_values():
+def test_tk_options_only_use_theme_values(mode):
     """option 数据库 (messagebox / OptionMenu / 滚动条 / 勾选框 ...): 颜色都是 theme 里的值, 斜边 2 像素."""
     opts = dict(th.tk_options())
     colors = set(_colors().values())
@@ -174,6 +302,29 @@ def test_setup_applies_fonts_and_options(family):
         assert th.setup(root, families=["Unifont"]) == "Unifont"           # 再调一次: 原地改, 不重复建
         assert tkfont.Font(root, name=th.FONT, exists=True).cget("size") == -16
     finally:
+        root.destroy()
+
+
+def test_setup_again_after_use_resets_tk_defaults(family):
+    """切配色 (#30): use() 后再 setup(), 之后新建的默认控件 (勾选框 / messagebox 的底) 吃新配色; 切回来也一样."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("没有显示")
+    try:
+        root.withdraw()
+        th.setup(root, families=[])
+        th.use("light")
+        th.setup(root, families=[])
+        cb = tk.Checkbutton(root)
+        assert (cb.cget("background"), cb.cget("foreground")) == (th.LIGHT["PANEL"], th.LIGHT["FG"])
+        assert tk.Entry(root).cget("background") == th.LIGHT["BG"]
+        th.use("dark")
+        th.setup(root, families=[])
+        assert tk.Checkbutton(root).cget("background") == th.DARK["PANEL"]
+    finally:
+        th.use("dark")
         root.destroy()
 
 

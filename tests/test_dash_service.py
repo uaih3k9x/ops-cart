@@ -235,3 +235,33 @@ def test_loop_shows_boot_screen_until_kiosk_alive_and_again_when_it_dies(tmp_pat
     runs = [f for i, f in enumerate(flags) if i == 0 or f != flags[i - 1]]
     assert runs == [True, False, True]                     # 自检 → 工作页 → 挂了回自检
     assert views[-1]["lines"][-1]["status"] == "未运行"
+
+
+def test_loop_switches_theme_on_the_next_frame(tmp_path, monkeypatch):
+    """#32: 快照里的模式变了, 下一帧就按新配色画 (版面 key 带上 theme, 变了一定重推); 整帧一次画完, 不经过白底."""
+    import theme as th
+    modes = ["dark", "light", "light", "dark"]
+    seen, n = [], {"round": 0}
+
+    class Stop(Exception):
+        pass
+
+    def fake_sleep(_s):
+        n["round"] += 1
+        if n["round"] >= len(modes):
+            raise Stop()
+
+    t = {"v": time.time()}
+    monkeypatch.setattr(ds.time, "sleep", fake_sleep)
+    monkeypatch.setattr(ds.time, "time", lambda: t.__setitem__("v", t["v"] + 1) or t["v"])
+    try:
+        ds.run(state_path=str(tmp_path / "s.json"), out=io.StringIO(), preview=str(tmp_path / "p.jpg"),
+               ctx=_ctx(theme=lambda: {"mode": modes[n["round"]]}, now=lambda: t["v"]),
+               render=lambda v: seen.append((v["theme"], th.MODE, th.DASH_BG)) or b"x")
+    except Stop:
+        pass
+    finally:
+        th.use("dark")
+    assert [m for m, _mode, _bg in seen] == ["dark", "light", "dark"]     # 没变的那轮不重推
+    assert all(m == mode for m, mode, _bg in seen)                 # 画的时候 theme 已经切好
+    assert seen[1][2] == th.LIGHT["DASH_BG"] and seen[2][2] == th.DARK["DASH_BG"]

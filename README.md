@@ -50,7 +50,7 @@
 |---|---|
 | [`pxeserver.py`](pxeserver.py) | PXE 服务端:DHCP 租约表、TFTP(块号回绕、流式读)、装机口守卫 `PxeGuard`(状态写 `/run/ops-cart/pxe-guard.json`)、grub 菜单模板(全仓库只此一处);Linux / Windows 通用 |
 | [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);ks 和装机菜单只给报出解锁 MAC 的请求(防误装,MAC 是客户端自报的,不是访问控制),`.bak` 一律 404;LAN1 没插线就等地址出现,不退出 |
-| [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter) |
+| [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter);深浅按快照里的 `theme`(#32):开机那一刻定主界面和自检页用哪套,之后模式变了等锁屏且没人碰时整个重建,开着面板 / 对话框 / 透传时不换;「画面设置」里「界面:自动 / 深 / 浅」写 `/etc/ops-cart/theme.json` 的档位并记 events.log |
 | [`kiosk_ui_core.py`](kiosk_ui_core.py) | GUI 的界面逻辑:`UiBridge`(后台结果回主线程)、左侧面板状态机、右侧菜单定义、装机定时器判定、CH9329 发送线程与鼠标位移拆分 |
 | [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、状态采集、nmcli 命令、装机模式与装机网段(读 `pxe.env`)、PIN 闸门;`python3 kiosk_core.py --write-rescue` 给部署脚本写救援菜单 |
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
@@ -85,10 +85,10 @@
 | [`srv_data_core.py`](srv_data_core.py) · [`samba_core.py`](samba_core.py) | 数据盘和装机库(#11):数据盘按 UUID 挂 `/srv/data`(XFS、nofail,没装盘照常开机)、ISO 只读挂载单元(单元名按 systemd-escape 转义)、目录布局;Samba 配置生成(只绑 LAN1、hosts allow 装机网段、装机共享账号登录、克隆共享照 `clone.json`)、firewalld 规则。部署 `scripts/setup-srv-data.sh` / `scripts/setup-samba.sh`,见 [`docs/DATA_DISK.md`](docs/DATA_DISK.md) |
 | [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
 | [`sun_core.py`](sun_core.py) | 按日出日落判断深色 / 浅色(#31,NOAA 算法、不联网):档位 auto / dark / light,auto 下日出日落后留缓冲(默认 20 分钟)不来回跳,没配经纬度或配置读不懂按深色;配置 `/etc/ops-cart/theme.json`(样例 [`examples/theme.example.json`](examples/theme.example.json),坐标是格林尼治天文台,推车位置在车上配);结果由 cart-dash 写进快照 `theme` |
-| [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;车机 kiosk 没就绪(kiosk.json 里的 pid 不在了)画开机自检,逐行出结果;`--once --preview` 导出画面不推屏 |
+| [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;车机 kiosk 没就绪(kiosk.json 里的 pid 不在了)画开机自检,逐行出结果;`--once --preview` 导出画面不推屏;每帧按快照里的 `theme.mode` 切配色,模式一变下一帧整帧换(#32) |
 | [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
 | [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;低电量两段式的判断 `shutdown_stage`(预告 / 倒计时 / 关机,车机和副屏共用) |
-| [`theme.py`](theme.py) | 车机 / 副屏的颜色、字体、斜边都在这里,业务代码只引用名字(测试扫描兜底);CDE 深色(#28),`setup(root)` 启动时挑字体(Unifont,没有退回 Noto)、设 Tk 默认控件的 option 数据库;`unreadable(w)` 查控件树里字和底够不够 4.5:1 |
+| [`theme.py`](theme.py) | 车机 / 副屏的颜色、字体、斜边都在这里,业务代码只引用名字(测试扫描兜底);两套同名配色 `DARK` / `LIGHT`(CDE 深色 #28、CDE 浅色 #30),`use(mode)` 切换(默认深色),模块级别名用 `follow()` 跟着换;`setup(root)` 启动时(和换配色后)挑字体(Unifont,没有退回 Noto)、设 Tk 默认控件的 option 数据库;`unreadable(w)` 查控件树里字和底够不够 4.5:1 |
 | [`lamps_core.py`](lamps_core.py) | 执行器条(屏幕底下)虚拟指示灯:每灯盯一个单调计数器(日志大小、网卡字节数、键鼠发送次数),变了就闪;串口操作头 `/dev/con-1~4` 收到 ^G 亮红 |
 | [`cart_dream.py`](cart_dream.py) | 推车"做梦":每晚 02:00 把 `CART-LOG.md` 新增部分交给车上的 Claude Code 整理成小结(不给工具、有花费上限、失败不前进),标题显示在锁屏底部 |
 

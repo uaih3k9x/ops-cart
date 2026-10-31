@@ -19,9 +19,10 @@ HOLD_S = 1.0            # 计数器变了以后多久内算"在动"
 BELL_HOLD_S = 0.6       # 设备回 ^G 后操作头亮红多久
 BLINK_S = 0.2
 
-HEALTH_COLOR = th.LAMP
-BODY, EMPTY_BODY = th.LAMP_BODY, th.LAMP_EMPTY
-FG, EMPTY_FG, LIT_FG = th.LAMP_FG, th.LAMP_EMPTY_FG, th.LAMP_LIT_FG
+# 跟着配色走 (#30): th.use() 切深浅时这几个名字一起换
+HEALTH_COLOR, BODY, EMPTY_BODY, FG, EMPTY_FG, LIT_FG = th.follow(
+    globals(), HEALTH_COLOR=lambda: th.LAMP, BODY="LAMP_BODY", EMPTY_BODY="LAMP_EMPTY",
+    FG="LAMP_FG", EMPTY_FG="LAMP_EMPTY_FG", LIT_FG="LAMP_LIT_FG")
 
 # 下排: (显示名, selftest.json 里那一行的 label, 计数器名)
 LOWER = [("键鼠", "CH9329", "kvm"), ("PXE", "PXE SERVER", "pxe"),

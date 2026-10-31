@@ -18,7 +18,7 @@ from kiosk_ui_core import UiBridge
 import theme as th
 
 FONT, FONT_MONO = th.FONT, th.FONT_MONO_BIG
-BG, FG, BOX = th.PANEL, th.FG, th.BOX
+BG, FG, BOX = th.follow(globals(), BG="PANEL", FG="FG", BOX="BOX")
 
 
 def _run(cmd, timeout=30):
@@ -67,8 +67,8 @@ class WifiPanel(BridgePanel):
 
     # ------------------------------------------------------------ UI
 
-    def _btn(self, parent, text, cmd, bg=BOX):
-        b = tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg, fg=FG,
+    def _btn(self, parent, text, cmd, bg=None):
+        b = tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg or BOX, fg=FG,
                       activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=12, pady=4)
         b.pack(side="left", padx=4)
         return b

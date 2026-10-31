@@ -25,6 +25,7 @@ import kvm_core as kvm
 import lamps_core as lc
 import mcp_pxe
 import mcp_serial
+import sun_core
 import ups_core as uc
 import serial_core as sc
 from serial_panel import SerialPanel
@@ -49,6 +50,9 @@ PANE_CLASSES = {"serial": SerialPanel, "ks": KsPanel, "wifi": WifiPanel,
 class Kiosk(tk.Tk):
     def __init__(self):
         super().__init__()
+        # 深浅 (#32): 主界面和开机自检页都按开机那一刻的模式建; 之后快照说要换, 等锁屏时整个重建
+        self._theme = th.use(kui.boot_theme(dc.read(), sun_core.read_conf(sun_core.CONF_PATH), time.time()))
+        self._theme_want = None             # 快照里最近一次的模式 (None = 快照过期 / 读不懂, 不动)
         self.ui_family = th.setup(self)     # 字体 (没 Unifont 退回 Noto) + Tk 默认控件配色, 先于一切控件 (#28)
         self.title("运维推车控制台")
         # 无 WM 环境: overrideredirect + 手动铺满, 不依赖 -fullscreen
@@ -90,7 +94,7 @@ class Kiosk(tk.Tk):
         kc.kp_enter_as_return(self)
         kui.kp_digits_as_digits(self)
         self._menu_btns = {}
-        self._net_view, self._lock_net = None, None     # 最近一次网络探测; 锁屏上的网络标
+        self._net_state, self._lock_net = None, None    # 最近一次网络探测 (state, text); 锁屏上的网络标
         self._ups, self._lock_ups, self._ups_path = None, None, None   # issue #4: UPS 状态
         self._ups_shutdown = False                     # 低电量关机只触发一次
         self._ups_stage, self._ups_since, self._ups_ticking = ("normal", None), None, False   # #4 两段式
@@ -184,6 +188,8 @@ class Kiosk(tk.Tk):
         self.video_dev = nodes[0]["dev"] if nodes else VIDEO_DEV
         self.btn_src.config(text=f"画面源:  {kc.video_friendly(self.video_dev)}")
         self._show_kvm()
+        self._show_mouse_mode()
+        self.btn_theme.config(text=kui.theme_button_text(self._theme_setting()))
 
     def _build_menu(self, btns):
         """右侧按钮按 kui.MENU 分页: 每页一个 Frame, 全部先建好, 切页只换显示哪一个."""
@@ -258,7 +264,7 @@ class Kiosk(tk.Tk):
             ups = self._ups
             if ups:
                 lines += [("", "dim"), ("电池  " + uc.label(ups)[3:], self._ups_tag(ups))]
-            return lines
+            return lines, dc.theme_mode(snap)        # 深浅也读这一份快照 (#32), 和副屏不各算各的
 
         if not self._checking and time.time() - self._check_ts > self.CHECK_EVERY:
             self._checking, self._check_ts = True, time.time()
@@ -592,18 +598,19 @@ class Kiosk(tk.Tk):
 
     def _render_net(self, state, text):
         """顶栏和锁屏的网络标用同一份探测结果, 锁着屏也照常刷新."""
-        self._net_view = kui.net_view(state, text)
+        self._net_state = (state, text)
         for label in (self.net_label, self._lock_net):
             if label is not None:
                 self._paint_net(label)
 
     def _paint_net(self, label):
-        v = self._net_view
+        v = kui.net_view(*self._net_state)          # 颜色画的时候取: 重建换了配色也对 (#32)
         label.config(image=self._net_imgs.get(v["image"], ""), text=v["text"], fg=v["fg"])
 
-    def _render(self, lines):
-        if isinstance(lines, Exception):
+    def _render(self, res):
+        if isinstance(res, Exception):
             return
+        lines, self._theme_want = res
         if self.status_text.winfo_ismapped():
             self.status_text.config(state="normal")
             self.status_text.delete("1.0", "end")
@@ -866,9 +873,12 @@ class Kiosk(tk.Tk):
     def toggle_mouse_mode(self):
         self._release_passthrough()
         self.mouse_abs = not self.mouse_abs
-        self.btn_mouse.config(text="鼠标:  绝对 (点哪是哪)" if self.mouse_abs else "鼠标:  相对 (BIOS 用)")
+        self._show_mouse_mode()
         if self.video_frame:
             self._banner_idle()
+
+    def _show_mouse_mode(self):
+        self.btn_mouse.config(text="鼠标:  绝对 (点哪是哪)" if self.mouse_abs else "鼠标:  相对 (BIOS 用)")
 
     def _warp_center(self):
         if self._center and self.video_frame:
@@ -1014,7 +1024,7 @@ class Kiosk(tk.Tk):
 
     def _boot_selftest(self):
         """全屏: Logo/标题 + 自检逐行出现; 完了进锁屏. 换皮见 /opt/pxe/branding/."""
-        b = kc.branding_read()
+        b = kc.branding_read(dark=self._theme == "dark")     # 自检页按开机那一刻的模式 (#32)
         w = tk.Toplevel(self, bg=th.BOOT_BG)
         w.overrideredirect(True)
         w.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
@@ -1129,7 +1139,7 @@ class Kiosk(tk.Tk):
         # 底部一行: 昨夜整理 (cart_dream.py) 的标题
         self._lock_dream = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.FAINT)
         self._lock_dream.place(relx=0.5, rely=0.97, anchor="s")
-        if self._net_view:
+        if self._net_state:
             self._paint_net(self._lock_net)
         box = tk.Frame(w, bg=th.BG)
         box.place(relx=0.5, rely=0.8, anchor="center")
@@ -1144,7 +1154,7 @@ class Kiosk(tk.Tk):
         self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg=th.BG, fg=th.DIM)
         self._lock_msg.pack(pady=12)
         self._lock_win = w
-        self._lock_tick()
+        self._lock_tick(w)
         w.after(100, lambda: (w.focus_force(), e.focus_set()))
         try:
             w.grab_set()
@@ -1157,9 +1167,9 @@ class Kiosk(tk.Tk):
             return
         self.lock()
 
-    def _lock_tick(self):
-        """锁屏每秒刷新时钟和公告; 解锁后自动停."""
-        if not self._lock_win:
+    def _lock_tick(self, w):
+        """锁屏每秒刷新时钟和公告; 解锁 / 这个锁屏窗口被换掉 (#32 重建) 后自动停."""
+        if w is not self._lock_win:
             return
         self._lock_clock.config(text=time.strftime("%H:%M"))
         self._lock_date.config(text=time.strftime("%Y-%m-%d  星期") + "一二三四五六日"[time.localtime().tm_wday])
@@ -1170,7 +1180,7 @@ class Kiosk(tk.Tk):
         dream = kc.dream_line()
         if dream != self._lock_dream.cget("text"):
             self._lock_dream.config(text=dream)
-        self._lock_win.after(1000, self._lock_tick)
+        w.after(1000, lambda: self._lock_tick(w))
 
     def _try_unlock(self):
         pin = self._pin_var.get()
@@ -1207,7 +1217,76 @@ class Kiosk(tk.Tk):
         if self.gate.required and kc.screensaver_due(self._last_input, time.time(), IDLE_SECONDS,
                                                      showing=self._lock_win is not None):
             self.lock()
+        self._theme_tick()
         self.after(5000, self._idle_tick)
+
+    # ------------------------------------------------------------ 深浅切换 (#32)
+
+    def _theme_tick(self):
+        """快照说要换模式时: 锁着屏、锁屏上一阵没人碰、没有不能打断的东西, 才整个重建 (判断见 kui.rebuild_due)."""
+        locked = self._lock_win is not None
+        if kui.rebuild_due(self._theme_want, self._theme, locked, time.time() - self._last_input,
+                           locked and self._ui_busy()):
+            self._rebuild_ui(self._theme_want)
+
+    def _ui_busy(self):
+        """重建会打断的: 左侧开着面板 (串口会话 / 预览 / 没存的 Kickstart、Wi-Fi 密码 ...)、透传、开机自检页、
+        装机解锁框、别的窗口 (确认框 / 申请框 / messagebox)、还没回来的菜单动作 (回调要恢复旧按钮)."""
+        if self.pane.current or self.passthrough or self._boot_win is not None:
+            return True
+        if self._arm_win is not None and self._arm_win.winfo_exists():
+            return True
+        return bool(self._other_windows()) or self.ui.busy_any(ignore=("board",))
+
+    def _other_windows(self):
+        """锁屏以外的顶层窗口 (Tk 路径). 问 Tcl 而不是 winfo_children: messagebox 不是 Python 建的."""
+        lock = str(self._lock_win) if self._lock_win is not None else None
+        tk_ = self.tk
+        return [w for w in tk_.splitlist(tk_.call("winfo", "children", "."))
+                if w != lock and str(tk_.call("winfo", "toplevel", w)) == w]
+
+    def _rebuild_ui(self, mode):
+        """换配色: 切 theme -> 重设 Tk 默认控件 -> 拆掉主界面重新建 -> 补画各处状态 -> 锁屏也重建.
+        只在 _theme_tick 判断过的时候调 (锁着屏, 左侧没开面板, 没别的窗口), 所以主界面里没有要保留的东西."""
+        old, video_dev = self._theme, self.video_dev
+        self._theme = th.use(mode)
+        th.setup(self)
+        self.configure(bg=th.BG)
+        for w in self.winfo_children():
+            if w.winfo_toplevel() is self:      # 锁屏是 Toplevel, 下面单独换
+                w.destroy()
+        self._menu_btns, self._ups_note, self.panels = {}, None, {}
+        self._build()
+        self.video_dev = video_dev              # _build 按 sysfs 第一路设的, 换回自检 / 人挑过的那路
+        self.btn_src.config(text=f"画面源:  {kc.video_friendly(video_dev)}")
+        self._show_kvm()
+        if self._net_state:
+            self._paint_net(self.net_label)
+        self._paint_ups()
+        self._pxe_tick(reschedule=False)
+        if self._lock_win is not None:
+            self._lock_win.destroy()
+            self._lock_win, self._lock_net, self._lock_ups, self._lock_serve = None, None, None, None
+            self.lock()
+        cartlog.event("theme", f"车机界面 {old} -> {self._theme} (锁屏时重建)")
+
+    def _theme_setting(self):
+        conf = sun_core.read_conf(sun_core.CONF_PATH)
+        return conf.get("mode", "auto") if isinstance(conf, dict) else None
+
+    def cycle_theme(self):
+        """车机设置里"界面: 自动 / 深 / 浅"点一下换下一档, 写 theme.json (经纬度原样留着), 记日志.
+        cart-dash 几秒内重读配置并进快照, 车机在下一次锁屏时重建 (有人在用不换)."""
+        old = self._theme_setting()
+        new = sun_core.next_setting(old)
+        try:
+            sun_core.write_setting(new, sun_core.CONF_PATH)
+        except (ValueError, OSError) as ex:
+            self.banner.config(text=f"界面档位改不了: {ex}")
+            return
+        cartlog.event("theme", f"界面档位 {old} -> {new} (车机设置)")
+        self.btn_theme.config(text=kui.theme_button_text(new))
+        self.banner.config(text=f"{kui.theme_button_text(new)}, 下次锁屏时换")
 
     # ------------------------------------------------------------ 装机模式
 

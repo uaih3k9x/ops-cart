@@ -7,6 +7,7 @@
   - 屏幕拔掉不退出: 继续写快照, 每 3 s 试着重连
   - LAN1 / LAN2 的 LLDP 监听线程归这里管 (#14): 起不来/没 root/网口没了都只是"不可用", 不退出
   - 车机 kiosk 没就绪 (没写 kiosk.json / 写它的进程没了) 画开机自检, 不画旧的锁屏/工作页 (#26)
+  - 深浅 (#32): 每帧按快照里的 theme.mode 切配色, 模式一变下一帧整帧换
 
 用法:
   python3 dash_service.py                                  # 常驻
@@ -22,6 +23,7 @@ import time
 import dash_core as dc
 import lamps_core
 import lldp_core
+import theme as th
 
 SAMPLE_S = 0.2          # 快照节奏
 RECONNECT_S = 3.0       # 拔线后重连间隔
@@ -88,8 +90,10 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, r
         snap = dc.collect(dict(ctx, seq=seq))
         dc.write(state_path, snap)
         now = time.time()
+        # 深浅 (#32): 先切配色再排版 (灯色在版面模型里), 模式记进版面: 变了 key 就变, 下一帧整帧换
+        mode = th.use((snap.get("theme") or {}).get("mode"))
         view = dc.layout_view(snap, active=moving.update(snap.get("lamps") or {}, now))
-        view = boot.view(snap, now) or view
+        view = dict(boot.view(snap, now) or view, theme=mode)
         key = _view_key(view)
 
         want = (key != last_key or view.get("clock") != last_clock or view.get("stale"))

@@ -298,3 +298,21 @@ def test_dash_font_falls_back_without_unifont(tmp_path):
     assert getattr(f, "path", None) != str(tmp_path / "nope.otf")
     if getattr(f, "path", None):              # 有系统 CJK 字体时按原字号, 不缩放
         assert f.size == 26
+
+
+# ---- #32: 浅色下副屏整帧是浅底, 灯色 / 字色都换成浅色那套
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_render_light_palette(locked):
+    import theme as th
+    th.use("light")
+    try:
+        v = dc.layout_view(_full_snap(), locked=locked, active={"con-1"})
+        img = r.render(v)
+        bg = tuple(int(th.DASH_BG[i:i + 2], 16) for i in (1, 3, 5))
+        assert img.getpixel((5, 5)) == bg and img.getpixel((r.PANEL_W - 5, r.PANEL_H // 2)) == bg
+        assert th.LIGHT["LAMP_OK"] != th.DARK["LAMP_OK"] and r.ACCENT == th.LIGHT["LAMP_OK"]
+    finally:
+        th.use("dark")
+    assert r.render(dc.layout_view(_full_snap(), locked=locked)).getpixel((5, 5)) == \
+        tuple(int(th.DARK["DASH_BG"][i:i + 2], 16) for i in (1, 3, 5))
