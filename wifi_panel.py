@@ -67,8 +67,8 @@ class WifiPanel(BridgePanel):
 
     # ------------------------------------------------------------ UI
 
-    def _btn(self, parent, text, cmd, bg=BOX):
-        b = tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg, fg=FG,
+    def _btn(self, parent, text, cmd, bg=None):
+        b = tk.Button(parent, text=text, font=FONT, command=cmd, bg=bg or BOX, fg=FG,
                       activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=12, pady=4)
         b.pack(side="left", padx=4)
         return b

@@ -129,7 +129,7 @@ def _deep_strs(v):
 
 
 def test_no_module_keeps_dark_colors_after_switch():
-    """切到浅色后, 业务模块的模块级常量 (BG = th.PANEL / 字典 / 元组) 里不许还留着只有深色才有的值:
+    """切到浅色后, 业务模块的模块级常量 (BG = th.PANEL / 字典 / 元组) 和函数默认参数里不许还留着只有深色才有的值:
     那样车机重建后那一块还是深的. 要别名就用 th.follow()."""
     import importlib
     mods = [f[:-3] for f in _tracked_py() if "/" not in f and "import theme as th" in open(os.path.join(ROOT, f),
@@ -141,9 +141,25 @@ def test_no_module_keeps_dark_colors_after_switch():
     try:
         stale = [(m.__name__, k) for m in mods for k, v in vars(m).items()
                  if k.isupper() and set(_deep_strs(v)) & dark_only]
+        stale += [(m.__name__, name) for m in mods for name, f in _functions(m)
+                  if set(_deep_strs(list(f.__defaults__ or ()) + list((f.__kwdefaults__ or {}).values())))
+                  & dark_only]
     finally:
         th.use("dark")
-    assert not stale
+    assert not stale, "默认参数 bg=th.BOX 是定义时取的值: 改成 bg=None, 用的时候再取"
+
+
+def _functions(mod):
+    """模块里定义的函数和类方法 (默认参数在定义时就取值, 切配色不会变)."""
+    import inspect
+    for name, obj in vars(mod).items():
+        if inspect.isfunction(obj) and obj.__module__ == mod.__name__:
+            yield name, obj
+        elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
+            for mname, meth in vars(obj).items():
+                f = getattr(meth, "__func__", meth)
+                if inspect.isfunction(f):
+                    yield f"{name}.{mname}", f
 
 
 def test_follow_unknown_name_fails_at_import():
