@@ -17,7 +17,12 @@
     sudo python3 /opt/pxe/cart_mcp.py reject <编号>         拒绝 (哪都能拒)
     sudo python3 /opt/pxe/cart_mcp.py estop [槽位]          急停, 不给槽位 = 全部 (哪都能停)
     sudo python3 /opt/pxe/cart_mcp.py resume <槽位|all>     解除急停 (只认推车本机终端)
+    sudo python3 /opt/pxe/cart_mcp.py requests             执行网页投来的急停 / 拒绝 (cart-serial-req 单元调)
 "本机" = 不是经 sshd / tailscaled 进来的 (查祖先进程), 且 stdin 是终端. 车机上"退出到终端"就是本机.
+
+确认 UI (#23): 车机 / 网页 / 副屏都用 peek() 只读看状态 (不加锁不写盘); 车机 (root, 本机) 点确认走
+send_confirmed(), 和命令行同一条路. 网页 (ops-web) 写不了状态文件, 只能经 write_request() 往
+/run/ops-cart/serial-req/ 投"停"方向的请求 (急停 / 拒绝), 由 root 的 cart-serial-req 单元 process_requests() 执行.
 """
 
 import argparse
@@ -25,6 +30,9 @@ import contextlib
 import fcntl
 import json
 import os
+import secrets
+import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -32,6 +40,7 @@ import time
 
 import atomicfile
 import cartlog
+import confirm_core as cc
 import lamps_core
 import mcp_core as mc
 import serial_core
@@ -39,6 +48,9 @@ import serial_write_core as sw
 
 STATE_PATH = "/run/ops-cart/serial-write.json"
 ESTOP_FLAG = "serial-estop.json"   # 和状态文件同目录; conbroker 默认读 /run/ops-cart/serial-estop.json
+REQ_DIR = "/run/ops-cart/serial-req"   # 网页投请求的目录 (ops-web 0700, tmpfiles 建), cart-serial-req.path 盯着
+REQ_POLL_S = 0.2                # 半截请求文件隔多久再看
+REQ_ROUNDS = 10                 # 最多看几轮 (= 等半截文件写完最多 2 秒)
 LOG_DIR = cartlog.LOG_DIR
 OUTPUT_MAX = 64 * 1024          # 回给 Agent 的设备输出上限
 TAIL_LINES = 8                  # 发前看几行认厂商 / 提示符 / 名字
@@ -114,6 +126,20 @@ class Store:
 
     def view(self, slot=None):
         return self.run(lambda b, now: b.view(now, slot))
+
+
+def peek(path=STATE_PATH, clock=time.time):
+    """只读看一眼 (车机 / 网页 / 副屏): 不加锁不写盘, 过期的在内存里算掉. 读不了 / 读不懂 = 全部急停.
+    写状态的一方都是原子改名, 不加锁也读不到半个文件."""
+    now = clock()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = None
+    except (OSError, UnicodeDecodeError):
+        return cc.stopped_view("读不到状态文件")
+    return sw.Book.from_text(text, now).view(now)
 
 
 def writers(store):
@@ -337,6 +363,114 @@ def real_tools(tail, store=None):
     return build_tools(store or Store(), slots=real_slots, tail=tail, send=conbroker_send)
 
 
+# ------------------------------------------------------------ 人确认后发送 / 网页请求
+
+def send_confirmed(store, iid, by, slots, send):
+    """人确认 #iid -> 标在途 -> 经 conbroker 发 -> finish. -> (条目, status, 输出, 说明).
+    Book 不让 (急停 / 租约没了 / 在途 / 不在挂起) 抛 sw.Refused, 一个字节都不发. 会阻塞到发完, 车机放后台线程调."""
+    it = store.run(lambda b, now: b.confirm(iid, by, now))
+    try:
+        dev = slots()[it["slot"] - 1]["dev"]
+        if it["kind"] == "key":
+            text, raw = sw.KEYS[it["cmd"]]["text"], sw.KEYS[it["cmd"]]["raw"]
+        else:
+            text, raw = it["cmd"], False
+    except Exception as e:              # noqa: BLE001  在途标记一定要收掉
+        dev, err = None, f"{type(e).__name__}: {e}"
+    t0 = time.monotonic()
+    if dev is None:
+        status, output, note = "error", "", err
+    else:
+        try:
+            status, output, note = send(dev, text, it["timeout"], raw)
+        except Exception as e:          # noqa: BLE001
+            status, output, note = "error", "", f"{type(e).__name__}: {e}"
+    ms_ = int((time.monotonic() - t0) * 1000)
+    store.run(lambda b, now: b.finish(it["id"], {"status": status, "echo": output, "ms": ms_, "note": note}, now))
+    return it, status, output, note
+
+
+def write_request(req, req_dir=None):
+    """网页 (ops-web) 投一个请求 (confirm_core.make_request 的结果): 新文件 O_EXCL、不跟链接、一次 write 写完."""
+    path = os.path.join(req_dir or REQ_DIR, f"{time.time_ns()}-{secrets.token_hex(4)}.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, json.dumps(req, ensure_ascii=False).encode())
+    finally:
+        os.close(fd)
+    return path
+
+
+def _remove(path):
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def _take_request(store, path, now, force):
+    """处理一个请求文件 -> 一句结果; 还没写完 (空 / 半截 JSON, 刚建的) 返回 None 等下一轮.
+    先删再执行: 执行出错也不会被单元反复拉起来重做."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:                # 链接 (ELOOP) / 已经没了
+        _remove(path)
+        return f"不认: 打不开 ({e.strerror})"
+    try:
+        st = os.fstat(fd)
+        raw = os.read(fd, cc.REQ_MAX + 1) if stat.S_ISREG(st.st_mode) else None
+    finally:
+        os.close(fd)
+    if raw is None:
+        _remove(path)
+        return "不认: 不是普通文件"
+    try:
+        req = cc.parse_request(raw.decode("utf-8"), now)
+    except ValueError as e:
+        try:
+            json.loads(raw)
+            partial = False
+        except ValueError:
+            partial = len(raw) <= cc.REQ_MAX
+        if partial and not force and now - st.st_mtime < REQ_POLL_S * REQ_ROUNDS:
+            return None
+        _remove(path)
+        return f"不认: {e}"
+    _remove(path)
+    try:
+        return store.run(lambda b, t: cc.apply_request(b, req, t))
+    except sw.Refused as e:
+        return f"不行: {e}"
+
+
+def process_requests(store, req_dir=None, clock=None, sleep=time.sleep):
+    """root 的 cart-serial-req 单元调: 目录里的请求逐个执行并删掉, 直到目录空. -> [(文件名, 结果)].
+    只认急停 / 拒绝、一分钟内的 (confirm_core.parse_request); 链接不跟, 目录和读不懂的一律删掉,
+    目录不空单元就会被反复拉起."""
+    req_dir, clock = req_dir or REQ_DIR, clock or store.clock
+    out = []
+    for rnd in range(REQ_ROUNDS + 1):
+        try:
+            names = sorted(os.listdir(req_dir))
+        except OSError:
+            return out
+        if not names:
+            break
+        wait = False
+        for name in names:
+            res = _take_request(store, os.path.join(req_dir, name), clock(), force=rnd == REQ_ROUNDS)
+            if res is None:
+                wait = True
+            else:
+                out.append((name, res))
+        if wait:
+            sleep(REQ_POLL_S)
+    return out
+
+
 # ------------------------------------------------------------ 本机判定
 
 REMOTE_COMMS = {"sshd", "sshd-session", "sshd-auth", "tailscaled", "dropbear", "mosh-server", "cockpit-ws",
@@ -377,7 +511,7 @@ def local_human(env, pid, stat=read_stat, tty=False):
 
 # ------------------------------------------------------------ 车机命令行
 
-CLI_CMDS = ("pending", "confirm", "reject", "estop", "resume")
+CLI_CMDS = ("pending", "confirm", "reject", "estop", "resume", "requests")
 
 
 def _print_view(v, out):
@@ -416,6 +550,7 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
     p.add_argument("--why", default=None)
     sub.add_parser("estop", help="急停; 不给槽位 = 全部").add_argument("slot", nargs="?", type=int, choices=sw.SLOTS)
     sub.add_parser("resume", help="解除急停 (只认推车本机终端)").add_argument("target", choices=["1", "2", "3", "4", "all"])
+    sub.add_parser("requests", help="执行网页投来的急停 / 拒绝 (cart-serial-req 单元调)")
     try:
         a = ap.parse_args(argv)
     except SystemExit as e:
@@ -436,6 +571,10 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         dropped = store.run(lambda b, now: b.estop(a.slot, by.replace("@local", ""), "human", now))
         print(f"已急停 {'全部槽位' if a.slot is None else f'槽位 {a.slot}'}; 丢弃挂起 {[d['id'] for d in dropped]}; "
               "没往设备发任何东西", file=out)
+        return 0
+    if a.cmd == "requests":
+        for name, res in process_requests(store):
+            print(f"{name}: {res}", file=out)
         return 0
     if a.cmd == "reject":
         if run(lambda b, now: b.reject(a.id, by.replace("@local", ""), now, why=a.why) or True) is None:
@@ -462,21 +601,11 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
     if stdin.readline().strip() != "yes":
         print("没输 yes, 不发 (还挂着)", file=out)
         return 1
-    it = run(lambda b, now: b.confirm(a.id, by, now))
-    if it is None:
-        return 1
-    dev = slots()[it["slot"] - 1]["dev"]
-    if it["kind"] == "key":
-        text, raw = sw.KEYS[it["cmd"]]["text"], sw.KEYS[it["cmd"]]["raw"]
-    else:
-        text, raw = it["cmd"], False
-    t0 = time.monotonic()
     try:
-        status, output, note = send(dev, text, it["timeout"], raw)
-    except Exception as e:              # noqa: BLE001  在途标记一定要收掉
-        status, output, note = "error", "", f"{type(e).__name__}: {e}"
-    ms_ = int((time.monotonic() - t0) * 1000)
-    store.run(lambda b, now: b.finish(it["id"], {"status": status, "echo": output, "ms": ms_, "note": note}, now))
+        it, status, output, note = send_confirmed(store, a.id, by, slots, send)
+    except sw.Refused as e:
+        print(f"不行: {e}", file=out)
+        return 1
     print(f"#{it['id']} -> {status}{' (' + note + ')' if note else ''}\n{sw.echo_summary(output)}", file=out)
     return 0 if status == "sent" else 1
 
