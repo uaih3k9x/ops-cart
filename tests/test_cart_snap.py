@@ -109,3 +109,36 @@ def test_ffmpeg_timeout_and_busy_are_explained(monkeypatch, capsys):
     monkeypatch.setattr(cs.subprocess, "run", lambda cmd, **kw: R())
     assert cs.main(["-o", "/nonexistent/x.png"]) == 1
     assert "占用" in capsys.readouterr().err
+
+
+# ============================================================ grab(): 给 cart_mcp 用, 不往 stdout 打字
+
+def test_grab_ok_returns_path_and_prints_nothing(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cs, "running_mpv_device", lambda: None)
+    monkeypatch.setattr(cs, "RUN_DIR", str(tmp_path))
+
+    def ok(dev, out):
+        open(out, "wb").write(b"PNG")
+        return True, ""
+    monkeypatch.setattr(cs, "via_ffmpeg", ok)
+    path, why, dev = cs.grab("/dev/video1")
+    assert path.startswith(str(tmp_path)) and open(path, "rb").read() == b"PNG"
+    assert why == "" and dev == "/dev/video1"
+    assert capsys.readouterr().out == ""            # stdio 模式下 stdout 是协议通道
+
+
+def test_grab_failure_removes_own_temp_file(monkeypatch, tmp_path):
+    import os
+    monkeypatch.setattr(cs, "running_mpv_device", lambda: None)
+    monkeypatch.setattr(cs, "RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(cs, "via_ffmpeg", lambda dev, out: (False, "没信号"))
+    path, why, dev = cs.grab()
+    assert path is None and "没信号" in why and dev == cs.DEFAULT_DEV
+    assert os.listdir(tmp_path) == []
+
+
+def test_grab_busy_without_ipc(monkeypatch):
+    monkeypatch.setattr(cs, "running_mpv_device", lambda: "/dev/video0")
+    monkeypatch.setattr(cs.os.path, "exists", lambda p: False)
+    path, why, dev = cs.grab()
+    assert path is None and "IPC" in why

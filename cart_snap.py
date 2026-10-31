@@ -123,29 +123,40 @@ def via_ffmpeg(dev, out):
     return False, err.strip().splitlines()[-1] if err.strip() else f"ffmpeg 退出码 {r.returncode}"
 
 
+BUSY_TEXT = "被预览占着, 但这个 mpv 没开 IPC (kiosk 还是旧版?)"
+
+
+def grab(want=None, out=None):
+    """抓一帧 -> (图片路径 或 None, 失败原因, 哪块卡). 不往 stdout 打字 (cart_mcp 的 stdio 是协议通道).
+    out=None 时在 /run/ops-cart 下新建私有文件, 失败时删掉."""
+    how, dev = route(want, running_mpv_device(), os.path.exists(MPV_SOCK))
+    if how == "busy":
+        return None, f"{dev} {BUSY_TEXT}", dev
+    path = out or default_out(RUN_DIR)
+    if how == "mpv":
+        ok, why = via_mpv(path), "mpv 没回成功 (预览刚关? 再试一次)"
+    else:
+        ok, why = via_ffmpeg(dev, path)
+    if ok:
+        return path, "", dev
+    if not out:                                 # 自己建的空文件别留着
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return None, f"截图失败 ({how} {dev}): {why}", dev
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("-d", "--dev", help="采集设备, 默认: 正在预览的那块, 没预览就 /dev/video0")
     ap.add_argument("-o", "--out", help="输出文件, 默认在 /run/ops-cart 下新建私有文件")
     a = ap.parse_args(argv)
-    how, dev = route(a.dev, running_mpv_device(), os.path.exists(MPV_SOCK))
-    if how == "busy":
-        print(f"{dev} 被预览占着, 但这个 mpv 没开 IPC (kiosk 还是旧版?)", file=sys.stderr)
-        return 2
-    out = a.out or default_out()
-    if how == "mpv":
-        ok, why = via_mpv(out), "mpv 没回成功 (预览刚关? 再试一次)"
-    else:
-        ok, why = via_ffmpeg(dev, out)
-    if not ok:
-        print(f"截图失败 ({how} {dev}): {why}", file=sys.stderr)
-        if not a.out:                           # 自己建的空文件别留着
-            try:
-                os.unlink(out)
-            except OSError:
-                pass
-        return 1
-    print(out)
+    path, why, _dev = grab(a.dev, a.out)
+    if path is None:
+        print(why, file=sys.stderr)
+        return 2 if BUSY_TEXT in why else 1
+    print(path)
     return 0
 
 
