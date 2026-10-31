@@ -389,7 +389,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "只看这个槽位, 不给 = 全部"}},
              pending_list, read_only=True),
         Tool("estop", "急停: 撤销写租约、丢弃挂起的命令, 之后谁都不能写这个槽位, 直到人在推车上解除. "
-             "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位. 觉得自己要出错时就用它.",
+             "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位, 同时作废在等确认的 PXE 解锁申请. "
+             "觉得自己要出错时就用它.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "槽位; 不给 = 全部"}},
              estop),
     ]

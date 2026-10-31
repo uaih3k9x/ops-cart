@@ -9,7 +9,8 @@ Claude Code 接法 (地址、令牌换成自己的):
     claude mcp add --transport http cart http://<推车 tailnet 地址>:8765/mcp --header "Authorization: Bearer <令牌>"
 
 工具: list_threads (槽位 1-4) / read_output (走 conbroker tail, 不直开串口) / screenshot (cart_snap) /
-      cart_status (/run/ops-cart/state.json) / pxe_status (只读, 解锁见 #24).
+      cart_status (/run/ops-cart/state.json) / pxe_status (只读).
+PXE 解锁申请 (#24, mcp_pxe): pxe_request 只挂起, 人在车机上照抄确认码才解锁; pxe_retire 提前上锁.
 写串口 (#21, mcp_serial): 写租约 + 闸门 (只读命令直发, 其余挂起等人确认) + 急停. 车机上确认 / 解除:
     sudo python3 /opt/pxe/cart_mcp.py pending | confirm <编号> | reject <编号> | estop [槽位] | resume <槽位|all>
 要 root: 截图要采集卡和 mpv 的 socket, 读串口输出要 sudo -u <serial.conf 的 user> 跑 conbroker.
@@ -33,6 +34,7 @@ import kiosk_core as kc
 import lamps_core
 import mcp_core as mc
 import mcp_label
+import mcp_pxe
 import mcp_serial
 import serial_core
 
@@ -131,7 +133,7 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
         mc.Tool("cart_status", "推车状态快照 (cart-dash 写的 state.json): UPS、网络、LAN1/LAN2 的 LLDP 对端、"
                 "操作头、锁屏、自检、温度风扇; stale=true 表示采集停了.", {}, cart_status),
         mc.Tool("pxe_status", "PXE 装机口状态 (只读): 当前模式 (rescue/install/expired)、解锁的 MAC、到期时间、"
-                "剩余秒数、用途 (rocky/winpe/clone-save/clone-restore)、守卫状态. 解锁要人在推车上操作.",
+                "剩余秒数、用途 (rocky/winpe/clone-save/clone-restore)、守卫状态. 解锁用 pxe_request 申请, 人在推车上确认.",
                 {}, pxe_status),
     ]
 
@@ -189,6 +191,7 @@ def real_tools():
     return (build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap, state=dash_core.read, pxe=read_pxe,
                         writer=lambda: mcp_serial.writers(store))
             + mcp_serial.real_tools(conbroker_tail, store)      # 写串口 (#21)
+            + mcp_pxe.real_tools()                              # PXE 解锁申请 (#24): 只挂起, 人在车机上确认
             + mcp_label.real_label_tools())                     # 标签 (#20)
 
 

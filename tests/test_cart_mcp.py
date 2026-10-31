@@ -332,6 +332,12 @@ def test_real_tools_include_serial_write_tools():
     assert "resume" not in names
 
 
+def test_real_tools_include_pxe_request_but_no_unlock():
+    names = {t.name for t in cm.real_tools()}
+    assert {"pxe_request", "pxe_requests", "pxe_retire", "pxe_status"} <= names
+    assert not {n for n in names if "arm" in n or "confirm" in n}
+
+
 def test_main_dispatches_serial_cli(monkeypatch):
     import mcp_serial
     seen = []
