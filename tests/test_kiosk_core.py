@@ -43,30 +43,6 @@ def test_lan1_unit_rewrite_path_is_gone():
         assert not hasattr(kc, name)
 
 
-def test_nmcli_set_static_builds_correct_cmd():
-    cmds = kc.nmcli_set_static("Lan1-pxe", "192.0.2.5/24", "192.0.2.254", "198.51.100.53")
-    assert cmds[0][:6] == ["nmcli", "con", "mod", "Lan1-pxe", "ipv4.method", "manual"]
-    assert "192.0.2.5/24" in cmds[0]
-    assert cmds[0][-1] == "198.51.100.53"     # dns
-    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == "192.0.2.254"
-    assert cmds[1] == ["nmcli", "con", "up", "Lan1-pxe"]
-
-
-def test_nmcli_set_static_empty_gateway_dns():
-    cmds = kc.nmcli_set_static("x", "10.0.0.1/24")
-    assert cmds[0][cmds[0].index("ipv4.gateway") + 1] == ""
-    # DNS 留空 = 清掉; 不带 ipv4.dns 的话 nmcli con mod 会留着旧 DNS
-    assert cmds[0][cmds[0].index("ipv4.dns") + 1] == ""
-
-
-def test_nmcli_set_dhcp_clears_static():
-    cmds = kc.nmcli_set_dhcp("enp3s0")
-    m = cmds[0]
-    assert m[m.index("ipv4.method") + 1] == "auto"
-    assert m[m.index("ipv4.addresses") + 1] == ""
-    assert m[m.index("ipv4.gateway") + 1] == ""
-
-
 SHOW = """Id=pxe-server.service
 ActiveState=active
 UnitFileState=enabled

@@ -2,7 +2,7 @@
 """kiosk_core: 推车 Kiosk 的可测核心层. UI(curses)之外的逻辑都在这.
 
 - 状态采集: systemd 服务 / 网卡 / tailscale / CH9329
-- 命令生成: nmcli 改地址 (纯函数, 测试不打真机)
+- 改网口地址不在这里: 归网口模式 netmode_core (#12)
 - 装机网段: 部署配置 /etc/ops-cart/pxe.env (pxe-* 单元和 grub 菜单共用同一份)
 """
 
@@ -733,22 +733,7 @@ def notice_font_px(text, width, height, lo=24, hi=220):
     return max(lo, min(hi, px))
 
 
-# ---------------------------------------------------------------- 命令生成 (纯函数)
-
-def nmcli_set_static(con, addr, gateway="", dns=""):
-    cmds = [["nmcli", "con", "mod", con,
-             "ipv4.method", "manual", "ipv4.addresses", addr]]
-    # 网关 / DNS 留空也要显式给 "", 否则 con mod 不动它, 旧值残留 (和确认框里写的"无"对不上)
-    cmds[0] += ["ipv4.gateway", gateway or "", "ipv4.dns", dns or ""]
-    cmds.append(["nmcli", "con", "up", con])
-    return cmds
-
-
-def nmcli_set_dhcp(con):
-    return [["nmcli", "con", "mod", con, "ipv4.method", "auto",
-             "ipv4.addresses", "", "ipv4.gateway", "", "ipv4.dns", ""],
-            ["nmcli", "con", "up", con]]
-
+# ---------------------------------------------------------------- 电源
 
 def power(off=True):
     run(["systemctl", "poweroff" if off else "reboot"], timeout=3)

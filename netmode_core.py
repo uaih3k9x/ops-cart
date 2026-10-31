@@ -129,7 +129,8 @@ def form_hint(iface, mode, form):
     if mode == LEGACY:
         return "交还旧配置: 撤掉推车托管的, 把选中的旧连接 up 起来; 旧连接推车不会删"
     if not (form.get("addr") or "").strip():
-        return npc.static_hint("")
+        return ("写成 地址/前缀, 比如 192.0.2.5/24, 掩码按你填的来; "
+                "对端地址可选: 填了只防撞址, 也可点「按对端预填」(对端也要带前缀)")
     egress = form.get("egress") or "never"
     try:
         p = static_params(iface, form.get("addr"), form.get("gateway"), form.get("dns"), egress,
