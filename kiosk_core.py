@@ -320,6 +320,7 @@ def check_ch9329(ctx):
 
 
 PXE_PROXY_TEXT = "代理模式：链路上已有别的 DHCP，推车不发地址，只回 PXE 引导"
+PXE_EXPIRED_TEXT = "自己发地址已到时停发，新机器拿不到地址；点车机顶上的条续期"
 
 
 def pxe_proxy_detail(guard):
@@ -340,6 +341,8 @@ def check_pxe(ctx, iface="eno1"):
         guard = ctx.get("pxe_guard", dict)()       # pxeserver 守卫状态; 装机口上有别的 DHCP 时是 proxy
         if guard.get("state") == "proxy":
             return "WARN", pxe_proxy_detail(guard)
+        if guard.get("state") == "expired":         # 限时到了: 新机器拿不到地址
+            return "WARN", PXE_EXPIRED_TEXT
         return "OK", "RUNNING"
     nic = {n["name"]: n for n in ctx["nics"]}.get(iface, {})
     return "--", "LINK UP / STANDBY" if nic.get("link") else "STANDBY"
@@ -504,6 +507,25 @@ def pxe_guard_read(path=None):
         return doc if isinstance(doc, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _pid_alive(pid):
+    return os.path.exists(f"/proc/{pid}")
+
+
+def pxe_guard_live(path=None, alive=_pid_alive):
+    """守卫状态, 但写它的 pxe-server 进程得还在 (停了服务文件还留着, 别显示旧的倒计时); 否则 {}."""
+    doc = pxe_guard_read(path)
+    pid = doc.get("pid")
+    return doc if isinstance(pid, int) and alive(pid) else {}
+
+
+PXE_RENEW = pxeserver.RENEW_PATH
+
+
+def pxe_serve_renew(path=None, now=None):
+    """请求守卫续期自己发地址 (守卫 2 秒内认, 开始/续期都写 [pxe] 事件). 写不了抛 OSError."""
+    pxeserver.request_renew(path or PXE_RENEW, now=now)
 
 
 def selftest_context():

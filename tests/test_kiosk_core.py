@@ -1534,3 +1534,26 @@ def test_arm_rocky_and_winpe_unaffected_by_clone_kwargs(tmp_path):
     """老调用方式 (不带 confirm) 照旧."""
     kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
     assert "inst.ks" in (tmp_path / "grub.cfg-01-02-00-00-00-00-01").read_text()
+
+
+# ---- #11: 自己发地址限时: 到时停发是 WARN; 续期请求; 守卫进程没了就不显示旧状态
+
+def test_selftest_pxe_expired_is_warn():
+    state, detail = kc.check_pxe(_pxe_ctx({"state": "expired", "until": 1, "window": 1800}))
+    assert state == "WARN" and "到时" in detail and "续期" in detail
+
+
+def test_pxe_serve_renew_writes_request(tmp_path):
+    p = tmp_path / "pxe-renew.json"
+    kc.pxe_serve_renew(path=str(p), now=1234.5)
+    assert json.loads(p.read_text()) == {"ts": 1234.5}
+
+
+def test_pxe_guard_live_drops_state_of_dead_server(tmp_path):
+    p = tmp_path / "pxe-guard.json"
+    p.write_text('{"state": "serving", "until": 99, "pid": 4242}')
+    assert kc.pxe_guard_live(str(p), alive=lambda pid: pid == 4242)["state"] == "serving"
+    assert kc.pxe_guard_live(str(p), alive=lambda pid: False) == {}      # pxe-server 停了, 文件还在
+    p.write_text('{"state": "serving"}')
+    assert kc.pxe_guard_live(str(p), alive=lambda pid: True) == {}       # 没 pid: 判断不了, 不显示
+    assert kc.pxe_guard_live(str(tmp_path / "nope.json")) == {}
