@@ -11,6 +11,7 @@ BUILD
 # 脱敏词表与本机验收产物
 .public-safe.local
 test-results/
+scripts/accept-manifest.json
 
 # 推车运行时文件 (在 /opt/pxe 里直接跑时会生成, 不进仓库)
 CART-LOG.md
