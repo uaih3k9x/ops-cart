@@ -53,6 +53,10 @@
   nav button.stop { background:#da3633; color:#fff; }
   .want { font-size:18px; font-weight:bold; font-family:"Noto Sans Mono CJK SC", monospace; margin:6px 0 2px; word-break:break-all; }
   .item { border-top:1px solid #2c3a52; padding:8px 0; }
+  /* PXE 日志 (#24 后续): 只读, 按 MAC 分组 */
+  .plog .item { padding:4px 0; }
+  .plog .mac { font-family:"Noto Sans Mono CJK SC", monospace; color:var(--fg); font-size:14px; }
+  .plog .t { font-family:"Noto Sans Mono CJK SC", monospace; color:var(--dim); margin-right:8px; }
 </style>
 </head>
 <body>
@@ -73,6 +77,7 @@
     <button data-p="kvm">KVM</button>
     <button data-p="serial">串口</button>
     <button data-p="agent" id="nav-agent">Agent</button>
+    <button data-p="pxe">PXE 日志</button>
     <button data-p="settings">设置</button>
   </nav>
   <button class="btn estop" id="estop-all" title="撤销所有 Agent 的写租约、丢弃挂起的命令; 不往设备发任何东西">全部急停</button>
@@ -123,6 +128,11 @@
     <div class="bar"><b id="ag-summary">Agent 没有挂起的命令</b><span class="dim" id="ag-note"></span><span id="ag-msg"></span></div>
     <div class="heads" id="ag-heads"></div>
     <div class="grid" id="ag-cards"></div>
+  </section>
+
+  <section id="p-pxe" class="page">
+    <div class="bar"><b>PXE 申请 / 解锁日志</b><span class="dim">只读, 按 MAC 分组, 新的在前; 在等的申请只在推车车机上看和确认</span><span class="dim" id="px-time"></span></div>
+    <div class="grid plog" id="px-groups"></div>
   </section>
 
   <section id="p-settings" class="page">
@@ -176,6 +186,7 @@ document.querySelectorAll("nav button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("on", x === b));
   document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.id === "p-" + b.dataset.p));
   if (b.dataset.p === "serial") setTimeout(() => fit(), 0);
+  if (b.dataset.p === "pxe") pxeRefresh().catch(() => {});
   if (b.dataset.p !== "kvm") stopVideo();       // 不看就别占着采集卡 (车机本地预览要用)
 });
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopVideo(); });
@@ -452,8 +463,26 @@ $("#ag-cards").onclick = (e) => {
 };
 $("#estop-all").onclick = () => agentOp("estop", {});
 
+// ---------------------------------------------------------------- PXE 日志 (#24 后续): 只读
+// pxe-req.log (申请 / 确认 / 拒绝 / 作废…) + events.log 的 [pxe] 行 (解锁 / 上锁 / 菜单被取走); 后端只给白名单字段
+function pxeEvent(e) {
+  const who = [e.who && `申请 ${e.who}`, e.by && `处理 ${e.by}`].filter(Boolean).join(" · ");
+  const head = [e.what, e.id !== undefined ? `#${e.id}` : "", e.purpose || ""].filter(Boolean).join(" ");
+  return `<div class="item"><span class="t">${esc(e.t)}</span><b>${esc(head)}</b>
+    ${who ? `<div class="dim">${esc(who)}</div>` : ""}${e.why ? `<div>${esc(e.why)}</div>` : ""}
+    ${e.msg ? `<div>${esc(e.msg)}</div>` : ""}</div>`;
+}
+const pxeGroup = (title, evs) => `<div class="card"><h3>${title}</h3>${evs.map(pxeEvent).join("")}</div>`;
+async function pxeRefresh() {
+  const v = await api("/api/pxe-log");
+  const cards = v.groups.map((g) => pxeGroup(`<span class="mac">${esc(g.mac)}</span> · 最近 ${esc(g.last)}`, g.events));
+  if (v.unlinked.length) cards.push(pxeGroup("未关联 MAC", v.unlinked));
+  $("#px-groups").innerHTML = cards.join("") || `<div class="dim">还没有 PXE 日志</div>`;
+  $("#px-time").textContent = new Date().toLocaleTimeString();
+}
+
 // ---------------------------------------------------------------- 启动
-let timer = null, agentTimer = null;
+let timer = null, agentTimer = null, pxeTimer = null;
 async function boot() {
   const w = await fetch("/api/whoami");
   if (w.status === 403) return denied(await w.text());
@@ -469,6 +498,8 @@ async function boot() {
   timer = setInterval(() => refresh().catch(() => {}), 3000);
   clearInterval(agentTimer);
   agentTimer = setInterval(() => agentRefresh().catch(() => {}), 1500);
+  clearInterval(pxeTimer);   // 日志只在看这一页时刷
+  pxeTimer = setInterval(() => { if ($("#p-pxe").classList.contains("on")) pxeRefresh().catch(() => {}); }, 5000);
 }
 boot();
 </script>

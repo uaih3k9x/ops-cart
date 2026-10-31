@@ -12,6 +12,8 @@
 - 审计: 登录 / 退出 / 开关 / 打字 (只记长度) / 画面和串口的开关 (只记字节数) 写 cartlog, PIN 不进日志
 - Agent 写串口 (#23): 只读看挂起和急停; 只能急停 / 拒绝 (投到 serial-req 目录, root 的 cart-serial-req 执行),
   确认发送和解除急停只在车机上 (只认本机人)
+- PXE 日志 (#24 后续): 只读看 pxe-req.log / events.log 的 [pxe] 行按 MAC 分组; 不读申请状态文件 (不显示在等的申请),
+  不给确认也不给拒绝
 """
 
 import argparse
@@ -33,6 +35,7 @@ import kvm_broker
 import kvm_core as kvm
 import lamps_core
 import mcp_serial
+import pxe_log_core
 import serial_core as sc
 import web_core as wc
 
@@ -105,6 +108,8 @@ class App:
         self._streams = {}              # 会话令牌 -> {关闭函数}
         # Agent 写串口 (#23): 状态只读 (CAP_DAC_READ_SEARCH), 急停 / 拒绝投请求文件
         self.serial_peek, self.req_dir, self.clock_wall = mcp_serial.peek, mcp_serial.REQ_DIR, time.time
+        # PXE 日志 (#24 后续): 只读日志尾, 同样靠 CAP_DAC_READ_SEARCH
+        self.pxe_log_paths = (pxe_log_core.REQ_LOG, pxe_log_core.EVENTS_LOG)
 
     # -------------------------------------------------------- 鉴权
 
@@ -251,6 +256,8 @@ class App:
             return self._serial_write_view()
         if method == "POST" and path.startswith("/api/serial-write/"):
             return self._serial_write_op(path.rsplit("/", 1)[1], req, ip, tok)
+        if (method, path) == ("GET", "/api/pxe-log"):
+            return _json(200, pxe_log_core.load(*self.pxe_log_paths))
         return _json(404, {"error": "no such api"})
 
     def _login(self, req, ip):
