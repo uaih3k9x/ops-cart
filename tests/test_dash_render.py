@@ -97,3 +97,16 @@ def test_wrap_keeps_ascii_runs_together():
 def test_wrap_never_starts_a_line_with_closing_punctuation():
     # 避头: "，" 放不下也挂在上一行末尾, 不另起一行
     assert r.wrap("第6-10，12周", _MonoFont(), 40, 5) == ["第", "6-10，", "12周"]
+
+
+# ---- #11: 自己发地址时副屏头部一整条红 (到时停发琥珀), 解锁/锁屏都画
+
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("state,color", [("serving", r.BAD), ("expired", r.WARN)])
+def test_render_serve_banner(locked, state, color):
+    from PIL import ImageColor
+    snap = _full_snap(pxe={"state": state, "until": 10 ** 12 if state == "serving" else 1, "window": 1800})
+    img = r.render(dc.layout_view(snap, locked=locked))
+    assert img.getpixel((4, 230)) == ImageColor.getrgb(color)          # 条的左边缘
+    plain = r.render(dc.layout_view(_full_snap(), locked=locked))
+    assert plain.getpixel((4, 230)) == r.BG
