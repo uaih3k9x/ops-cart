@@ -53,6 +53,15 @@ def test_not_danger(cmd):
     assert sw.danger_words(cmd) == []
 
 
+@pytest.mark.parametrize("cmd, hit", [
+    ("ls;rm -rf /", "rm"), ("ls&&reboot", "reboot"), ("echo `reboot`", "reboot"), ("x $(reboot)", "reboot"),
+    ("r'm' -rf /", "rm"), ('"reboot"', "reboot"), ("\\rm -rf /", "rm"), ("cat a>b;dd if=x", "dd"),
+])
+def test_danger_words_see_through_shell_tricks(cmd, hit):
+    """Linux shell 能拼接、引号、反斜杠拆词; 切词时都按分隔算, 引号反斜杠去掉 (往多拦的方向错)."""
+    assert hit in sw.danger_words(cmd)
+
+
 def test_danger_extra_words_only_add():
     assert sw.danger_words("license active", extra=["license"]) == ["license"]
     assert "save" in sw.danger_words("save", extra=[])
@@ -83,13 +92,60 @@ def test_load_rules_reads_slots_verbs_danger(tmp_path):
     assert r["slots"] == {2: "cisco"}                   # 槽位号不对 / 值不是字符串的丢掉
     assert r["auto_huawei"] is False
     assert r["vendors"]["huawei"]["extra_verbs"] == ["ping", "tracert"]
-    assert "linux" not in r["vendors"]                  # 只有内置有只读规则的厂商才认
+    assert r["vendors"]["linux"]["extra_verbs"] == []   # 只有内置有只读规则的厂商能加只读动词
     assert set(r["danger"]) >= {"patch", "license"}
 
 
 def test_example_rules_file_loads():
     r = sw.load_rules("examples/serial_gate.example.json")
     assert "ping" in r["vendors"]["huawei"]["extra_verbs"]
+    assert set(r["vendors"]) >= {"huawei", "cisco", "ruijie", "linux"}
+    assert r["model"]["enabled"] is False               # 样例默认不开模型: 装上不会凭空多出一层判断
+
+
+def test_load_rules_model_defaults_off():
+    r = sw.load_rules(None)
+    assert r["model"] == sw.MODEL_DEFAULT and r["model"]["enabled"] is False
+    for v in ("huawei", "cisco", "ruijie", "linux"):
+        assert r["vendors"][v]["model"] is True and r["vendors"][v]["notes"] == ""
+
+
+def test_load_rules_model_section(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"model": {"enabled": True, "timeout_s": 15, "budget_usd": 0.1, "context_chars": 2000,
+                                       "model": "deepseek-chat"},
+                             "vendors": {"linux": {"model": False}, "huawei": {"notes": "V8 要 commit"}}}))
+    r = sw.load_rules(str(p))
+    assert r["model"] == {"enabled": True, "timeout_s": 15, "budget_usd": "0.1", "context_chars": 2000,
+                          "model": "deepseek-chat"}
+    assert r["vendors"]["linux"]["model"] is False
+    assert r["vendors"]["huawei"]["notes"] == "V8 要 commit" and r["vendors"]["huawei"]["model"] is True
+
+
+@pytest.mark.parametrize("model", [
+    {"enabled": "yes"}, {"enabled": 1}, {"timeout_s": "x"}, {"budget_usd": "abc"}, {"budget_usd": -1},
+    {"budget_usd": 99}, {"model": "a b"}, {"model": "--dangerously-skip-permissions"}, {"context_chars": None},
+    "on", [1],
+])
+def test_load_rules_bad_model_values_fall_back(tmp_path, model):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"model": model}))
+    assert sw.load_rules(str(p))["model"] == sw.MODEL_DEFAULT
+
+
+def test_load_rules_model_numbers_clamped(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"model": {"timeout_s": 9999, "context_chars": 10 ** 7}}))
+    r = sw.load_rules(str(p))["model"]
+    assert r["timeout_s"] == sw.MODEL_TIMEOUT_MAX_S and r["context_chars"] == sw.MODEL_CONTEXT_MAX
+
+
+def test_load_rules_vendor_notes_capped(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"vendors": {"huawei": {"notes": "长" * 5000, "model": "no"}, "cisco": {"notes": 3}}}))
+    r = sw.load_rules(str(p))
+    assert len(r["vendors"]["huawei"]["notes"]) == sw.NOTES_MAX and r["vendors"]["huawei"]["model"] is True
+    assert r["vendors"]["cisco"]["notes"] == ""
 
 
 # ------------------------------------------------------------ 认厂商 / 提示符
@@ -120,6 +176,24 @@ def test_slot_vendor_from_rules():
     assert sw.slot_vendor(2, rules, "SW1#") == ("cisco", True)
     assert sw.slot_vendor(2, rules, "SW1(config)#") == ("cisco", True)
     assert sw.slot_vendor(2, rules, "<SW1>") == ("cisco", False)     # 登记成思科, 华为提示符不算到提示符上
+
+
+def test_slot_vendor_ruijie_and_linux_need_registering():
+    rules = dict(RULES, slots={3: "ruijie", 4: "linux"})
+    assert sw.slot_vendor(3, rules, "Ruijie#") == ("ruijie", True)
+    assert sw.slot_vendor(3, rules, "Ruijie(config-if-GigabitEthernet 0/1)#") == ("ruijie", True)
+    assert sw.slot_vendor(3, rules, "Password:") == ("ruijie", False)
+    for ln in ("root@host:~#", "ops@cart-01:/var/log$", "[root@host ~]#", "bash-4.4#", "sh-5.1$", "$", "#"):
+        assert sw.slot_vendor(4, rules, "x\n" + ln) == ("linux", True), ln
+    for ln in ("Password:", "[sudo] password for ops:", "Are you sure? [y/N]", "--More--", "root@host:~# ls"):
+        assert sw.slot_vendor(4, rules, ln) == ("linux", False), ln
+    assert sw.slot_vendor(1, RULES, "root@host:~#") == (None, False)    # 不登记认不出
+
+
+def test_load_rules_slots_accept_new_vendors(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"slots": {"3": "ruijie", "4": "linux", "2": "juniper"}}))
+    assert sw.load_rules(str(p))["slots"] == {3: "ruijie", 4: "linux"}
 
 
 def test_slot_vendor_auto_off():
@@ -163,6 +237,79 @@ def test_classify_extra_verbs_from_rules():
 def test_classify_wrong_vendor_verb():
     assert sw.classify("show version", "huawei", True, RULES)["verdict"] == "confirm"
     assert sw.classify("show version", "cisco", True, RULES)["verdict"] == "pass"
+
+
+# ------------------------------------------------------------ 闸门第 2 层接口 (#22): 模型经 judge 注入
+
+def _judge(allow, reason="理由", calls=None, **model):
+    def j(cmd, vendor):
+        if calls is not None:
+            calls.append((cmd, vendor))
+        return {"allow": allow, "reason": reason, "model": dict(model, verdict="allow" if allow else "block")}
+    return j
+
+
+def test_classify_without_judge_is_unchanged_confirm():
+    g = sw.classify("system-view", "huawei", True, RULES)
+    assert g["verdict"] == "confirm" and g["layer"] == 3 and "没开" in g["reason"]
+    assert "model" not in g
+
+
+def test_classify_judge_allow_is_layer2_pass():
+    calls = []
+    g = sw.classify("system-view", "huawei", True, RULES, judge=_judge(True, "进配置视图, 不改配置", calls))
+    assert calls == [("system-view", "huawei")]
+    assert g["verdict"] == "pass" and g["layer"] == 2 and g["danger"] == [] and g["vendor"] == "huawei"
+    assert "进配置视图, 不改配置" in g["reason"] and g["model"]["verdict"] == "allow"
+
+
+def test_classify_judge_block_confirms_with_reason():
+    g = sw.classify("undo ip address", "huawei", True, RULES, judge=_judge(False, "会断管理口"))
+    assert g["verdict"] == "confirm" and g["layer"] == 3 and "会断管理口" in g["reason"]
+    assert g["model"]["verdict"] == "block"
+
+
+def test_classify_judge_not_consulted_for_readonly_danger_unknown_or_off_prompt():
+    calls = []
+    j = _judge(True, calls=calls)
+    assert sw.classify("display version", "huawei", True, RULES, judge=j)["layer"] == 1
+    assert sw.classify("save", "huawei", True, RULES, judge=j)["verdict"] == "confirm"
+    assert sw.classify("reboot fast", "linux", True, RULES, judge=j)["verdict"] == "confirm"
+    assert sw.classify("system-view", None, True, RULES, judge=j)["verdict"] == "confirm"
+    assert sw.classify("system-view", "huawei", False, RULES, judge=j)["verdict"] == "confirm"
+    assert calls == []                                  # 高危的不送模型
+
+
+@pytest.mark.parametrize("bad", [
+    lambda c, v: (_ for _ in ()).throw(RuntimeError("boom")),
+    lambda c, v: None, lambda c, v: "allow", lambda c, v: {"allow": "true", "reason": "x"},
+    lambda c, v: {"allow": 1, "reason": "x"}, lambda c, v: {"reason": "x"}, lambda c, v: {"allow": True},
+    lambda c, v: {"allow": True, "reason": ""}, lambda c, v: {"allow": True, "reason": 5},
+])
+def test_classify_judge_misbehaving_is_confirm(bad):
+    g = sw.classify("system-view", "huawei", True, RULES, judge=bad)
+    assert g["verdict"] == "confirm" and g["layer"] == 3
+
+
+@pytest.mark.parametrize("cmd", ["ls;id", "ls && id", "ls > /tmp/a", "cat < a", "echo `id`", "echo $(id)",
+                                 "ls \\", "sleep 9 &", "sudo !!"])
+def test_classify_linux_shell_meta_never_goes_to_model(cmd):
+    calls = []
+    g = sw.classify(cmd, "linux", True, RULES, judge=_judge(True, calls=calls))
+    assert g["verdict"] == "confirm" and calls == []
+    assert "拼接" in g["reason"]
+
+
+def test_classify_linux_pipe_goes_to_model():
+    g = sw.classify("dmesg | tail -n 50", "linux", True, RULES, judge=_judge(True))
+    assert g["verdict"] == "pass" and g["layer"] == 2
+
+
+def test_classify_vendor_model_off_by_rules():
+    rules = dict(RULES, vendors=dict(RULES["vendors"], linux=dict(RULES["vendors"]["linux"], model=False)))
+    calls = []
+    g = sw.classify("uptime", "linux", True, rules, judge=_judge(True, calls=calls))
+    assert g["verdict"] == "confirm" and calls == [] and "linux" in g["reason"]
 
 
 def test_classify_key():

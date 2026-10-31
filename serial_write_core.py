@@ -7,8 +7,9 @@
 - 只收行级命令: 一行可打印 ASCII, 不许控制字符 / 换行 / 制表符 / 全角 / 零宽; 原始字节能拆碎、退格拼出 save, 不给.
   特殊键只给三个固定的: 回车、翻页空格 (直接放行), Ctrl+C (打断键, 要人确认).
 - 闸门第 1 层: 认得出厂商、设备停在提示符上、命令过只读白名单 (survey_core.is_readonly, 规则文件只能加动词)
-  才直接发; 带高危词 (save / reboot / reset / format / delete ...) 的永远要人确认; 其余一律挂起等人确认
-  (第 2 层决策模型是 #22, 这一版没有).
+  才直接发; 带高危词 (save / reboot / reset / format / delete ...) 的永远要人确认, 不送模型.
+- 闸门第 2 层 (#22): 认得出厂商、停在提示符上、不在白名单里、不带高危词的, 交调用方注入的 judge (决策模型,
+  serial_gate_model) 判; 判放行才直发 (layer=2), 判拦 / 出错 / 超时 / 结果不对 / 没开一律挂起等人确认.
 - 写租约: 每个槽位同一时间一个写入者, 认令牌不认名字; 有期限 (默认 60 秒), 要续期, 过期自动释放,
   它挂着的命令一起作废. 一条在途: 上一条没回来不发下一条.
 - 人优先: 人在车机 / 网页上敲键不经租约; 人 3 秒内敲过键 Agent 的输入由 conbroker 排队; 人随时急停、确认、拒绝.
@@ -70,7 +71,8 @@ def check_line(cmd):
 # 只增不减: 规则文件能往里加, 删不掉. 认的是整词, 以及整词的缩写 (VRP / IOS 认唯一前缀: sav = save, wr = write).
 DANGER = ("save", "reboot", "reload", "reset", "format", "delete", "erase", "rmdir", "rm", "write", "copy",
           "startup", "shutdown", "poweroff", "halt", "init", "mkfs", "fdisk", "wipefs", "dd", "upgrade")
-_SPLIT = re.compile(r"[\s|]+")
+_SPLIT = re.compile(r"[\s|;&<>()`$]+")         # Linux shell 的拼接 / 重定向 / 命令替换也当分隔
+_QUOTE = re.compile(r"['\"\\]")                  # r'm' "reboot" \rm: 去掉引号反斜杠再切词
 
 
 def danger_words(cmd, extra=()):
@@ -78,7 +80,7 @@ def danger_words(cmd, extra=()):
     第一个词 2 个字符起、后面的词 3 个字符起, 是高危词的前缀也算 (缩写); 往"多拦"的方向错."""
     words = tuple(DANGER) + tuple(w for w in extra if w not in DANGER)
     out = []
-    for i, tok in enumerate(t for t in _SPLIT.split((cmd or "").lower()) if t):
+    for i, tok in enumerate(t for t in _SPLIT.split(_QUOTE.sub("", (cmd or "").lower())) if t):
         for w in words:
             if tok == w or (len(tok) >= (2 if i == 0 else 3) and w.startswith(tok)):
                 if w not in out:
@@ -90,16 +92,55 @@ def danger_words(cmd, extra=()):
 
 RULES_PATH = "/etc/ops-cart/serial-gate.json"
 _VERB = re.compile(r"[a-z][a-z0-9-]{1,31}")
+# 第 2 层决策模型 (#22). 默认不开: 没配就和第 1 层之外全人确认一样
+MODEL_DEFAULT = {"enabled": False, "timeout_s": 30, "budget_usd": "0.2", "context_chars": 3000, "model": None}
+MODEL_TIMEOUT_MIN_S = 5
+MODEL_TIMEOUT_MAX_S = 120
+MODEL_BUDGET_MAX = 1.0      # 美元, 单次调用
+MODEL_CONTEXT_MAX = 8000    # 送给模型的设备最近输出, 字符
+NOTES_MAX = 500             # 每个厂商给模型的补充说明
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}")      # 不许 - 开头: 会被当成 claude 的选项
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _model_conf(doc):
+    """规则文件的 model 段 -> 规范化; 哪项不对哪项按默认, 数字夹到范围里."""
+    out = dict(MODEL_DEFAULT)
+    if not isinstance(doc, dict):
+        return out
+    if isinstance(doc.get("enabled"), bool):
+        out["enabled"] = doc["enabled"]
+    if _num(doc.get("timeout_s")):
+        out["timeout_s"] = int(max(MODEL_TIMEOUT_MIN_S, min(MODEL_TIMEOUT_MAX_S, doc["timeout_s"])))
+    if _num(doc.get("context_chars")):
+        out["context_chars"] = int(max(0, min(MODEL_CONTEXT_MAX, doc["context_chars"])))
+    b = doc.get("budget_usd")
+    try:
+        b = float(b) if (_num(b) or isinstance(b, str)) else None
+    except ValueError:
+        b = None
+    if b is not None and 0 < b <= MODEL_BUDGET_MAX:
+        out["budget_usd"] = str(b)
+    if isinstance(doc.get("model"), str) and _MODEL_NAME.fullmatch(doc["model"]):
+        out["model"] = doc["model"]
+    return out
 
 
 def load_rules(path=RULES_PATH):
-    """规则文件 -> {slots: {槽位: 厂商}, auto_huawei, vendors: {厂商: {extra_verbs}}, danger: [...]}.
+    """规则文件 -> {slots: {槽位: 厂商}, auto_huawei, vendors: {厂商: {extra_verbs, model, notes}},
+    danger: [...], model: {enabled, timeout_s, budget_usd, context_chars, model}}.
 
-    只能收紧或加只读动词: 厂商只认内置有只读规则的 (survey_core: huawei / cisco); 高危词只加不减.
-    文件不在 / 坏了 = 内置默认 (没有额外动词, 槽位不登记, 华为提示符自动认)."""
-    vendors = sorted(survey_core._RULES)
-    out = {"slots": {}, "auto_huawei": True, "vendors": {v: {"extra_verbs": []} for v in vendors},
-           "danger": list(DANGER)}
+    只能收紧或加只读动词: 只读动词只能加给内置有只读规则的厂商 (survey_core: huawei / cisco); 锐捷 / Linux
+    没有第 1 层白名单, 登记了槽位只走第 2 层或人确认; 高危词只加不减. vendors.<厂商>.model=false 关掉该厂商的
+    第 2 层, notes 是给模型的补充说明. 文件不在 / 坏了 = 内置默认 (没有额外动词, 槽位不登记, 华为提示符自动认,
+    模型不开)."""
+    vendors = sorted(_PROMPT)
+    out = {"slots": {}, "auto_huawei": True,
+           "vendors": {v: {"extra_verbs": [], "model": True, "notes": ""} for v in vendors},
+           "danger": list(DANGER), "model": dict(MODEL_DEFAULT)}
     doc = {}
     if path:
         try:
@@ -119,9 +160,15 @@ def load_rules(path=RULES_PATH):
         if v not in vendors or not isinstance(spec, dict):
             continue
         verbs = [w for w in spec.get("extra_verbs") or () if isinstance(w, str) and _VERB.fullmatch(w)]
-        out["vendors"][v]["extra_verbs"] = sorted(set(verbs))
+        if v in survey_core._RULES:
+            out["vendors"][v]["extra_verbs"] = sorted(set(verbs))
+        if isinstance(spec.get("model"), bool):
+            out["vendors"][v]["model"] = spec["model"]
+        if isinstance(spec.get("notes"), str):
+            out["vendors"][v]["notes"] = spec["notes"][:NOTES_MAX]
         extra_danger += [w for w in spec.get("danger") or () if isinstance(w, str) and _VERB.fullmatch(w)]
     out["danger"] += sorted(set(extra_danger) - set(DANGER))
+    out["model"] = _model_conf(doc.get("model"))
     return out
 
 
@@ -130,6 +177,10 @@ def load_rules(path=RULES_PATH):
 _PROMPT = {
     "huawei": re.compile(r"<[^\s<>]{1,64}>|\[[~*]?[^\s\[\]~*][^\s\[\]]{0,127}\]"),     # <名> [名] [~名] [名-子视图]
     "cisco": re.compile(r"[A-Za-z0-9][\w.-]{0,63}(?:\([^()\s]{0,32}\))?[#>]"),          # 名# 名> 名(config)#
+    "ruijie": re.compile(r"[A-Za-z0-9][\w.-]{0,63}(?:\([^()]{0,48}\))?[#>]"),            # 同思科, 子视图带空格
+    # 用户@主机:路径$  [用户@主机 路径]#  bash-4.4#  光秃秃的 $ / #
+    "linux": re.compile(r"(?:[\w.-]{1,32}@[\w.-]{1,64}(?::\S{0,128})?|\[[\w.-]{1,32}@[\w.-]{1,64}(?: \S{1,128})?\]"
+                        r"|[a-z]{0,4}sh-\d+(?:\.\d+)*)?[#$]"),
 }
 _MARK = re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\n]*\]")                       # conbroker 自己写进日志的标记行
 
@@ -158,13 +209,22 @@ def slot_vendor(slot, rules, text):
 
 # ------------------------------------------------------------ 闸门
 
-def _gate(verdict, reason, danger=(), vendor=None):
-    return {"verdict": verdict, "layer": 1 if verdict == "pass" else 3, "reason": reason,
-            "danger": list(danger), "vendor": vendor}
+def _gate(verdict, reason, danger=(), vendor=None, layer=None, model=None):
+    g = {"verdict": verdict, "layer": layer or (1 if verdict == "pass" else 3), "reason": reason,
+         "danger": list(danger), "vendor": vendor}
+    if model is not None:
+        g["model"] = model          # 第 2 层的原始判断 / 出错说明, 随闸门结果整个进执行绪日志
+    return g
 
 
-def classify(cmd, vendor, at_prompt, rules):
-    """一行命令 -> 闸门结果 {verdict: pass|confirm, layer, reason, danger, vendor}. 调用方先 check_line."""
+_SHELL_META = re.compile(r"[;&<>`\\!]|\$\(")   # Linux: 拼接 / 后台 / 重定向 / 命令替换 / 续行 / 历史展开
+
+
+def classify(cmd, vendor, at_prompt, rules, judge=None):
+    """一行命令 -> 闸门结果 {verdict: pass|confirm, layer, reason, danger, vendor[, model]}. 调用方先 check_line.
+
+    judge(cmd, vendor) -> {allow: bool, reason: 非空字符串, model: {...}}: 第 2 层决策模型 (serial_gate_model);
+    None = 没开. 只有认得出厂商、停在提示符上、不在只读白名单里、不带高危词的才问它."""
     d = danger_words(cmd, rules.get("danger", ()))
     if d:
         return _gate("confirm", f"带高危词 {', '.join(d)}, 永远要人确认", d, vendor)
@@ -175,7 +235,31 @@ def classify(cmd, vendor, at_prompt, rules):
     extra = rules.get("vendors", {}).get(vendor, {}).get("extra_verbs", ())
     if survey_core.is_readonly(cmd, vendor, extra_verbs=extra):
         return _gate("pass", f"{vendor} 只读命令 (第 1 层放行)", vendor=vendor)
-    return _gate("confirm", "不在只读白名单里, 要人确认 (第 2 层决策模型还没接, #22)", vendor=vendor)
+    return _layer2(cmd, vendor, rules, judge)
+
+
+def _layer2(cmd, vendor, rules, judge):
+    """第 2 层: 模型判放行才 pass; 其余 (判拦 / 抛异常 / 结果不对 / 没开) 一律 confirm. fail-closed."""
+    pre = "不在只读白名单里"
+    if vendor == "linux" and _SHELL_META.search(cmd):
+        return _gate("confirm", f"{pre}, 带 shell 拼接 / 重定向 / 命令替换 / 反斜杠 / 历史展开, 不送模型, 要人确认",
+                     vendor=vendor)
+    if judge is None:
+        return _gate("confirm", f"{pre}, 第 2 层决策模型没开, 要人确认", vendor=vendor)
+    if not rules.get("vendors", {}).get(vendor, {}).get("model", True):
+        return _gate("confirm", f"{pre}, 规则文件关了 {vendor} 的第 2 层决策模型, 要人确认", vendor=vendor)
+    try:
+        r = judge(cmd, vendor)
+    except Exception as e:              # noqa: BLE001  judge 本该自己兜住; 漏出来也只能是人确认
+        why = f"{type(e).__name__}: {e}"[:300]
+        return _gate("confirm", f"{pre}, 第 2 层决策模型出错 ({why}), 要人确认", vendor=vendor, model={"error": why})
+    model = r.get("model") if isinstance(r, dict) and isinstance(r.get("model"), dict) else None
+    if not (isinstance(r, dict) and isinstance(r.get("allow"), bool)
+            and isinstance(r.get("reason"), str) and r["reason"].strip()):
+        return _gate("confirm", f"{pre}, 第 2 层决策模型给的结果不对, 要人确认", vendor=vendor, model=model)
+    if r["allow"]:
+        return _gate("pass", f"模型放行 (第 2 层): {r['reason']}", vendor=vendor, layer=2, model=model)
+    return _gate("confirm", f"{pre}, 要人确认: {r['reason']}", vendor=vendor, model=model)
 
 
 # 固定特殊键: conbroker send 的参数 (text, raw). raw 时 conbroker 会做 unicode_escape, 所以 Ctrl+C 写成 \\x03.
