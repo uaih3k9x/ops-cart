@@ -12,7 +12,6 @@ import pxe_req_core as pr
 import theme as th
 
 FONT, FONT_BIG, FONT_MONO = th.FONT, th.FONT_BIG, th.FONT_MONO
-FONT_CODE = th.font(40, bold=True, mono=True)
 BG, CARD, FG, DIM, RED, AMBER = th.PANEL, th.BOX, th.FG, th.DIM, th.BAD, th.WARN
 EDGE = th.DANGER_EDGE            # 同手动解锁对话框: 解锁是危险操作
 BTN = {"go": (th.DANGER_BG, th.DANGER_FG), "no": (th.BTN2, th.DANGER_FG), "plain": (th.BTN2, th.FG)}
@@ -74,7 +73,7 @@ class PxeRequestDialog(tk.Toplevel):
             tk.Label(self.body, text=f"还有 {c['more']} 条申请在等, 处理完这条接着显示", font=FONT, bg=BG,
                      fg=DIM).pack(pady=(4, 0))
         tk.Label(self.body, text="看过清单, 照抄确认码:", font=FONT, bg=BG, fg=DIM).pack(pady=(10, 0))
-        tk.Label(self.body, text=c["code_text"], font=FONT_CODE, bg=BG, fg=AMBER).pack()
+        tk.Label(self.body, text=c["code_text"], font=th.font(40, bold=True, mono=True), bg=BG, fg=AMBER).pack()
         e = tk.Entry(self.body, font=th.font(22, mono=True), width=10, justify="center", bg=CARD, fg=FG,
                      insertbackground=FG, relief="flat")
         e.pack(pady=6, ipady=6)

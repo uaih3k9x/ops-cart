@@ -208,6 +208,13 @@ def serve_renew_question(window):
 
 # ---------------------------------------------------------------- 开机自检兜底
 
+def font_row(family):
+    """自检多一行界面字体 (#28): Unifont 取到 OK; 退回 Noto 是 WARN (能用, 但部署时字体没装好)."""
+    if family == th.UNIFONT:
+        return {"label": "UI FONT", "state": "OK", "detail": "UNIFONT 16PX", "check": "uifont"}
+    return {"label": "UI FONT", "state": "WARN", "detail": "FALLBACK NOTO", "check": "uifont"}
+
+
 def fail_rows(ex):
     return [{"label": "SELFTEST", "state": "FAIL", "detail": type(ex).__name__, "check": None}]
 

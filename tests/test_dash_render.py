@@ -268,3 +268,21 @@ def test_render_agent_summary_line_only_when_needed():
 def confirm_core_color(name):
     import confirm_core
     return getattr(confirm_core, name + "_COLOR")
+
+
+# ---- #28: 副屏跟车机同一个 Unifont 文件, 点阵字只按 16 的整数倍放大; 没有就退回原来的字体表
+
+def test_dash_font_prefers_unifont_and_snaps_to_whole_multiples(tmp_path):
+    import theme as th
+    assert [f[0] for f in r.FONTS[:len(th.UNIFONT_PATHS)]] == list(th.UNIFONT_PATHS)
+    repo_font = th.UNIFONT_PATHS[-1]
+    f = r.load_font(26, fonts=[(str(tmp_path / "nope.otf"), 0, True), (repo_font, 0, True)])
+    assert f.size == 32 and f.path == repo_font
+    assert r.load_font(150, fonts=[(repo_font, 0, True)]).size == 144
+
+
+def test_dash_font_falls_back_without_unifont(tmp_path):
+    f = r.load_font(26, fonts=[(str(tmp_path / "nope.otf"), 0, True)] + r.FONTS[len(r.FONTS) - 3:])
+    assert getattr(f, "path", None) != str(tmp_path / "nope.otf")
+    if getattr(f, "path", None):              # 有系统 CJK 字体时按原字号, 不缩放
+        assert f.size == 26

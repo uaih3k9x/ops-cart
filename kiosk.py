@@ -49,6 +49,7 @@ PANE_CLASSES = {"serial": SerialPanel, "ks": KsPanel, "wifi": WifiPanel,
 class Kiosk(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.ui_family = th.setup(self)     # 字体 (没 Unifont 退回 Noto) + Tk 默认控件配色, 先于一切控件 (#28)
         self.title("运维推车控制台")
         # 无 WM 环境: overrideredirect + 手动铺满, 不依赖 -fullscreen
         self.overrideredirect(True)
@@ -233,7 +234,8 @@ class Kiosk(tk.Tk):
         """状态板 = 实时自检: 跟开机自检同一张计划表 (selftest.json), 再加温度/风扇.
         采集都在后台 (UiBridge), 上一轮没回来就不再起新的, 线程不会越攒越多."""
         def checks():
-            return kc.net_probe(), kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
+            rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
+            return kc.net_probe(), rows + [kui.font_row(self.ui_family)]
 
         def checks_done(res):
             self._checking = False
@@ -401,7 +403,7 @@ class Kiosk(tk.Tk):
             elif alert["level"] == "warn":
                 label.config(text=alert["short"], fg=th.WARN, bg=th.BG, font=FONT)
             else:
-                label.config(text=alert["short"], fg=th.WHITE, bg=th.ALERT_BG, font=FONT_BIG + ("bold",))
+                label.config(text=alert["short"], fg=th.WHITE, bg=th.ALERT_BG, font=th.font(15, bold=True))
 
     def _paint_ups_alert(self, alert):
         """顶栏标题右边一行: 预告琥珀字, 倒计时红底白字; 正常时收起. 不用 banner (别的提示会盖掉它)."""
@@ -1034,7 +1036,8 @@ class Kiosk(tk.Tk):
                  fg=th.BOOT_STEP, anchor="w").pack(anchor="w", pady=(0, 10))   # 接 Plymouth 的 1/3 2/3
 
         def work():
-            rows = kui.boot_rows_safe(lambda: kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context()))
+            rows = kui.boot_rows_safe(lambda: kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
+                                      + [kui.font_row(self.ui_family)])
             try:
                 video = kc.default_video(kc.video_nodes())
             except Exception:                   # noqa: BLE001  挑不出就用 _build 时的第一路

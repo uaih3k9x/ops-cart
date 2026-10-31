@@ -10,7 +10,7 @@ import theme as th
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEX = re.compile(r"""["']#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?["']""")
-FONT_FAMILY = re.compile(r"""["']Noto Sans(?: Mono)? CJK SC["']""")
+FONT_FAMILY = re.compile(r"""["'](?:Noto Sans(?: Mono)? CJK SC|Unifont)["']""")
 # tspl_preview 产出的是给浏览器看的 HTML/SVG 预览, 有自己的浅色/深色 CSS, 不归车机主题管
 EXEMPT = {"theme.py", "tspl_preview.py"}
 
@@ -69,31 +69,116 @@ def test_health_colors_cover_every_state():
 
 
 @pytest.mark.parametrize("fg,bg", [
-    ("FG", "BG"), ("FG", "PANEL"), ("FG", "BOX"), ("TEXT", "BG"), ("TEXT", "PANEL"),
-    ("DIM", "BG"), ("DIM", "PANEL"),
-    ("OK", "BG"), ("WARN", "BG"), ("BAD", "BG"), ("NOTICE", "BG"), ("MUTED", "BG"),
-    ("FG", "PRIMARY"), ("FG", "BTN2"), ("DANGER_FG", "DANGER_BG"), ("WHITE", "ALERT_BG"),
+    ("FG", "BG"), ("FG", "TOP"), ("FG", "PANEL"), ("FG", "BOX"), ("FG", "ACTIVE"),
+    ("TEXT", "BG"), ("TEXT", "PANEL"), ("TEXT", "BOX"),
+    ("DIM", "BG"), ("DIM", "TOP"), ("DIM", "PANEL"), ("FAINT", "BG"), ("FAINT", "TOP"),
+    ("OK", "BG"), ("WARN", "BG"), ("BAD", "BG"), ("NOTICE", "BG"), ("MUTED", "BG"), ("MARK", "BG"),
+    ("OK", "TOP"), ("WARN", "TOP"), ("BAD", "TOP"), ("NOTICE", "TOP"),
+    ("OK", "PANEL"), ("WARN", "PANEL"), ("BAD", "PANEL"), ("NOTICE", "PANEL"), ("MUTED", "PANEL"),
+    ("FG", "PRIMARY"), ("FG", "BTN2"), ("DANGER_FG", "BTN2"), ("WHITE", "TITLE"), ("DANGER_FG", "DANGER_BG"),
+    ("FG", "WARN_BG"), ("FG", "AMBER_BG"), ("WHITE", "DANGER_EDGE"), ("WHITE", "ALERT_BG"),
     ("WHITE", "SERVE_BG"), ("WHITE", "SERVE_EXPIRED_BG"), ("GO_FG", "GO_BG"),
-    ("BOOT_FG", "BOOT_BG"), ("BOOT_SUB", "BOOT_BG"),
+    ("BOOT_FG", "BOOT_BG"), ("BOOT_SUB", "BOOT_BG"), ("BOOT_DIM", "BOOT_BG"), ("BOOT_STEP", "BOOT_BG"),
     ("BOOT_OK", "BOOT_BG"), ("BOOT_WARN", "BOOT_BG"), ("BOOT_FAIL", "BOOT_BG"),
-    ("LAMP_FG", "LAMP_BODY"), ("LAMP_LIT_FG", "LAMP_OK"), ("LAMP_LIT_FG", "LAMP_FAIL"),
+    ("LAMP_FG", "LAMP_BODY"), ("LAMP_EMPTY_FG", "LAMP_EMPTY"),
+    ("LAMP_LIT_FG", "LAMP_OK"), ("LAMP_LIT_FG", "LAMP_WARN"), ("LAMP_LIT_FG", "LAMP_FAIL"), ("LAMP_LIT_FG", "AGENT"),
+    ("LAMP_FG", "DASH_BG"), ("DASH_DIM", "DASH_BG"),
+    ("LAMP_OK", "DASH_BG"), ("LAMP_WARN", "DASH_BG"), ("LAMP_FAIL", "DASH_BG"),
 ])
 def test_text_pairs_readable(fg, bg):
-    """正文配色 >= 4.5:1 (WCAG AA). 推车常在亮堂的教室里用, 只会往高里调."""
+    """正文配色 >= 4.5:1 (WCAG AA). 推车常在亮堂的教室里用, 只会往高里调.
+    亮着的灯 (绿 / 黄 / 红 / 紫) 上一律写深字; 副屏的红黄绿直接当字色用."""
     assert th.contrast(getattr(th, fg), getattr(th, bg)) >= 4.5
 
 
-def test_font_helper():
+@pytest.fixture
+def family():
+    """测完把挑中的字体还原, 别影响别的测试."""
+    old = th.FAMILY
+    yield
+    th.FAMILY = old
+
+
+def test_pick_family_prefers_unifont_and_falls_back_to_noto(family):
+    assert th.select_family(["DejaVu Sans", "Unifont", "Noto Sans CJK SC"]) == "Unifont" == th.FAMILY
+    assert th.select_family(["DejaVu Sans", "Noto Sans CJK SC"]) == "Noto Sans CJK SC" == th.FAMILY
+    assert th.select_family([]) == "Noto Sans CJK SC"           # 一个字体都列不出来也不抛
+
+
+def test_unifont_is_whole_multiples_of_16px(family):
+    """点阵字只按整数倍放大; 正文各档一律 16px, 大字取最近的 16 的倍数. 粗体照给 (Xft 加粗, 实测清楚)."""
+    th.select_family(["Unifont"])
+    assert th.font(13) == ("Unifont", -16)
+    assert th.font(12) == th.font(15) == th.font(14, mono=True) == ("Unifont", -16)
+    assert th.font(22, mono=True) == ("Unifont", -32)
+    assert th.font(40, bold=True) == ("Unifont", -48, "bold")
+    assert th.font(64) == ("Unifont", -80)
+    assert th.font(-100, bold=True) == ("Unifont", -96, "bold")      # 负数 = 像素
+    assert th.font(-5) == ("Unifont", -16)                            # 再小也是 16
+    assert {th.font_spec(n) for n in th.FONT_TIERS} == {("Unifont", -16)}
+
+
+def test_noto_fallback_keeps_old_sizes(family):
+    """取不到 Unifont: 回到 1.10.00 的 Noto 和字号."""
+    th.select_family([])
     assert th.font(13) == ("Noto Sans CJK SC", 13)
     assert th.font(22, mono=True) == ("Noto Sans Mono CJK SC", 22)
     assert th.font(40, bold=True) == ("Noto Sans CJK SC", 40, "bold")
-    assert th.FONT_BIG + ("bold",) == th.font(15, bold=True)
+    assert th.font(-60) == ("Noto Sans CJK SC", -60)
+    assert th.font_spec(th.FONT_BIG) == th.font(15)
+    assert th.font_spec(th.FONT_MONO) == th.font(13, mono=True)
+    assert th.font_spec(th.FONT_MONO_BIG) == th.font(14, mono=True)
 
 
-def test_mono_font_tiers_are_monospace():
-    """状态板、串口终端、输入框靠等宽对齐; 第 1 步外观不变, 字号也照原样."""
-    assert th.FONT_MONO == th.font(13, mono=True)
-    assert th.FONT_MONO_BIG == th.font(14, mono=True)
+def test_font_tiers_are_named_fonts():
+    """各档是 Tk 命名字体: 模块导入时就能拿名字, setup() 时才按机器上的字体定下来 (以后换也只改一处)."""
+    assert set(th.FONT_TIERS) == {th.FONT_SMALL, th.FONT, th.FONT_BIG, th.FONT_MONO, th.FONT_MONO_BIG}
+    assert all(isinstance(n, str) and " " not in n for n in th.FONT_TIERS)
+
+
+def test_pixel_px_snaps_to_16():
+    assert [th.pixel_px(x) for x in (1, 16, 23, 24, 26, 38, 56, 72, 150)] == [16, 16, 16, 32, 32, 32, 64, 64, 144]
+
+
+def test_tk_options_only_use_theme_values():
+    """option 数据库 (messagebox / OptionMenu / 滚动条 / 勾选框 ...): 颜色都是 theme 里的值, 斜边 2 像素."""
+    opts = dict(th.tk_options())
+    colors = set(_colors().values())
+    for k in ("*Background", "*Foreground", "*activeBackground", "*selectColor", "*troughColor",
+              "*selectBackground", "*insertBackground", "*disabledForeground"):
+        assert opts[k] in colors, k
+    assert opts["*Font"] == th.FONT
+    assert opts["*borderWidth"] == 2
+    assert opts["*highlightThickness"] == 0
+
+
+def test_setup_applies_fonts_and_options(family):
+    """真起 Tk (没显示就跳过): 命名字体按挑中的字体建好, 新建的勾选框吃 option 数据库的底色."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("没有显示")
+    try:
+        root.withdraw()
+        assert th.setup(root, families=[]) == "Noto Sans CJK SC"
+        import tkinter.font as tkfont
+        assert tuple(tkfont.Font(root, name=th.FONT_BIG, exists=True).cget(k) for k in ("family", "size")) \
+            == ("Noto Sans CJK SC", 15)
+        cb = tk.Checkbutton(root)
+        assert cb.cget("background") == th.PANEL and cb.cget("selectcolor") == dict(th.tk_options())["*selectColor"]
+        assert th.setup(root, families=["Unifont"]) == "Unifont"           # 再调一次: 原地改, 不重复建
+        assert tkfont.Font(root, name=th.FONT, exists=True).cget("size") == -16
+    finally:
+        root.destroy()
+
+
+def test_relief_constants():
+    """CDE 斜边: 控件凸 / 输入区凹, 2 像素; 对话框 3 像素. 亮暗边 Tk 按底色自己算."""
+    assert th.RAISED == {"relief": "raised", "bd": 2}
+    assert th.SUNKEN == {"relief": "sunken", "bd": 2}
+    assert th.DIALOG == {"relief": "raised", "bd": 3}
+    assert th.FLAT == {"relief": "flat", "bd": 0}
 
 
 def test_ui_code_has_no_color_literals():
@@ -102,3 +187,4 @@ def test_ui_code_has_no_color_literals():
 
 def test_ui_code_has_no_font_family_literals():
     assert not _hits(FONT_FAMILY), "字体用 th.FONT* 或 th.font(), 别再写字体名"
+

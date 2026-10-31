@@ -18,10 +18,12 @@ PANEL_H = 1280         # 竖屏高 (= 横屏配置串里的宽)
 JPEG_QUALITY = 72
 JPEG_BUDGET = 100 * 1024      # 固件示例每帧缓冲 100KB, 超了会被丢
 
-# 字体: 推车上是 Noto CJK; Mac 本地预览退到苹方/黑体. 都没有才用 Pillow 自带 (不认中文).
-FONTS = [("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc", 2),   # 0=JP 1=KR 2=SC
-         ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
-         ("/System/Library/Fonts/PingFang.ttc", 0)]
+# 字体: 先用车机同一个 Unifont (#28, 点阵: 只按 16 的整数倍放大); 没有退回 Noto CJK,
+# Mac 本地预览退到苹方/黑体. 都没有才用 Pillow 自带 (不认中文). (路径, ttc 里第几个, 是不是点阵)
+FONTS = [(path, 0, True) for path in th.UNIFONT_PATHS] + [
+    ("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc", 2, False),   # 0=JP 1=KR 2=SC
+    ("/System/Library/Fonts/STHeiti Medium.ttc", 0, False),
+    ("/System/Library/Fonts/PingFang.ttc", 0, False)]
 
 M = 40                          # 左右边距
 BG = th.DASH_BG
@@ -40,17 +42,20 @@ MARK = {"FAIL": ("×", BAD), "WARN": ("▲", WARN)}   # ✕ 不少中文字体�
 _font_cache = {}
 
 
+def load_font(size, fonts=FONTS):
+    """按表找第一个开得了的字体; 点阵字的字号换成 16 的整数倍 (版面按 getlength 量, 不按字号算)."""
+    from PIL import ImageFont
+    for path, index, pixel in fonts:
+        try:
+            return ImageFont.truetype(path, th.pixel_px(size) if pixel else size, index=index)
+        except OSError:
+            continue
+    return ImageFont.load_default(size)
+
+
 def _font(size):
     if size not in _font_cache:
-        from PIL import ImageFont
-        for path, index in FONTS:
-            try:
-                _font_cache[size] = ImageFont.truetype(path, size, index=index)
-                break
-            except OSError:
-                continue
-        else:
-            _font_cache[size] = ImageFont.load_default(size)
+        _font_cache[size] = load_font(size)
     return _font_cache[size]
 
 

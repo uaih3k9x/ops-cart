@@ -10,6 +10,7 @@ import time
 import pytest
 
 import kiosk_ui_core as ui
+import theme as th
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -512,9 +513,9 @@ def test_panels_use_bridge_not_after0():
 
 
 def test_net_view_colors_and_unknown_state():
-    assert ui.net_view("on", "在线") == {"image": "on", "text": "在线", "fg": "#7ee787"}
-    assert ui.net_view("warn", "出不去")["fg"] == "#f0b429"
-    assert ui.net_view("off", "无路由")["fg"] == "#ff7b72"
+    assert ui.net_view("on", "在线") == {"image": "on", "text": "在线", "fg": th.OK}
+    assert ui.net_view("warn", "出不去")["fg"] == th.WARN
+    assert ui.net_view("off", "无路由")["fg"] == th.BAD
     assert ui.net_view("???", "x")["image"] == "off"         # 认不出的状态按离线画, 不抛
 
 
@@ -660,3 +661,10 @@ def test_serve_bar_texts_have_no_symbols():
 def test_serve_renew_question_names_minutes_and_whole_segment():
     q = ui.serve_renew_question(1800)
     assert "30 分钟" in q and "整个网段" in q
+
+
+def test_font_row_reports_unifont_or_fallback():
+    """自检多一行界面字体 (#28): Unifont 取到 OK; 退回 Noto 是 WARN (能用, 但部署时字体没装好)."""
+    assert ui.font_row(th.UNIFONT) == {"label": "UI FONT", "state": "OK", "detail": "UNIFONT 16PX", "check": "uifont"}
+    row = ui.font_row(th.NOTO)
+    assert row["state"] == "WARN" and row["detail"] == "FALLBACK NOTO" and row["label"] == "UI FONT"

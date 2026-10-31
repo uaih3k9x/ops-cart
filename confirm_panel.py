@@ -12,7 +12,6 @@ import confirm_core as cc
 import theme as th
 
 FONT, FONT_BIG = th.FONT, th.FONT_BIG
-FONT_CMD = th.font(20, bold=True, mono=True)
 BG, CARD, FG, DIM = th.PANEL, th.LAMP_BODY, th.FG, th.DIM
 BTN = {"go": (th.GO_BG, th.GO_FG), "no": (th.DANGER_BG, th.DANGER_FG), "stop": (th.ALERT_BG, th.WHITE),
        "plain": (th.BTN2, th.FG)}
@@ -88,7 +87,7 @@ class ConfirmDialog(tk.Toplevel):
     def _item(self, it):
         f = tk.Frame(self.body, bg=CARD, padx=12, pady=8)
         f.pack(fill="x", pady=4)
-        tk.Label(f, text=it["head"], font=FONT_CMD, bg=CARD, fg=FG, anchor="w", justify="left",
+        tk.Label(f, text=it["head"], font=th.font(20, bold=True, mono=True), bg=CARD, fg=FG, anchor="w", justify="left",
                  wraplength=680).pack(fill="x")
         self._meta[it["id"]] = tk.Label(f, text=it["meta"], font=FONT, bg=CARD, fg=DIM, anchor="w")
         self._meta[it["id"]].pack(fill="x")
