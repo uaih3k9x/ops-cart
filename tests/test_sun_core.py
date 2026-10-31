@@ -1,9 +1,10 @@
-"""sun_core 测试: 日出日落对公开表 (误差 <= 2 分钟)、极昼极夜、三档 / 缓冲 / 没配置 / 配置坏了 / last 维持.
+"""sun_core 测试: 日出日落对独立实现 (误差 <= 2 分钟) + 性质测试、极昼极夜、三档 / 缓冲 / 没配置 / 配置坏了 / last 维持.
 
-参考值来源: PyEphem 4.2.1 (XEphem libastro, VSOP87 星历, 和 NOAA 算法互相独立) 按 USNO 口径
-(太阳上缘、折射 34'、气压 0、海拔 0) 算出再取整到分钟, 2026-10-31 生成, 生成脚本见文末注释.
-伦敦一行另和英国气象局 (Met Office) 公布的 2026 夏至 04:43 / 21:21 对过. timeanddate.com 和
-USNO API 在开发机上抓不到 (Cloudflare 拦 / 代理 502), 没直接用.
+参考值来源: 未能取得外部表格 —— timeanddate.com 403 / Cloudflare 拦, USNO API
+(aa.usno.navy.mil/api/rstt/oneday) 开发机代理 502, 2026-10-31 都试过. 退而用独立实现交叉验证:
+PyEphem 4.2.1 (XEphem libastro, VSOP87 星历, 和 NOAA 算法互相独立) 按 USNO 口径 (太阳上缘、
+折射 34'、气压 0、海拔 0) 算出再取整到分钟, 2026-10-31 生成, 生成方法见文末注释.
+所以 REFS 不是外部权威数据; 另有不依赖外部数据的性质测试 (二分点昼长、夏至昼最长、日出 < 中天 < 日落).
 """
 
 import datetime as dt
@@ -63,6 +64,41 @@ def test_sun_times_default_tz_is_utc():
     st = sc.sun_times(dt.date(2026, 3, 20), 0.0, 0.0)
     assert st["rise"].utcoffset() == dt.timedelta(0)
     assert abs(st["rise"].hour * 60 + st["rise"].minute - 6 * 60) <= 10     # 赤道春分 ~06:04 UTC
+
+
+# ---- 性质测试: 不依赖任何外部数据 ----
+
+def _len_h(day, lat, lon=0.0):
+    st = sc.sun_times(day, lat, lon)
+    return (st["set"] - st["rise"]).total_seconds() / 3600
+
+
+@pytest.mark.parametrize("lat", [-60, -35, 0, 23.4, 51.5, 60])
+def test_equinox_day_is_about_12_hours(lat):
+    # 折射和日面半径让二分点白天比 12 小时略长, 纬度越高越长 (60 度约 +15 分钟)
+    for day in (dt.date(2026, 3, 20), dt.date(2026, 9, 23)):
+        assert 12.0 < _len_h(day, lat) < 12.3
+
+
+def test_solstice_is_longest_day():
+    summer, winter = dt.date(2026, 6, 21), dt.date(2026, 12, 21)
+    north = [_len_h(summer + dt.timedelta(days=k), 51.5) for k in range(-20, 21, 5)]
+    assert max(north) == north[4]                                  # 北半球夏至最长
+    south = [_len_h(winter + dt.timedelta(days=k), -33.9) for k in range(-20, 21, 5)]
+    assert max(south) == south[4]                                  # 南半球冬至 (12 月) 最长
+    assert 24 < _len_h(summer, 51.5) + _len_h(summer, -51.5) < 24.6     # 南北对称, 多出来的是两边的折射
+
+
+@pytest.mark.parametrize("lat,lon", [(51.5, -0.1), (-33.9, 151.2), (1.9, -157.4), (-13.8, -171.8), (64.1, -21.9)])
+def test_rise_before_noon_before_set(lat, lon):
+    for month in range(1, 13):
+        st = sc.sun_times(dt.date(2026, month, 15), lat, lon)
+        noon = st["rise"] + (st["set"] - st["rise"]) / 2
+        assert st["rise"] < noon < st["set"]
+        assert 0 < (st["set"] - st["rise"]).total_seconds() < 86400
+        # 中天的 UTC 钟点 = 12:00 - 经度 * 4 分钟 (+- 时差, 一年里不超过 17 分钟)
+        solar = (noon.hour * 60 + noon.minute + 4 * lon - 720 + 720) % 1440 - 720
+        assert abs(solar) <= 17
 
 
 # ---- 模式选择 ----
@@ -186,6 +222,6 @@ def test_example_conf_is_valid():
     assert conf and conf["mode"] == "auto" and conf["lat"] is not None
 
 
-# 参考值生成 (开发机上, pip install ephem==4.2.1):
+# 参考值生成 (开发机上, pip install ephem==4.2.1; 不进仓库依赖):
 #   o = ephem.Observer(); o.lat, o.lon = "51.508", "-0.126"; o.pressure = 0; o.horizon = "-0:34"
 #   o.date = <当地正午的 UTC>; o.previous_rising(ephem.Sun()), o.next_setting(ephem.Sun())
