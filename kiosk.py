@@ -9,7 +9,6 @@ v2: overrideredirect 全屏铺满; UVC 预览(mpv 嵌入); CH9329 键鼠透传
 """
 
 import os
-import shlex
 import sys
 import time
 import tkinter as tk
@@ -23,13 +22,12 @@ import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
 import lamps_core as lc
-import netprof_core as npc
 import ups_core as uc
 import serial_core as sc
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
-from netprof_panel import NetProfPanel, ask_valid
+from netmode_panel import NetModePanel
 from wol_panel import WolPanel
 
 FONT = ("Noto Sans CJK SC", 13)
@@ -42,7 +40,7 @@ CH_REAP_MS = 1000           # 每秒让 ChWorker 看一次键鼠空不空闲 (�
 CH_BUSY_NOTE_MS = 2500      # "键鼠被占用" 横幅留多久
 BOOT_WATCHDOG_MS = 30000    # 自检 30 秒还没完就强制进主界面 (锁屏)
 PANE_CLASSES = {"serial": SerialPanel, "ks": KsPanel, "wifi": WifiPanel,
-                "netprof": NetProfPanel, "wol": WolPanel}
+                "netmode": NetModePanel, "wol": WolPanel}
 
 
 class Kiosk(tk.Tk):
@@ -278,15 +276,15 @@ class Kiosk(tk.Tk):
                 self._lamps[key] = (f, stripe, lab, [None])
                 return
             for w in (f, lab):
-                # 操作头带上自己那一路 (issue #5); 其余面板不带
-                slot = lc.slot_for_lamp(key) if key.startswith("con-") else None
+                # 操作头带上自己那一路 (issue #5); LAN1/LAN2 灯带上网口 (#12); 其余面板不带
+                slot = lc.slot_for_lamp(key) if key.startswith("con-") else key[4:] if pane == "netmode" else None
                 w.bind("<Button-1>", lambda _e, p=pane, s=slot: self._open_pane(p, s))
             self._lamps[key] = (f, stripe, lab, [None])
 
         for n in range(1, len(lc.SLOTS) + 1):
             block(f"con-{n}", 8, "serial")
         tk.Frame(bar, bg="#2a3347", width=2).pack(side="left", fill="y", padx=(4, 10))
-        pane_of = {"kvm": "preview", "pxe": "ks", "net:eno1": "netprof", "net:enp3s0": "netprof",
+        pane_of = {"kvm": "preview", "pxe": "ks", "net:eno1": "netmode", "net:enp3s0": "netmode",
                    "net:wlp4s0": "wifi"}
         for name, _label, key in lc.LOWER:
             block(key, 5, pane_of[key])
@@ -295,7 +293,7 @@ class Kiosk(tk.Tk):
         self._lamps[uc.UPS_KEY][2].config(text="电池")
 
     def _open_pane(self, name, select=None):
-        """select: 串口面板要选中的那一路 (issue #5 执行器条点操作头)."""
+        """select: 串口面板要选中的那一路 (issue #5 执行器条点操作头) / 网口模式面板要选中的口 (#12)."""
         if self.pane.current != name:
             self.toggle_pane(name, select=select)
         elif select:
@@ -432,7 +430,7 @@ class Kiosk(tk.Tk):
     # ------------------------------------------------------------ 左侧面板
 
     def toggle_pane(self, name, select=None):
-        """左侧面板 (预览/串口/ks/无线/网口配置/WOL) 同时只开一个; 再点一次回状态板."""
+        """左侧面板 (预览/串口/ks/无线/网口模式/WOL) 同时只开一个; 再点一次回状态板."""
         if name == "preview" and self.pane.current != "preview" and not os.path.exists(self.video_dev):
             messagebox.showwarning("UVC 预览", f"未检测到采集设备 {self.video_dev}")
             return
@@ -461,8 +459,8 @@ class Kiosk(tk.Tk):
             self._start_preview()
             return
         try:
-            # 串口面板: 打开时就指定要选的那一路, 列表回来后落位 (issue #5)
-            if select and name == "serial":
+            # 串口面板: 打开时就指定要选的那一路, 列表回来后落位 (issue #5); 网口模式面板: 选中那个口 (#12)
+            if select and name in ("serial", "netmode"):
                 w = PANE_CLASSES[name](self.body, want=select)
             else:
                 w = PANE_CLASSES[name](self.body)
@@ -812,67 +810,6 @@ class Kiosk(tk.Tk):
                 text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
                 else f"PXE 装机服务{verb}失败, 详见 journalctl"), f"正在{verb} PXE 装机服务…")
         self._bg_action("toggle_pxe", lambda: kc.services_status(("pxe-server",)), asked, "读取服务状态…")
-
-    def cfg_lan2(self):
-        """#8: 这里改的是内置连接; 「网口配置文件」改的是命名配置, 两个入口都会动 enp3s0.
-        实时状态按 netprof_core.lan2_view 单一口径读, 有冲突就把参与方写进对话框.
-        静态地址由人填并校验; 下发前确认框写明原来/改为/怎么回滚 (回滚 = 写回改之前的 ipv4 字段)."""
-        def read():
-            return (kc.nics_status(), kc.run(npc.CMD_CONS)[1],
-                    npc.parse_ipv4(kc.run(npc.cmd_ipv4(kc.LAN2_CON))[1]))
-
-        def apply(cmds, note):
-            res = "已下发, 状态见左侧(远程会断属正常)"
-            for cmd in cmds:
-                rc, _ = kc.run(cmd, timeout=30)
-                if rc:
-                    res = f"失败: {' '.join(cmd[:4])} 返回 {rc}"
-                    break
-            cartlog.event("netprof", f"{note} {res}")      # 远程断了也能在 events.log 里找到回滚命令
-            return res
-
-        def ask(res):
-            self.banner.config(text="")
-            nics, cons, before = res if not isinstance(res, Exception) else ([], "", None)
-            view = npc.lan2_view(kc.LAN2_CON, cons, nics)
-            if view["ip"] == "-" and not view["link"]:
-                return messagebox.showerror("LAN2", "读不到 enp3s0 的状态")
-            warn = ("注意: LAN2 是管理口(远程/SSH/tailscale 走这里)!\n"
-                    "修改后当前远程连接会断, 请确保你人在车边操作.\n\n"
-                    f"当前: {view['ip']} ({view['method']})  生效配置: {view['active'] or '-'}\n"
-                    + (f"\n{view['warning']}\n" if view["conflict"] else "")
-                    + "\n要继续吗?")
-            if not messagebox.askyesno("LAN2 管理口", warn, icon="warning"):
-                return
-            if messagebox.askyesno("LAN2", f"当前: {view['ip']} ({view['method']})\n\n改为 DHCP(自动获取)?"):
-                after = {"method": "auto", "addr": "", "gateway": "", "dns": ""}
-                cmds = kc.nmcli_set_dhcp(kc.LAN2_CON)
-            else:
-                old = before or {}
-                form = ask_valid(self, "静态 IP", "LAN2 地址/前缀 (预填的是当前地址, 可改):",
-                                 view["ip"] if view["ip"] != "-" else "", npc.static_form)
-                if form is None:
-                    return
-                addr = form["addr"]
-                gw = ask_valid(self, "网关", "网关(可空):", old.get("gateway", ""),
-                               lambda t: npc.static_form(addr, gateway=t)["gateway"]) or ""
-                dns = ask_valid(self, "DNS", "DNS(可空, 多个用逗号):", old.get("dns", ""),
-                                lambda t: npc.static_form(addr, dns=t)["dns"]) or ""
-                after = {"method": "manual", "addr": addr, "gateway": gw, "dns": dns}
-                cmds = kc.nmcli_set_static(kc.LAN2_CON, addr, gw, dns)
-            if not messagebox.askyesno("LAN2 下发确认", npc.lan2_confirm_text(kc.LAN2_CON, before, after),
-                                       icon="warning"):
-                return
-            rb = npc.lan2_rollback(kc.LAN2_CON, before)["cmds"]
-            note = (f"LAN2 管理口配置 {npc.describe_ipv4(before)} -> {npc.describe_ipv4(after)}"
-                    + (f" (回滚: {' && '.join(shlex.join(c) for c in rb)})" if rb else ""))
-
-            def applied(r):
-                messagebox.showinfo("LAN2", str(r))
-
-            self._bg_action("cfg_lan2_apply", lambda: apply(cmds, note), applied, "正在下发 LAN2 配置…")
-
-        self._bg_action("cfg_lan2", read, ask, "读取网口状态…")
 
     def confirm_power(self, off):
         verb = "关机" if off else "重启"

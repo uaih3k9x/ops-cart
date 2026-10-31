@@ -183,6 +183,11 @@ class NetModePanel(BridgePanel):
             self.lb.insert("end", f"{v['port']} {v['iface']:<7} {v['title']:<28} {v['ip']:<18} "
                                   f"{link}  {v['egress'] or '不出网'}{note}")
 
+    def select_slot(self, iface):
+        """顶栏 LAN1 / LAN2 灯点进来 (面板已开着): 选中那个口. 和串口面板同名, kiosk 统一调."""
+        if iface in nmc.PORTS:
+            self._pick(iface)
+
     def _on_select(self):
         cur = self.lb.curselection()
         if cur and cur[0] < len(self.views):

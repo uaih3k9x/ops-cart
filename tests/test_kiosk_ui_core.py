@@ -237,7 +237,7 @@ def test_leftpane_close_and_unknown():
 
 
 def test_panes_include_preview():
-    assert {"preview", "serial", "ks", "wifi", "netprof", "wol"} == set(ui.PANES)
+    assert {"preview", "serial", "ks", "wifi", "netmode", "wol"} == set(ui.PANES)
 
 
 # ------------------------------------------------------------ B4 菜单
@@ -256,7 +256,7 @@ def test_menu_pages_reachable_and_actions_unique():
 def test_menu_keeps_every_action_and_panes_are_parameterized():
     acts = set(_actions(ui.MENU))
     assert {a for a, _ in acts} == {"toggle_pane", "switch_source", "toggle_mouse_mode", "cycle_kvm",
-                                    "toggle_pxe", "toggle_install_mode", "cfg_lan2", "lock_now",
+                                    "toggle_pxe", "toggle_install_mode", "lock_now",
                                     "reboot", "poweroff"}
     assert {arg for a, arg in acts if a == "toggle_pane"} == set(ui.PANES)
 
@@ -477,13 +477,22 @@ def test_kiosk_pin_gate_persists_failures():
         assert "state_path" in kw and ast.unparse(kw["state_path"]) == "kc.PIN_STATE"
 
 
+def test_one_entry_for_wired_ports():
+    """#8/#12: LAN1 / LAN2 只剩「网口模式」一个入口, 旧的「网口配置文件」和「LAN2 管理口配置」都撤了."""
+    texts = [it["text"] for items in ui.MENU.values() for it in items]
+    assert "网口模式" in texts and "网口配置文件" not in texts and "LAN2 管理口配置" not in texts
+    src = _src("kiosk.py")
+    assert "cfg_lan2" not in src and "NetProfPanel" not in src and "netprof_panel" not in src
+    assert '"net:eno1": "netmode"' in src and '"net:enp3s0": "netmode"' in src
+
+
 def test_kiosk_has_no_lan1_config_and_no_cross_thread_after():
     src = _src("kiosk.py")
     assert "cfg_lan1" not in src and "pxe_conf_read" not in src and "apply_pxe_conf" not in src
     assert "after(0" not in src
 
 
-@pytest.mark.parametrize("name", ["kiosk.py", "wifi_panel.py", "ks_panel.py", "netprof_panel.py", "wol_panel.py",
+@pytest.mark.parametrize("name", ["kiosk.py", "wifi_panel.py", "ks_panel.py", "netmode_panel.py", "wol_panel.py",
                                   "kiosk_ui_core.py"])
 def test_ui_sources_have_no_emoji_or_symbols(name):
     hits = [(i, ln.strip()) for i, ln in enumerate(_src(name).splitlines(), 1) if ui.is_symbol_char(ln)]
@@ -497,7 +506,7 @@ def test_is_symbol_char_rules():
 
 
 def test_panels_use_bridge_not_after0():
-    for name in ("wifi_panel.py", "netprof_panel.py", "ks_panel.py", "wol_panel.py"):
+    for name in ("wifi_panel.py", "netmode_panel.py", "ks_panel.py", "wol_panel.py"):
         src = _src(name)
         assert "after(0" not in src and "threading.Thread" not in src, name
 
