@@ -74,7 +74,7 @@
 | [`recipe_core.py`](recipe_core.py) · [`recipe.py`](recipe.py) | 屏幕自动化配方:截图 + OCR + CH9329,第一个配方 `boot-pxe` 自动进启动菜单选网络启动;配方里不许出现保存类按键 |
 | [`clone_core.py`](clone_core.py) | 整盘克隆(Clonezilla over PXE):解锁用途 clone-save / clone-restore、启动参数生成、目标盘按型号/序列号显式匹配(绝不默认 sda)、批量清单确认;见 [`docs/CLONE.md`](docs/CLONE.md) |
 | [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
-| [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;`--once --preview` 导出画面不推屏 |
+| [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;车机 kiosk 没就绪(kiosk.json 里的 pid 不在了)画开机自检,逐行出结果;`--once --preview` 导出画面不推屏 |
 | [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
 | [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;按百分比判低电量 |
 | [`lamps_core.py`](lamps_core.py) | 顶栏虚拟指示灯:每灯盯一个单调计数器(日志大小、网卡字节数、键鼠发送次数),变了就闪;串口操作头 `/dev/con-1~4` 收到 ^G 亮红 |
