@@ -29,6 +29,7 @@ ReadWritePaths=/opt/pxe/web.conf
 # 串口急停 / 拒绝 (#23): 只往这个目录投请求文件, root 的 cart-serial-req 执行; 目录不在 (没装) 就忽略
 ReadWritePaths=-/run/ops-cart/serial-req
 ProtectHome=read-only
+# CAP_DAC_READ_SEARCH 能读 shadow, 所以遮掉; SELinux enforcing 下要先装 deploy/selinux/ops_cart_mounton.te, 不然起不来 (226/NAMESPACE)
 InaccessiblePaths=-/etc/shadow -/etc/gshadow -/root
 PrivateTmp=yes
 ProtectKernelTunables=yes

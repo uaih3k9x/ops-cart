@@ -1,0 +1,14 @@
+# webkiosk.service 的 InaccessiblePaths=/etc/shadow /etc/gshadow 要 systemd (init_t) 在 shadow_t 文件上挂载遮挡;
+# Rocky 9 默认策略不给, 服务起不来 (status=226/NAMESPACE, avc denied mounton). 只加这一条.
+# 装: checkmodule -M -m -o ops_cart_mounton.mod ops_cart_mounton.te
+#     semodule_package -o ops_cart_mounton.pp -m ops_cart_mounton.mod && semodule -i ops_cart_mounton.pp
+# 卸: semodule -r ops_cart_mounton
+module ops_cart_mounton 1.0;
+
+require {
+	type init_t;
+	type shadow_t;
+	class file mounton;
+}
+
+allow init_t shadow_t:file mounton;
