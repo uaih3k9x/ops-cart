@@ -266,7 +266,7 @@ class Server:
             self.audit.write(audit_line(who, tool, args, ok, error=error, ms=ms))
 
     def _call(self, rid, params, who):
-        name, args = params.get("name"), params.get("arguments")
+        name, args = params.get("name"), params.get("arguments", {})
         tool = self.tools.get(name) if isinstance(name, str) else None
         if tool is None:
             self._log(who, name, args, False, error="没有这个工具")
