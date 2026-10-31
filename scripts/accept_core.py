@@ -170,12 +170,13 @@ def closure(entries, graph):
     return seen
 
 
-# deploy/<子目录> -> 推车上的目录; 改名的单列. selinux 是装模块不是拷文件, pxe.env.example 要按现场改, 都不比对.
+# deploy/<子目录> -> 推车上的目录; 改名的单列. selinux 是装模块不是拷文件, pxe.env.example 要按现场改,
+# srv-data/ 只在装了数据盘时由 setup-srv-data.sh / setup-samba.sh 装 (#11, 可选), 都不比对.
 DEPLOY_DIRS = {"systemd": "/etc/systemd/system", "tmpfiles.d": "/etc/tmpfiles.d",
                "logrotate.d": "/etc/logrotate.d", "sysctl.d": "/etc/sysctl.d",
                "journald.conf.d": "/etc/systemd/journald.conf.d", "bin": "/usr/local/bin"}
 DEPLOY_RENAME = {"bin/kiosk-launcher": "kiosk"}
-DEPLOY_SKIP = ("selinux/", "pxe.env.example")
+DEPLOY_SKIP = ("selinux/", "pxe.env.example", "srv-data/")
 ASSET_DIRS = ("web", "icons")
 FONT_DEST = "/usr/local/share/fonts/ops-cart"
 
@@ -387,7 +388,7 @@ def parse_semodule(text):
 def judge_selinux(enforce, modules):
     enforce = (enforce or "").strip()
     if enforce == "Disabled":
-        return MANUAL, "SELinux 关着 (Disabled), 模块装不装都行; 推车平时应是 Enforcing, 问一下 9x"
+        return MANUAL, "SELinux 关着 (Disabled), 模块装不装都行; 推车平时应是 Enforcing, 问一下 维护者"
     if SELINUX_MODULE in modules:
         return PASS, f"{enforce or '?'}, 模块 {SELINUX_MODULE} 已加载"
     return FAIL, f"{enforce or '?'}, 模块 {SELINUX_MODULE} 没加载 (webkiosk 在 Enforcing 下会 226 起不来)"

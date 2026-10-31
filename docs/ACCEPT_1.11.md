@@ -51,7 +51,7 @@ sudo python3 /tmp/accept/cart_accept.py | tee ~/accept-1.11-run1.txt
 **应该看到**：每行一个 `[PASS] / [FAIL] / [SKIP] / [人工]`，后面是 issue 号和一句原因；最后有汇总，FAIL 和"人工"再列一遍。
 
 - 这时候还没接线，下面这些出 SKIP / 人工 / FAIL 都是正常的，**先别管**：LLDP 对端（#14）、CH9329 键鼠线（#9）、标签机（#20）、串口操作头（#15）、Clonezilla 文件（#18）、自己发地址限时（#11）。
-- 其余的 **FAIL 要先处理**（原因那句话一般就说了怎么修），修不了的记下来，问 9x。
+- 其余的 **FAIL 要先处理**（原因那句话一般就说了怎么修），修不了的记下来，问 维护者。
 - 只想重跑某一项：`sudo python3 /tmp/accept/cart_accept.py --only '#14'`（按 issue 号或名字里的字过滤）。
 
 ---
@@ -80,7 +80,7 @@ sudo python3 /tmp/accept/cart_accept.py | tee ~/accept-1.11-run1.txt
 - **没有看不清的字**：灰底上的灰字、确认框里的小字都能读。看不清的拍下来，记哪个界面哪行。
 - 按钮文字没被截断、没有挤出框。
 
-**过了**：#28 可以关；#27（主题规范化）的验收就是"实机每个界面过一遍"，一起关。照片发给 9x 留底。
+**过了**：#28 可以关；#27（主题规范化）的验收就是"实机每个界面过一遍"，一起关。照片发给 维护者 留底。
 
 ### 2.3 深 / 浅（#31）——**只看脚本，不看界面**
 
@@ -143,7 +143,7 @@ sudo python3 /tmp/accept/cart_accept.py | tee ~/accept-1.11-run1.txt
 3. 确认框列出要执行的命令和撤销（undo）命令，写清"原来 / 改为"。
 4. `ip -4 addr show enp3s0` 里是 `/23`（按人填的来）。切回 DHCP 后地址恢复正常、远程又能连上。
 
-**过了**：#13 可以关。#12、#25（网口模式重构、静态加网关 DNS）也是这个面板，顺手试了网关 / DNS 没问题可以在 issue 里留言，关不关问 9x。
+**过了**：#13 可以关。#12、#25（网口模式重构、静态加网关 DNS）也是这个面板，顺手试了网关 / DNS 没问题可以在 issue 里留言，关不关问 维护者。
 
 ### 4.3 装机口自己发地址限时 30 分钟（#11 的一部分）**【要外部条件：待装机】**
 
@@ -158,7 +158,7 @@ sudo python3 /tmp/accept/cart_accept.py | tee ~/accept-1.11-run1.txt
 - 点那条红条 → 确认 → 续期，剩余时间重新从 30:00 开始。
 - （可选，要等）到点后红条变成"已到时、已停发"，events.log 有一行 `[pxe]`，配了推送的话手机收到。想快点验：临时在 `/etc/ops-cart/pxe.env` 加 `PXE_SERVE_MINUTES=2`，`sudo systemctl restart pxe-server`，验完删掉这行再重启。
 
-**过了**：在 #11 里留言"限时验过"。#11 本身还包括数据盘、WinPE、Samba 等，**不关**，等 9x 看。
+**过了**：在 #11 里留言"限时验过"。#11 本身还包括数据盘、WinPE、Samba 等，**不关**，等 维护者 看。
 
 ---
 
@@ -177,7 +177,7 @@ sudo python3 /tmp/accept/cart_accept.py | tee ~/accept-1.11-run1.txt
 2. 真跑：屏幕上出现启动菜单、自动选中网络启动（PXE / Network / IPv4）、回车，待装机开始 PXE，出现推车的救援菜单。退出码 0。
 3. 配方里没有进 BIOS 设置、没有"保存"类按键。
 
-**过了**：#17 可以关。不过的话把 `/run/ops-cart/recipe-*` 整个目录拷回来给 9x（重启推车会清掉）。
+**过了**：#17 可以关。不过的话把 `/run/ops-cart/recipe-*` 整个目录拷回来给 维护者（重启推车会清掉）。
 
 ---
 
@@ -363,7 +363,7 @@ claude mcp add cart -- ssh <推车> sudo python3 /opt/pxe/cart_mcp.py stdio
 sudo python3 /tmp/accept/cart_accept.py | tee ~/accept-1.11-final.txt
 ```
 
-- 把 `~/accept-1.11-run1.txt`、`~/accept-1.11-final.txt` 和照片发给 9x。
+- 把 `~/accept-1.11-run1.txt`、`~/accept-1.11-final.txt` 和照片发给 维护者。
 - 关 issue：`gh issue close <号> -c "1.11.00 实机验收通过: <一句话写看到了什么>"`。没测的、不过的在 issue 里留言写原因，**别关**。
 
 ## 验收记录（现场填）

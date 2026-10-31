@@ -50,7 +50,7 @@ python3 scripts/cart_accept.py --make-manifest scripts/accept-manifest.json   # 
 
 ```bash
 ssh <推车>
-cat /opt/pxe/VERSION /opt/pxe/BUILD      # 预期 1.09.01; 不是就停下来问 9x
+cat /opt/pxe/VERSION /opt/pxe/BUILD      # 预期 1.09.01; 不是就停下来问 维护者
 getenforce; sudo semodule -l | grep ops_cart_mounton    # 待核对: webkiosk 在 1.09.01 时是不是已经因为 226 起不来、有没有人手装过模块
 systemctl is-enabled webkiosk cart-mcp kvm-broker cart-notify.timer 2>&1
 id ops-web                              # 网页口用户在不在 (决定第 4 步 serial-req 那几行)
