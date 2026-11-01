@@ -659,7 +659,7 @@ def issue_checks(expect_version):
         ac.Check("状态快照 state.json 在更新", "#26", snap_fresh),
         ac.Check("快照里的版本号", "-", snap_version),
         ac.Check("UPS 读数", "#4", ups),
-        ac.Check("UPS 两段式阈值 25% / 15% / 30 秒", "#4", ups_consts),
+        ac.Check("UPS 两段式阈值 40% / 15% / 30 秒", "#4", ups_consts),
         ac.Check("LLDP 对端", "#14", lldp),
         ac.Check("深浅模式进快照", "#31", theme),
         ac.Check("自己发地址限时", "#11", guard),

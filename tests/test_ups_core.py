@@ -310,3 +310,13 @@ def test_log_goes_to_ops_cart_dir_and_events(tmp_path, monkeypatch):
     uc.log("倒计时开始", path=str(tmp_path / "ups.log"))
     assert "[ups] 倒计时开始" in (tmp_path / "ups.log").read_text(encoding="utf-8")
     assert "[ups] 倒计时开始" in (tmp_path / "events.log").read_text(encoding="utf-8")
+
+
+def test_warn_early_enough_for_real_discharge_curve():
+    """11-01 实测 (BX1200CI-CN, 负载 16%): 25% 预告后 15 秒就到 15% (末段断崖), 等于没预告.
+    预告要在断崖之前: 33% / 剩 628 秒那一刻必须已经在预告; 59% / 剩 1134 秒还不用."""
+    assert uc.shutdown_stage(_ob(percent=33, runtime=628), None, T) == ("warn", None)
+    assert uc.shutdown_stage(_ob(percent=40, runtime=1000), None, T) == ("warn", None)
+    assert uc.shutdown_stage(_ob(percent=54, runtime=1032), None, T) == ("normal", None)
+    assert uc.shutdown_stage(_ob(percent=59, runtime=1134), None, T) == ("normal", None)
+    assert uc.shutdown_stage(_ob(percent=70, runtime=880), None, T) == ("warn", None)     # 负载大时靠剩余时间

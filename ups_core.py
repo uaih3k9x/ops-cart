@@ -18,8 +18,8 @@ import re
 import subprocess
 
 LOW_PCT = 15                    # 放电到这个百分比进关机倒计时
-WARN_PCT = 25                   # 放电到这个百分比先预告 (10/31 演练: 约 3.7%/分, 25%->15% 约 2.7 分钟)
-WARN_RUNTIME_S = 8 * 60         # 或 UPS 估计剩余 (hidraw battery.runtime) 不到这么多秒, 也预告
+WARN_PCT = 40                   # 放电到这个百分比先预告. 11-01 实测末段断崖: 25%->15% 只用 15 秒, 所以提早到 40%
+WARN_RUNTIME_S = 15 * 60        # 或 UPS 估计剩余 (hidraw battery.runtime) 不到这么多秒, 也预告 (11-01: 8 分钟太晚)
 COUNTDOWN_S = 30                # 到 LOW_PCT 后倒计时这么多秒再关机, 期间插回市电取消
 UPS_KEY = "ups"                 # 顶栏电池灯在 _lamps 里的键
 UPS_LOG = "/var/log/ops-cart/ups.log"   # 目录由 tmpfiles 建, logrotate 管 *.log

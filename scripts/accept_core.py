@@ -592,7 +592,7 @@ def judge_kvm_status(reply):
     return PASS, "代理应答 status: " + json.dumps(r.get("status"), ensure_ascii=False)[:160]
 
 
-UPS_EXPECT = (25, 15, 30)       # 预告 %, 倒计时 %, 倒计时秒 (#4)
+UPS_EXPECT = (40, 15, 30)       # 预告 %, 倒计时 %, 倒计时秒 (#4)
 
 
 def netmode_summary(doc):
