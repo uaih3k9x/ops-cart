@@ -1516,3 +1516,18 @@ def test_parse_args_serve_minutes(monkeypatch):
     monkeypatch.setenv("PXE_SERVE_MINUTES", "45")             # pxe.env 里配, 单元不用改
     assert _px.parse_args(base).serve_minutes == 45
     assert _px.parse_args(base).renew_file == _px.RENEW_PATH
+
+
+def test_serve_notice_expired_hides_after_a_while():
+    """#33: 到时停发的横条只挂 EXPIRED_NOTICE_S (10 分钟), 之后收起, 只留 PXE 灯 / 自检 WARN.
+    时间起点是 until (到时那一刻); 没有 until 就看 since; 都没有就照旧一直显示 (宁可多提醒)."""
+    S = _px.EXPIRED_NOTICE_S
+    assert S == 600
+    doc = {"state": "expired", "until": 1000, "window": 1800}
+    assert _px.serve_notice(doc, 1000 + S)["level"] == "expired"
+    assert _px.serve_notice(doc, 1000 + S + 1) is None
+    assert _px.serve_notice({"state": "expired", "until": None, "since": 1000}, 1000 + S + 1) is None
+    assert _px.serve_notice({"state": "expired", "until": None, "since": 1000}, 1000 + 5)["level"] == "expired"
+    assert _px.serve_notice({"state": "expired"}, 10 ** 10)["level"] == "expired"
+    # 守卫还没改状态 (serving 但已过 until) 也按同样规则收
+    assert _px.serve_notice({"state": "serving", "until": 1000, "window": 1800}, 1000 + S + 1) is None

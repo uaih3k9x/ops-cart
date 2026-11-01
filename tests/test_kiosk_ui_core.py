@@ -727,3 +727,18 @@ def test_theme_button_text_names_setting():
 def test_menu_has_theme_switch_in_screen_settings():
     items = [it for it in ui.MENU["video"] if it.get("do") == "cycle_theme"]
     assert items and items[0]["attr"] == "btn_theme"
+
+
+def test_pxe_lamp_click_renews_when_expired():
+    """#33: 横条收起后, 点底部 PXE 灯续期; 平时照旧开装机面板. 不限时 / 没 window 的不续."""
+    import kiosk_ui_core as k
+    assert k.pxe_lamp_action({"state": "expired", "window": 1800}) == "renew"
+    for g in ({"state": "serving", "window": 1800}, {"state": "expired", "window": None},
+              {"state": "proxy"}, {}, None):
+        assert k.pxe_lamp_action(g) == "pane"
+
+
+def test_expired_selfcheck_text_points_to_lamp():
+    """横条会收起, 自检那行不能只说"点顶上的条"."""
+    import kiosk_core as kc
+    assert "PXE 灯" in kc.PXE_EXPIRED_TEXT

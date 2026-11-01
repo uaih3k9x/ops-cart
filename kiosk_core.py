@@ -321,7 +321,7 @@ def check_ch9329(ctx):
 
 
 PXE_PROXY_TEXT = "代理模式：链路上已有别的 DHCP，推车不发地址，只回 PXE 引导"
-PXE_EXPIRED_TEXT = "自己发地址已到时停发，新机器拿不到地址；点车机顶上的条续期"
+PXE_EXPIRED_TEXT = "自己发地址已到时停发，新机器拿不到地址；点底部 PXE 灯续期"
 
 
 def pxe_proxy_detail(guard):

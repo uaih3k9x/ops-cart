@@ -105,7 +105,9 @@ def test_wrap_never_starts_a_line_with_closing_punctuation():
 @pytest.mark.parametrize("state,color", [("serving", r.BAD), ("expired", r.WARN)])
 def test_render_serve_banner(locked, state, color):
     from PIL import ImageColor
-    snap = _full_snap(pxe={"state": state, "until": 10 ** 12 if state == "serving" else 1, "window": 1800})
+    import time                                 # 到时停发只挂 10 分钟 (#33): 用 1 分钟前到时
+    snap = _full_snap(pxe={"state": state, "until": 10 ** 12 if state == "serving" else time.time() - 60,
+                           "window": 1800})
     img = r.render(dc.layout_view(snap, locked=locked))
     assert img.getpixel((4, 230)) == ImageColor.getrgb(color)          # 条的左边缘
     plain = r.render(dc.layout_view(_full_snap(), locked=locked))

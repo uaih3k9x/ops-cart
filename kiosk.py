@@ -299,6 +299,9 @@ class Kiosk(tk.Tk):
                 if key.startswith("con-"):      # 操作头: 有 Agent 的事 (#23) 开确认框, 没有开串口面板 (#5)
                     w.bind("<Button-1>", lambda _e, n=int(key[4:]): self._head_click(n))
                     continue
+                if key == "pxe":                # #33: 到时停发时点 PXE 灯续期 (横条 10 分钟后会收起), 平时开装机面板
+                    w.bind("<Button-1>", lambda _e, p=pane: self._pxe_lamp_click(p))
+                    continue
                 # LAN1/LAN2 灯带上网口 (#12); 其余面板不带
                 slot = key[4:] if pane == "netmode" else None
                 w.bind("<Button-1>", lambda _e, p=pane, s=slot: self._open_pane(p, s))
@@ -1468,10 +1471,16 @@ class Kiosk(tk.Tk):
         finally:
             self.after(1000, self._serve_tick)
 
-    def renew_serve(self):
-        """点红条续期: 问一句 (要说清是整个网段), 写续期请求, 守卫 2 秒内认."""
+    def _pxe_lamp_click(self, pane):
+        if kui.pxe_lamp_action(kc.pxe_guard_live()) == "renew":
+            self.renew_serve(force=True)
+        else:
+            self._open_pane(pane)
+
+    def renew_serve(self, force=False):
+        """点红条 (或到时停发后点 PXE 灯, force) 续期: 问一句 (要说清是整个网段), 写续期请求, 守卫 2 秒内认."""
         v = self._serve_view
-        if not v or not v["renew"]:
+        if not force and (not v or not v["renew"]):
             return
         window = (kc.pxe_guard_live().get("window") or 0)
         if not window or not messagebox.askyesno("续期自己发地址", kui.serve_renew_question(window)):

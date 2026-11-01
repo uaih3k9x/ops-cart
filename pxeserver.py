@@ -366,8 +366,12 @@ def _hhmm(ts):
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+EXPIRED_NOTICE_S = 600          # #33: 到时停发的横条挂这么久就收起 (之后只留 PXE 灯 / 自检 WARN, 点 PXE 灯续期)
+
+
 def serve_notice(doc, now):
     """守卫状态 (pxe-guard.json) -> 车机/副屏上醒目的那一句; 不在自己发地址/刚到时停发就 None.
+    到时停发超过 EXPIRED_NOTICE_S (从 until 算, 没有就从 since 算; 都没有就一直显示) 也 None.
     -> {"level": "serving" | "expired", "left": 剩几秒 (不限时 None), "window": 限时秒, "text"}"""
     if not isinstance(doc, dict) or doc.get("state") not in ("serving", "expired"):
         return None
@@ -377,6 +381,9 @@ def serve_notice(doc, now):
         return {"level": "serving", "left": None, "window": window, "text": "正在给整个网段发地址 (不限时)"}
     left = max(0, int(until - now)) if timed else 0
     if doc["state"] == "expired" or left <= 0:
+        t0 = until if timed else doc.get("since")
+        if isinstance(t0, (int, float)) and not isinstance(t0, bool) and now - t0 > EXPIRED_NOTICE_S:
+            return None
         return {"level": "expired", "left": 0, "window": window, "text": "自己发地址已到时, 已停发"}
     return {"level": "serving", "left": left, "window": window,
             "text": f"正在给整个网段发地址 剩 {left // 60:02d}:{left % 60:02d}"}

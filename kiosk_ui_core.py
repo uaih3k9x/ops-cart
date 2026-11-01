@@ -194,6 +194,15 @@ SERVE_BAR_BG, = th.follow(globals(),               # 正在发: 红; 到时停�
                           SERVE_BAR_BG=lambda: {"serving": th.SERVE_BG, "expired": th.SERVE_EXPIRED_BG})
 
 
+def pxe_lamp_action(guard):
+    """#33 点底部 PXE 灯: 到时停发 (横条可能已收起) 且有限时窗口 -> "renew" 问续期; 其余 -> "pane" 开装机面板."""
+    if isinstance(guard, dict) and guard.get("state") == "expired":
+        w = guard.get("window")
+        if isinstance(w, int) and not isinstance(w, bool) and w > 0:
+            return "renew"
+    return "pane"
+
+
 def serve_bar_view(guard, now):
     """守卫状态 (kc.pxe_guard_live) -> 顶上那条 {text, short, bg, fg, renew}; 不在自己发地址/到时停发就 None.
     short 不带"点此续期" (锁屏用, 锁着不能续); renew = 点这条能续期 (不限时就没有)."""
