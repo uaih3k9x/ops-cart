@@ -60,6 +60,13 @@ journalctl -u cart-revtunnel -n 20               # 有 "remote port forwarding f
 在跳板机上：`ssh -p 22022 <推车账号>@localhost`，能进推车、`hostname` 是 `ops-cart` 就算通。
 从自己电脑一步进：`ssh -J <跳板机> -p 22022 <推车账号>@localhost`。
 
+## 踩过的坑
+
+- SELinux 下 systemd 直接 exec `/usr/bin/ssh` 会被**静默**拒（`status=203/EXEC`，审计日志里也没有），
+  所以单元里是 `/bin/sh -c 'exec /usr/bin/ssh ...'`。别"简化"回去。
+- 从自己电脑经跳板进推车时，加 `-o HostKeyAlias=<推车局域网地址或 ops-cart>`，让 known_hosts 认同一把推车主机钥匙，
+  不然 `localhost:22022` 会被当成新机器。
+
 ## 停用
 
 `sudo systemctl disable --now cart-revtunnel.service`；不想留痕就再删 `/etc/ops-cart/revtunnel*`，

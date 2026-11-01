@@ -9,13 +9,14 @@ After=network-online.target
 [Service]
 EnvironmentFile=/etc/ops-cart/revtunnel.env
 # 跳板机指纹事先写进 revtunnel_known_hosts (部署时人核对), 不认识就不连.
-ExecStart=/usr/bin/ssh -N -T \
+# SELinux 下 systemd (init_t) 直接 exec /usr/bin/ssh 会被静默拒 (203/EXEC); 经 /bin/sh 再 exec 就行 (11/01 推车实测).
+ExecStart=/bin/sh -c 'exec /usr/bin/ssh -N -T \
     -o BatchMode=yes -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/ops-cart/revtunnel_known_hosts \
     -i /etc/ops-cart/revtunnel_ed25519 -p ${JUMP_PORT} \
     -R localhost:${REMOTE_PORT}:localhost:22 \
-    ${JUMP_USER}@${JUMP_HOST}
+    ${JUMP_USER}@${JUMP_HOST}'
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

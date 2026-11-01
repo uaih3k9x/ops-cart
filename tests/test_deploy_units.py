@@ -122,6 +122,8 @@ def test_revtunnel_unit_off_by_default_and_pinned():
               "NoNewPrivileges=yes", "ProtectSystem=strict"):
         assert k in body, k
     assert "0.0.0.0" not in body and "GatewayPorts" not in body
+    # SELinux: systemd (init_t) 不能直接 exec ssh_exec_t (静默拒, 203/EXEC); 经 /bin/sh 再 exec 才行 (推车实测)
+    assert "ExecStart=/bin/sh -c 'exec /usr/bin/ssh " in body
 
 
 def test_revtunnel_example_env_has_no_real_host():
