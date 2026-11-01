@@ -219,7 +219,7 @@ def test_text_shifted_by_y0_but_ruler_not():
 
 def test_calibration_constants():
     """实机校准值, 改之前先看 CART-LOG."""
-    assert (cl.FL, cl.FR, cl.CY, cl.Y0, cl.X0) == (52.0, 87.5, 9.0, 5.0, -3.0)   # 10-31 实机: 整体左挪 3mm
+    assert (cl.FL, cl.FR, cl.CY, cl.Y0, cl.X0) == (55.0, 90.5, 9.0, 1.0, 0.0)   # 11-01 实机: X0 归 0、Y0 改 1mm
     assert "SHIFT 18,39" in cl.HEAD and "SIZE 104 mm, 25 mm" in cl.HEAD
     assert cl.ASSET_HEADER == "SIZE 60 mm, 37.4 mm\r\nGAP 2 mm, 0 mm\r\nDENSITY 15\r\nDIRECTION 1\r\nSHIFT 34,-76\r\n"
 
@@ -301,3 +301,8 @@ def test_validate_abbrev_reports_bad_entries():
     bad = {"_limits": cl.LIMITS, "vendor": {"华为": "华为", "X": "TOOLONGVALUE"}, "port": {"X": "Y"}}
     probs = cl.validate_abbrev(bad)
     assert len(probs) == 3
+
+
+def test_calibration_is_the_one_confirmed_on_cart():
+    """11-01 实机: 原 X0=-3 / Y0=5 偏下偏左, 改到 X0=0 / Y0=1 维护者确认"齐了". 改校准要再实机确认, 别顺手动."""
+    assert (cl.X0, cl.Y0) == (0.0, 1.0)
