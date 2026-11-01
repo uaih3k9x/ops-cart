@@ -412,3 +412,10 @@ def test_netmode_summary_reads_modes_list():
     assert ac.netmode_summary(doc) == "托管: enp3s0=dhcp, eno1=static"
     assert ac.netmode_summary({"modes": []}) == "托管: 无"
     assert "failed" in ac.netmode_summary({"modes": [{"mode": "static", "ports": ["eno1"], "status": "failed"}]})
+
+
+def test_default_expect_version_follows_repo_version():
+    """推车上单独拷脚本跑时没仓库 VERSION 可读, 用 EXPECT_VERSION; 改版本号忘了改它, 验收就会把新版判成没部署."""
+    src = open(os.path.join(ROOT, "scripts", "cart_accept.py"), encoding="utf-8").read()
+    want = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
+    assert f'EXPECT_VERSION = "{want}"' in src
