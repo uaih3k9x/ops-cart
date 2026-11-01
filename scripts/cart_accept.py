@@ -643,8 +643,8 @@ def issue_checks(expect_version):
             return ac.FAIL, err
         if doc is None:
             return ac.SKIP, "还没用网口模式面板切过 (没有 netmode.json)"
-        modes = (doc or {}).get("modes") or {}
-        return ac.PASS, "托管: " + (", ".join(f"{k}={(v or {}).get('mode')}" for k, v in sorted(modes.items())) or "无")
+        bad = [m for m in doc.get("modes") or [] if m.get("status") not in (None, "ok")]
+        return (ac.FAIL if bad else ac.PASS), ac.netmode_summary(doc)
 
     def kiosk_alive():
         doc, _ = load_json(RUN + "/kiosk.json")

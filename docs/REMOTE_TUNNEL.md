@@ -10,7 +10,7 @@
 - 默认**不启用**：没有 `/etc/ops-cart/revtunnel.env`，`cart-revtunnel.service` 不起。
 - 跳板机上只在 localhost 听，外面直接扫跳板机扫不到推车；进推车照旧要推车自己的 ssh 认证。
 - 推车只认事先核对过的跳板机指纹（`StrictHostKeyChecking=yes`），断了 20 秒后自动重连。
-- 推车要能连出去（连上 SCNUNET 或 LAN2 有网）。跳板机要推车够得着、人也够得着：
+- 推车要能连出去（连上校园网 Wi-Fi 或 LAN2 有网）。跳板机要推车够得着、人也够得着：
   有公网 IP 的云主机，或者同在校园网里的实验室机器都行。
 
 ## 跳板机要满足

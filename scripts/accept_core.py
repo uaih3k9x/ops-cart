@@ -191,7 +191,7 @@ def derive(root):
     py      = 入口的 import 闭包. 入口 = deploy/ 和 scripts/*.sh 里写到的 /opt/pxe/<m>.py,
               加模块 docstring 里写的命令行用法 (sudo python3 /opt/pxe/recipe.py ...).
     venv    = 闭包里用到 PIL / usb 的 (只能用 /opt/pxe/venv/bin/python import).
-    assets  = web/ icons/ 全部 + fonts/*.otf (相对 /opt/pxe).
+    assets  = web/ icons/ 全部 (相对 /opt/pxe); 字体算 system (装到 FONT_DEST).
     system  = {推车上的路径: deploy 里的源文件}."""
     local = {f[:-3] for f in os.listdir(root) if f.endswith(".py")}
     srcs = {m: _read(os.path.join(root, m + ".py")) for m in local}
@@ -229,8 +229,8 @@ def derive(root):
     for d in ASSET_DIRS:
         for dp, _, files in os.walk(os.path.join(root, d)):
             assets += [os.path.relpath(os.path.join(dp, f), root).replace(os.sep, "/") for f in files]
+    # 字体只装系统字体目录 (theme.UNIFONT_PATHS 先找那里); 仓库里的 fonts/ 是开发机预览用的, 不拷进 /opt/pxe
     fonts = sorted(f for f in os.listdir(os.path.join(root, "fonts")) if f.endswith(".otf"))
-    assets += ["fonts/" + f for f in fonts]
     for f in fonts:
         system[FONT_DEST + "/" + f] = "fonts/" + f
 
@@ -263,7 +263,7 @@ VENV_PY = (
     "dash_render", "dash_service", "udisp_usb",
 )
 ASSETS = (
-    "fonts/unifont-18.0.01.otf", "icons/net-off.png",
+    "icons/net-off.png",
     "icons/net-on.png", "icons/net-warn.png",
     "web/index.html", "web/vendor/LICENSE.xterm",
     "web/vendor/xterm.css", "web/vendor/xterm.js",
@@ -593,3 +593,13 @@ def judge_kvm_status(reply):
 
 
 UPS_EXPECT = (25, 15, 30)       # 预告 %, 倒计时 %, 倒计时秒 (#4)
+
+
+def netmode_summary(doc):
+    """netmode.json -> 一行 "托管: 口=模式, ..."; modes 是列表, 每项 {mode, ports, status}. 状态不是 ok 的带上状态."""
+    parts = []
+    for m in (doc or {}).get("modes") or []:
+        st = m.get("status")
+        tag = f"{'+'.join(m.get('ports') or ['?'])}={m.get('mode')}"
+        parts.append(tag if st in (None, "ok") else f"{tag}({st})")
+    return "托管: " + (", ".join(parts) or "无")

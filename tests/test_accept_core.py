@@ -395,3 +395,20 @@ def test_kvm_status_request_is_control_op():
 def test_ups_constants_expected_match_code():
     import ups_core
     assert (ups_core.WARN_PCT, ups_core.LOW_PCT, ups_core.COUNTDOWN_S) == ac.UPS_EXPECT
+
+
+def test_fonts_are_system_files_not_opt_pxe_assets():
+    """字体只装系统字体目录 (theme.UNIFONT_PATHS 第一条); /opt/pxe/fonts 是开发机预览用的, 车上没有不算缺."""
+    d = ac.derive(ROOT)
+    assert not any(a.startswith("fonts/") for a in d["assets"])
+    assert any(k.startswith(ac.FONT_DEST + "/") for k in d["system"])
+
+
+def test_netmode_summary_reads_modes_list():
+    """netmode.json 的 modes 是列表 (每项 mode + ports), 不是 dict."""
+    doc = {"version": 1, "modes": [
+        {"mode": "dhcp", "ports": ["enp3s0"], "status": "ok"},
+        {"mode": "static", "ports": ["eno1"], "params": {"addr": "192.0.2.1/24"}, "status": "ok"}]}
+    assert ac.netmode_summary(doc) == "托管: enp3s0=dhcp, eno1=static"
+    assert ac.netmode_summary({"modes": []}) == "托管: 无"
+    assert "failed" in ac.netmode_summary({"modes": [{"mode": "static", "ports": ["eno1"], "status": "failed"}]})
