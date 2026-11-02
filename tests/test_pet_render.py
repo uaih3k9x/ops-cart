@@ -82,3 +82,8 @@ def test_every_pose_and_coat_has_an_image_both_ways():
         for coat in ps.COATS:
             for d in (1, -1):
                 assert pr.sprite(name, coat, d).size == (24 * pc.S, 24 * pc.S)
+
+
+def test_divider_cat_stays_inside_area_and_covers_little_of_the_lamps():
+    assert pr.AREA_TOP < pc.DIVIDER_Y - 23 * pc.S
+    assert pr.AREA_BOTTOM > pc.FLOOR_Y + pc.S

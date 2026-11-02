@@ -54,12 +54,60 @@ def test_perches_below_the_ceiling_only():
     assert pc.layout(_glyphs(top=pc.CEILING + pc.CAT_H - 1))["perches"] == []
 
 
-def test_no_perches_means_no_cat():
+def test_platforms_are_perches_even_without_text():
     pet = pc.Pet(random.Random(1))
     pet.sync(True, True, [])
     for _ in range(40):
         pet.tick(0.125)
-    assert pet.draws() == [] and pet.interval() is None
+    assert pet.draws()
+
+
+def test_red_lamp_takes_the_divider_away():
+    assert pc.DIVIDER_Y in {p["top"] for p in pc.platforms(False)}
+    assert {p["top"] for p in pc.platforms(True)} == {pc.FLOOR_Y}
+
+
+def test_red_lamp_means_lamp_fail_only_not_routine_yellow():
+    assert not pc.red_lamp({"lower": [{"health": "WARN"}, {"health": None}], "heads": [{"health": "OK"}]})
+    assert pc.red_lamp({"lower": [{"health": "FAIL"}], "heads": []})
+    assert pc.red_lamp({"lower": [], "heads": [{"health": "FAIL"}]})
+
+
+def test_cat_on_divider_gets_off_when_a_lamp_goes_red():
+    pet = pc.Pet(random.Random(1))
+    glyphs = _glyphs()
+    pet.sync(True, True, glyphs)
+    div = next(g for g in pet.lay["perches"] if g["top"] == pc.DIVIDER_Y)
+    pet.cat.visible, pet.cat.script = True, None
+    pet.cat.place(div)
+    pet.sync(True, True, glyphs, red=True)
+    _settle(pet, 5)
+    assert pet.cat.y != pc.DIVIDER_Y
+    assert all(g["top"] != pc.DIVIDER_Y for g in pet.lay["perches"])
+    _settle(pet, 1200)
+    assert pet.cat.y != pc.DIVIDER_Y
+
+
+def test_cat_visits_every_level():
+    pet = pc.Pet(random.Random(8))
+    pet.sync(True, True, _glyphs())
+    tops = set()
+    for _ in range(int(3 * 3600 / 0.125)):
+        pet.tick(0.125)
+        if pet.cat.visible and not pet.cat.air and pet.cat.run:
+            tops.add(pet.cat.y)
+    assert {840, pc.DIVIDER_Y, pc.FLOOR_Y} <= tops
+
+
+def test_platforms_are_not_obstacles_for_text():
+    """贴着分隔线的字照样能站, 线不算挡头."""
+    lay = pc.layout(_glyphs(top=pc.DIVIDER_Y + 20), pc.platforms(False))
+    assert any(g["top"] == pc.DIVIDER_Y + 20 for g in lay["perches"])
+
+
+def test_text_never_merges_with_platform_runs():
+    lay = pc.layout(_glyphs(top=pc.FLOOR_Y), pc.platforms(False))
+    assert len(lay["runs"]) == 3
 
 
 def _settle(pet, secs=400, dt=0.125):
@@ -77,7 +125,7 @@ def test_cat_arrives_and_stands_on_a_glyph_top():
         d = pet.draws()
         assert d
         if not pet.cat.air and pet.cat.visible and pet.cat.run:
-            assert d[-1]["y"] == 840
+            assert d[-1]["y"] in (840, pc.DIVIDER_Y, pc.FLOOR_Y)
             seen_on += 1
     assert seen_on > 1000
 
@@ -153,7 +201,8 @@ def test_layout_change_lands_cat_on_new_text():
     _settle(pet, 5)
     pet.sync(True, True, _glyphs(top=960, n=2, x0=300))
     _settle(pet, 8)
-    assert pet.draws()[-1]["y"] == 960 or pet.cat.air
+    assert pet.draws()[-1]["y"] in (960, pc.DIVIDER_Y, pc.FLOOR_Y) or pet.cat.air
+    assert all(g["top"] != 840 for g in pet.lay["perches"])
 
 
 def test_positions_snap_to_art_pixels():

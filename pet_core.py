@@ -12,8 +12,11 @@ import random
 S = 5                   # 美术像素放大倍数
 CAT_W = S * 21          # 猫占的矩形, 判断某个字头顶站不站得下
 CAT_H = S * 20
-CEILING = 682           # 版面分隔线; 猫头不许顶到上面的状态区
+CEILING = 560           # 猫头最高到这儿: 站分隔线时盖一点下排灯, 维护者说无所谓
 W = 800
+M = 40                  # 跟 dash_render 的左右边距一致
+DIVIDER_Y = 680         # 版面分隔线: 能当跑道
+FLOOR_Y = 1130          # 公告下面的空地, 底部提示上方
 MOVE_S = 1 / 8          # 动的时候 8 fps (#35 真机整帧 8 fps 目视顺滑)
 SLEEP_S = 1 / 2         # 睡着退回副屏原来的 2 fps
 MAX_DT = 0.6            # 采集卡一下别让猫瞬移
@@ -41,16 +44,36 @@ def allowed(view):
     return not any(h.get("active") for h in view.get("heads") or [])
 
 
-def layout(glyphs):
-    """字框 → 落脚点和能走的连续字段. 站不下 (猫会盖住别的字 / 顶到状态区) 的字不算."""
-    glyphs = [dict(g) for g in glyphs]
+def red_lamp(view):
+    """有红灯: 猫别上分隔线挡着. 只算 FAIL: 黄灯车上常年亮着 (Wi-Fi 占线之类), 算上猫就永远上不去了."""
+    return any(x.get("health") == "FAIL" for x in (view.get("lower") or []) + (view.get("heads") or []))
+
+
+def platforms(red=False):
+    """不是字的落脚面. li 用负数, 不跟公告行连成一段; 红灯时拿掉分隔线."""
+    floor = {"ch": "地", "li": -1, "left": M, "right": W - M, "top": FLOOR_Y, "bottom": FLOOR_Y + 2, "flat": True}
+    if red:
+        return [floor]
+    return [{"ch": "线", "li": -2, "left": M, "right": W - M, "top": DIVIDER_Y, "bottom": DIVIDER_Y + 2, "flat": True},
+            floor]
+
+
+def layout(glyphs, plats=()):
+    """字框 + 落脚面 → 落脚点和能走的连续字段. 站不下 (猫会盖住别的字 / 顶到状态区) 的字不算.
+    落脚面总能站: 不算障碍, 自己也不怕路过时盖一下字."""
+    text = [dict(g) for g in glyphs]
+    glyphs = text + [dict(p) for p in plats]
     for g in glyphs:
+        if g.get("flat"):
+            g["lo"], g["hi"] = g["left"] + CAT_W / 2, g["right"] - CAT_W / 2
+            g["x"] = (g["lo"] + g["hi"]) / 2
+            continue
         pad = min(14, (g["right"] - g["left"]) / 3)
         lo, hi, a, b = g["left"] + pad, g["right"] - pad, None, None
         x = lo
         while x <= hi:
             free = g["top"] - CAT_H >= CEILING and not any(
-                o is not g and x + CAT_W / 2 > o["left"] and x - CAT_W / 2 < o["right"]
+                o is not g and not o.get("flat") and x + CAT_W / 2 > o["left"] and x - CAT_W / 2 < o["right"]
                 and g["top"] - CAT_H < o["bottom"] and g["top"] - 2 > o["top"] for o in glyphs)
             if free:
                 a = x if a is None else a
@@ -181,24 +204,22 @@ class Pet:
         self.drawn = False      # 上一帧画过猫, 猫走了要补一帧擦掉
 
     # ---------------------------------------------------- 外部接口
-    def sync(self, locked, ok, glyphs):
-        """locked: 当前是锁屏页; ok: allowed(view); glyphs: 公告字框."""
+    def sync(self, locked, ok, glyphs, red=False):
+        """locked: 当前是锁屏页; ok: allowed(view); glyphs: 公告字框; red: red_lamp(view)."""
         if not locked:                  # 换页了, 猫站的字都没了: 立刻消失, 不演
             self._vanish()
             self.wanted = False
             self.glyph_key = None
             return
-        key = tuple((g["left"], g["top"]) for g in glyphs)
+        key = (red, tuple((g["left"], g["top"]) for g in glyphs))
         if key != self.glyph_key:
             self.glyph_key = key
-            self.lay = layout(glyphs)
-            if not self.lay["perches"]:
-                self._vanish()
-            elif self.cat.visible and self.wanted:
+            self.lay = layout(glyphs, platforms(red))
+            if self.cat.visible and self.wanted:
                 self.cat.air, self.cat.run = True, None
                 self.other.visible, self.other.script, self.other.say = False, None, ""
                 self.cat.set_script(self._reland(self.cat))
-        if ok and not self.wanted and self.lay["perches"]:
+        if ok and not self.wanted:
             self.wanted = True
             self.cat.set_script(self._come_back(self.cat))
         elif not ok and self.wanted:
@@ -267,6 +288,8 @@ class Pet:
 
     # ---------------------------------------------------- 动作
     def _jump_to(self, c, g, x=None):
+        if x is None and g.get("flat"):     # 跑道那么长, 别每次都落在正中间
+            x = self.rng.uniform(g["lo"], g["hi"])
         yield from _hold(c, "antic", .5)
         yield from _arc(c, g["x"] if x is None else x, g["top"])
         c.place(g, x)

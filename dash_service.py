@@ -182,7 +182,7 @@ def _pet_sync(box, view, out):
         locked = bool(view.get("locked")) and not view.get("boot")
         if box.get("notice") != view.get("notice") or "glyphs" not in box:     # 量字不贵, 但一轮采集没必要量一次
             box["notice"], box["glyphs"] = view.get("notice"), dash_render.glyph_boxes(view) if locked else []
-        pet.sync(locked, pet_core.allowed(view), box["glyphs"] if locked else [])
+        pet.sync(locked, pet_core.allowed(view), box["glyphs"] if locked else [], pet_core.red_lamp(view))
     except Exception as e:
         _drop_pet(box, out, e)
 

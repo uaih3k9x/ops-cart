@@ -280,7 +280,7 @@ class _FakePet:
         self.gap = 0.125
         self.fail_on = fail_on
 
-    def sync(self, locked, ok, glyphs):
+    def sync(self, locked, ok, glyphs, red=False):
         if self.fail_on == "sync":
             raise ValueError("猫坏了")
         self.synced.append((locked, ok))

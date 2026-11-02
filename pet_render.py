@@ -2,7 +2,7 @@
 """pet_render: 把桌宠贴到副屏整帧上 (#35). 依赖 Pillow, 不碰 USB.
 
 背景只在版面变了才重画一次, 之后每帧: 拷背景 → 贴猫 → 转 → 压 JPEG (推车实测约 5 ms).
-猫只能画在 AREA_TOP..AREA_BOTTOM 之间, 状态区和底部提示一个像素都不盖.
+猫只能画在 AREA_TOP..AREA_BOTTOM 之间: 站分隔线时盖一点下排灯, 再往上的状态和底部提示不盖.
 """
 
 import json
@@ -12,7 +12,7 @@ import pet_core as pc
 import pet_sprites as ps
 import theme as th
 
-AREA_TOP = pc.CEILING
+AREA_TOP = pc.CEILING - 20      # 留点余地给起伏和 z
 AREA_BOTTOM = r.PANEL_H - 140   # 底部 "推车已锁定" 提示和 footer 留出来
 SIZE = 24 * pc.S
 
