@@ -27,6 +27,17 @@ def test_every_pose_composes_to_24_by_24_for_both_coats():
             assert all(ch == "." or ch in th.PET_COATS[coat] for r in grid for ch in r), name
 
 
+def test_no_pose_is_clipped_by_the_sprite_box():
+    """脸和身子都不能被 24x24 切掉一块 (踩奶时脸缺过一列)."""
+    for name, pose in ps.POSES.items():
+        head = ps.EARS_FLAT + ps.HEAD[4:] if pose["head"]["flat"] else ps.HEAD
+        parts = list(pose["parts"]) + [(head, pose["hx"], pose["hy"], "h")]
+        for rows, cx, cy, _ in parts:
+            for r, row in enumerate(rows):
+                for c, ch in enumerate(row):
+                    assert ch == "." or (0 <= cx + c < 24 and 0 <= cy + r < 24), (name, cx + c, cy + r)
+
+
 def test_every_animation_frame_is_a_real_pose():
     for anim in pc.ANIM.values():
         assert all(f in ps.POSES for f in anim["f"])

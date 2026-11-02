@@ -281,17 +281,17 @@ _pose("rise", _head(), 10, 0, (TAIL_LOW, 0, 13, "t"), (far_leg(LEGS["riseBack"])
       (far_leg(LEGS["riseFront"]), 15, 12, ""), (TORSO_RISE, 1, 8, "b"),
       (LEGS["riseBack"], 1, 16, ""), (LEGS["riseFront"], 14, 14, ""))
 _pose("apex", _head(), 10, 3, (TAIL_LOW, 0, 12, "t"), (TORSO, 2, 10, "b"), (LEGS["runIn"], 0, 16, ""))
-_pose("fall", _head(), 10, 7, (TAIL_UP, 0, -3, "t"), (far_leg(LEGS["fallBack"]), 8, 13, ""),
+_pose("fall", _head(), 10, 7, (TAIL_UP, 0, 0, "t"), (far_leg(LEGS["fallBack"]), 8, 13, ""),
       (TORSO_FALL, 0, 5, "b"), (LEGS["fallBack"], 6, 12, ""), (far_leg(LEGS["fallFront"]), 18, 18, ""),
       (LEGS["fallFront"], 14, 19, ""))
 _pose("land", _head("squint"), 10, 10, (TAIL_UP, 1, 8, "t"), (TORSO_SQUASH, 0, 17, "b"), (LEGS["land"], 0, 22, ""))
 _pose("sleep0", _head("sleep"), 8, 9, (TORSO_LOAF, 1, 12, "b"), (TAIL_WRAP, 1, 20, ""), (PAWS, 12, 22, ""))
 _pose("sleep1", _head("sleep"), 8, 10, (TORSO_LOAF[1:], 1, 13, "b"), (TAIL_WRAP, 1, 20, ""), (PAWS, 12, 22, ""))
 _pose("knead0", _head("happy"), 10, 7, (TAIL_UP, 1, 5, "t"), (TORSO, 2, 13, "b"), (_stand_half, 0, 19, ""), (LEGS["k0"], 0, 19, ""))
-_pose("knead1", _head("happy"), 11, 8, (TAIL_SWAY, 1, 5, "t"), (TORSO, 2, 13, "b"), (_stand_half, 0, 19, ""), (LEGS["k1"], 0, 19, ""))
+_pose("knead1", _head("happy"), 10, 8, (TAIL_SWAY, 1, 5, "t"), (TORSO, 2, 13, "b"), (_stand_half, 0, 19, ""), (LEGS["k1"], 0, 19, ""))
 _angry = _head("angry", flat=True, hiss=True)
 _pose("puff0", _angry, 10, 6, (TAIL_PUFF, 0, 0, "t"), (TORSO_PUFF0, 2, 8, "b"), (LEGS["puff"], 0, 18, ""))
-_pose("puff1", _angry, 11, 5, (TAIL_PUFF, 1, 1, "t"), (TORSO_PUFF1, 2, 8, "b"), (LEGS["puff"], 0, 18, ""))
+_pose("puff1", _angry, 10, 5, (TAIL_PUFF, 1, 1, "t"), (TORSO_PUFF1, 2, 8, "b"), (LEGS["puff"], 0, 18, ""))
 _alert = _head("open", flat=True)
 _pose("run0", _alert, 10, 6, (TAIL_LOW, 0, 14, "t"), (TORSO, 2, 12, "b"), (LEGS["runOut"], 0, 18, ""))
 _pose("run1", _alert, 10, 6, (TAIL_LOW, 0, 14, "t"), (TORSO, 2, 13, "b"), (LEGS["stand"], 0, 19, ""))
