@@ -105,7 +105,7 @@ def clean_skin():
 def test_skin_replaces_main_cat_only(clean_skin):
     pr.use_skin(_skin())
     assert pr.sprite("stand", pc.COAT, 1).getpixel((0, 23 * pc.S))[:3] == (0x12, 0x34, 0x56)
-    assert pr.sprite("stand", pc.VISITOR, 1).getpixel((0, 23 * pc.S))[3] == 0
+    assert pr.sprite("stand", "cow", 1).getpixel((0, 23 * pc.S))[3] == 0
     pr.use_skin(None)
     assert pr.sprite("stand", pc.COAT, 1).getpixel((0, 23 * pc.S))[:3] != (0x12, 0x34, 0x56)
 
@@ -166,3 +166,19 @@ def test_load_skin_accepts_expression_keys_rejects_unknown(tmp_path):
     assert pr.load_skin(str(p))
     p.write_text(json.dumps({"palette": {}, "poses": {"nope@half": g}}))
     assert pr.load_skin(str(p)) is None
+
+
+def test_stage_draws_smoke_when_cats_are_hidden():
+    view = _view()
+    pet = pc.Pet(random.Random(1), strays=("stray",))
+    pet.sync(True, True, r.glyph_boxes(view))
+    for _ in range(40):
+        pet.tick(0.125)
+    pet.visit("stray", fight=True)
+    stage = pr.Stage()
+    for _ in range(int(70 / 0.125)):
+        pet.tick(0.125)
+        if pet.effects() is not None and not pet.draws():
+            break
+    assert pet.effects() is not None
+    assert stage.frame(view, pet) != r.make_frame(view)

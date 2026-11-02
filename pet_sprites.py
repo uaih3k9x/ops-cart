@@ -314,7 +314,7 @@ _pose("run0", _alert, 10, 6, (TAIL_LOW, 0, 14, "t"), (TORSO, 2, 12, "b"), (LEGS[
 _pose("run1", _alert, 10, 6, (TAIL_LOW, 0, 14, "t"), (TORSO, 2, 13, "b"), (LEGS["stand"], 0, 19, ""))
 _pose("run2", _alert, 10, 7, (TAIL_UP, 1, 6, "t"), (TORSO, 2, 14, "b"), (LEGS["runIn"], 0, 19, ""))
 
-COATS = ("ginger", "cow")      # 配色在 theme.PET_COATS
+COATS = ("ginger", "cow", "stray", "tabby")      # 配色在 theme.PET_COATS
 _PATCH = {
     "cow": {"h": lambda c, r: (c <= 6 and r <= 5) or (c >= 11 and 4 <= r <= 7),
             "b": lambda c, r: c <= 8 or (c >= 11 and r <= 2),

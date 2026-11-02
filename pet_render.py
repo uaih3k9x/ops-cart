@@ -6,6 +6,7 @@
 """
 
 import json
+import math
 
 import dash_render as r
 import pet_core as pc
@@ -106,6 +107,10 @@ def _fx(d, c):
     if c["alarm"]:
         d.rectangle([head_x - 4, y - s * 27, head_x + 3, y - s * 27 + 23], fill=th.PET_FX["alarm"])
         d.rectangle([head_x - 4, y - s * 27 + 28, head_x + 3, y - s * 27 + 35], fill=th.PET_FX["alarm"])
+    if c["bump"]:
+        px_, py = x + direction * s * 3, y - s * 25
+        d.rectangle([px_, py - s, px_ + s - 1, py + 2 * s - 1], fill=th.PET_FX["star"])
+        d.rectangle([px_ - s, py, px_ + 2 * s - 1, py + s - 1], fill=th.PET_FX["star"])
     if c["say"]:
         font = r._font(32)
         bw, bh = int(font.getlength(c["say"])) + 24, 48
@@ -117,6 +122,38 @@ def _fx(d, c):
         d.rectangle([tail - 6, by + bh + 4, tail + 5, by + bh + 11], fill=th.PET_FX["ink"])
         d.rectangle([tail - 6, by + bh, tail + 5, by + bh + 5], fill=th.PET_FX["paper"])
         d.text((bx + 12, by + bh // 2 + 2), c["say"], font=font, fill=th.PET_FX["say"], anchor="lm")
+
+
+# 烟雾: 几团方块按帧翻滚, 飞出爪子和星星. 位置只看帧号, 同一帧画两次一样
+_PUFFS = ((-62, -24, 30), (-30, -58, 34), (22, -66, 32), (60, -30, 30), (-22, -8, 30), (30, -12, 28))
+
+
+def _smoke(d, smoke, top):
+    x, y, f = int(smoke["x"]), int(smoke["y"]) - top, int(smoke["t"] * 8)
+    s = pc.S
+    for i, (dx, dy, r_) in enumerate(_PUFFS):
+        ph = (f + i * 3) % 6
+        grow = (0, 5, 10, 10, 5, 0)[ph]
+        rr = r_ + grow
+        cx, cy = x + dx + (-5 if (f + i) % 2 else 5), y + dy
+        color = th.PET_FX["smoke"] if (f + i) % 3 else th.PET_FX["smoke2"]
+        cx, cy = cx // s * s, cy // s * s
+        for row in range(-rr // s, rr // s + 1):   # 一格一格的圆, 别成方砖
+            half = int(math.sqrt(max(0, rr * rr - (row * s) ** 2))) // s * s
+            if half:
+                d.rectangle([cx - half, cy + row * s, cx + half - 1, cy + row * s + s - 1], fill=color)
+    for i in range(3):                  # 飞出去的星星和爪子
+        ph = (f + i * 4) % 12
+        ang = (i * 2.1 + f // 12) % 6.28
+        reach = 60 + ph * 9
+        px_, py = x + int(math.cos(ang) * reach), y - 40 + int(math.sin(ang) * reach * .7)
+        px_, py = px_ // s * s, py // s * s
+        if i == 2:          # 爪子
+            d.rectangle([px_, py, px_ + 3 * s - 1, py + 2 * s - 1], fill=th.PET_FX["ink"])
+            d.rectangle([px_ + s, py, px_ + 2 * s - 1, py + 2 * s - 1], fill=th.PET_COATS["ginger"]["W"])
+        else:
+            d.rectangle([px_ + s, py, px_ + 2 * s - 1, py + 3 * s - 1], fill=th.PET_FX["star"])
+            d.rectangle([px_, py + s, px_ + 3 * s - 1, py + 2 * s - 1], fill=th.PET_FX["star"])
 
 
 class Stage:
@@ -136,7 +173,8 @@ class Stage:
     def frame(self, view, pet):
         base = self._base(view)
         draws = pet.draws() if pet is not None else []
-        if not draws:
+        smoke = pet.effects() if pet is not None else None
+        if not draws and not smoke:
             if self.plain is None:
                 self.plain = r.encode_within_budget(r.rot90(base))
             return self.plain
@@ -150,6 +188,8 @@ class Stage:
         shifted = [dict(c, y=c["y"] - AREA_TOP) for c in draws]
         for c in shifted:
             _fx(d, c)
+        if smoke:
+            _smoke(d, smoke, AREA_TOP)
         out = base.copy()
         out.paste(layer, (0, AREA_TOP))
         return r.encode_within_budget(r.rot90(out))

@@ -21,7 +21,11 @@ MOVE_S = 1 / 8          # 动的时候 8 fps (#35 真机整帧 8 fps 目视顺�
 SLEEP_S = 1 / 2         # 睡着退回副屏原来的 2 fps
 MAX_DT = 0.6            # 采集卡一下别让猫瞬移
 EPS = 1e-6
-COAT, VISITOR = "ginger", "cow"
+COAT = "ginger"         # 主猫; 外部皮肤换的就是它
+PERSONA = {"cow": "timid", "stray": "bold", "tabby": "watcher"}   # 路人的性格
+TERRITORY = 190         # 进这个距离才哈气
+FIGHT_CHANCE = .35      # 橘猫僵持时打起来的概率
+VISIT_GAP = (240, 600)  # 路人多久来一次 (秒)
 
 ANIM = {
     "walk": {"f": ["walk%d" % i for i in range(8)], "beat": .125},
@@ -118,6 +122,9 @@ class Cat:
         self.eye = None         # 当前心情; None = 姿势自带的眼睛
         self.blink_left = 2.0   # 还有多久眨眼
         self.blink = []         # 眨眼还剩哪几帧
+        self.hidden = False     # 打架时藏在烟雾里
+        self.signal = None      # 主猫发给路人的: flee / puff / rush
+        self.bump = 0.0         # 打完架头上的星星还剩几秒
 
     def shown_eye(self):
         """这一帧实际画什么眼睛; None = 姿势自带."""
@@ -188,12 +195,17 @@ def _arc(c, tx, ty, T=None, h=None):
 
 
 class Pet:
-    """橘猫一只常驻, 奶牛猫偶尔路过吵架. sync() 每次采集调一次, tick() 按 interval() 调."""
+    """主猫常驻, 路人猫随机来, 各走各的状态机. sync() 每次采集调一次, tick() 按 interval() 调."""
 
-    def __init__(self, rng=None):
+    def __init__(self, rng=None, strays=("cow", "stray", "tabby")):
         self.rng = rng or random.Random()
         self.cat = Cat(COAT)
-        self.other = Cat(VISITOR)
+        self.other = Cat(strays[0] if strays else "cow")
+        self.strays = strays
+        self.smoke = None       # 打架烟雾 {x, y, t}
+        self.reacting = False   # 主猫正在应付路人
+        self.forced_fight = None
+        self.next_visit = self.rng.uniform(*VISIT_GAP)
         self.lay = layout([])
         self.glyph_key = None
         self.wanted = False
@@ -216,6 +228,8 @@ class Pet:
             if self.cat.visible and self.wanted:
                 self.cat.air, self.cat.run = True, None
                 self.other.visible, self.other.script, self.other.say = False, None, ""
+                self.other.hidden = self.cat.hidden = False
+                self.reacting, self.smoke = False, None
                 self.cat.set_script(self._reland(self.cat))
         if ok and not self.wanted:
             self.wanted = True
@@ -224,6 +238,8 @@ class Pet:
             self.wanted = False
             if self.cat.visible:
                 self.cat.set_script(self._leave(self.cat))
+            self.reacting, self.smoke = False, None
+            self.cat.hidden = self.other.hidden = False
             if self.other.visible:
                 self.other.set_script(self._flee(self.other))
 
@@ -240,6 +256,8 @@ class Pet:
                     c.dust_t = -1.0
             if c.alarm > 0:
                 c.alarm -= dt
+            if c.bump > 0:
+                c.bump -= dt
             if c.script:
                 try:
                     if c.started:
@@ -249,6 +267,38 @@ class Pet:
                         next(c.script)
                 except StopIteration:
                     c.script = None
+        if self.smoke:
+            self.smoke["t"] += dt
+        self._director(dt)
+
+    def visit(self, coat=None, fight=None):
+        """叫一只路人来. coat/fight 不给就随机. 已经有路人就不叫."""
+        o = self.other
+        if o.visible or o.script or not self.strays:
+            return
+        o.coat = coat or self._pick(self.strays)
+        o.signal, o.say, o.hidden = None, "", False
+        self.forced_fight = fight
+        o.set_script(self._stray(o))
+        self.next_visit = self.rng.uniform(*VISIT_GAP)
+
+    def effects(self):
+        """烟雾这类不属于哪只猫的东西."""
+        return self.smoke
+
+    def _director(self, dt):
+        """路人什么时候来; 路人落地后主猫就开始盯."""
+        if not self.wanted or not self.cat.visible:
+            return
+        o = self.other
+        if o.visible or o.script:
+            if not self.reacting and o.visible and not o.air:
+                self.reacting = True
+                self.cat.set_script(self._react(self.cat, o))
+            return
+        self.next_visit -= dt
+        if self.next_visit <= 0:
+            self.visit()
 
     def _blink(self, dt):
         """睁着眼才眨: 隔几秒来一次, 半眯 → 闭眼 → 睁开, 各一帧. 本来就半眯的只闭一帧."""
@@ -266,9 +316,9 @@ class Pet:
 
     def interval(self):
         """下一帧隔多久; 没猫 None (不用推)."""
-        if not self.cat.visible and not self.other.visible and not self.cat.script:
+        if not self.cat.visible and not self.other.visible and not self.cat.script and not self.smoke:
             return None
-        if self.cat.pose == "sleep" and self.cat.visible and not self.other.visible:
+        if self.cat.pose == "sleep" and self.cat.visible and not self.other.visible and not self.smoke:
             return SLEEP_S
         return MOVE_S
 
@@ -276,16 +326,17 @@ class Pet:
         """要画的猫, 后画的在上面."""
         out = []
         for c in (self.other, self.cat):
-            if c.visible:
+            if c.visible and not c.hidden:
                 x, y = c.snapped()
                 out.append({"pose": c.frame(), "state": c.pose, "coat": c.coat, "x": x, "y": y, "dir": c.dir,
-                            "t": c.anim_t, "eye": c.shown_eye(), "say": c.say, "dust_t": c.dust_t, "alarm": c.alarm > 0})
+                            "t": c.anim_t, "eye": c.shown_eye(), "say": c.say, "dust_t": c.dust_t, "alarm": c.alarm > 0, "bump": c.bump > 0})
         return out
 
     # ---------------------------------------------------- 工具
     def _vanish(self):
         for c in (self.cat, self.other):
-            c.visible, c.script, c.say, c.run = False, None, "", None
+            c.visible, c.script, c.say, c.run, c.hidden = False, None, "", None, False
+        self.reacting, self.smoke = False, None
 
     def _widest(self):
         return max(self.lay["runs"], key=lambda r: r["span"])
@@ -390,63 +441,153 @@ class Pet:
         yield from _arc(c, -90 if left else W + 90, c.y + 200, T=1, h=40)
         c.visible, c.script, c.say, c.run = False, None, "", None
 
-    def _visitor(self, c, run, tx, from_left):
-        self._spawn(c, -90 if from_left else W + 90, run["glyphs"][0]["top"] + 200)
+    def _near(self, a, b):
+        return math.hypot(a.x - b.x, (a.y - b.y) * 1.2) < TERRITORY
+
+    def _face(self, c, o):
+        if abs(o.x - c.x) > 1:
+            c.dir = 1 if o.x > c.x else -1
+
+    def _stray(self, c):
+        """路人自己的状态机: 进场 → 溜达 → 听主猫的信号. 不用管主猫在干嘛."""
+        persona = PERSONA.get(c.coat, "timid")
+        runs = self.lay["runs"]
+        me = self.cat
+        if persona == "watcher":                # 梨花找个离主猫够远的地方蹲
+            yield from self._watch_from_afar(c)
+            return
+        run = me.run or self._pick([r for r in runs if r["span"] >= 90] or runs)
+        from_left = me.x > (run["lo"] + run["hi"]) / 2
+        g = run["glyphs"][0 if from_left else -1]
+        self._spawn(c, -90 if from_left else W + 90, g["top"] + 200)
         c.dir = 1 if from_left else -1
         c.set_pose("rise")
-        g = run["glyphs"][0 if from_left else -1]
         lx = run["lo"] if from_left else run["hi"]
         yield from _arc(c, lx, g["top"], T=1.5, h=90)
         c.place(g, lx)
         c.dust_t = 0.0
         yield from _hold(c, "landing", .5)
-        yield from _walk_to(c, tx, 56)
-        c.set_pose("stand")
-        c.arrived = True
-        while True:
-            yield
+        t = 0.0
+        c.set_pose("walk")
+        while c.signal is None and t < 45:      # 往主猫那边走; 够不着就算了
+            dt = (yield)
+            t += dt
+            tx = min(run["hi"], max(run["lo"], me.x - (1 if from_left else -1) * 120))
+            if abs(tx - c.x) > 2:
+                c.dir = 1 if tx > c.x else -1
+                c.x += c.dir * min(56 * dt, abs(tx - c.x))
+                c.y = _surface_y(run, c.x)
+                c.set_pose("walk")
+            else:
+                c.set_pose("stand")
+        if c.signal == "puff":
+            self._face(c, me)
+            c.set_pose("puff")
+            while c.signal == "puff":
+                yield
+        while c.signal == "rush":
+            dt = (yield)
+            self._face(c, me)
+            c.set_pose("run")
+            c.x += c.dir * min(160 * dt, abs(me.x - c.x))
+        c.hidden, c.say = False, ""
+        yield from self._flee(c)
 
-    def _act_visitor(self, c):
-        run = self._widest()
-        mid = (run["lo"] + run["hi"]) / 2
-        if c.run is not run:
-            first = c.x < mid
-            yield from self._jump_to(c, run["glyphs"][0 if first else -1], run["lo"] if first else run["hi"])
-        side = -1 if c.x <= mid else 1
-        ax = run["lo"] if side < 0 else run["hi"]
-        yield from _walk_to(c, ax, 90)
-        c.dir = -side
-        yield from _hold(c, "sit", .5)
-        b = self.other
-        b.arrived = False
-        b.set_script(self._visitor(b, run, ax - side * min(150, run["hi"] - run["lo"]), side > 0))
-        while not b.arrived:
+    def _watch_from_afar(self, c):
+        """梨花: 跳到领地外, 蹲着盯一会儿, 自己走. 主猫靠近地盘外不会哈它."""
+        me, margin = self.cat, TERRITORY + 40
+        spots = [(g, x) for g in self.lay["perches"] for x in (g["lo"], g["hi"])
+                 if math.hypot(x - me.x, (g["top"] - me.y) * 1.2) >= margin]
+        if not spots:                           # 整屏都太近, 那今天就不来了
+            c.visible, c.script = False, None
+            return
+        g, x = self._pick(spots)
+        from_left = x < W / 2
+        self._spawn(c, -90 if from_left else W + 90, g["top"] + 200)
+        c.dir = 1 if from_left else -1
+        c.set_pose("rise")
+        yield from _arc(c, x, g["top"], T=1.5, h=90)
+        c.place(g, x)
+        c.dust_t = 0.0
+        yield from _hold(c, "landing", .5)
+        c.set_pose("sit")
+        self._face(c, me)
+        t, stay = 0.0, self.rng.uniform(15, 30)
+        while t < stay and c.signal is None:
+            self._face(c, me)
+            t += (yield)
+        yield from self._flee(c, 120)
+
+    def _react(self, c, o):
+        """主猫: 醒 → 盯 → 靠近才哈 → 哈跑 → 舔爪 → 接着过日子."""
+        if c.air or not c.run:
+            yield from self._ground(c)
+        if c.pose == "sleep":
+            c.eye = "half"
+            yield from _hold(c, "sit", .5)
+        c.eye = "half"
+        c.set_pose("sit")
+        while o.visible and not self._near(c, o):
+            self._face(c, o)
             yield
-        c.set_pose("stand")             # 对视一拍, 然后炸毛
-        c.dir, b.dir = -side, side
-        c.alarm = b.alarm = .5
+        if o.visible:
+            yield from self._hiss(c, o)
+        c.eye = None
+        self.reacting = False
+        yield from self._act_lick(c)
+        yield from self._life(c)
+
+    def _hiss(self, c, o):
+        persona = PERSONA.get(o.coat, "timid")
+        c.eye = None
+        c.set_pose("stand")
+        self._face(c, o)
+        c.alarm = .5
         yield from _wait(.5)
         c.set_pose("puff")
-        b.set_pose("puff")
         c.say = "哈!"
         yield from _wait(1)
-        c.say, b.say = "", "哈!"
+        if persona == "bold":
+            o.signal = "puff"
+            self._face(o, c)
+            c.say, o.say = "", "哈!"
+            yield from _wait(1)
+            c.say, o.say = "哈!", ""
+            yield from _wait(1)
+            c.say = ""
+            fight = self.forced_fight
+            if fight is None:
+                fight = self.rng.random() < FIGHT_CHANCE
+            if fight:
+                yield from self._fight(c, o)
+                return
+        c.say = ""
+        o.signal = "flee"
         yield from _wait(1)
-        c.say = "哈!"
+        c.set_pose("stand")
+
+    def _fight(self, c, o):
+        """两只都钻进一团烟里, 飞点爪子和星星, 散开后对方跑了, 主猫头上多颗星."""
+        o.signal = "rush"
+        self._face(c, o)
+        c.set_pose("run")
+        while abs(c.x - o.x) > 60:
+            dt = (yield)
+            c.x += c.dir * 160 * dt
+        c.hidden = o.hidden = True
+        self.smoke = {"x": (c.x + o.x) / 2, "y": c.y, "t": 0.0}
+        yield from _wait(self.rng.uniform(2, 3))
+        self.smoke = None
+        c.hidden, c.bump = False, 6.0
+        c.set_pose("sit")
+        o.signal = "flee"
         yield from _wait(1)
-        c.say = b.say = ""
-        b.set_script(self._flee(b))
-        yield from _wait(1)
-        yield from _hold(c, "stand", .5)
-        yield from self._act_lick(c)    # 吵完舔爪: 刚才不是我
-        yield from _walk_to(c, (run["lo"] + run["hi"]) / 2)
 
     def _life(self, c):
-        acts = {"walk": self._act_walk, "knead": self._act_knead, "hop": self._act_hop,
-                "jump": self._act_jump, "visitor": self._act_visitor}
+        acts = {"walk": self._act_walk, "knead": self._act_knead, "hop": self._act_hop, "jump": self._act_jump}
         while True:
             yield from self._nap(c, self.rng.uniform(24, 42))
-            act = self._pick(["walk", "walk", "knead", "knead", "knead", "hop", "hop", "hop", "jump", "visitor"])
+            act = self._pick(["walk", "walk", "knead", "knead", "knead", "hop", "hop", "hop", "jump"])
             yield from self._wake(c)
             if self.rng.random() < .4:      # 睡醒先舔爪
                 yield from self._act_lick(c)

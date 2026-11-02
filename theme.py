@@ -327,5 +327,9 @@ PET_COATS = {
     "cow": {"K": "#0c0e13", "W": "#f3f1ea", "D": "#bcbcb6", "S": "#f3f1ea", "B": "#ffffff", "P": "#ff9db2",
             "C": "#ffd3d8", "E": "#1c3b2a", "H": "#ffffff", "#": "#454b60"},
 }
-PET_FX = {"z": "#9fc4e8", "heart": "#ff8fa8", "dust": "#8088a0", "alarm": "#ffd84a",
+PET_COATS["stray"] = {"K": "#0c0e13", "W": "#d9822b", "D": "#a96420", "S": "#8f4c14", "B": "#fff1dc", "P": "#ff9db2",
+                      "C": "#f0a56c", "E": "#23150f", "H": "#ffffff"}     # 路人大橘: 比内置主猫深一档, 同框也分得清
+PET_COATS["tabby"] = {"K": "#0c0e13", "W": "#b7a58a", "D": "#8f7f66", "S": "#5e5040", "B": "#eadfcc", "P": "#ff9db2",
+                      "C": "#d9b8a0", "E": "#23150f", "H": "#ffffff"}     # 梨花
+PET_FX = {"smoke": "#c6cad6", "smoke2": "#8b90a0", "star": "#ffd84a", "z": "#9fc4e8", "heart": "#ff8fa8", "dust": "#8088a0", "alarm": "#ffd84a",
           "ink": "#0c0e13", "paper": "#fff7e6", "say": "#c62d2a"}

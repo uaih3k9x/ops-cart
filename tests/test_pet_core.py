@@ -167,7 +167,7 @@ def test_all_behaviours_eventually_happen():
         for d in pet.draws():
             poses.add(d["pose"])
             says.add(d["say"])
-    assert {"puff0", "knead0", "crouch", "land", "run0", "sit"} <= poses
+    assert {"puff0", "knead0", "crouch", "land", "sit"} <= poses
     assert "哈!" in says
 
 
@@ -334,3 +334,146 @@ def test_cat_shows_varied_expressions():
         pet.tick(0.125)
         seen.update(d["eye"] for d in pet.draws())
     assert {"half", "closed"} <= seen
+
+
+def _with_visit(coat, seed=11, fight=None, glyphs=None):
+    pet = pc.Pet(random.Random(seed), strays=("cow", "stray", "tabby"))
+    pet.sync(True, True, glyphs or _glyphs())
+    _settle(pet, 8)
+    pet.visit(coat, fight=fight)
+    return pet
+
+
+def _watch(pet, secs=70):
+    poses, says, bumps, smoke, other_seen = set(), set(), False, False, False
+    for _ in range(int(secs / 0.125)):
+        pet.tick(0.125)
+        for d in pet.draws():
+            poses.add(d["pose"])
+            says.add(d["say"])
+            bumps = bumps or d["bump"]
+        other_seen = other_seen or pet.other.visible
+        smoke = smoke or pet.effects() is not None
+    return poses, says, bumps, smoke, other_seen
+
+
+def test_stray_visits_at_random_and_leaves():
+    pet = pc.Pet(random.Random(2), strays=("cow",))
+    pet.sync(True, True, _glyphs())
+    seen = 0
+    was = False
+    for _ in range(int(3600 / 0.125)):
+        pet.tick(0.125)
+        if pet.other.visible and not was:
+            seen += 1
+        was = pet.other.visible
+    assert 3 <= seen <= 20
+
+
+def test_timid_stray_runs_after_one_hiss_then_cat_licks():
+    pet = _with_visit("cow")
+    poses, says, _, smoke, seen = _watch(pet)
+    assert seen and "puff0" in poses and "哈!" in says and not smoke
+    assert "lick0" in poses
+    assert not pet.other.visible
+
+
+def test_bold_stray_hisses_back():
+    pet = _with_visit("stray", fight=False)
+    says_by = set()
+    for _ in range(int(70 / 0.125)):
+        pet.tick(0.125)
+        if pet.other.say:
+            says_by.add(pet.other.coat)
+    assert "stray" in says_by
+    assert not pet.other.visible
+
+
+def test_fight_hides_both_in_smoke_and_leaves_a_bump():
+    pet = _with_visit("stray", fight=True)
+    hid = False
+    for _ in range(int(70 / 0.125)):
+        pet.tick(0.125)
+        if pet.effects() is not None:
+            hid = hid or pet.draws() == []
+    assert hid
+    assert pet.effects() is None and not pet.other.visible
+
+
+def test_fight_can_also_not_happen_for_timid():
+    pet = _with_visit("cow", fight=True)
+    _, _, _, smoke, _ = _watch(pet)
+    assert not smoke
+
+
+def test_tabby_keeps_distance_and_leaves_alone():
+    pet = _with_visit("tabby")
+    poses, says, _, smoke, seen = _watch(pet, 90)
+    assert seen and not smoke
+    assert "哈!" not in says
+    assert not pet.other.visible
+
+
+def test_cat_watches_stray_while_it_is_around():
+    pet = _with_visit("tabby")
+    awake = 0
+    for _ in range(int(25 / 0.125)):
+        pet.tick(0.125)
+        if pet.other.visible and not pet.other.air:
+            awake += pet.cat.pose != "sleep"
+    assert awake > 20
+
+
+def test_all_strays_can_visit_by_default():
+    assert set(pc.Pet(random.Random(1)).strays) == {"cow", "stray", "tabby"}
+
+
+def test_stray_orange_looks_different_from_main():
+    assert th.PET_COATS["stray"]["W"] != th.PET_COATS["ginger"]["W"]
+
+
+def test_busy_clears_smoke_and_both_cats_leave():
+    pet = _with_visit("stray", fight=True)
+    for _ in range(int(70 / 0.125)):
+        pet.tick(0.125)
+        if pet.effects() is not None:
+            break
+    assert pet.effects() is not None
+    pet.sync(True, False, _glyphs())
+    _settle(pet, 15)
+    assert pet.effects() is None and pet.draws() == []
+
+
+def test_unlock_vanishes_stray_and_smoke():
+    pet = _with_visit("stray", fight=True)
+    _settle(pet, 2)
+    pet.sync(False, False, [])
+    assert pet.draws() == [] and pet.effects() is None and pet.interval() is None
+
+
+def test_visits_keep_working_across_many_hours():
+    for seed in range(3):
+        pet = pc.Pet(random.Random(seed), strays=("cow", "stray", "tabby"))
+        pet.sync(True, True, _glyphs())
+        asleep = total = fights = 0
+        was = False
+        for _ in range(int(6 * 3600 / 0.125)):
+            pet.tick(0.125)
+            asleep += pet.cat.pose == "sleep"
+            total += 1
+            now = pet.effects() is not None
+            fights += now and not was
+            was = now
+        assert asleep / total > 0.5
+        assert fights >= 1
+
+
+def test_tabby_lands_outside_the_territory():
+    for seed in range(12):
+        pet = _with_visit("tabby", seed=seed)
+        far = True
+        for _ in range(int(40 / 0.125)):
+            pet.tick(0.125)
+            if pet.other.visible and not pet.other.air:
+                far = far and not pet._near(pet.cat, pet.other)
+        assert far, seed
