@@ -13,10 +13,40 @@ import pet_sprites as ps
 import theme as th
 
 AREA_TOP = pc.CEILING - 20      # 留点余地给起伏和 z
+SKIN_PATH = "/etc/ops-cart/pet-skin.json"       # 可选: 换主猫的样子, 现场自备, 不进仓库
 AREA_BOTTOM = r.PANEL_H - 140   # 底部 "推车已锁定" 提示和 footer 留出来
 SIZE = 24 * pc.S
 
 _sprites = {}
+_skin = None
+
+
+def load_skin(path=SKIN_PATH):
+    """读皮肤 JSON: {"palette": {字符: "#rrggbb"}, "poses": {姿势: 24 行 24 列字符串}}. 纯数据, 不执行代码.
+    没有文件或内容不对都返回 None, 退回内置的猫: 皮肤坏了不能拖累副屏."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            skin = json.load(f)
+        palette, poses = skin["palette"], skin["poses"]
+        for color in palette.values():
+            int(color[1:], 16)
+            if color[0] != "#" or len(color) != 7:
+                raise ValueError(color)
+        for name, grid in poses.items():
+            if name not in ps.POSES or len(grid) != 24 or any(len(row) != 24 for row in grid):
+                raise ValueError(name)
+            if any(ch != "." and ch not in palette for row in grid for ch in row):
+                raise ValueError(name)
+        return {"palette": palette, "poses": poses}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
+        return None
+
+
+def use_skin(skin):
+    """换主猫皮肤; None 用内置的. 路过的第二只不换."""
+    global _skin
+    _skin = skin
+    _sprites.clear()
 
 
 def _rgba(hex_color):
@@ -28,10 +58,12 @@ def sprite(name, coat, direction):
     key = (name, coat, direction)
     if key not in _sprites:
         from PIL import Image
-        colors = th.PET_COATS[coat]
+        skinned = _skin is not None and coat == pc.COAT and name in _skin["poses"]
+        colors = _skin["palette"] if skinned else th.PET_COATS[coat]
+        grid = _skin["poses"][name] if skinned else ps.compose(name, coat)
         img = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
         px = img.load()
-        for y, row in enumerate(ps.compose(name, coat)):
+        for y, row in enumerate(grid):
             for x, ch in enumerate(row):
                 if ch != ".":
                     px[x, y] = _rgba(colors[ch])

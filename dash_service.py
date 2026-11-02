@@ -61,6 +61,7 @@ def _make_pet():
     """真机才有猫; 模块坏了也不能拖累状态板."""
     import pet_core
     import pet_render
+    pet_render.use_skin(pet_render.load_skin())
     return pet_core.Pet(), pet_render.Stage()
 
 

@@ -87,3 +87,60 @@ def test_every_pose_and_coat_has_an_image_both_ways():
 def test_divider_cat_stays_inside_area_and_covers_little_of_the_lamps():
     assert pr.AREA_TOP < pc.DIVIDER_Y - 23 * pc.S
     assert pr.AREA_BOTTOM > pc.FLOOR_Y + pc.S
+
+
+def _skin(**over):
+    grid = ["." * 24] * 23 + ["XX" + "." * 22]
+    skin = {"palette": {"X": "#123456"}, "poses": {"stand": grid}}
+    skin.update(over)
+    return skin
+
+
+@pytest.fixture
+def clean_skin():
+    yield
+    pr.use_skin(None)
+
+
+def test_skin_replaces_main_cat_only(clean_skin):
+    pr.use_skin(_skin())
+    assert pr.sprite("stand", pc.COAT, 1).getpixel((0, 23 * pc.S))[:3] == (0x12, 0x34, 0x56)
+    assert pr.sprite("stand", pc.VISITOR, 1).getpixel((0, 23 * pc.S))[3] == 0
+    pr.use_skin(None)
+    assert pr.sprite("stand", pc.COAT, 1).getpixel((0, 23 * pc.S))[:3] != (0x12, 0x34, 0x56)
+
+
+def test_skin_missing_pose_falls_back_to_builtin(clean_skin):
+    pr.use_skin(_skin())
+    assert pr.sprite("sit", pc.COAT, 1).getbbox() is not None
+
+
+def test_load_skin_from_file(tmp_path):
+    import json
+    p = tmp_path / "skin.json"
+    p.write_text(json.dumps(_skin()))
+    assert pr.load_skin(str(p))["palette"]["X"] == "#123456"
+
+
+def test_load_skin_missing_file_is_none(tmp_path):
+    assert pr.load_skin(str(tmp_path / "nope.json")) is None
+
+
+@pytest.mark.parametrize("bad", [
+    "不是 JSON",
+    "[]",
+    '{"palette": {}, "poses": {"stand": ["."]}}',                        # 尺寸不对
+    '{"palette": {"X": "red"}, "poses": {}}',                            # 颜色不是 #rrggbb
+    '{"palette": {}, "poses": {"nope": []}}',                            # 没这个姿势
+])
+def test_load_skin_rejects_bad_files(tmp_path, bad):
+    p = tmp_path / "skin.json"
+    p.write_text(bad)
+    assert pr.load_skin(str(p)) is None
+
+
+def test_load_skin_rejects_unknown_char(tmp_path):
+    import json
+    p = tmp_path / "skin.json"
+    p.write_text(json.dumps(_skin(palette={})))
+    assert pr.load_skin(str(p)) is None
