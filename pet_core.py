@@ -59,28 +59,14 @@ def platforms(red=False):
 
 
 def layout(glyphs, plats=()):
-    """字框 + 落脚面 → 落脚点和能走的连续字段. 站不下 (猫会盖住别的字 / 顶到状态区) 的字不算.
-    落脚面总能站: 不算障碍, 自己也不怕路过时盖一下字."""
-    text = [dict(g) for g in glyphs]
-    glyphs = text + [dict(p) for p in plats]
+    """字框 + 落脚面 → 落脚点和能走的连续字段. 每个字都能站, 站下面一行就挡住上一行 (维护者要的);
+    只有头会顶破 CEILING 的字不算."""
+    glyphs = [dict(g) for g in glyphs] + [dict(p) for p in plats]
     for g in glyphs:
-        if g.get("flat"):
-            g["lo"], g["hi"] = g["left"] + CAT_W / 2, g["right"] - CAT_W / 2
-            g["x"] = (g["lo"] + g["hi"]) / 2
-            continue
-        pad = min(14, (g["right"] - g["left"]) / 3)
-        lo, hi, a, b = g["left"] + pad, g["right"] - pad, None, None
-        x = lo
-        while x <= hi:
-            free = g["top"] - CAT_H >= CEILING and not any(
-                o is not g and not o.get("flat") and x + CAT_W / 2 > o["left"] and x - CAT_W / 2 < o["right"]
-                and g["top"] - CAT_H < o["bottom"] and g["top"] - 2 > o["top"] for o in glyphs)
-            if free:
-                a = x if a is None else a
-                b = x
-            x += 2
-        g["lo"], g["hi"] = a, b
-        g["x"] = None if a is None else max(a, min(b, (g["left"] + g["right"]) / 2))
+        pad = CAT_W / 2 if g.get("flat") else min(14, (g["right"] - g["left"]) / 3)
+        ok = g["top"] - CAT_H >= CEILING
+        g["lo"], g["hi"] = (g["left"] + pad, g["right"] - pad) if ok else (None, None)
+        g["x"] = (g["lo"] + g["hi"]) / 2 if ok else None
     runs = []
     for g in glyphs:
         if g["x"] is None:

@@ -39,15 +39,14 @@ def test_allowed_only_when_locked_and_nothing_going_on():
         assert not pc.allowed(_idle(**over)), over
 
 
-def test_perches_skip_glyphs_blocked_by_the_line_above():
+def test_cat_can_stand_on_second_line_and_cover_the_first():
     upper = _glyphs(top=800, n=2, x0=304)
     for g in upper:
         g["bottom"] = 840
     lower = [dict(g, li=1) for g in _glyphs(top=850, n=4)]
     lay = pc.layout(upper + lower)
-    perched = {(g["li"], g["left"]) for g in lay["perches"]}
-    assert all((0, g["left"]) in perched for g in upper)
-    assert (1, 304) not in perched and (1, 208) in perched or (1, 496) in perched
+    assert len(lay["perches"]) == 6
+    assert sum(1 for r in lay["runs"] if r["li"] == 1) == 1
 
 
 def test_perches_below_the_ceiling_only():
@@ -212,3 +211,16 @@ def test_positions_snap_to_art_pixels():
         pet.tick(0.125)
         for d in pet.draws():
             assert d["x"] % pc.S == 0
+
+
+def test_cat_walks_the_second_line_under_the_first():
+    upper = _glyphs(top=800, n=2, x0=304)
+    lower = [dict(g, li=1) for g in _glyphs(top=850, n=4)]
+    pet = pc.Pet(random.Random(9))
+    pet.sync(True, True, upper + lower)
+    tops = set()
+    for _ in range(int(3 * 3600 / 0.125)):
+        pet.tick(0.125)
+        if pet.cat.visible and not pet.cat.air and pet.cat.run:
+            tops.add(pet.cat.y)
+    assert 850 in tops
