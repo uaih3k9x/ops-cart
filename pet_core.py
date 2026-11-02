@@ -31,6 +31,7 @@ ANIM = {
     "sleep": {"f": ["sleep0", "sleep1"], "beat": 1.2},
     "knead": {"f": ["knead0", "knead1"], "beat": .5},
     "puff": {"f": ["puff0", "puff1"], "beat": .25},
+    "lick": {"f": ["lick0", "lick1", "lick2", "lick1"], "beat": .25},
 }
 
 
@@ -326,6 +327,13 @@ class Pet:
         yield from _hold(c, "knead", 5)
         yield from _hold(c, "stand", .5)
 
+    def _act_lick(self, c):
+        """坐下舔两下爪子, 一副什么都没发生的样子."""
+        yield from _hold(c, "sit", .5)
+        yield from _hold(c, "lick", self.rng.uniform(3, 4))
+        yield from _hold(c, "sit", .5)
+        c.set_pose("stand")
+
     def _other_perch(self, c):
         others = [g for g in self.lay["perches"] if g["run"] is not c.run]
         if others:
@@ -398,7 +406,7 @@ class Pet:
         b.set_script(self._flee(b))
         yield from _wait(1)
         yield from _hold(c, "stand", .5)
-        yield from _hold(c, "sit", 1)
+        yield from self._act_lick(c)    # 吵完舔爪: 刚才不是我
         yield from _walk_to(c, (run["lo"] + run["hi"]) / 2)
 
     def _life(self, c):
@@ -408,6 +416,8 @@ class Pet:
             yield from self._nap(c, self.rng.uniform(24, 42))
             act = self._pick(["walk", "walk", "knead", "knead", "knead", "hop", "hop", "hop", "jump", "visitor"])
             yield from self._wake(c)
+            if self.rng.random() < .4:      # 睡醒先舔爪
+                yield from self._act_lick(c)
             yield from acts[act](c)
 
     def _reland(self, c):

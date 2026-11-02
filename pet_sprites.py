@@ -247,9 +247,9 @@ def _head(eye="open", flat=False, hiss=False):
     return {"eye": eye, "flat": flat, "hiss": hiss}
 
 
-def _pose(name, head, hx, hy, *parts):
-    """parts: (矩阵, 列, 行, 种类); 种类 b=身体 t=尾巴, 其它不上花斑. 先画的在后面."""
-    POSES[name] = {"parts": parts, "head": head, "hx": hx, "hy": hy}
+def _pose(name, head, hx, hy, *parts, over=()):
+    """parts: (矩阵, 列, 行, 种类); 种类 b=身体 t=尾巴, 其它不上花斑. 先画的在后面. over 画在脸前面."""
+    POSES[name] = {"parts": parts, "head": head, "hx": hx, "hy": hy, "over": over}
 
 
 _pose("stand", _head(), 10, 5, (TAIL_UP, 1, 5, "t"), (TORSO, 2, 13, "b"), (LEGS["stand"], 0, 19, ""))
@@ -289,6 +289,17 @@ _pose("sleep0", _head("sleep"), 8, 9, (TORSO_LOAF, 1, 12, "b"), (TAIL_WRAP, 1, 2
 _pose("sleep1", _head("sleep"), 8, 10, (TORSO_LOAF[1:], 1, 13, "b"), (TAIL_WRAP, 1, 20, ""), (PAWS, 12, 22, ""))
 _pose("knead0", _head("happy"), 10, 7, (TAIL_UP, 1, 5, "t"), (TORSO, 2, 13, "b"), (_stand_half, 0, 19, ""), (LEGS["k0"], 0, 19, ""))
 _pose("knead1", _head("happy"), 10, 8, (TAIL_SWAY, 1, 5, "t"), (TORSO, 2, 13, "b"), (_stand_half, 0, 19, ""), (LEGS["k1"], 0, 19, ""))
+# 舔爪: 坐着抬前爪, 闭眼低头, 舌头一点粉. 抬起的那只从地上拿走, 地上只剩一只
+_TORSO_SIT_ONE = TORSO_SIT[:6] + [
+    "...KWWWWWWWWWWWKWWK",
+    "...KWWWWWWWWWWWKWWK",
+    "KKKKWWWWWWWWWWWKBBK",
+    "KSWSKKKKKKKKKKKKKK"]
+_PAW_UP = ["KBBBK", "KBBBK", "KWWWK", "KKKKK"]
+_lick = _head("happy")
+_pose("lick0", _lick, 7, 3, (_TORSO_SIT_ONE, 0, 14, "b"), over=((_PAW_UP, 12, 15, ""),))
+_pose("lick1", _lick, 7, 3, (_TORSO_SIT_ONE, 0, 14, "b"), over=((["KPPK"], 13, 14, ""), (_PAW_UP, 12, 15, "")))
+_pose("lick2", _lick, 7, 4, (_TORSO_SIT_ONE, 0, 14, "b"), over=((["KPPK"], 13, 15, ""), (_PAW_UP, 12, 16, "")))
 _angry = _head("angry", flat=True, hiss=True)
 _pose("puff0", _angry, 10, 6, (TAIL_PUFF, 0, 0, "t"), (TORSO_PUFF0, 2, 8, "b"), (LEGS["puff"], 0, 18, ""))
 _pose("puff1", _angry, 10, 5, (TAIL_PUFF, 1, 1, "t"), (TORSO_PUFF1, 2, 8, "b"), (LEGS["puff"], 0, 18, ""))
@@ -328,6 +339,8 @@ def compose(name, coat="ginger"):
         paint(m, hx + ex, hy + ey)
     if head["hiss"]:
         paint(HISS[2], hx + HISS[0], hy + HISS[1])
+    for rows, cx, cy, kind in pose["over"]:
+        paint(rows, cx, cy, kind)
     grid[23] = ["." if ch == "K" else ch for ch in grid[23]]
     return grid
 

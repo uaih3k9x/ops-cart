@@ -31,7 +31,7 @@ def test_no_pose_is_clipped_by_the_sprite_box():
     """脸和身子都不能被 24x24 切掉一块 (踩奶时脸缺过一列)."""
     for name, pose in ps.POSES.items():
         head = ps.EARS_FLAT + ps.HEAD[4:] if pose["head"]["flat"] else ps.HEAD
-        parts = list(pose["parts"]) + [(head, pose["hx"], pose["hy"], "h")]
+        parts = list(pose["parts"]) + [(head, pose["hx"], pose["hy"], "h")] + list(pose["over"])
         for rows, cx, cy, _ in parts:
             for r, row in enumerate(rows):
                 for c, ch in enumerate(row):
@@ -235,3 +235,29 @@ def test_cat_walks_the_second_line_under_the_first():
         if pet.cat.visible and not pet.cat.air and pet.cat.run:
             tops.add(pet.cat.y)
     assert 850 in tops
+
+
+def test_lick_shows_paw_over_the_face():
+    assert {"lick0", "lick1", "lick2"} <= set(ps.POSES)
+    assert ps.compose("lick0") != ps.compose("sit")
+    assert any("P" in "".join(r) for r in ps.compose("lick1"))
+
+
+def test_lick_has_one_front_paw_on_the_ground():
+    """抬起一只, 地上就只剩一只; 不然看着像两条腿站着又多长一只手."""
+    def feet(name):
+        row = "".join(ps.compose(name)[22])
+        return len([x for x in row.replace("K", ".").split(".") if "B" in x])
+    assert feet("sit") == 2
+    for name in ("lick0", "lick1", "lick2"):
+        assert feet(name) == 1
+
+
+def test_cat_licks_its_paw_sometimes():
+    pet = pc.Pet(random.Random(5))
+    pet.sync(True, True, _glyphs())
+    seen = set()
+    for _ in range(int(2 * 3600 / 0.125)):
+        pet.tick(0.125)
+        seen.update(d["pose"] for d in pet.draws())
+    assert {"lick0", "lick1", "lick2"} <= seen
