@@ -261,3 +261,76 @@ def test_cat_licks_its_paw_sometimes():
         pet.tick(0.125)
         seen.update(d["pose"] for d in pet.draws())
     assert {"lick0", "lick1", "lick2"} <= seen
+
+
+def test_eye_override_changes_face_but_not_body():
+    a, b = ps.compose("stand"), ps.compose("stand", eye="half")
+    assert a != b
+    assert a[20:] == b[20:]     # 身子和腿不动
+
+
+def test_hiss_poses_keep_their_angry_eyes():
+    assert ps.compose("puff0", eye="happy") == ps.compose("puff0")
+
+
+def test_every_expression_composes_with_every_pose():
+    for name in ps.POSES:
+        for eye in ps.EXPRESSIONS:
+            assert len(ps.compose(name, eye=eye)) == 24
+
+
+def test_cat_blinks_half_then_closed_then_open():
+    pet = pc.Pet(random.Random(3))
+    pet.cat.visible = True
+    pet.cat.set_pose("stand")
+    seen = []
+    for _ in range(int(60 / 0.125)):
+        pet._blink(0.125)
+        seen.append(pet.cat.shown_eye())
+    assert 8 <= seen.count("closed") <= 40          # 大约几秒一次
+    assert seen.count("half") == seen.count("closed")
+    for i, e in enumerate(seen):
+        if e == "closed":
+            assert seen[i - 1] == "half" and seen[i + 1] is None
+
+
+def test_half_lidded_cat_only_closes_when_blinking():
+    pet = pc.Pet(random.Random(3))
+    pet.cat.set_pose("stand")
+    pet.cat.eye = "half"
+    seen = []
+    for _ in range(400):
+        pet._blink(0.125)
+        seen.append(pet.cat.shown_eye())
+    assert "closed" in seen and set(seen) == {"half", "closed"}
+
+
+def test_no_blink_while_asleep_or_eyes_closed():
+    pet = pc.Pet(random.Random(3))
+    pet.cat.set_pose("sleep")
+    pet.cat.blink_left = 0
+    for _ in range(200):
+        pet._blink(0.125)
+        assert pet.cat.shown_eye() is None
+    pet.cat.set_pose("stand")
+    pet.cat.eye = "closed"
+    for _ in range(200):
+        pet._blink(0.125)
+        assert pet.cat.shown_eye() == "closed"
+
+
+def test_draws_report_eye():
+    pet = pc.Pet(random.Random(1))
+    pet.sync(True, True, _glyphs())
+    pet.tick(0.125)
+    assert "eye" in pet.draws()[0]
+
+
+def test_cat_shows_varied_expressions():
+    pet = pc.Pet(random.Random(5))
+    pet.sync(True, True, _glyphs())
+    seen = set()
+    for _ in range(int(2 * 3600 / 0.125)):
+        pet.tick(0.125)
+        seen.update(d["eye"] for d in pet.draws())
+    assert {"half", "closed"} <= seen

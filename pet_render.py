@@ -33,7 +33,7 @@ def load_skin(path=SKIN_PATH):
             if color[0] != "#" or len(color) != 7:
                 raise ValueError(color)
         for name, grid in poses.items():
-            if name not in ps.POSES or len(grid) != 24 or any(len(row) != 24 for row in grid):
+            if name.split("@")[0] not in ps.POSES or len(grid) != 24 or any(len(row) != 24 for row in grid):
                 raise ValueError(name)
             if any(ch != "." and ch not in palette for row in grid for ch in row):
                 raise ValueError(name)
@@ -53,14 +53,16 @@ def _rgba(hex_color):
     return tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5)) + (255,)
 
 
-def sprite(name, coat, direction):
-    """姿势 → 放大好的 RGBA 图; 朝左的镜像. 缓存."""
-    key = (name, coat, direction)
+def sprite(name, coat, direction, eye=None):
+    """姿势 + 表情 → 放大好的 RGBA 图; 朝左的镜像. 缓存. 皮肤里 "姿势@表情" 优先, 没有就用姿势本身."""
+    key = (name, coat, direction, eye)
     if key not in _sprites:
         from PIL import Image
-        skinned = _skin is not None and coat == pc.COAT and name in _skin["poses"]
+        poses = _skin["poses"] if _skin is not None and coat == pc.COAT else {}
+        skin_key = "%s@%s" % (name, eye) if "%s@%s" % (name, eye) in poses else name
+        skinned = skin_key in poses
         colors = _skin["palette"] if skinned else th.PET_COATS[coat]
-        grid = _skin["poses"][name] if skinned else ps.compose(name, coat)
+        grid = poses[skin_key] if skinned else ps.compose(name, coat, eye)
         img = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
         px = img.load()
         for y, row in enumerate(grid):
@@ -142,7 +144,7 @@ class Stage:
         area = base.crop((0, AREA_TOP, r.PANEL_W, AREA_BOTTOM))
         layer = area.copy()
         for c in draws:
-            img = sprite(c["pose"], c["coat"], c["dir"])
+            img = sprite(c["pose"], c["coat"], c["dir"], c.get("eye"))
             layer.paste(img, (c["x"] - SIZE // 2, c["y"] - 23 * pc.S - AREA_TOP), img)
         d = ImageDraw.Draw(layer)
         shifted = [dict(c, y=c["y"] - AREA_TOP) for c in draws]

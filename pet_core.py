@@ -35,6 +35,10 @@ ANIM = {
 }
 
 
+NO_BLINK = {"sleep", "knead", "puff", "lick", "landing"}     # 这些动作眼睛闭着, 或者张嘴不能换表情
+NO_BLINK_EYES = {"happy", "closed", "sleep", "squint"}
+
+
 def allowed(view):
     """这一帧猫能不能待着: 锁屏, 且没有自检 / 掉线 / 发地址 / UPS 告警 / Agent 待确认 / 操作头在动.
     跟 #34 的"当前动词"接上之前, 就只认这些副屏本来就知道的信号."""
@@ -111,6 +115,13 @@ class Cat:
         self.dust_t = -1.0
         self.alarm = 0.0
         self.arrived = False
+        self.eye = None         # 当前心情; None = 姿势自带的眼睛
+        self.blink_left = 2.0   # 还有多久眨眼
+        self.blink = []         # 眨眼还剩哪几帧
+
+    def shown_eye(self):
+        """这一帧实际画什么眼睛; None = 姿势自带."""
+        return self.blink[0] if self.blink else self.eye
 
     def set_pose(self, p):
         if self.pose != p:
@@ -218,6 +229,7 @@ class Pet:
 
     def tick(self, dt):
         dt = min(dt, MAX_DT)
+        self._blink(dt)
         for c in (self.cat, self.other):
             if not c.visible and not c.script:
                 continue
@@ -238,6 +250,20 @@ class Pet:
                 except StopIteration:
                     c.script = None
 
+    def _blink(self, dt):
+        """睁着眼才眨: 隔几秒来一次, 半眯 → 闭眼 → 睁开, 各一帧. 本来就半眯的只闭一帧."""
+        c = self.cat
+        if c.blink:
+            c.blink = c.blink[1:]
+            return
+        c.blink_left -= dt
+        if c.blink_left > 0:
+            return
+        c.blink_left = self.rng.uniform(2, 6)
+        if c.pose in NO_BLINK or c.eye in NO_BLINK_EYES:
+            return
+        c.blink = ["closed"] if c.eye == "half" else ["half", "closed"]
+
     def interval(self):
         """下一帧隔多久; 没猫 None (不用推)."""
         if not self.cat.visible and not self.other.visible and not self.cat.script:
@@ -253,7 +279,7 @@ class Pet:
             if c.visible:
                 x, y = c.snapped()
                 out.append({"pose": c.frame(), "state": c.pose, "coat": c.coat, "x": x, "y": y, "dir": c.dir,
-                            "t": c.anim_t, "say": c.say, "dust_t": c.dust_t, "alarm": c.alarm > 0})
+                            "t": c.anim_t, "eye": c.shown_eye(), "say": c.say, "dust_t": c.dust_t, "alarm": c.alarm > 0})
         return out
 
     # ---------------------------------------------------- 工具
@@ -309,9 +335,11 @@ class Pet:
             w = self._widest()["glyphs"]
             yield from self._jump_to(c, w[1] if len(w) > 1 else w[0])
         r = c.run
+        c.eye = self._pick([None, None, None, "half"])    # 偶尔没睡醒
         yield from _walk_to(c, r["lo"] if c.x - r["lo"] > r["hi"] - c.x else r["hi"])
         yield from _hold(c, "stand", .5)
         yield from _walk_to(c, r["lo"] + (r["hi"] - r["lo"]) * self.rng.uniform(.3, .7))
+        c.eye = None
         yield from _hold(c, "stand", .5)
 
     def _act_jump(self, c):
@@ -324,14 +352,18 @@ class Pet:
 
     def _act_knead(self, c):
         yield from _hold(c, "stand", .5)
+        c.eye = self._pick([None, None, "half", "down"])
         yield from _hold(c, "knead", 5)
+        c.eye = None
         yield from _hold(c, "stand", .5)
 
     def _act_lick(self, c):
         """坐下舔两下爪子, 一副什么都没发生的样子."""
         yield from _hold(c, "sit", .5)
+        c.eye = self._pick(["half", "half", "closed", "open", None])     # 面无表情: 刚才不是我
         yield from _hold(c, "lick", self.rng.uniform(3, 4))
         yield from _hold(c, "sit", .5)
+        c.eye = None
         c.set_pose("stand")
 
     def _other_perch(self, c):

@@ -32,7 +32,13 @@ EYES = {
     "squint": ((3, 8, ["KKK"]), (8, 8, ["KKK"])),
     "angry": ((3, 6, ["K..", "HEK", "HE."]), (8, 6, ["..K", "KEH", ".EH"])),
 }
-HISS = (4, 10, ["KKKKKK", "KHPPHK", ".KKKK."])
+EYES.update({
+    "half": ((4, 7, ["KK", "EE"]), (10, 7, ["KK", "EE"])),          # 上眼皮压下来半只眼
+    "closed": ((4, 8, ["KK"]), (10, 8, ["KK"])),                    # 闭眼: 一条横线
+    "down": ((4, 7, ["EE", "EE"]), (10, 7, ["EE", "EE"])),          # 往下看
+})
+EXPRESSIONS = ("open", "half", "closed", "down", "happy", "sleep", "squint")
+HISS = (5, 10, ["KKHK", "KKKK"])     # 2x4 黑嘴, 第三格一颗虎牙; 白脸上牙要靠黑底才看得见
 
 TORSO = [
 "...KKKKKKKKKKK..",
@@ -316,8 +322,9 @@ _PATCH = {
 }
 
 
-def compose(name, coat="ginger"):
-    """姿势 → 24 行 24 列字符网格. 底行描边去掉, 爪子直接贴字: 深描边压在深底上看着像悬空."""
+def compose(name, coat="ginger", eye=None):
+    """姿势 → 24 行 24 列字符网格. 底行描边去掉, 爪子直接贴字: 深描边压在深底上看着像悬空.
+    eye: 换表情, 动作不变. 张嘴哈气的姿势不换, 不然会大笑着哈气."""
     pose = POSES[name]
     grid = [["."] * 24 for _ in range(24)]
     patches = _PATCH.get(coat, {})
@@ -335,7 +342,7 @@ def compose(name, coat="ginger"):
         paint(rows, cx, cy, kind)
     head, hx, hy = pose["head"], pose["hx"], pose["hy"]
     paint(EARS_FLAT + HEAD[4:] if head["flat"] else HEAD, hx, hy, "h")
-    for ex, ey, m in EYES[head["eye"]]:
+    for ex, ey, m in EYES[head["eye"] if eye is None or head["hiss"] else eye]:
         paint(m, hx + ex, hy + ey)
     if head["hiss"]:
         paint(HISS[2], hx + HISS[0], hy + HISS[1])

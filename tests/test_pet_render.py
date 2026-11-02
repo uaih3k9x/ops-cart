@@ -144,3 +144,25 @@ def test_load_skin_rejects_unknown_char(tmp_path):
     p = tmp_path / "skin.json"
     p.write_text(json.dumps(_skin(palette={})))
     assert pr.load_skin(str(p)) is None
+
+
+def test_sprite_takes_expression(clean_skin):
+    assert pr.sprite("stand", pc.COAT, 1, "half").tobytes() != pr.sprite("stand", pc.COAT, 1).tobytes()
+
+
+def test_skin_expression_key_wins_then_falls_back(clean_skin):
+    grid = ["." * 24] * 23 + ["XX" + "." * 22]
+    grid2 = ["." * 24] * 23 + [".." + "XX" + "." * 20]
+    pr.use_skin({"palette": {"X": "#123456"}, "poses": {"stand": grid, "stand@half": grid2}})
+    assert pr.sprite("stand", pc.COAT, 1, "half").getpixel((0, 23 * pc.S))[3] == 0
+    assert pr.sprite("stand", pc.COAT, 1, "closed").getpixel((0, 23 * pc.S))[3] == 255
+
+
+def test_load_skin_accepts_expression_keys_rejects_unknown(tmp_path):
+    import json
+    g = ["." * 24] * 24
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"palette": {}, "poses": {"stand@half": g}}))
+    assert pr.load_skin(str(p))
+    p.write_text(json.dumps({"palette": {}, "poses": {"nope@half": g}}))
+    assert pr.load_skin(str(p)) is None
