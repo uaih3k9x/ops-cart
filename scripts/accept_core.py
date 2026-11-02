@@ -250,7 +250,7 @@ def _not_stdlib(names):
 REQUIRED_PY = (
     "atomicfile", "cart_dream", "cart_label", "cart_mcp", "cart_ocr", "cart_snap",
     "cartlog", "ch9329", "clone_core", "confirm_core", "confirm_panel", "dash_core",
-    "dash_render", "dash_service", "hidpdc", "httpserve", "kiosk", "kiosk_core",
+    "dash_render", "dash_service", "pet_core", "pet_render", "pet_sprites", "hidpdc", "httpserve", "kiosk", "kiosk_core",
     "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core", "lamps_core",
     "lldp_core", "mcp_core", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
     "netmode_panel", "netprof_core", "notify_core", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
@@ -260,7 +260,7 @@ REQUIRED_PY = (
     "wifi_panel", "wifi_prefer", "wol_core", "wol_panel",
 )
 VENV_PY = (
-    "dash_render", "dash_service", "udisp_usb",
+    "dash_render", "dash_service", "pet_render", "udisp_usb",
 )
 ASSETS = (
     "icons/net-off.png",

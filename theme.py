@@ -318,3 +318,14 @@ def unreadable(top, floor=4.5):
             if ratio < floor:
                 out.append((str(w), text, kind, round(ratio, 2)))
     return out
+
+
+# 副屏桌宠 (#35): 猫不跟深浅模式变; K 描边 W 主毛色 D 远侧腿 S 条纹 B 肚子 P 粉 C 腮红 E 眼 H 高光 # 花斑
+PET_COATS = {
+    "ginger": {"K": "#0c0e13", "W": "#f2a44f", "D": "#c47a33", "S": "#c8712b", "B": "#ffe6c2", "P": "#ff9db2",
+               "C": "#ffbf8f", "E": "#23150f", "H": "#ffffff"},
+    "cow": {"K": "#0c0e13", "W": "#f3f1ea", "D": "#bcbcb6", "S": "#f3f1ea", "B": "#ffffff", "P": "#ff9db2",
+            "C": "#ffd3d8", "E": "#1c3b2a", "H": "#ffffff", "#": "#454b60"},
+}
+PET_FX = {"z": "#9fc4e8", "heart": "#ff8fa8", "dust": "#8088a0", "alarm": "#ffd84a",
+          "ink": "#0c0e13", "paper": "#fff7e6", "say": "#c62d2a"}

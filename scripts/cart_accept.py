@@ -38,7 +38,7 @@ OPT = OPT_DEFAULT                   # --opt 可换 (开发机上拿仓库目录�
 ETC = "/etc/ops-cart"
 RUN = "/run/ops-cart"
 LOG = "/var/log/ops-cart"
-EXPECT_VERSION = "1.12.01"          # 没有仓库的 VERSION 可读时用 (推车上单独拷过去跑)
+EXPECT_VERSION = "1.12.02"          # 没有仓库的 VERSION 可读时用 (推车上单独拷过去跑)
 MANIFEST = os.path.join(HERE, "accept-manifest.json")
 PY_ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
 PY_ENV.pop("PYTHONSTARTUP", None)

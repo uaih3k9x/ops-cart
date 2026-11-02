@@ -4,6 +4,8 @@ import io
 import json
 import time
 
+import pytest
+
 import dash_core as dc
 import dash_service as ds
 
@@ -265,3 +267,132 @@ def test_loop_switches_theme_on_the_next_frame(tmp_path, monkeypatch):
     assert [m for m, _mode, _bg in seen] == ["dark", "light", "dark"]     # 没变的那轮不重推
     assert all(m == mode for m, mode, _bg in seen)                 # 画的时候 theme 已经切好
     assert seen[1][2] == th.LIGHT["DASH_BG"] and seen[2][2] == th.DARK["DASH_BG"]
+
+
+class _FakePet:
+    """够 _loop 用的假猫."""
+
+    def __init__(self, fail_on=None):
+        self.next_at = self.last_tick = None
+        self.drawn = False
+        self.ticks = 0
+        self.synced = []
+        self.gap = 0.125
+        self.fail_on = fail_on
+
+    def sync(self, locked, ok, glyphs):
+        if self.fail_on == "sync":
+            raise ValueError("猫坏了")
+        self.synced.append((locked, ok))
+
+    def tick(self, dt):
+        self.ticks += 1
+
+    def interval(self):
+        return self.gap
+
+    def draws(self):
+        return []
+
+
+class _Stage:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def frame(self, view, pet):
+        if self.fail:
+            raise ValueError("画不出来")
+        return b"pet"
+
+
+def _pet_clock(monkeypatch, stop_after):
+    """假时钟: sleep 直接拨表; 拨够了抛异常结束循环."""
+    now = [1000.0]
+
+    def fake_sleep(s):
+        now[0] += s
+        if now[0] > 1000.0 + stop_after:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(ds.time, "time", lambda: now[0])
+    monkeypatch.setattr(ds.time, "sleep", fake_sleep)
+    return now
+
+
+def _run_pet(tmp_path, monkeypatch, pet, stage, secs=2.0, disp=None):
+    disp = disp or FakeDisp()
+    _pet_clock(monkeypatch, secs)
+    with pytest.raises(KeyboardInterrupt):
+        ds.run(ctx=_ctx(), state_path=str(tmp_path / "s.json"), out=io.StringIO(),
+                         display_factory=lambda: FakeFactory(disp), pet=pet, stage=stage)
+    return disp
+
+
+def test_pet_gets_8fps_frames_between_samples(tmp_path, monkeypatch):
+    pet = _FakePet()
+    disp = _run_pet(tmp_path, monkeypatch, pet, _Stage())
+    assert 14 <= pet.ticks <= 18
+    assert disp.sent.count(b"pet") >= 14
+    assert len(pet.synced) >= 8     # 200 ms 一轮的采集没被挤掉
+
+
+def test_pet_sleeping_pushes_only_2fps(tmp_path, monkeypatch):
+    pet = _FakePet()
+    pet.gap = 0.5
+    _run_pet(tmp_path, monkeypatch, pet, _Stage())
+    assert 3 <= pet.ticks <= 6
+
+
+def test_pet_gone_pushes_one_erase_frame_then_nothing(tmp_path, monkeypatch):
+    pet = _FakePet()
+    pet.gap = None
+    pet.drawn = True
+    disp = _run_pet(tmp_path, monkeypatch, pet, _Stage())
+    assert pet.ticks == 0
+    assert disp.sent.count(b"pet") == 2      # 首帧 + 擦除帧
+
+
+def test_pet_sync_error_drops_pet_but_dash_keeps_going(tmp_path, monkeypatch):
+    out = io.StringIO()
+    disp = FakeDisp()
+    _pet_clock(monkeypatch, 1.0)
+    with pytest.raises(KeyboardInterrupt):
+        ds.run(ctx=_ctx(), state_path=str(tmp_path / "s.json"), out=out,
+                         display_factory=lambda: FakeFactory(disp), pet=_FakePet("sync"), stage=_Stage(),
+                         render=lambda v: b"plain")
+    assert "摘掉" in out.getvalue()
+    assert disp.sent == [b"plain"]
+
+
+def test_pet_stage_error_falls_back_to_plain_frame(tmp_path, monkeypatch):
+    out = io.StringIO()
+    pet = _FakePet()
+    disp = FakeDisp()
+    _pet_clock(monkeypatch, 1.0)
+    monkeypatch.setattr("dash_render.make_frame", lambda v: b"plain")
+    with pytest.raises(KeyboardInterrupt):
+        ds.run(ctx=_ctx(), state_path=str(tmp_path / "s.json"), out=out,
+                         display_factory=lambda: FakeFactory(disp), pet=pet, stage=_Stage(fail=True))
+    assert "摘掉" in out.getvalue()
+    assert b"pet" not in disp.sent and b"plain" in disp.sent
+
+
+def test_pet_usb_error_reconnects_instead_of_dying(tmp_path, monkeypatch):
+    out = io.StringIO()
+    pet = _FakePet()
+    disp = FakeDisp()
+    real = disp.send
+    calls = []
+
+    def send(payload):
+        calls.append(1)
+        if len(calls) == 3:
+            raise OSError("usb")
+        real(payload)
+
+    disp.send = send
+    _pet_clock(monkeypatch, 5.0)
+    with pytest.raises(KeyboardInterrupt):
+        ds.run(ctx=_ctx(), state_path=str(tmp_path / "s.json"), out=out,
+                         display_factory=lambda: FakeFactory(disp), pet=pet, stage=_Stage())
+    assert "推送失败" in out.getvalue() and len(calls) > 3

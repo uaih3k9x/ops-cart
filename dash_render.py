@@ -372,8 +372,8 @@ def _work_body(d, view, W, H):
         d.text((M, H - 60 - 38 * (len(lines) - i)), line, font=_font(26), fill=DIM)
 
 
-def _locked_body(d, view, W, H):
-    """锁屏: 教室引导牌. 公告大字居中, 别的都不显示."""
+def _locked_lines(view, W, H):
+    """锁屏公告排版: (字号, 行距, 各行, 第一行顶). 字框 (glyph_boxes) 和实际画字共用, 不能各算各的."""
     paras = paragraphs(view.get("notice")) or ["推车锁定中"]
     room = H - 160 - 700                    # 分隔线以下、底部提示以上
     for size in (96, 80, 64, 52, 44):       # 字号从大往下试, 整段放得进为止
@@ -382,11 +382,36 @@ def _locked_body(d, view, W, H):
         if len(lines) * lh <= room:
             break
     lines = lines[:room // lh]
-    top = 700 + max(0, (room - lh * len(lines)) // 2)
+    return size, lh, lines, 700 + max(0, (room - lh * len(lines)) // 2)
+
+
+def _locked_body(d, view, W, H):
+    """锁屏: 教室引导牌. 公告大字居中, 别的都不显示."""
+    size, lh, lines, top = _locked_lines(view, W, H)
     for i, line in enumerate(lines):
         d.text((W // 2, top + i * lh + lh // 2), line, font=_font(size), fill=FG, anchor="mm")
     d.text((W // 2, H - 110), "推车已锁定 · 在车上解锁后显示状态", font=_font(26), fill=DIM,
            anchor="mm")
+
+
+def glyph_boxes(view, W=PANEL_W, H=PANEL_H):
+    """锁屏公告每个字的墨迹框 (竖屏坐标), 给桌宠找落脚点 (#35). 空白字符不算."""
+    from PIL import Image, ImageDraw
+    d = ImageDraw.Draw(Image.new("L", (1, 1)))
+    size, lh, lines, top = _locked_lines(view, W, H)
+    font = _font(size)
+    out = []
+    for li, line in enumerate(lines):
+        cy = top + li * lh + lh // 2
+        mid = (W // 2, cy)
+        base = cy + d.textbbox(mid, line, font=font, anchor="mm")[1] - d.textbbox(mid, line, font=font, anchor="ms")[1]
+        x0 = d.textbbox(mid, line, font=font, anchor="mm")[0] - d.textbbox((0, 0), line, font=font, anchor="ls")[0]
+        for i, ch in enumerate(line):
+            if not ch.strip():
+                continue
+            box = d.textbbox((x0 + font.getlength(line[:i]), base), ch, font=font, anchor="ls")
+            out.append({"ch": ch, "li": li, "left": box[0], "top": box[1], "right": box[2], "bottom": box[3]})
+    return out
 
 
 def encode(img, quality=JPEG_QUALITY):
@@ -409,6 +434,11 @@ def make_frame(view, rotate=True, quality=JPEG_QUALITY, budget=JPEG_BUDGET):
     img = render(view)
     if rotate:
         img = rot90(img)
+    return encode_within_budget(img, quality, budget)
+
+
+def encode_within_budget(img, quality=JPEG_QUALITY, budget=JPEG_BUDGET):
+    """压 JPEG, 超预算逐档降质量. 转的是像素不是 JPEG, 每档只压一次."""
     q = quality
     jpeg = encode(img, q)
     while len(jpeg) > budget and q > 30:
