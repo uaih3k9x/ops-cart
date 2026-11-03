@@ -110,7 +110,7 @@ class Cart:
                              retire=lambda macs: kc.pxe_retire(macs, root=self.root))
         kvm = mk.build_tools(mk.LeaseStore(str(self.tmp / "kvm-lease.json"), clock=self.clock, stopped=lambda: False),
                              ports=lambda: {"S1": "/dev/null"}, opener=lambda port, who: _NullCh(),
-                             ocr=lambda dev, lang: ([], "x"), wol=lambda mac, iface: None, broker_up=lambda p: True)
+                             ocr=lambda dev, lang: ([], "x", "t"), wol=lambda mac, iface: None, broker_up=lambda p: True)
         return ro + serial + label + pxe + kvm
 
     # ---- 看

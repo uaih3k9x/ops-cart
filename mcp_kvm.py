@@ -40,7 +40,7 @@ HISTORY_MAX = 10
 SUMMARY_EVS = {"confirm", "reject", "revoked"}
 OCR_MIN_LINE = 40.0             # 低于这个置信度的行当噪声扔掉
 OCR_MIN_MEAN = 60.0             # 平均低于这个: 明说读不出, 叫 Agent 看图
-OCR_HINT = "OCR 读不出 (彩色桌面 / 图形界面 / 没信号都这样), 用 screenshot 看图"
+OCR_HINT = "OCR 读不出 (没信号、纯图形画面都这样; 退回 Tesseract 时彩色桌面也读不出), 用 screenshot 看图"
 # 串口闸门的词表之外, 操作系统上常见的清盘 / 引导命令 (子串匹配: mkfs.ext4、Format-Volume 都算)
 DANGER_SUB = ("diskpart", "bcdedit", "mkfs", "wipefs", "fdisk", "sgdisk", "parted", "shred", "dd if=", "cipher /w",
               "format-volume", "clear-disk", "remove-item", "reg delete")
@@ -330,7 +330,7 @@ def redact_type(args):
 
 def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
     """ports() -> {序列号: 路径}; opener(port, who) -> 代理连接 (send_keys / type_text / close);
-    ocr(dev|None, lang) -> (行, 哪块卡的说明); wol(mac, iface); broker_up(port) -> bool. 测试里全换成假的."""
+    ocr(dev|None, lang) -> (行, 哪块卡的说明, 引擎); wol(mac, iface); broker_up(port) -> bool. 测试里全换成假的."""
 
     def _port(serial):
         online = ports()
@@ -401,8 +401,8 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
         dev = a.get("device")
         if dev and not dev.startswith("/dev/"):
             dev = "/dev/" + dev
-        lines, label = ocr(dev, a["lang"])
-        return [mc.json_content(dict(ocr_view(lines), screen=label))]
+        lines, label, engine = ocr(dev, a["lang"])
+        return [mc.json_content(dict(ocr_view(lines), screen=label, engine=engine))]
 
     def wol_send(a):
         try:
@@ -437,10 +437,11 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
            "lease": LEASE, "serial": SERIAL},
           kvm_type, destructive=True, redact=redact_type),
         T("screen_ocr", "读被测机屏幕上的字 (OCR, 带坐标), 比 screenshot 省得多, 看画面先用这个. readable=false 时再用 "
-          "screenshot. BIOS / 命令行读得准, 彩色桌面读不出.",
+          "screenshot. engine 写明用的引擎; 可能有形近字错误, 命令和路径回车前要核对.",
           {"device": {"type": "string", "pattern": r"(/dev/)?video[0-9]{1,2}", "maxLength": 16,
                       "description": "采集设备, 默认正在预览的那块, 没预览就有信号的采集卡"},
-           "lang": {"type": "string", "enum": ["eng", "eng+chi_sim"], "default": "eng", "description": "语言"}},
+           "lang": {"type": "string", "enum": ["eng", "eng+chi_sim"], "default": "eng",
+                    "description": "只对退回 Tesseract 时有用; RapidOCR 中英都读"}},
           screen_ocr, read_only=True),
         T("wol_send", "往 LAN1 (装机口) 发网络唤醒魔术包. 不保证醒.",
           {"mac": {"type": "string", "required": True, "maxLength": 17,
@@ -477,7 +478,7 @@ def real_ocr(dev, lang):
     if path is None:
         raise mc.ToolError(why)
     try:
-        lines = cart_ocr.ocr_image(path, lang=lang)
+        lines, engine = cart_ocr.ocr_best(path, lang)
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         raise mc.ToolError(f"OCR 失败 (tesseract / convert): {e}") from None
     finally:
@@ -485,7 +486,7 @@ def real_ocr(dev, lang):
             os.unlink(path)
         except OSError:
             pass
-    return lines, describe_dev(used)
+    return lines, describe_dev(used), engine
 
 
 def real_tools(store=None):

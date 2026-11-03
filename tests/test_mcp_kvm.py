@@ -37,6 +37,7 @@ class Rig:
         self.opened, self.sent, self.fail, self.open_fail = [], [], None, None
         self.ports = {"SER1": PORT}
         self.wols = []
+        self.engine = "rapidocr"
         self.ocr_lines = [{"text": "Media Present", "x": 1, "y": 2, "w": 3, "h": 4, "conf": 90.0}]
         self.log = tmp_path / "kvm-thread.log"
         self.events = []
@@ -44,7 +45,7 @@ class Rig:
                                    stopped=lambda: self.stopped, log_path=str(self.log),
                                    event=lambda tag, msg: self.events.append((tag, msg)))
         tools = mk.build_tools(self.store, ports=lambda: self.ports, opener=self.opener,
-                               ocr=lambda dev, lang: (self.ocr_lines, "卡2 (/dev/video3) 当前画面"),
+                               ocr=lambda dev, lang: (self.ocr_lines, "卡2 (/dev/video3) 当前画面", self.engine),
                                wol=lambda mac, iface: self.wols.append((mac, iface)),
                                broker_up=lambda port: True)
         self.server = ms.Server(tools)
@@ -415,3 +416,8 @@ def test_nothing_goes_out_while_something_is_held(rig, tool, args):
     mk.human_action(rig.store, "reject", r["id"], "human:kiosk")
     assert not rig.call(tool, lease=tok, **args)[0]
 
+
+def test_ocr_says_which_engine(rig):
+    assert rig.call("screen_ocr")[1]["engine"] == "rapidocr"
+    rig.engine = "tesseract (RapidOCR 不可用: x)"
+    assert "不可用" in rig.call("screen_ocr")[1]["engine"]

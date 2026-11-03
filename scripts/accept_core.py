@@ -113,6 +113,7 @@ def judge_build(text, expect=None):
 # ============================================================ 清单推导
 
 THIRD_PARTY = ("PIL", "usb")             # 只有副屏用, 装在 /opt/pxe/venv
+OCR_THIRD_PARTY = ("rapidocr_onnxruntime",)     # 只有 ocr_rapid_worker 用, 装在 /opt/pxe/ocr-venv (#46)
 _PYREF = re.compile(r"\b(\w+)\.py\b")
 _OPTREF = re.compile(r"/opt/pxe/(\w+)\.py\b")
 
@@ -176,7 +177,7 @@ DEPLOY_DIRS = {"systemd": "/etc/systemd/system", "tmpfiles.d": "/etc/tmpfiles.d"
                "logrotate.d": "/etc/logrotate.d", "sysctl.d": "/etc/sysctl.d",
                "journald.conf.d": "/etc/systemd/journald.conf.d", "bin": "/usr/local/bin"}
 DEPLOY_RENAME = {"bin/kiosk-launcher": "kiosk"}
-DEPLOY_SKIP = ("selinux/", "pxe.env.example", "srv-data/")
+DEPLOY_SKIP = ("selinux/", "pxe.env.example", "srv-data/", "ocr-requirements.txt")
 ASSET_DIRS = ("web", "icons")
 FONT_DEST = "/usr/local/share/fonts/ops-cart"
 
@@ -250,7 +251,7 @@ def _not_stdlib(names):
 REQUIRED_PY = (
     "atomicfile", "cart_dream", "cart_label", "cart_mcp", "cart_ocr", "cart_snap",
     "cartlog", "ch9329", "clone_core", "confirm_core", "confirm_panel", "dash_core",
-    "dash_render", "dash_service", "pet_core", "pet_render", "pet_sprites", "hidpdc", "httpserve", "kiosk", "kiosk_core",
+    "dash_render", "dash_service", "ocr_rapid_worker", "pet_core", "pet_render", "pet_sprites", "hidpdc", "httpserve", "kiosk", "kiosk_core",
     "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core", "lamps_core",
     "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
     "netmode_panel", "netprof_core", "notify_core", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
@@ -622,4 +623,13 @@ def judge_pxe_zone(zone, ports):
     if miss:
         return FAIL, f"eno1 在 {zone} 区, 没放行 {' '.join(miss)}, 新机器拿不到地址. {fix}"
     return PASS, f"eno1 在 {zone} 区, PXE 端口都放行"
+
+
+def judge_rapid(installed, rc, out):
+    """RapidOCR (#46) 可选: 没装退回 Tesseract, 装了却跑不起来才算错."""
+    if not installed:
+        return SKIP, "没装 ocr-venv: screen_ocr 用 Tesseract, 彩色桌面读不出 (scripts/setup-ocr.sh 装)"
+    if rc != 0:
+        return FAIL, f"ocr-venv 跑不起来, screen_ocr 退回 Tesseract: {(out or '').strip()[-120:]}"
+    return PASS, f"rapidocr {(out or '').strip()}"
 

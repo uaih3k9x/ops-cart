@@ -135,7 +135,7 @@ def test_third_party_imports_are_only_venv_ones():
     if not hasattr(sys, "stdlib_module_names"):
         pytest.skip("要 3.10+ 才有标准库清单")
     d = ac.derive(ROOT)
-    assert d["third_party"] <= set(ac.THIRD_PARTY)
+    assert d["third_party"] <= set(ac.THIRD_PARTY) | set(ac.OCR_THIRD_PARTY)
 
 
 def test_system_files_cover_every_unit():
@@ -441,3 +441,12 @@ def test_pxe_zone_no_zone_is_fail():
 
 def test_pxe_zone_firewalld_off_is_skip():
     assert ac.judge_pxe_zone(None, None)[0] == ac.SKIP
+
+
+# ---- RapidOCR (#46): 可选, 没装不算错
+
+def test_judge_rapid():
+    assert ac.judge_rapid(False, 0, "")[0] == ac.SKIP
+    assert ac.judge_rapid(True, 0, "1.4.4")[0] == ac.PASS
+    st, why = ac.judge_rapid(True, 1, "ImportError: libGL")
+    assert st == ac.FAIL and "libGL" in why

@@ -156,6 +156,8 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 # LAN1 防火墙区 (#38): 没放进 pxe 区时新机器拿不到地址 (netmode 新建的配置自带; 老配置手工改一次):
 #   sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload
 #   sudo nmcli con mod cart-eno1-static connection.zone pxe && sudo nmcli con up cart-eno1-static
+# screen_ocr 的 RapidOCR (#46, 可选; 不装退回 Tesseract, 彩色桌面读不出):
+#   sudo bash scripts/setup-ocr.sh deploy/ocr-requirements.txt
 # Agent 接入 (MCP) 按需: stdio 不用装单元, HTTP 先配令牌:
 #   sudo install -m 0600 examples/mcp.example.json /etc/ops-cart/mcp.json   (改掉 CHANGE-ME)
 #   sudo systemctl enable --now cart-mcp.service
