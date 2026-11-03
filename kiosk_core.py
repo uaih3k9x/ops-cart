@@ -76,7 +76,7 @@ def parse_systemctl_show(text, names):
     return out
 
 
-def services_status(names=("pxe-server", "pxe-http-repo", "pxe-http-boot")):
+def services_status(names=("pxe-server", "pxe-http-repo", "pxe-http-boot", "cart-ocr")):
     """{服务名: (enabled, active)}; 一次 systemctl show 查全部."""
     names = list(names)
     _, out = run(["systemctl", "show", "-p", "Id,ActiveState,UnitFileState"] + names)
@@ -424,6 +424,7 @@ CHECKS = {"lan": check_lan, "tailscale": check_tailscale, "serial": check_serial
 DEFAULT_PLAN = [{"check": "service", "label": "PXE SERVER", "unit": "pxe-server"},
                 {"check": "service", "label": "PXE HTTP REPO", "unit": "pxe-http-repo"},
                 {"check": "service", "label": "PXE HTTP BOOT", "unit": "pxe-http-boot"},
+                {"check": "service", "label": "OCR", "unit": "cart-ocr"},
                 {"check": "lan", "label": "LAN2", "iface": "enp3s0"},
                 {"check": "wifi", "label": "WIFI"},
                 {"check": "tailscale"},

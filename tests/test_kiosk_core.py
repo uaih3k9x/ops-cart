@@ -66,9 +66,9 @@ def test_services_status_one_systemctl_call(monkeypatch):
     monkeypatch.setattr(kc, "run", fake_run)
     st = kc.services_status()
     assert st == {"pxe-server": (True, True), "pxe-http-repo": (False, False),
-                  "pxe-http-boot": (True, False)}
+                  "pxe-http-boot": (True, False), "cart-ocr": (False, False)}
     assert len(calls) == 1 and calls[0][:2] == ["systemctl", "show"]
-    assert "-p" in calls[0] and calls[0][-3:] == ["pxe-server", "pxe-http-repo", "pxe-http-boot"]
+    assert "-p" in calls[0] and calls[0][-4:] == ["pxe-server", "pxe-http-repo", "pxe-http-boot", "cart-ocr"]
 
 
 def test_parse_systemctl_show_matches_by_id_and_tolerates_junk():

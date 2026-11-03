@@ -2,6 +2,7 @@
   {"check": "service",   "label": "PXE SERVER",    "unit": "pxe-server"},
   {"check": "service",   "label": "PXE HTTP REPO", "unit": "pxe-http-repo"},
   {"check": "service",   "label": "PXE HTTP BOOT", "unit": "pxe-http-boot"},
+  {"check": "service",   "label": "OCR",           "unit": "cart-ocr"},
   {"check": "lan",       "label": "LAN2",          "iface": "enp3s0"},
   {"check": "pxe",       "label": "LAN1 / PXE",    "iface": "eno1"},
   {"check": "wifi",      "label": "WIFI"},
