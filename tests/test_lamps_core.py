@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import lamps_core as lc
 
 
@@ -68,6 +70,7 @@ def test_slot_status(tmp_path):
     alive = {111}.__contains__
     s = lc.slot_status(str(tmp_path), ["/dev/con-1", "/dev/con-2", "/dev/con-3", "/dev/con-4"],
                        exists=exists, alive=alive)
+    assert s[1].pop("mtime") is not None and s[0].pop("mtime") is None
     assert s[0] == {"dev": "/dev/con-1", "present": True, "baud": None, "count": None}
     assert s[1] == {"dev": "/dev/con-2", "present": True, "baud": 115200, "count": 42}
     assert s[2]["baud"] is None and s[2]["count"] == 42     # 残留状态文件, 进程已死
@@ -136,3 +139,15 @@ def test_slot_for_lamp_gives_device_path():
     # 面板真正能用它选中
     import serial_core as sc
     assert sc.select_port(["/dev/con-1", "/dev/con-3"], lc.slot_for_lamp("con-3")) == ("/dev/con-3", True)
+
+
+def test_slot_status_has_log_mtime(tmp_path):
+    """#45: list_threads 用它判断日志尾巴上的输出新不新."""
+    (tmp_path / "logs").mkdir()
+    dev = "/dev/con-1"
+    log = tmp_path / "logs" / f"{lc._safe(dev)}.log"
+    log.write_text("x")
+    row = lc.slot_status(str(tmp_path), devs=[dev], exists=lambda d: True)[0]
+    assert row["mtime"] == pytest.approx(log.stat().st_mtime)
+    assert lc.slot_status(str(tmp_path), devs=["/dev/con-2"], exists=lambda d: True)[0]["mtime"] is None
+

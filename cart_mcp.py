@@ -44,6 +44,7 @@ DEFAULT_CONF = {"port": 8765, "tokens": {}, "hosts": []}
 READ_LINES = 80                 # read_output 默认行数
 NAME_TAIL = 30                  # 列执行绪时为认名字读多少行
 OUTPUT_TAIL = 200                # 判断"有没有设备输出"多看多少行
+RECENT_S = 3600                 # 多久内的输出算最近
 TAIL_TIMEOUT = 10
 MAX_IMAGE = 12 * 1024 * 1024    # 截图再大就是抓错东西了
 MAX_BODY = 256 * 1024           # 只读工具的请求都很小
@@ -85,19 +86,23 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
     def list_threads(_a):
         out, writers = [], writer()
         for n, s in enumerate(slots(), 1):
-            name, seen = None, None
+            name, seen, age = None, None, None
             if s["present"] and s["baud"]:              # 转接头拔了 / 没服务: 名字清空, 不读旧日志
                 try:
                     text = tail(s["dev"], NAME_TAIL)
-                    name, seen = mc.thread_name(text), mc.device_output_seen(text)
-                    seen = seen or mc.device_output_seen(tail(s["dev"], OUTPUT_TAIL))   # 尾巴全是接入 / 断开标记时往前看
+                    name = mc.thread_name(text)
+                    if not mc.device_output_seen(text):     # 尾巴全是接入 / 断开标记时往前看
+                        text = tail(s["dev"], OUTPUT_TAIL)
+                    age = mc.last_output_age(text, now(), s.get("mtime"))
+                    seen = age is not None and age <= RECENT_S
                 except mc.ToolError:
                     pass
             row = {"slot": n, "dev": s["dev"], "present": bool(s["present"]), "service": bool(s["baud"]),
                    "baud": s["baud"], "name": name, "label": mc.slot_label(n, name),
-                   "recent_output": seen, "writer": writers.get(n)}     # 写租约持有者 (#21)
+                   "recent_output": seen, "last_output_age_s": age, "writer": writers.get(n)}   # 写租约持有者 (#21)
             if seen is False:
-                row["hint"] = "日志里没有设备输出: 可能没接设备, 也可能只是没动静. 要确认就拿租约 send_key enter 看有没有回显"
+                when = "日志里没有设备输出" if age is None else f"上次设备输出约 {age // 3600} 小时前"
+                row["hint"] = f"{when}: 可能没接设备, 也可能只是没动静. 要确认就拿租约 send_key enter 看有没有回显"
             out.append(row)
         return [mc.json_content({"threads": out})]
 
@@ -128,7 +133,7 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
 
     return [
         mc.Tool("list_threads", "列出串口操作头槽位 1-4 的执行绪: present = USB 转接头在 (串口探测不了对端, 不代表接了设备), "
-                "recent_output = 最近有没有设备输出; 有没有在跑的 conbroker 服务、波特率、"
+                "recent_output = 一小时内有没有设备输出 (只看日志, 不探测), last_output_age_s = 大约多少秒前; 有没有在跑的 conbroker 服务、波特率、"
                 "从提示符认出的设备名 (华为 <名>/[名]), 写入者 (写租约持有者). 名字只是标签, 以槽位号为准.",
                 {}, list_threads),
         mc.Tool("read_output", "读某个槽位串口最近 N 行输出 (经 conbroker tail 读它的日志, 不直接开串口). 只读.",

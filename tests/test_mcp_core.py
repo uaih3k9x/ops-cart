@@ -423,3 +423,32 @@ def test_snap_label():
     assert mc.snap_label("/dev/video3", "SC0710 卡2", True) == "SC0710 卡2 (/dev/video3) 当前画面"
     assert "没信号" in mc.snap_label("/dev/video2", "SC0710 卡1", False)
     assert mc.snap_label("/dev/video0", None, None) == "/dev/video0 当前画面"
+
+
+# ---- #45: 输出新不新, 看日志里的时间
+
+import time  # noqa: E402
+
+T = time.mktime(time.strptime("2026-11-03 12:00:00", "%Y-%m-%d %H:%M:%S"))
+
+
+def test_output_age_none_without_output():
+    assert mc.last_output_age("[2026-11-02 16:27:41 人 接入]\n", T) is None
+
+
+def test_output_age_bounded_by_next_marker():
+    text = "<SW1>\n[2026-11-03 11:00:00 人 断开]\n \n[2026-11-03 11:59:00 人 接入]\n"
+    assert mc.last_output_age(text, T) == 3600
+
+
+def test_output_age_at_tail_uses_log_mtime():
+    assert mc.last_output_age("[2026-11-03 09:00:00 人 接入]\n<SW1>", T, log_mtime=T - 120) == 120
+
+
+def test_output_age_at_tail_without_mtime_is_zero():
+    assert mc.last_output_age("<SW1>", T) == 0
+
+
+def test_output_age_bad_marker_time_falls_back():
+    assert mc.last_output_age("<SW1>\n[2026-13-99 25:00:00 人 接入]\n", T, log_mtime=T - 5) == 5
+

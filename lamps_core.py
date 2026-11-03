@@ -129,8 +129,12 @@ def slot_status(ddir, devs=SLOTS, exists=os.path.exists, alive=_pid_alive):
                 baud = st.get("baud")
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        out.append({"dev": dev, "present": bool(exists(dev)), "baud": baud,
-                    "count": file_size(os.path.join(ddir, "logs", f"{_safe(dev)}.log"))})
+        log = os.path.join(ddir, "logs", f"{_safe(dev)}.log")
+        try:
+            mtime = os.path.getmtime(log)
+        except OSError:
+            mtime = None
+        out.append({"dev": dev, "present": bool(exists(dev)), "baud": baud, "count": file_size(log), "mtime": mtime})
     return out
 
 

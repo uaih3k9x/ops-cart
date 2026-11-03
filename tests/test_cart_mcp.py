@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import threading
+import time
 
 import pytest
 
@@ -64,7 +65,7 @@ def test_list_threads():
     th = _json(_call(f.server(), "list_threads"))["threads"]
     assert [t["slot"] for t in th] == [1, 2, 3, 4]
     assert th[0] == {"slot": 1, "dev": "/dev/con-1", "present": True, "service": True, "baud": "9600",
-                     "name": "SW1", "label": "槽位 1 (SW1)", "recent_output": True, "writer": None}
+                     "name": "SW1", "label": "槽位 1 (SW1)", "recent_output": True, "last_output_age_s": 0, "writer": None}
     assert th[1]["service"] is False and th[1]["name"] is None       # 插着线但没开服务: 不读日志
     assert th[2]["present"] is False and th[2]["name"] is None       # 线拔了: 名字清空
     assert th[3]["name"] is None                                     # 只有 login:, 认不出
@@ -362,22 +363,42 @@ def test_list_threads_description_does_not_promise_cable_detection():
     assert "转接头" in t.description
 
 
-# ---- #45: 多看一些日志, 告诉 Agent 怎么探测
+# ---- #45: 看日志里的时间, 旧输出不算 "接着设备"
 
-def test_recent_output_looks_further_back_when_tail_is_only_markers():
-    f = Fake()
+NOW = time.mktime(time.strptime("2026-11-03 12:00:00", "%Y-%m-%d %H:%M:%S"))
+
+
+def _threads(f, tail):
+    th = {t.name: t for t in cm.build_tools(slots=lambda: f.slots, tail=tail, snap=f.snap, state=lambda: {},
+                                            pxe=dict, now=lambda: NOW)}
+    return json.loads(th["list_threads"].fn({})[0]["text"])["threads"]
+
+
+def test_recent_output_looks_further_back():
     calls = []
 
     def tail(dev, n):
         calls.append(n)
-        return "<SW1>\n[2026-11-02 16:27:41 人 接入]\n" if n > cm.NAME_TAIL else "[2026-11-02 16:27:41 人 接入]\n"
-    th = {t.name: t for t in cm.build_tools(slots=lambda: f.slots, tail=tail, snap=f.snap, state=lambda: {}, pxe=dict)}
-    out = json.loads(th["list_threads"].fn({})[0]["text"])["threads"]
-    assert out[0]["recent_output"] is True and max(calls) == cm.OUTPUT_TAIL
+        return "<SW1>\n[2026-11-03 11:50:00 人 接入]\n" if n > cm.NAME_TAIL else "[2026-11-03 11:50:00 人 接入]\n"
+    out = _threads(Fake(), tail)[0]
+    assert out["recent_output"] is True and out["last_output_age_s"] == 600 and max(calls) == cm.OUTPUT_TAIL
+
+
+def test_old_output_is_not_recent_and_says_so():
+    """没接线的槽位日志里还留着上回的输出: 不能说成最近有输出."""
+    out = _threads(Fake(), lambda dev, n: "<SW1>\n[2026-11-02 12:00:00 人 断开]\n")[0]
+    assert out["recent_output"] is False and out["last_output_age_s"] == 86400
+    assert "24 小时前" in out["hint"] and "send_key enter" in out["hint"]
 
 
 def test_no_output_hint_says_how_to_probe():
+    out = _threads(Fake(), lambda dev, n: "[2026-11-02 16:27:41 人 接入]\n")[0]
+    assert out["recent_output"] is False and out["last_output_age_s"] is None
+    assert "send_key enter" in out["hint"]
+
+
+def test_tail_output_uses_log_mtime():
     f = Fake()
-    f.tail_text = {"/dev/con-1": "[2026-11-02 16:27:41 人 接入]\n", "/dev/con-4": "login:"}
-    out = _json(_call(f.server(), "list_threads"))["threads"]
-    assert "send_key enter" in out[0]["hint"]
+    f.slots[0]["mtime"] = NOW - 7200
+    out = _threads(f, lambda dev, n: "<SW1>")[0]
+    assert out["recent_output"] is False and out["last_output_age_s"] == 7200

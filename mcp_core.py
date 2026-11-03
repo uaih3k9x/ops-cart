@@ -61,11 +61,29 @@ def thread_name(text):
 
 
 _MARKER = re.compile(r"\[\d{4}-\d{2}-\d{2} ")
+_MARKER_TIME = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ")
 
 
 def device_output_seen(text):
     """这段串口日志里有没有设备自己吐的字 (conbroker 的 [时间 ...] 标记行和空行不算). 串口探测不了对端, 只能看这个."""
     return any(ln.strip() and not _MARKER.match(ln) for ln in (text or "").splitlines())
+
+
+def last_output_age(text, now, log_mtime=None):
+    """最后一次设备输出大约多少秒前; 没输出 None. 输出行没时间: 后面有标记行就按它算 (输出不晚于标记),
+    在日志尾巴上就按日志修改时间, 都没有算 0."""
+    lines = (text or "").splitlines()
+    last = next((i for i in range(len(lines) - 1, -1, -1) if device_output_seen(lines[i])), None)
+    if last is None:
+        return None
+    for ln in lines[last + 1:]:
+        m = _MARKER_TIME.match(ln)
+        if m:
+            try:
+                return max(0, int(now - time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))))
+            except (ValueError, OverflowError):
+                break
+    return max(0, int(now - log_mtime)) if log_mtime else 0
 
 
 def snap_label(dev, friendly, signal):
