@@ -71,3 +71,17 @@ journalctl -u cart-revtunnel -n 20               # 有 "remote port forwarding f
 
 `sudo systemctl disable --now cart-revtunnel.service`；不想留痕就再删 `/etc/ops-cart/revtunnel*`，
 并从跳板机的 `authorized_keys` 里删掉那一行（推车丢了也照这样做）。
+
+## 跳板机要配保活（断线后才连得回来）
+
+跳板机的 sshd 默认 `ClientAliveInterval 0`，不清理死连接。网络一断，旧会话还占着 `REMOTE_PORT`，推车重连时一直报 `remote port forwarding failed`。实际出过一次事：断了约 2 小时，服务重启了 348 次。
+
+在跳板机上加一个配置文件，再重载（不断现有连接）：
+
+```bash
+printf 'ClientAliveInterval 30\nClientAliveCountMax 3\n' | sudo tee /etc/ssh/sshd_config.d/10-client-alive.conf
+sudo sshd -t && sudo systemctl reload sshd
+```
+
+配完重启一次 `cart-revtunnel`，已建立的会话不会用上新设置。实测：把推车上的隧道进程暂停模拟假死，约 2 分钟后跳板机释放端口，隧道随后自己连回来。
+
