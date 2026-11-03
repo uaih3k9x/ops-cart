@@ -36,7 +36,6 @@ LOG_PATH = os.path.join(cartlog.LOG_DIR, "kvm-thread.log")
 TTL_S, TTL_MIN_S, TTL_MAX_S = 60, 10, 300
 LAN1 = "eno1"                   # 魔术包只从装机口发: LAN2 / 无线上都是别人的机器
 TEXT_MAX = 1000
-PENDING_MAX = 5
 HISTORY_MAX = 10
 SUMMARY_EVS = {"confirm", "reject", "revoked"}
 OCR_MIN_LINE = 40.0             # 低于这个置信度的行当噪声扔掉
@@ -141,6 +140,8 @@ class LeaseStore:
         """-> None 直接发 (已标在发); 挂起时 -> 回给 Agent 的说明. secret 命中高危词抛 ToolError."""
         with self._tx() as (st, now, evs):
             who = self._need(st, token)["who"]
+            if st["pending"]:           # 键盘是一条流: 接着发的话, 人确认后顺序就乱了
+                raise mc.ToolError(f"有 {len(st['pending'])} 条在等确认, 处理完才能接着发; 一个键都没发. 用 kvm_status 看结果")
             shown = "+".join(keys) if kind == "key" else _shown(text, secret)
             line, why = st["line"], None
             if kind == "key":
@@ -155,8 +156,6 @@ class LeaseStore:
                 evs.append({"ev": "refused", "src": "agent", "who": who, "text": shown})   # 命中哪个词也不记, 算泄露
                 raise mc.ToolError("secret 内容带高危词, 不能挂起给人看, 已拒绝; 一个键都没发")
             if hits:
-                if len(st["pending"]) >= PENDING_MAX:
-                    raise mc.ToolError(f"已有 {PENDING_MAX} 条等确认, 先等人处理")
                 item = {"id": st["next"], "kind": kind, "keys": list(keys), "text": text, "enter": bool(enter),
                         "who": who, "t": now, "reason": why, "danger": hits, "line": full, "serial": serial}
                 st["next"] += 1

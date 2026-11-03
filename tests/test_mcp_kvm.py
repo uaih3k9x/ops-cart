@@ -268,6 +268,7 @@ def test_danger_combo_held(rig):
     tok = rig.lease()
     err, r = rig.call("kvm_key", keys="ctrl+alt+delete", lease=tok)
     assert r["status"] == "pending" and rig.sent == []
+    mk.human_action(rig.store, "reject", r["id"], "human:kiosk")
     assert rig.call("kvm_key", keys="esc", lease=tok)[1]["sent"]
 
 
@@ -401,3 +402,16 @@ def test_peek_when_stopped_or_missing(tmp_path, rig):
     v = mk.peek(rig.store.path, clock=lambda: rig.t[0], stopped=lambda: True)
     assert v["stopped"] and v["writer"] is None and v["pending"] == []
     assert mk.peek(str(tmp_path / "none.json"), stopped=lambda: False)["writer"] is None
+
+
+@pytest.mark.parametrize("tool,args", [("kvm_type", {"text": "mat c:"}), ("kvm_key", {"keys": "enter"})])
+def test_nothing_goes_out_while_something_is_held(rig, tool, args):
+    """键盘是一条流: 挂起时接着发, 人确认后顺序就乱了 (试用时 for 挂起, mat c: 真发出去了)."""
+    tok = rig.lease()
+    _, r = rig.call("kvm_type", text="for", lease=tok)
+    assert r["status"] == "pending"
+    err, msg = rig.call(tool, lease=tok, **args)
+    assert err and "等确认" in msg and rig.sent == []
+    mk.human_action(rig.store, "reject", r["id"], "human:kiosk")
+    assert not rig.call(tool, lease=tok, **args)[0]
+
