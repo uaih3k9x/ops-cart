@@ -65,7 +65,7 @@ def _int(r, k, default=0):
     return v
 
 
-def parse_request(line):
+def parse_request(line, trusted=True):
     """一行 JSON -> 规整过的请求 dict. 坏的抛 BadRequest."""
     if isinstance(line, bytes):
         line = line.decode("utf-8", "replace")
@@ -81,8 +81,10 @@ def parse_request(line):
     src = r.get("src", "agent")
     if src not in ("human", "agent"):
         raise BadRequest("src 只能是 human / agent")
+    downgraded = src == "human" and not trusted       # 对端不是 root / ops-web: 自报 human 不算 (#44), 按 agent 查
+    src = "agent" if downgraded else src
     who = _WHO_BAD.sub("_", str(r.get("who") or ""))[:WHO_MAX] or "?"
-    out = dict(r, op=op, src=src, who=who, secret=bool(r.get("secret")))
+    out = dict(r, op=op, src=src, who=who, secret=bool(r.get("secret")), downgraded=downgraded)
     if op in DEVICE_OPS:
         if not isinstance(r.get("port"), str) or not r["port"]:
             raise BadRequest("要指明哪块键鼠 (port)")

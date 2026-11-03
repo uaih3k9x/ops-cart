@@ -329,3 +329,59 @@ def test_real_store_all_stop_reaches_broker_and_resume_frees_it(env):
     store.run(lambda b, now: b.resume(None, "人", now))
     a.send_keys(["a"], press_ms=0)
 
+
+# ---- #44: 不信自报来源; 有人持键鼠租约时别的 agent 不能插话
+
+@pytest.fixture
+def strict(tmp_path):
+    d = tempfile.mkdtemp(prefix="kb")
+    sent = []
+    holder = {"who": None}
+    sock = os.path.join(d, "s")
+    b = kbr.Broker(sock, os.path.join(d, "l"), opener=lambda p: FakeDev(p, sent), quiet_s=0.05, wait_max_s=1.0,
+                   realpath=lambda p: p, group=None, estop_flag=os.path.join(d, "f"),
+                   human_uids={-1}, lease=lambda who, dev, now: holder["who"] in (None, who))
+    threading.Thread(target=b.serve_forever, daemon=True).start()
+    yield {"sock": sock, "sent": sent, "holder": holder, "log": os.path.join(d, "l")}
+    b.shutdown()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_unprivileged_human_is_downgraded_and_cannot_resume(strict):
+    c = kbr.BrokerCh(PORT, src="human", who="fake-human", sock_path=strict["sock"])
+    with pytest.raises(ValueError):                     # agent 不给原始报告
+        c.send_report(bytes(8))
+    with pytest.raises(kbr.KvmStopped):
+        c.resume()
+    assert "downgrade" in [json.loads(ln)["ev"] for ln in open(strict["log"]) if ln.strip()]
+
+
+def test_other_agent_refused_while_lease_held(strict):
+    strict["holder"]["who"] = "stdio:claude"
+    with pytest.raises(kbr.KvmStopped):
+        kbr.BrokerCh(PORT, who="cli", sock_path=strict["sock"]).send_keys(["a"], press_ms=0)
+    kbr.BrokerCh(PORT, who="stdio:claude", sock_path=strict["sock"]).send_keys(["a"], press_ms=0)
+    assert strict["sent"]
+
+
+def test_cli_works_when_nobody_holds_lease(strict):
+    kbr.BrokerCh(PORT, who="cli", sock_path=strict["sock"]).send_keys(["a"], press_ms=0)
+    assert strict["sent"]
+
+
+def test_lease_allows_reads_file(tmp_path):
+    path = tmp_path / "kvm-lease.json"
+    assert kbr.lease_allows("cli", str(path), clock=lambda: 100.0)
+    path.write_text(json.dumps({"lease": {"who": "stdio:claude", "until": 200.0}}))
+    assert not kbr.lease_allows("cli", str(path), clock=lambda: 100.0)
+    assert kbr.lease_allows("stdio:claude", str(path), clock=lambda: 100.0)
+    assert kbr.lease_allows("cli", str(path), clock=lambda: 300.0)      # 过期
+    path.write_text("{bad")
+    assert kbr.lease_allows("cli", str(path), clock=lambda: 100.0)      # 读不懂 = 没有租约
+
+
+def test_human_uids_default_has_root(monkeypatch):
+    def nope(name):
+        raise KeyError(name)
+    monkeypatch.setattr(kbr.pwd, "getpwnam", nope)
+    assert kbr.human_uids() == {0}

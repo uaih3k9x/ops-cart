@@ -297,7 +297,8 @@ class Server:
             content, err = None, str(e)
         except Exception as e:          # noqa: BLE001  一个工具炸了不能把服务带走
             content, err = None, f"内部错误 {type(e).__name__}: {e}"
-        self._log(who, name, args, err is None, error=err, ms=(self.clock() - t0) * 1000)
+        logged = tool.redact(args) if getattr(tool, "redact", None) else args      # 密码不进审计 (#42)
+        self._log(who, name, logged, err is None, error=err, ms=(self.clock() - t0) * 1000)
         if err is not None:
             return _result(rid, {"content": [text_content(err)], "isError": True})
         return _result(rid, {"content": content, "isError": False})

@@ -23,8 +23,8 @@ class Ch:
     def send_keys(self, keys):
         self._go("keys", tuple(keys))
 
-    def type_text(self, text):
-        self._go("type", text)
+    def type_text(self, text, secret=False):
+        self._go("type", text, secret) if secret else self._go("type", text)
 
     def close(self):
         self.log.append(("close",))
@@ -38,8 +38,11 @@ class Rig:
         self.ports = {"SER1": PORT}
         self.wols = []
         self.ocr_lines = [{"text": "Media Present", "x": 1, "y": 2, "w": 3, "h": 4, "conf": 90.0}]
+        self.log = tmp_path / "kvm-thread.log"
+        self.events = []
         self.store = mk.LeaseStore(str(tmp_path / "kvm-lease.json"), clock=lambda: self.t[0],
-                                   stopped=lambda: self.stopped)
+                                   stopped=lambda: self.stopped, log_path=str(self.log),
+                                   event=lambda tag, msg: self.events.append((tag, msg)))
         tools = mk.build_tools(self.store, ports=lambda: self.ports, opener=self.opener,
                                ocr=lambda dev, lang: (self.ocr_lines, "卡2 (/dev/video3) 当前画面"),
                                wol=lambda mac, iface: self.wols.append((mac, iface)),
@@ -82,9 +85,9 @@ def test_keys_need_lease(rig):
 
 def test_lease_then_keys_go_through_broker_as_agent(rig):
     tok = rig.lease()
-    err, _ = rig.call("kvm_key", keys="ctrl+alt+delete", lease=tok)
+    err, _ = rig.call("kvm_key", keys="ctrl+shift+esc", lease=tok)
     assert not err
-    assert rig.sent[0] == ("keys", ("ctrl", "alt", "delete")) and rig.opened == [(PORT, "agent-a")]
+    assert rig.sent[0] == ("keys", ("ctrl", "shift", "esc")) and rig.opened == [(PORT, "agent-a")]
     assert rig.sent[-1] == ("close",)
 
 
@@ -119,7 +122,7 @@ def test_lease_file_is_private_and_token_not_in_status(rig):
     tok = rig.lease()
     assert stat.S_IMODE(os.stat(rig.store.path).st_mode) == 0o600
     err, st = rig.call("kvm_status")
-    assert not err and tok not in json.dumps(st) and st["writer"] == "agent-a"
+    assert not err and tok not in json.dumps(st) and st["writer"] == "agent-a" and st["all_stopped"] is False
 
 
 def test_corrupt_lease_file_means_no_lease(rig):
@@ -223,3 +226,178 @@ def test_same_who_cannot_steal_live_lease(rig):
     tok = rig.lease()
     assert rig.call("kvm_lease_acquire")[0]
     assert not rig.call("kvm_key", keys="a", lease=tok)[0]
+
+
+# ---- 闸门 (#42)
+
+def logs(rig):
+    return [json.loads(ln) for ln in rig.log.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("text", ["format c:", "diskpart", "mkfs.ext4 /dev/sda", "Format-Volume -DriveLetter C",
+                                  "rm -rf /", "dd if=/dev/zero of=/dev/sda"])
+def test_dangerous_line_is_held_not_sent(rig, text):
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text=text, enter=True, lease=tok)
+    assert not err and r["status"] == "pending" and rig.sent == []
+
+
+@pytest.mark.parametrize("text", ["ipconfig /all", "uname -r", "lsblk"])
+def test_harmless_line_goes_straight(rig, text):
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text=text, lease=tok)
+    assert not err and r["sent"] is True
+
+
+def test_splitting_across_calls_is_still_caught(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="disk", lease=tok)[1]["sent"]
+    err, r = rig.call("kvm_type", text="part", lease=tok)
+    assert r["status"] == "pending"
+    assert rig.store.view()["pending"][0]["line"] == "diskpart"
+
+
+def test_enter_resets_line_buffer(rig):
+    tok = rig.lease()
+    rig.call("kvm_type", text="disk", lease=tok)
+    rig.call("kvm_key", keys="enter", lease=tok)
+    assert rig.call("kvm_type", text="part", lease=tok)[1]["sent"]
+
+
+def test_danger_combo_held(rig):
+    tok = rig.lease()
+    err, r = rig.call("kvm_key", keys="ctrl+alt+delete", lease=tok)
+    assert r["status"] == "pending" and rig.sent == []
+    assert rig.call("kvm_key", keys="esc", lease=tok)[1]["sent"]
+
+
+def test_human_confirm_sends_as_agent_holder(rig):
+    tok = rig.lease()
+    rig.call("kvm_type", text="format c:", enter=True, lease=tok)
+    pid = rig.store.view()["pending"][0]["id"]
+    res = mk.human_action(rig.store, "confirm", pid, "human:kiosk", opener=rig.opener, ports=lambda: rig.ports)
+    assert "format c:" in res and rig.sent[:2] == [("type", "format c:"), ("keys", ("enter",))]
+    assert rig.opened == [(PORT, "agent-a")] and rig.store.view()["pending"] == []
+    assert rig.store.view()["history"][-1]["result"] == "confirmed"
+
+
+def test_human_reject_sends_nothing(rig):
+    tok = rig.lease()
+    rig.call("kvm_type", text="format c:", lease=tok)
+    pid = rig.store.view()["pending"][0]["id"]
+    mk.human_action(rig.store, "reject", pid, "human:kiosk")
+    assert rig.sent == [] and rig.store.view()["history"][-1]["result"] == "rejected"
+
+
+def test_agent_has_no_confirm_tool():
+    assert not [t.name for t in mk.real_tools() if "confirm" in t.name or "reject" in t.name]
+
+
+@pytest.mark.parametrize("how", ["expire", "release", "estop"])
+def test_pending_dies_with_lease(rig, how):
+    tok = rig.lease(ttl_s=60)
+    rig.call("kvm_type", text="format c:", lease=tok)
+    pid = rig.store.view()["pending"][0]["id"]
+    if how == "expire":
+        rig.t[0] += 61
+    elif how == "release":
+        rig.call("kvm_lease_release", lease=tok)
+    else:
+        rig.stopped = True
+    with pytest.raises(ValueError):
+        mk.human_action(rig.store, "confirm", pid, "human:kiosk", opener=rig.opener, ports=lambda: rig.ports)
+    assert rig.sent == []
+    rig.stopped = False
+    assert rig.store.view()["pending"] == []
+
+
+def test_confirm_during_estop_refused(rig):
+    tok = rig.lease()
+    rig.call("kvm_type", text="format c:", lease=tok)
+    rig.stopped = True
+    with pytest.raises(ValueError):
+        mk.human_action(rig.store, "confirm", 1, "human:kiosk", opener=rig.opener, ports=lambda: rig.ports)
+
+
+# ---- secret
+
+def test_secret_not_in_audit_or_log(rig, tmp_path):
+    audit = []
+
+    class A:
+        def write(self, line):
+            audit.append(line)
+    rig.server.audit = A()
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="hunter2xyz", secret=True, lease=tok)[1]["sent"]
+    assert rig.sent[0] == ("type", "hunter2xyz", True)
+    assert "hunter2xyz" not in "".join(audit) and "hunter2xyz" not in rig.log.read_text()
+    assert "hunter2xyz" not in rig.store.path and "hunter2xyz" not in open(rig.store.path).read()
+
+
+def test_secret_with_danger_word_refused_not_held(rig):
+    tok = rig.lease()
+    err, msg = rig.call("kvm_type", text="format", secret=True, lease=tok)
+    assert err and "secret" in msg and rig.sent == [] and rig.store.view()["pending"] == []
+    assert "format" not in rig.log.read_text().replace("ev", "")
+
+
+def test_plain_text_is_audited(rig):
+    audit = []
+
+    class A:
+        def write(self, line):
+            audit.append(line)
+    rig.server.audit = A()
+    rig.call("kvm_type", text="uname -r", lease=rig.lease())
+    assert "uname -r" in "".join(audit)
+
+
+# ---- 日志 (#43)
+
+def test_thread_log_records_lifecycle(rig):
+    tok = rig.lease()
+    rig.call("kvm_type", text="uname", enter=True, lease=tok)
+    rig.call("kvm_type", text="format c:", lease=tok)
+    mk.human_action(rig.store, "reject", 1, "human:kiosk")
+    rig.call("kvm_lease_release", lease=tok)
+    evs = [r["ev"] for r in logs(rig)]
+    assert evs == ["lease_acquire", "send", "pending", "reject", "lease_release"]
+    send = logs(rig)[1]
+    assert send["text"] == "uname + 回车" and send["src"] == "agent" and send["who"] == "agent-a" and send["ok"] is True
+    assert logs(rig)[3]["src"] == "human"
+    assert rig.events and rig.events[0][0] == "kvm"
+
+
+def test_failed_send_logged(rig):
+    tok = rig.lease()
+    rig.fail = OSError("gone")
+    rig.call("kvm_type", text="x", lease=tok)
+    assert logs(rig)[-1]["ok"] is False
+
+
+def test_estop_revocation_logged_once(rig):
+    tok = rig.lease()
+    rig.stopped = True
+    rig.call("kvm_key", keys="a", lease=tok)
+    rig.call("kvm_key", keys="a", lease=tok)
+    assert [r["ev"] for r in logs(rig)].count("revoked") == 1
+
+
+# ---- peek
+
+def test_peek_readonly_and_no_token(rig):
+    tok = rig.lease()
+    rig.call("kvm_type", text="format c:", lease=tok)
+    before = open(rig.store.path).read()
+    v = mk.peek(rig.store.path, clock=lambda: rig.t[0], stopped=lambda: False)
+    assert open(rig.store.path).read() == before and tok not in json.dumps(v)
+    assert v["writer"] == "agent-a" and v["pending"][0]["id"] == 1
+
+
+def test_peek_when_stopped_or_missing(tmp_path, rig):
+    tok = rig.lease()
+    rig.call("kvm_type", text="format c:", lease=tok)
+    v = mk.peek(rig.store.path, clock=lambda: rig.t[0], stopped=lambda: True)
+    assert v["stopped"] and v["writer"] is None and v["pending"] == []
+    assert mk.peek(str(tmp_path / "none.json"), stopped=lambda: False)["writer"] is None

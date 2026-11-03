@@ -360,3 +360,24 @@ def test_list_threads_says_when_no_device_output():
 def test_list_threads_description_does_not_promise_cable_detection():
     t = next(t for t in cm.build_tools(slots=list, tail=None, snap=None, state=None, pxe=None) if t.name == "list_threads")
     assert "转接头" in t.description
+
+
+# ---- #45: 多看一些日志, 告诉 Agent 怎么探测
+
+def test_recent_output_looks_further_back_when_tail_is_only_markers():
+    f = Fake()
+    calls = []
+
+    def tail(dev, n):
+        calls.append(n)
+        return "<SW1>\n[2026-11-02 16:27:41 人 接入]\n" if n > cm.NAME_TAIL else "[2026-11-02 16:27:41 人 接入]\n"
+    th = {t.name: t for t in cm.build_tools(slots=lambda: f.slots, tail=tail, snap=f.snap, state=lambda: {}, pxe=dict)}
+    out = json.loads(th["list_threads"].fn({})[0]["text"])["threads"]
+    assert out[0]["recent_output"] is True and max(calls) == cm.OUTPUT_TAIL
+
+
+def test_no_output_hint_says_how_to_probe():
+    f = Fake()
+    f.tail_text = {"/dev/con-1": "[2026-11-02 16:27:41 人 接入]\n", "/dev/con-4": "login:"}
+    out = _json(_call(f.server(), "list_threads"))["threads"]
+    assert "send_key enter" in out[0]["hint"]

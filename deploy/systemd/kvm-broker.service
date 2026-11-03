@@ -6,7 +6,7 @@ Description=ops-cart 键鼠代理 (CH9329 统一持有; 人优先, Agent 排队,
 # root 但去掉全部能力: 只靠属主身份开 /dev/ttyACM* (root:dialout 0660)、写 /var/log/ops-cart/kvm.log.
 # socket /run/ops-kvm/kvm.sock = 0660 root:dialout —— 能直接写键鼠串口的 (dialout 组 / root), 才能经代理发键;
 # 网页口的 ops-web 本来就在 dialout, 车机是 root, 命令行用户要在 dialout (同以前直开的要求).
-# 来源 (human/agent) 是客户端自报的, 日志另记对端 uid.
+# 来源 (human/agent) 是客户端自报的, 只有 root 和 ops-web 说 human 才算 (#44), 别的降级成 agent; 日志另记对端 uid.
 ExecStart=/usr/bin/python3 /opt/pxe/kvm_broker.py
 WorkingDirectory=/opt/pxe
 SupplementaryGroups=dialout

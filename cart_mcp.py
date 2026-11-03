@@ -43,6 +43,7 @@ MCP_CONF = "/etc/ops-cart/mcp.json"
 DEFAULT_CONF = {"port": 8765, "tokens": {}, "hosts": []}
 READ_LINES = 80                 # read_output 默认行数
 NAME_TAIL = 30                  # 列执行绪时为认名字读多少行
+OUTPUT_TAIL = 200                # 判断"有没有设备输出"多看多少行
 TAIL_TIMEOUT = 10
 MAX_IMAGE = 12 * 1024 * 1024    # 截图再大就是抓错东西了
 MAX_BODY = 256 * 1024           # 只读工具的请求都很小
@@ -89,13 +90,14 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
                 try:
                     text = tail(s["dev"], NAME_TAIL)
                     name, seen = mc.thread_name(text), mc.device_output_seen(text)
+                    seen = seen or mc.device_output_seen(tail(s["dev"], OUTPUT_TAIL))   # 尾巴全是接入 / 断开标记时往前看
                 except mc.ToolError:
                     pass
             row = {"slot": n, "dev": s["dev"], "present": bool(s["present"]), "service": bool(s["baud"]),
                    "baud": s["baud"], "name": name, "label": mc.slot_label(n, name),
                    "recent_output": seen, "writer": writers.get(n)}     # 写租约持有者 (#21)
             if seen is False:
-                row["hint"] = "最近没有设备输出: 可能没接设备, 也可能只是没动静"
+                row["hint"] = "日志里没有设备输出: 可能没接设备, 也可能只是没动静. 要确认就拿租约 send_key enter 看有没有回显"
             out.append(row)
         return [mc.json_content({"threads": out})]
 

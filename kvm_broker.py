@@ -15,6 +15,7 @@ import argparse
 import grp
 import json
 import os
+import pwd
 import socket
 import socketserver
 import struct
@@ -26,6 +27,7 @@ import ch9329
 import kvm_broker_core as kbc
 
 SOCK = "/run/ops-kvm/kvm.sock"
+LEASE_PATH = "/run/ops-cart/kvm-lease.json"     # mcp_kvm 的键鼠写租约
 ESTOP_FLAG = "/run/ops-cart/serial-estop.json"  # mcp_serial 写的公开急停标记 (0644); kvm=真 = 串口全部急停, 键鼠也停
 LOG = "/var/log/ops-cart/kvm.log"
 GROUP = "dialout"           # socket 给哪个组: 能直接写 ttyACM 的人, 才能经代理发键
@@ -68,13 +70,34 @@ def serial_all_stopped(path=None):
     return not isinstance(doc, dict) or bool(doc.get("kvm") or doc.get("all"))
 
 
+def lease_allows(who, path=LEASE_PATH, clock=time.time):
+    """有人持键鼠写租约 (mcp_kvm) 时只放他; 没人持、过期、读不懂都放行, 命令行和配方照旧能用 (#44)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lease = json.load(f).get("lease")
+        return lease["until"] <= clock() or lease["who"] == who
+    except (OSError, ValueError, AttributeError, KeyError, TypeError):
+        return True
+
+
+def human_uids():
+    """能当 human 的对端 uid (#44): root (车机) 和 ops-web (网页口). 来源是自报的, 只有这些人说了才算."""
+    uids = {0}
+    try:
+        uids.add(pwd.getpwnam("ops-web").pw_uid)
+    except KeyError:
+        pass
+    return uids
+
+
 class Broker:
     def __init__(self, sock_path=SOCK, log_path=LOG, opener=None, quiet_s=kbc.QUIET_S,
                  wait_max_s=kbc.AGENT_WAIT_MAX_S, realpath=os.path.realpath, group=GROUP,
-                 clock=time.monotonic, estop_flag=None):
+                 clock=time.monotonic, estop_flag=None, human_uids=None, lease=None):
         self.opener = opener or (lambda dev: ch9329.Ch9329(dev, log=lambda *a: None))
         self.realpath, self.clock, self.port_ok = realpath, clock, kbc.port_ok
-        self.arb = kbc.Arbiter(quiet_s, wait_max_s, ext_stop=lambda: serial_all_stopped(estop_flag))
+        self.arb = kbc.Arbiter(quiet_s, wait_max_s, lease=lease, ext_stop=lambda: serial_all_stopped(estop_flag))
+        self.human_uids = human_uids            # None = 信自报 (测试 / 非 Linux); 正式跑 main 传 human_uids()
         self.bursts = kbc.HumanBursts(quiet_s)
         self.idle_wait = min(1.0, quiet_s / 2)
         self.cv = threading.Condition()
@@ -171,9 +194,11 @@ class Broker:
     def handle(self, line, uid=None):
         """一行请求 -> 应答 dict. 发键请求会一直等到发完 / 被丢."""
         try:
-            r = kbc.parse_request(line)
+            r = kbc.parse_request(line, trusted=self.human_uids is None or uid in self.human_uids)
         except kbc.BadRequest as e:
             return {"ok": False, "err": "bad", "msg": str(e)}
+        if r.get("downgraded"):
+            self.log(kbc.record("downgrade", src="agent", who=r["who"], uid=uid))
         if r["op"] in kbc.CONTROL_OPS:
             return self._control(r, uid)
         dev = self.realpath(r["port"])
@@ -419,7 +444,8 @@ def main(argv=None):
     ap.add_argument("--group", default=GROUP)
     ap.add_argument("--quiet", type=float, default=kbc.QUIET_S, help="人停手多少秒 agent 才能发")
     args = ap.parse_args(argv)
-    b = Broker(args.sock, args.log, quiet_s=args.quiet, group=args.group or None)
+    b = Broker(args.sock, args.log, quiet_s=args.quiet, group=args.group or None, human_uids=human_uids(),
+               lease=lambda who, dev, now: lease_allows(who))
     import signal
     signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=b.shutdown).start())
     try:

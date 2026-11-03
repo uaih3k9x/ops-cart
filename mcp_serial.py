@@ -233,9 +233,9 @@ class Server(mc.Server):
 
 
 class Tool(mc.Tool):
-    def __init__(self, name, description, params, fn, read_only=False, destructive=False):
+    def __init__(self, name, description, params, fn, read_only=False, destructive=False, redact=None):
         super().__init__(name, description, params, fn)
-        self.read_only, self.destructive = read_only, destructive
+        self.read_only, self.destructive, self.redact = read_only, destructive, redact
 
     def spec(self):
         d = super().spec()

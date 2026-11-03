@@ -8,7 +8,7 @@
   python3 ch9329.py --port /dev/ttyACM0 combo ctrl alt del
   python3 ch9329.py --port /dev/ttyACM0 hold 2000 a   # 按住 a 键 2000ms
   python3 ch9329.py estop --all                        # 急停: 丢掉 agent 还没发的键 (要代理在跑)
-  python3 ch9329.py --src human resume --all           # 解除急停 (要人来)
+  sudo python3 ch9329.py --src human resume --all      # 解除急停 (要人来; 只有 root / ops-web 说 human 才算)
 
 键鼠代理 (kvm_broker.py) 在跑时命令行经它发键, 默认算 agent (人最近 3 秒动过键鼠就排队);
 代理不在就跟以前一样直开串口.
