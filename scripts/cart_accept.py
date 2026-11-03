@@ -38,7 +38,7 @@ OPT = OPT_DEFAULT                   # --opt 可换 (开发机上拿仓库目录�
 ETC = "/etc/ops-cart"
 RUN = "/run/ops-cart"
 LOG = "/var/log/ops-cart"
-EXPECT_VERSION = "1.14.00"          # 没有仓库的 VERSION 可读时用 (推车上单独拷过去跑)
+EXPECT_VERSION = "1.15.00"          # 没有仓库的 VERSION 可读时用 (推车上单独拷过去跑)
 MANIFEST = os.path.join(HERE, "accept-manifest.json")
 PY_ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
 PY_ENV.pop("PYTHONSTARTUP", None)
@@ -574,8 +574,8 @@ def issue_checks(expect_version):
         py = OPT + "/ocr-venv/bin/python"
         if not os.path.exists(py):
             return ac.judge_rapid(False, 0, "")
-        rc, out, err = sh([py, "-I", "-c", "import rapidocr_onnxruntime, importlib.metadata as m; "
-                           "print(m.version('rapidocr-onnxruntime'))"], timeout=30)
+        rc, out, err = sh([py, "-I", "-c", "import rapidocr_openvino, importlib.metadata as m; "
+                           "print(m.version('rapidocr-openvino'))"], timeout=30)
         return ac.judge_rapid(True, rc, out if rc == 0 else err)
 
     def mcp_tools(issue):
@@ -688,7 +688,7 @@ def issue_checks(expect_version):
         ac.Check("MCP 串口写工具", "#21", mcp_tools("#21"), timeout=40),
         ac.Check("MCP PXE 申请工具", "#24", mcp_tools("#24"), timeout=40),
         ac.Check("MCP 键鼠 / OCR / WOL 工具", "#41", mcp_tools("#41"), timeout=40),
-        ac.Check("RapidOCR 环境", "#46", rapid_env, timeout=40),
+        ac.Check("OCR 环境 (RapidOCR + OpenVINO)", "#47", rapid_env, timeout=40),
         ac.Check("标签机 /dev/usb/lp0", "#20", printer),
         ac.Check("串口写状态 serial-write.json", "#21", private_state(RUN + "/serial-write.json", "还没人拿过写租约")),
         ac.Check("PXE 申请状态 pxe-req.json", "#24", private_state(RUN + "/pxe-req.json", "还没有过 PXE 申请")),

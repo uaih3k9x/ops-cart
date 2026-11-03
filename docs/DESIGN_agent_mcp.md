@@ -156,7 +156,7 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 ## 十四、试用后补的工具（#38–#41）
 
 - **键鼠**（`mcp_kvm.py`）：`kvm_status`、`kvm_lease_acquire/renew/release`、`kvm_key`、`kvm_type`。一把写租约（`/run/ops-cart/kvm-lease.json`，root 0600），认令牌不认名字；全部急停时收回，解除后要重新申请。只经键鼠代理、来源固定 agent，代理不在就报错，不退回直开。闸门和来源见第十五节。
-- **OCR**（`screen_ocr`）：看画面先用它。优先 RapidOCR（#46，子进程跑 `/opt/pxe/ocr-venv`，限 4 线程，彩色桌面也能读，车上 1080p 约 1 秒，峰值约 640MB），没装或出错退回 Tesseract，`engine` 字段写明。按字数加权平均置信度低于 60 就 `readable=false`，让 Agent 改用 `screenshot`，不把噪声当结果。可能有形近字错误，回车前要核对。配方仍用 Tesseract。
+- **OCR**（`screen_ocr`）：看画面先用它。优先常驻服务 `cart-ocr`（#47，RapidOCR + OpenVINO，venv 在 `/opt/pxe/ocr-venv`，限 4 线程，彩色桌面也能读）。它解析被测机的截图，算不可信输入，所以用动态用户、无能力、断网运行，图片经 `/run/ops-ocr/ocr.sock` 传字节，不读 root 的文件。没开或出错退回 Tesseract，`engine` 字段写明。按字数加权平均置信度低于 60 就 `readable=false`，让 Agent 改用 `screenshot`，不把噪声当结果。可能有形近字错误，回车前要核对。配方仍用 Tesseract。
 - **WOL**（`wol_send`）：只从 LAN1 发。LAN2 和无线上是别人的机器。
 - **`pxe_clients`**：`pxeserver.ClientLog` 把 DISCOVER 的 MAC、厂商串、架构记到 `/run/ops-cart/pxe-clients.json`，停发时也记。防火墙挡住的看不到。
 

@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import struct
 import subprocess
 import sys
@@ -22,9 +23,9 @@ SCALE = 3                   # 读不出图宽时的放大倍数
 TARGET_W = 3072             # 放大后的目标宽度
 CONVERT_TIMEOUT = 30
 TESSERACT_TIMEOUT = 90
-RAPID_PY = "/opt/pxe/ocr-venv/bin/python"   # 独立 venv, scripts/setup-ocr.sh 装 (#46)
-RAPID_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_rapid_worker.py")
+RAPID_SOCK = "/run/ops-ocr/ocr.sock"        # 常驻服务 cart-ocr (#47)
 RAPID_TIMEOUT = 30
+ENGINE = "rapidocr-openvino"
 RAPID_MIN_CONF = 60.0       # RapidOCR 的置信度偏高, 低于这个基本是图标被当成字
 RAPID_SYMBOL_CONF = 90.0    # 孤零零一个符号要更有把握才留
 GAP = 3          # 同一行里词间空隙 > 3 倍字高就切成两栏(BIOS 左菜单 / 中间取值 / 右说明)
@@ -99,13 +100,17 @@ def ocr_image(path, lang="eng", scale=None, psm=6):
     return parse_tsv(tsv, scale=scale)
 
 
-def parse_rapid(stdout):
-    """worker 的 stdout -> 行 (最后一行是 JSON, 前面可能有库的日志). 形状不对抛 ValueError."""
-    rows = json.loads(((stdout or "").strip().splitlines() or [""])[-1])
-    keys = {"text", "x", "y", "w", "h", "conf"}
+def parse_rapid(line):
+    """服务回的一行 -> 行列表. 服务报错或形状不对抛 ValueError."""
+    doc = json.loads(line or "")
+    if not isinstance(doc, dict):
+        raise ValueError("OCR 服务回复格式不对")
+    if "error" in doc:
+        raise ValueError(str(doc["error"]))
+    rows, keys = doc.get("rows"), {"text", "x", "y", "w", "h", "conf"}
     if not isinstance(rows, list) or not all(isinstance(r, dict) and keys <= set(r) and isinstance(r["text"], str)
                                              for r in rows):
-        raise ValueError("RapidOCR 输出格式不对")
+        raise ValueError("OCR 服务回复格式不对")
     return rows
 
 
@@ -119,17 +124,29 @@ def drop_noise(rows):
     return [r for r in rows if keep(r)]
 
 
-def ocr_rapid(path, run=subprocess.run, py=RAPID_PY):
-    r = run([py, "-I", RAPID_WORKER, path], capture_output=True, text=True, check=True, timeout=RAPID_TIMEOUT)
-    return drop_noise(parse_rapid(r.stdout))
+def ocr_rapid(path, sock_path=RAPID_SOCK):
+    """把图片字节发给常驻服务 (root 的私有截图服务读不到). 连不上抛 OSError, 回复不对抛 ValueError."""
+    with open(path, "rb") as f:
+        data = f.read()
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(RAPID_TIMEOUT)
+    try:
+        s.connect(sock_path)
+        s.sendall(struct.pack("!I", len(data)) + data)
+        with s.makefile("rb") as r:
+            line = r.readline().decode("utf-8", "replace")
+    finally:
+        s.close()
+    return drop_noise(parse_rapid(line))
 
 
 def ocr_best(path, lang="eng", rapid=ocr_rapid, tess=None):
-    """-> (行, 引擎说明). 优先 RapidOCR; 没装 / 超时 / 出错退回 Tesseract 并写明原因. 配方不走这里, 仍用 ocr_image."""
+    """-> (行, 引擎说明). 优先常驻服务; 没开 / 超时 / 出错退回 Tesseract 并写明原因. 配方不走这里, 仍用 ocr_image."""
     try:
-        return rapid(path), "rapidocr"
-    except (OSError, ValueError, subprocess.SubprocessError) as e:
-        why = "没装" if isinstance(e, FileNotFoundError) else type(e).__name__
+        return rapid(path), ENGINE
+    except (OSError, ValueError) as e:
+        why = "服务没开" if isinstance(e, (FileNotFoundError, ConnectionRefusedError)) else type(e).__name__
+        why = "timeout" if isinstance(e, socket.timeout) else why
     return (tess or (lambda p, lg: ocr_image(p, lang=lg)))(path, lang), f"tesseract (RapidOCR 不可用: {why})"
 
 
@@ -139,7 +156,7 @@ def main(argv=None):
     ap.add_argument("--lang", default="eng")
     ap.add_argument("--find", help="只找这行, 打印坐标; 找不到退出码 1")
     ap.add_argument("--engine", choices=("auto", "tesseract"), default="auto",
-                    help="auto = 优先 RapidOCR (彩色桌面也能读), 没装退回 Tesseract")
+                    help="auto = 优先常驻服务 RapidOCR (彩色桌面也能读), 没开退回 Tesseract")
     args = ap.parse_args(argv)
     try:
         if args.engine == "auto":

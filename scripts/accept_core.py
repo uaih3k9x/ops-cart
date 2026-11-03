@@ -113,7 +113,7 @@ def judge_build(text, expect=None):
 # ============================================================ 清单推导
 
 THIRD_PARTY = ("PIL", "usb")             # 只有副屏用, 装在 /opt/pxe/venv
-OCR_THIRD_PARTY = ("rapidocr_onnxruntime",)     # 只有 ocr_rapid_worker 用, 装在 /opt/pxe/ocr-venv (#46)
+OCR_THIRD_PARTY = ("rapidocr_openvino",)        # 只有 ocr_rapid_worker 用, 装在 /opt/pxe/ocr-venv (#47)
 _PYREF = re.compile(r"\b(\w+)\.py\b")
 _OPTREF = re.compile(r"/opt/pxe/(\w+)\.py\b")
 
@@ -284,6 +284,7 @@ SYSTEM_FILES = {
     "/etc/systemd/system/cart-dream.timer": "deploy/systemd/cart-dream.timer",
     "/etc/systemd/system/cart-fan-curve.service": "deploy/systemd/cart-fan-curve.service",
     "/etc/systemd/system/cart-mcp.service": "deploy/systemd/cart-mcp.service",
+    "/etc/systemd/system/cart-ocr.service": "deploy/systemd/cart-ocr.service",
     "/etc/systemd/system/cart-notify.service": "deploy/systemd/cart-notify.service",
     "/etc/systemd/system/cart-revtunnel.service": "deploy/systemd/cart-revtunnel.service",
     "/etc/systemd/system/cart-notify.timer": "deploy/systemd/cart-notify.timer",
@@ -322,6 +323,7 @@ UNITS = {
     "pxe-http-repo.service": _u(None, None, "#11"),
     "webkiosk.service": _u(None, None, "#24", note="网页口 (含 PXE 日志页)"),
     "cart-mcp.service": _u(None, None, "#19", note="MCP HTTP; 默认不开, 只用 stdio"),
+    "cart-ocr.service": _u(None, None, "#47", note="OCR 常驻服务; 不开退回 Tesseract"),
     "cart-serial-req.path": _u(None, None, "#23", note="网页急停 / 拒绝"),
     "cart-serial-req.service": _u(None, None, "#23", oneshot=True),
     "cart-notify.timer": _u(True, True, "#4", note="关键事件推手机 (UPS 预告也走它)"),
@@ -626,9 +628,9 @@ def judge_pxe_zone(zone, ports):
 
 
 def judge_rapid(installed, rc, out):
-    """RapidOCR (#46) 可选: 没装退回 Tesseract, 装了却跑不起来才算错."""
+    """OCR 常驻服务 (#47) 可选: 没装退回 Tesseract, 装了却跑不起来才算错."""
     if not installed:
-        return SKIP, "没装 ocr-venv: screen_ocr 用 Tesseract, 彩色桌面读不出 (scripts/setup-ocr.sh 装)"
+        return SKIP, "没装 ocr-venv: screen_ocr 用 Tesseract, 彩色桌面读不出 (scripts/setup-ocr.sh 装, 再开 cart-ocr)"
     if rc != 0:
         return FAIL, f"ocr-venv 跑不起来, screen_ocr 退回 Tesseract: {(out or '').strip()[-120:]}"
     return PASS, f"rapidocr {(out or '').strip()}"

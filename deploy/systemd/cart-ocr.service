@@ -1,0 +1,37 @@
+[Unit]
+Description=ops-cart OCR 常驻服务 (RapidOCR + OpenVINO; 普通权限, 断网, 只听本机 socket, #47)
+# 不装也行: screen_ocr 退回 Tesseract. venv 由 scripts/setup-ocr.sh 建.
+
+[Service]
+# 解析被测机的截图, 算不可信输入: 动态用户、没有能力、没有网络. 图片经 socket 传字节, 不读 root 的文件.
+# socket 0600 属动态用户, 客户端 cart-mcp 是 root, 进得来.
+ExecStart=/opt/pxe/ocr-venv/bin/python -I /opt/pxe/ocr_rapid_worker.py /run/ops-ocr/ocr.sock
+WorkingDirectory=/
+DynamicUser=yes
+RuntimeDirectory=ops-ocr
+RuntimeDirectoryMode=0755
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# 内存有上限, 优先级让给车机和副屏
+MemoryMax=1500M
+CPUWeight=50
+Nice=5
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
