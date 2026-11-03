@@ -477,3 +477,36 @@ def test_tabby_lands_outside_the_territory():
             if pet.other.visible and not pet.other.air:
                 far = far and not pet._near(pet.cat, pet.other)
         assert far, seed
+
+
+def _arc_path(x0, y0, tx, ty, **kw):
+    c = pc.Cat(pc.COAT)
+    c.x, c.y = x0, y0
+    gen = pc._arc(c, tx, ty, **kw)
+    ys, secs = [], 0.0
+    next(gen)
+    try:
+        while True:
+            ys.append(c.y)
+            gen.send(0.125)
+            secs += 0.125
+    except StopIteration:
+        pass
+    return ys, secs
+
+
+def test_jump_up_barely_clears_the_target_like_a_cat():
+    ys, secs = _arc_path(400, 1130, 450, 836)   # 从地上跳到字上
+    assert min(ys) >= 836 - pc.CLEARANCE - 8
+    assert 0.4 <= secs <= 0.95                  # 猫跳得快, 不飘
+
+
+def test_short_hop_stays_low():
+    ys, secs = _arc_path(300, 836, 420, 836)
+    assert min(ys) >= 836 - pc.CLEARANCE - 8
+    assert secs <= 0.5
+
+
+def test_jump_down_does_not_go_up_much():
+    ys, _ = _arc_path(300, 680, 420, 1130)
+    assert min(ys) >= 680 - pc.CLEARANCE - 8

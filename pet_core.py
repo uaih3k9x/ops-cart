@@ -21,6 +21,8 @@ MOVE_S = 1 / 8          # 动的时候 8 fps (#35 真机整帧 8 fps 目视顺�
 SLEEP_S = 1 / 2         # 睡着退回副屏原来的 2 fps
 MAX_DT = 0.6            # 采集卡一下别让猫瞬移
 EPS = 1e-6
+GRAVITY = 1700          # px/s², 跟 8 fps 配出来的体感
+CLEARANCE = 24          # 跳跃只比目标高这么多
 COAT = "ginger"         # 主猫; 外部皮肤换的就是它
 PERSONA = {"cow": "timid", "stray": "bold", "tabby": "watcher"}   # 路人的性格
 TERRITORY = 190         # 进这个距离才哈气
@@ -177,18 +179,27 @@ def _walk_to(c, tx, speed=56, anim="walk"):
 
 
 def _arc(c, tx, ty, T=None, h=None):
-    """一段抛物线. 当拍就离地; 按真实时间走, 采集卡一下也落在同一个点."""
+    """一段抛物线. 按重力算: 只比高的那头再高 CLEARANCE, 时间也由重力定, 猫跳得快且不飘.
+    给了 T / h 就照给的 (进出场这种特写). 当拍就离地; 按真实时间走, 采集卡一下也落在同一个点."""
     x0, y0 = c.x, c.y
-    T = T if T is not None else (1.5 if math.hypot(tx - x0, ty - y0) > 160 else 1)
-    h = h if h is not None else 46 + abs(y0 - ty) * .6
+    if T is None:
+        apex = min(y0, ty) - (CLEARANCE if h is None else h)
+        T = math.sqrt(2 * (y0 - apex) / GRAVITY) + math.sqrt(2 * (ty - apex) / GRAVITY)
+    else:
+        apex = None
     if abs(tx - x0) > 1:
         c.dir = 1 if tx > x0 else -1
     c.air, c.run = True, None
+    vy = -math.sqrt(2 * GRAVITY * (y0 - apex)) if apex is not None else 0.0
+    arch = h if h is not None else 46 + abs(y0 - ty) * .6
     t = MOVE_S
     while t < T - EPS:
         u = t / T
         c.x = x0 + (tx - x0) * u
-        c.y = y0 + (ty - y0) * u - 4 * h * u * (1 - u)
+        if apex is not None:
+            c.y = y0 + vy * t + GRAVITY * t * t / 2
+        else:
+            c.y = y0 + (ty - y0) * u - 4 * arch * u * (1 - u)
         c.set_pose("rise" if u < .4 else "apex" if u <= .6 + EPS else "fall")
         t += (yield)
     c.x, c.y, c.air = tx, ty, False
@@ -369,7 +380,7 @@ class Pet:
     def _ground(self, c):
         if c.air or not c.run:
             g = self._nearest(c.x, c.y)
-            yield from _arc(c, g["x"], g["top"], T=1)
+            yield from _arc(c, g["x"], g["top"])
             c.place(g)
             c.dust_t = 0.0
             yield from _hold(c, "landing", .5)
@@ -396,7 +407,7 @@ class Pet:
     def _act_jump(self, c):
         yield from _hold(c, "antic", .5)
         x, y, run = c.x, c.y, c.run
-        yield from _arc(c, x, y, T=1, h=84)
+        yield from _arc(c, x, y, h=56)
         c.run, c.dust_t = run, 0.0
         yield from _hold(c, "landing", .5)
         yield from _hold(c, "stand", .5)
@@ -463,7 +474,7 @@ class Pet:
         c.dir = 1 if from_left else -1
         c.set_pose("rise")
         lx = run["lo"] if from_left else run["hi"]
-        yield from _arc(c, lx, g["top"], T=1.5, h=90)
+        yield from _arc(c, lx, g["top"])
         c.place(g, lx)
         c.dust_t = 0.0
         yield from _hold(c, "landing", .5)
@@ -506,7 +517,7 @@ class Pet:
         self._spawn(c, -90 if from_left else W + 90, g["top"] + 200)
         c.dir = 1 if from_left else -1
         c.set_pose("rise")
-        yield from _arc(c, x, g["top"], T=1.5, h=90)
+        yield from _arc(c, x, g["top"])
         c.place(g, x)
         c.dust_t = 0.0
         yield from _hold(c, "landing", .5)
@@ -608,7 +619,7 @@ class Pet:
             self._spawn(c, -90, g["top"] + 200)
             c.dir = 1
             c.set_pose("rise")
-            yield from _arc(c, g["x"], g["top"], T=1.5, h=90)
+            yield from _arc(c, g["x"], g["top"])
             c.place(g)
             c.dust_t = 0.0
             yield from _hold(c, "landing", .5)
