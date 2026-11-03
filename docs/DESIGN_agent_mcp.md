@@ -152,3 +152,12 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 - **解除**：全部急停后四路都解了键鼠才放，解一路不算。键鼠代理的 `resume` 解不了这个急停。`ch9329.py estop` 是键鼠自己的急停，和这个互不影响。
 - **读不懂标记 = 停**；没有标记文件 = 没停；重启推车 `/run` 清空，和串口一样。
 - **已知缺口**：代理没跑、Agent 退回直开串口时，只在打开那一下查标记；已经开着的 `recipe` 中途停不下来。车上代理是开机自启的，正常走不到这条路。
+
+## 十四、试用后补的工具（#38–#41）
+
+- **键鼠**（`mcp_kvm.py`）：`kvm_status`、`kvm_lease_acquire/renew/release`、`kvm_key`、`kvm_type`。一把写租约（`/run/ops-cart/kvm-lease.json`，root 0600），认令牌不认名字；全部急停时收回，解除后要重新申请。只经键鼠代理、来源固定 agent，代理不在就报错，不退回直开。没有闸门：敲进被测机的内容推车看不懂，靠人盯和急停。命令行 `ch9329.py` 不走这把租约（来源自报，能开 `dialout` 的本来就能直写串口）。
+- **OCR**（`screen_ocr`）：看画面先用它。BIOS 和命令行读得准，彩色桌面读不出；按字数加权平均置信度低于 60 就 `readable=false`，让 Agent 改用 `screenshot`，不把噪声当结果。
+- **WOL**（`wol_send`）：只从 LAN1 发。LAN2 和无线上是别人的机器。
+- **`pxe_clients`**：`pxeserver.ClientLog` 把 DISCOVER 的 MAC、厂商串、架构记到 `/run/ops-cart/pxe-clients.json`，停发时也记。防火墙挡住的看不到。
+- **待定**：车机上还没显示“Agent 正在动键鼠”（#9 第 4 点）；键鼠操作还没进执行绪日志，只在 `kvm.log` 和审计日志里。
+

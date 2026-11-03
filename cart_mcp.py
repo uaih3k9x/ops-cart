@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cart_snap
 import dash_core
 import kiosk_core as kc
+import mcp_kvm
 import lamps_core
 import mcp_core as mc
 import mcp_label
@@ -175,15 +176,7 @@ def real_snap(dev):
             pass
     if len(data) > MAX_IMAGE:
         raise mc.ToolError(f"截图太大 ({len(data)} 字节), 不发")
-    return data, describe_dev(used)
-
-
-def describe_dev(dev):
-    """哪块卡 + 有没有信号; 探测失败不影响截图."""
-    try:
-        return mc.snap_label(dev, kc.video_friendly(dev), kc.video_signal(dev))
-    except Exception:                   # noqa: BLE001
-        return mc.snap_label(dev, None, None)
+    return data, mcp_kvm.describe_dev(used)
 
 
 def read_pxe(mode_path=kc.PXE_MODE, root=kc.TFTP_ROOT, guard_path=None, now=None):
@@ -205,6 +198,7 @@ def real_tools():
                         writer=lambda: mcp_serial.writers(store))
             + mcp_serial.real_tools(conbroker_tail, store)      # 写串口 (#21)
             + mcp_pxe.real_tools()                              # PXE 解锁申请 (#24): 只挂起, 人在车机上确认
+            + mcp_kvm.real_tools()                              # 键鼠 / OCR / WOL (#41)
             + mcp_label.real_label_tools())                     # 标签 (#20)
 
 

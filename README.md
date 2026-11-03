@@ -71,6 +71,7 @@
 | [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19 只读部分 + #20 标签;写串口见下一行 #21):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;列执行绪时带写租约持有者。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
 | [`mcp_serial.py`](mcp_serial.py) · [`serial_write_core.py`](serial_write_core.py) | 串口写路径(#21):MCP 工具 `lease_acquire/renew/release`、`send_command`(只收一行可打印 ASCII)、`send_key`(回车 / 翻页空格 / Ctrl+C)、`pending_list`、`estop`。每槽位同时一个写入者,租约默认 60 秒要续、过期作废;闸门第 1 层:认得出厂商(华为提示符自动认,思科 / 锐捷 / Linux 在 [`examples/serial_gate.example.json`](examples/serial_gate.example.json) 登记)、停在提示符上、过只读白名单才直发,带 save/reboot/reset/format/delete 等高危词的永远要人确认;第 2 层(#22,[`serial_gate_model.py`](serial_gate_model.py),规则文件 `model.enabled` 打开,默认关):其余命令交决策模型按命令 + 设备最近输出 + Agent 声明的 `intent` 判,放行直发,判拦 / 超时 / 报错 / 格式不对 / 预算超限一律挂起等人确认,理由进日志;Ctrl+C 要人确认。急停单条 / 全部:撤租约、丢挂起,不往设备发任何东西。状态 `/run/ops-cart/serial-write.json`(读不懂 = 全部急停),每槽位 JSONL 日志 `/var/log/ops-cart/serial-slot<N>.log`。车机上 `cart_mcp.py pending / confirm / reject / estop / resume`,确认和解除只认本机终端(不经 sshd / tailscaled) |
 | [`confirm_core.py`](confirm_core.py) · [`confirm_panel.py`](confirm_panel.py) | Agent 写串口确认 UI(#23):执行器条操作头急停红 / 待确认黄闪 / Agent 输入紫闪,点开确认框确认 / 拒绝 / 急停 / 解除(高危词再问一次),另有「Agent 全部急停」块;网页「Agent」页只能急停和拒绝(经 `/run/ops-cart/serial-req/` 投请求,root 的 `cart-serial-req.path` 执行),确认和解除只在车机;副屏操作头同色并写挂起数和急停。状态读不懂 = 全部急停 |
+| [`mcp_kvm.py`](mcp_kvm.py) | MCP 看和动被测机(#41):`screen_ocr` 读屏幕字、键鼠 `kvm_*`(写租约、只经代理、全部急停收回)、`wol_send`(只发 LAN1) |
 | [`mcp_pxe.py`](mcp_pxe.py) · [`pxe_req_core.py`](pxe_req_core.py) · [`pxe_req_panel.py`](pxe_req_panel.py) | 经 MCP 申请 PXE 解锁(#24):`pxe_request(purpose, mac \| batch)` 按现有 `clone_plan` / 守卫算清单、发随机确认码,**只挂起不解锁**(码和清单摘要不回给 Agent);车机弹申请框(谁、用途、清单、确认码),人照抄确认码、推车重算清单和申请时一样才 `pxe_arm`。申请 10 分钟作废,「Agent 全部急停」同时作废未确认的申请;`pxe_requests` 只读看结果,`pxe_retire` 提前上锁(只收紧,直接执行)。网页不给确认。状态 `/run/ops-cart/pxe-req.json`(root 0600,读不懂 = 没有申请),日志 `/var/log/ops-cart/pxe-req.log` |
 | [`pxe_log_core.py`](pxe_log_core.py) | 网页「PXE 日志」页(#24 后续):只读 `pxe-req.log` 和 `events.log` 的 `[pxe]` 行的尾部,按 MAC 分组(一条涉及几台进几组,没 MAC 的进「未关联」),字段白名单,确认码和清单摘要绝不出;网页不显示在等的申请、不给确认也不给拒绝 |
 | [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
@@ -152,7 +153,10 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 #   sudo useradd -r -s /sbin/nologin ops-web
 #   sudo install -o ops-web -g ops-web -m 0600 /dev/null /opt/pxe/web.conf
 #   sudo systemctl enable --now webkiosk.service
-# Agent 接入 (MCP, 只读) 按需: stdio 不用装单元, HTTP 先配令牌:
+# LAN1 防火墙区 (#38): 没放进 pxe 区时新机器拿不到地址 (netmode 新建的配置自带; 老配置手工改一次):
+#   sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload
+#   sudo nmcli con mod cart-eno1-static connection.zone pxe && sudo nmcli con up cart-eno1-static
+# Agent 接入 (MCP) 按需: stdio 不用装单元, HTTP 先配令牌:
 #   sudo install -m 0600 examples/mcp.example.json /etc/ops-cart/mcp.json   (改掉 CHANGE-ME)
 #   sudo systemctl enable --now cart-mcp.service
 #   claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio

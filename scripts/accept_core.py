@@ -252,7 +252,7 @@ REQUIRED_PY = (
     "cartlog", "ch9329", "clone_core", "confirm_core", "confirm_panel", "dash_core",
     "dash_render", "dash_service", "pet_core", "pet_render", "pet_sprites", "hidpdc", "httpserve", "kiosk", "kiosk_core",
     "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core", "lamps_core",
-    "lldp_core", "mcp_core", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
+    "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
     "netmode_panel", "netprof_core", "notify_core", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
     "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_core", "serial_gate_model",
     "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme", "tspl_preview",
@@ -539,6 +539,8 @@ MCP_TOOLS = {
     "#20": ("label_preview", "label_print", "label_printer_status", "label_abbrev_propose"),
     "#21": ("lease_acquire", "lease_renew", "lease_release", "send_command", "send_key", "pending_list", "estop"),
     "#24": ("pxe_request", "pxe_requests", "pxe_retire"),
+    "#41": ("kvm_status", "kvm_lease_acquire", "kvm_lease_renew", "kvm_lease_release", "kvm_key", "kvm_type",
+            "screen_ocr", "wol_send", "pxe_clients"),
 }
 
 

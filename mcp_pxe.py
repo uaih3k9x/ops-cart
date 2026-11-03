@@ -24,6 +24,7 @@ import atomicfile
 import cartlog
 import clone_core
 import kiosk_core as kc
+import pxeserver
 import mcp_core as mc
 import mcp_serial
 import pxe_req_core as pr
@@ -128,8 +129,24 @@ def real_arm(it, p):
 MAC_PARAM = {"type": "string", "pattern": r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}", "maxLength": 17}
 
 
+def read_clients(path=pxeserver.CLIENTS_PATH, now=None):
+    """pxeserver.ClientLog 记的 -> 新的在前. 没有 / 读不懂 = 空. 只有 MAC 和厂商串, 不解锁任何东西."""
+    now = time.time() if now is None else now
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(doc, dict):
+        return []
+    rows = [{"mac": m, "vendor": d.get("vendor"), "arch": d.get("arch"),
+             "seen_s_ago": int(now - d.get("t", 0)), "count": d.get("n", 0)}
+            for m, d in doc.items() if isinstance(d, dict)]
+    return sorted(rows, key=lambda r: r["seen_s_ago"])
+
+
 def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disarm, retire=kc.pxe_retire,
-                who=mcp_serial.current_who):
+                who=mcp_serial.current_who, clients=read_clients):
     """plan(purpose, mac) -> 清单; mode() -> pxe_mode_read 的结果; disarm() 整个上锁; retire([mac]) 删这几台的菜单.
     故意不收 pxe_arm: 解锁不在这里. 测试里全换成假的."""
 
@@ -185,7 +202,13 @@ def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disa
             return {"dropped": dropped, "action": act, "mac": mac}
         return [mc.json_content(_run(go))]
 
+    def pxe_clients(_a):
+        return [mc.json_content({"clients": clients(), "note": "最近在 LAN1 上要过地址的机器. 防火墙挡住的看不到."})]
+
     return [
+        mcp_serial.Tool(
+            "pxe_clients", "最近在 LAN1 上要地址的机器 (只读): MAC、厂商串、架构、多久前. pxe_request 要 MAC 时先看这个.",
+            {}, pxe_clients, read_only=True),
         mcp_serial.Tool(
             "pxe_request", "申请 PXE 解锁 (只挂起, 不解锁): purpose = rocky (自动装 Rocky, 清空整块硬盘) / winpe "
             "(进 WinPE) / clone-save (整盘抓镜像到推车, 给 mac) / clone-restore (按推车上的克隆清单整批覆盖, "

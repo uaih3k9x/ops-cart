@@ -679,6 +679,7 @@ def issue_checks(expect_version):
         ac.Check("MCP 标签工具", "#20", mcp_tools("#20"), timeout=40),
         ac.Check("MCP 串口写工具", "#21", mcp_tools("#21"), timeout=40),
         ac.Check("MCP PXE 申请工具", "#24", mcp_tools("#24"), timeout=40),
+        ac.Check("MCP 键鼠 / OCR / WOL 工具", "#41", mcp_tools("#41"), timeout=40),
         ac.Check("标签机 /dev/usb/lp0", "#20", printer),
         ac.Check("串口写状态 serial-write.json", "#21", private_state(RUN + "/serial-write.json", "还没人拿过写租约")),
         ac.Check("PXE 申请状态 pxe-req.json", "#24", private_state(RUN + "/pxe-req.json", "还没有过 PXE 申请")),

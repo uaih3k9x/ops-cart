@@ -140,6 +140,7 @@ def open_dhcp_socket(sock, ip, port, iface=None, platform=sys.platform, sleep=ti
 # ---------------------------------------------------------------- 守卫: 别在别人的网段上发 DHCP
 
 GUARD_STATE = "/run/ops-cart/pxe-guard.json"
+CLIENTS_PATH = "/run/ops-cart/pxe-clients.json"
 RENEW_PATH = "/run/ops-cart/pxe-renew.json"     # 车机写 {"ts": ...} 请求续期, 守卫每轮 tick 看一眼
 SERVE_S = 30 * 60       # 自己发地址的限时 (--serve-minutes / pxe.env 的 PXE_SERVE_MINUTES 改); 0 = 不限时
 REPLUG_S = 60           # 拔线这么久再插 = 人换了地方接, 新开一段限时; iPXE 接管网卡只断几秒, 不算
@@ -439,6 +440,33 @@ def supervise(threads, log, guard=None, sleep=time.sleep, every_s=2):
         sleep(every_s)
 
 
+class ClientLog:
+    """最近要过地址的机器 -> JSON 文件, 给 MCP pxe_clients (#41). 只留最新 cap 台; 写不了就算了, 不影响发地址."""
+
+    def __init__(self, path=CLIENTS_PATH, clock=time.time, cap=32):
+        self.path, self.clock, self.cap = path, clock, cap
+        self._lock = threading.Lock()
+
+    def __call__(self, mac, vendor, arch):
+        with self._lock:
+            try:
+                try:
+                    with open(self.path, encoding="utf-8") as f:
+                        doc = json.load(f)
+                    doc = doc if isinstance(doc, dict) else {}
+                except (OSError, ValueError):
+                    doc = {}
+                old = doc.get(mac) if isinstance(doc.get(mac), dict) else {}
+                doc[mac] = {"vendor": vendor, "arch": arch, "t": self.clock(), "n": int(old.get("n", 0)) + 1}
+                keep = sorted(doc, key=lambda m: doc[m].get("t", 0) if isinstance(doc[m], dict) else 0)[-self.cap:]
+                tmp = f"{self.path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({m: doc[m] for m in keep}, f)
+                os.replace(tmp, self.path)
+            except (OSError, ValueError, TypeError):
+                pass
+
+
 class DhcpServer:
     LEASE_S = 3600          # ACK 给的租期; 到期不续就回收
     OFFER_HOLD_S = 60       # 只 DISCOVER 不 REQUEST 的机器, 地址先替它留这么久
@@ -465,6 +493,7 @@ class DhcpServer:
         self.declined = {}      # ip -> 隔离到什么时候
         self._lock = threading.Lock()
         self.guard = None       # PxeGuard; None = 不设防 (测试/Windows)
+        self.on_client = None   # ClientLog: 谁在要地址, 不发地址时也记 (#41)
 
     def _leasing(self):
         """67 口能发地址 (守卫 serving, 或不设防)."""
@@ -538,6 +567,9 @@ class DhcpServer:
             return None
         if msg[0] != 1:
             return None
+        if self.on_client is not None and parsed[2].get(53, b"")[0:1] == b"\x01":
+            self.on_client(parsed[1].hex(":"), parsed[2].get(60, b"").decode("ascii", "replace"),
+                           parsed[2].get(93, b"").hex())
         sid = parsed[2].get(54, b"")
         if self.guard is not None and parsed[2].get(53, b"")[0:1] == b"\x03" and len(sid) == 4 \
                 and sid != socket.inet_aton(self.ip):
@@ -1093,6 +1125,7 @@ def main(argv=None):
     except (ValueError, TypeError) as e:
         log.error("参数不对: %s", e)
         sys.exit(EXIT_CONFIG)
+    dhcp.on_client = ClientLog()
     linux = sys.platform.startswith("linux")
     if linux and not args.iface:
         log.warning("Linux 上没给 --iface: DHCP 只绑 %s, 收不到客户端的广播 DISCOVER", args.ip)

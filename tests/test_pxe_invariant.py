@@ -16,6 +16,7 @@ import pytest
 import cart_mcp as cm
 import kiosk_core as kc
 import mcp_label as ml
+import mcp_kvm as mk
 import mcp_pxe as mp
 import mcp_serial as ms
 import pxe_req_core as pr
@@ -27,6 +28,12 @@ MAC, MAC2, MAC3 = "02:00:00:00:00:01", "02:00:00:00:00:02", "52:54:00:aa:bb:03"
 DISK1 = {"name": "nvme0n1", "model": "EXAMPLE NVME 512GB", "serial": "SN-EXAMPLE-1", "size": 512110190592,
          "type": "disk", "tran": "nvme"}
 BY = "human:kiosk@local"
+
+
+class _NullCh:
+    def send_keys(self, keys): pass
+    def type_text(self, text): pass
+    def close(self): pass
 
 
 class Clock:
@@ -101,7 +108,10 @@ class Cart:
         pxe = mp.build_tools(self.pxe, plan=self.plan, mode=self.mode,
                              disarm=lambda: kc.pxe_disarm(root=self.root, path=self.mode_path),
                              retire=lambda macs: kc.pxe_retire(macs, root=self.root))
-        return ro + serial + label + pxe
+        kvm = mk.build_tools(mk.LeaseStore(str(self.tmp / "kvm-lease.json"), clock=self.clock, stopped=lambda: False),
+                             ports=lambda: {"S1": "/dev/null"}, opener=lambda port, who: _NullCh(),
+                             ocr=lambda dev, lang: ([], "x"), wol=lambda mac, iface: None, broker_up=lambda p: True)
+        return ro + serial + label + pxe + kvm
 
     # ---- 看
 

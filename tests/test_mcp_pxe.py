@@ -163,7 +163,7 @@ def test_requests_list_has_no_secrets(rig):
 def test_tools_annotations(rig):
     specs = {t["name"]: t for t in rig.server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
              ["result"]["tools"]}
-    assert set(specs) == {"pxe_request", "pxe_requests", "pxe_retire"}
+    assert set(specs) == {"pxe_clients", "pxe_request", "pxe_requests", "pxe_retire"}
     assert specs["pxe_requests"]["annotations"]["readOnlyHint"] is True
     assert specs["pxe_request"]["inputSchema"]["properties"]["batch"]["type"] == "boolean"
 
@@ -360,3 +360,20 @@ def test_drop_on_estop(rig, monkeypatch):
     h = mp.peek(rig.path, clock=rig.clock, stopped=lambda: False)
     assert h["pending"] == [] and h["history"][-1]["status"] == "dropped"
     assert "human:kiosk@local" in h["history"][-1]["why"]
+
+
+# ---- pxe_clients: 不用抓包就知道谁在要地址 (#41)
+
+def test_pxe_clients_reads_file(tmp_path):
+    path = tmp_path / "pxe-clients.json"
+    path.write_text(json.dumps({"aa:bb:cc:00:11:22": {"vendor": "PXEClient:Arch:00007", "arch": "0007", "t": 90.0, "n": 3}}))
+    assert mp.read_clients(str(path), now=100.0) == [
+        {"mac": "aa:bb:cc:00:11:22", "vendor": "PXEClient:Arch:00007", "arch": "0007", "seen_s_ago": 10, "count": 3}]
+
+
+@pytest.mark.parametrize("content", [None, "{bad", "[1]"])
+def test_pxe_clients_missing_or_bad_is_empty(tmp_path, content):
+    path = tmp_path / "pxe-clients.json"
+    if content is not None:
+        path.write_text(content)
+    assert mp.read_clients(str(path), now=100.0) == []

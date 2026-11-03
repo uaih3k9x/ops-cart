@@ -1531,3 +1531,54 @@ def test_serve_notice_expired_hides_after_a_while():
     assert _px.serve_notice({"state": "expired"}, 10 ** 10)["level"] == "expired"
     # 守卫还没改状态 (serving 但已过 until) 也按同样规则收
     assert _px.serve_notice({"state": "serving", "until": 1000, "window": 1800}, 1000 + S + 1) is None
+
+
+import pxeserver as pxeserver_module  # noqa: E402
+
+
+# ---- 记下谁在要地址, 给 MCP pxe_clients (#41)
+
+def _dhcp_mac():
+    return "aa:bb:cc:dd:ee:01"
+
+
+def test_note_client_records_and_counts(tmp_path):
+    path = tmp_path / "c.json"
+    d = dhcp_for_test()
+    d.on_client = pxeserver_module.ClientLog(str(path), clock=lambda: 50.0)
+    d.handle(make_discover(), ("0.0.0.0", 68))
+    d.handle(make_discover(), ("0.0.0.0", 68))
+    doc = json.loads(path.read_text())
+    assert doc[_dhcp_mac()]["n"] == 2 and doc[_dhcp_mac()]["t"] == 50.0 and doc[_dhcp_mac()]["arch"] == "0007"
+
+
+def test_note_client_even_when_not_leasing(tmp_path):
+    """到时停发时最需要知道谁在要, 不发地址也要记."""
+    path = tmp_path / "c.json"
+    d = dhcp_for_test()
+    d.on_client = pxeserver_module.ClientLog(str(path), clock=lambda: 50.0)
+
+    class Off:
+        def may_reply(self): return False
+        def may_proxy(self): return False
+        def may_renew(self): return False
+    d.guard = Off()
+    assert d.handle(make_discover(), ("0.0.0.0", 68)) is None
+    assert _dhcp_mac() in json.loads(path.read_text())
+
+
+def test_client_log_keeps_newest_and_survives_bad_file(tmp_path):
+    path = tmp_path / "c.json"
+    path.write_text("{bad")
+    t = [0.0]
+    log = pxeserver_module.ClientLog(str(path), clock=lambda: t[0], cap=2)
+    for i in range(3):
+        t[0] = float(i)
+        log(f"aa:00:00:00:00:0{i}", "PXEClient", "0007")
+    assert sorted(json.loads(path.read_text())) == ["aa:00:00:00:00:01", "aa:00:00:00:00:02"]
+
+
+def test_client_log_write_failure_does_not_break_dhcp(tmp_path):
+    d = dhcp_for_test()
+    d.on_client = pxeserver_module.ClientLog(str(tmp_path / "no" / "such" / "dir" / "x.json"), clock=lambda: 1.0)
+    assert d.handle(make_discover(), ("0.0.0.0", 68)) is not None
