@@ -812,3 +812,18 @@ def test_confirm_text_pxe_warning_when_pxe_server_runs_on_port():
     plan = nm.plan_switch(nm.empty_state(), nm.rec("dhcp", "enp3s0"), cons, uuids(), details=details,
                           pxe_active=True)
     assert "装机口地址" not in nm.confirm_text(plan)                     # PXE 只在 LAN1 上
+
+
+# ------------------------------------------------------------ 防火墙区 (#38)
+
+def test_lan1_profile_goes_into_pxe_zone():
+    """LAN1 落进默认 public 区时 DHCP / TFTP 全被挡: 不管什么模式, 建配置都写明区."""
+    for r in (static("eno1"), nm.rec("dhcp", "eno1", {}), nm.rec("off", "eno1", {})):
+        add = nm.apply_steps(r, uuids())[0]
+        add = next(c for c in add if c[:3] == ["nmcli", "con", "add"])
+        assert kv_of(add)["connection.zone"] == "pxe"
+
+
+def test_lan2_profile_leaves_zone_alone():
+    add, _up = nm.apply_steps(static(egress="backup", gateway="192.0.2.1"), uuids())[0]
+    assert "connection.zone" not in add

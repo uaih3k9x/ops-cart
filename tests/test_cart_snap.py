@@ -142,3 +142,51 @@ def test_grab_busy_without_ipc(monkeypatch):
     monkeypatch.setattr(cs.os.path, "exists", lambda p: False)
     path, why, dev = cs.grab()
     assert path is None and "IPC" in why
+
+
+# ---- 残留的旧 mpv 不能冒充当前预览; 默认不写死 video0 (#39)
+
+def _proc(root, pid, argv, start):
+    d = root / str(pid)
+    d.mkdir()
+    (d / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
+    fields = ["S"] + ["0"] * 18 + [str(start)]      # ")" 后面第 20 个是 starttime
+    (d / "stat").write_text(f"{pid} (mpv) " + " ".join(fields))
+
+
+def test_running_mpv_is_the_newest_not_the_first(tmp_path):
+    _proc(tmp_path, 10, ["mpv", "av://v4l2:/dev/video0"], 100)
+    _proc(tmp_path, 20, ["mpv", "av://v4l2:/dev/video3"], 300)
+    _proc(tmp_path, 30, ["mpv", "av://v4l2:/dev/video0"], 200)
+    (tmp_path / "self").mkdir()
+    assert cs.running_mpv_device(str(tmp_path)) == "/dev/video3"
+
+
+def test_running_mpv_ignores_other_programs(tmp_path):
+    _proc(tmp_path, 10, ["bash", "av://v4l2:/dev/video0"], 100)
+    assert cs.running_mpv_device(str(tmp_path)) is None
+
+
+def test_route_default_comes_from_caller():
+    assert cs.route(None, None, False, default="/dev/video3") == ("ffmpeg", "/dev/video3")
+    assert cs.route("/dev/video2", None, False, default="/dev/video3") == ("ffmpeg", "/dev/video2")
+
+
+def test_route_named_device_being_previewed_uses_mpv():
+    assert cs.route("/dev/video3", "/dev/video3", True) == ("mpv", "/dev/video3")
+
+
+def test_default_device_prefers_capture_with_signal(monkeypatch):
+    import kiosk_core as kc
+    monkeypatch.setattr(kc, "video_nodes", lambda: [{"dev": "/dev/video0", "name": "USB Camera"},
+                                                    {"dev": "/dev/video3", "name": "SC0710:RAW 01"}])
+    monkeypatch.setattr(kc, "video_signal", lambda d: True)
+    assert cs.default_device() == "/dev/video3"
+
+
+def test_default_device_falls_back_when_probe_fails(monkeypatch):
+    import kiosk_core as kc
+    def boom():
+        raise OSError("no v4l2")
+    monkeypatch.setattr(kc, "video_nodes", boom)
+    assert cs.default_device() == cs.DEFAULT_DEV

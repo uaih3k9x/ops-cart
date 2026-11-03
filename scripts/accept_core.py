@@ -172,7 +172,7 @@ def closure(entries, graph):
 
 # deploy/<子目录> -> 推车上的目录; 改名的单列. selinux 是装模块不是拷文件, pxe.env.example 要按现场改,
 # srv-data/ 只在装了数据盘时由 setup-srv-data.sh / setup-samba.sh 装 (#11, 可选), 都不比对.
-DEPLOY_DIRS = {"systemd": "/etc/systemd/system", "tmpfiles.d": "/etc/tmpfiles.d",
+DEPLOY_DIRS = {"systemd": "/etc/systemd/system", "tmpfiles.d": "/etc/tmpfiles.d", "firewalld": "/etc/firewalld/zones",
                "logrotate.d": "/etc/logrotate.d", "sysctl.d": "/etc/sysctl.d",
                "journald.conf.d": "/etc/systemd/journald.conf.d", "bin": "/usr/local/bin"}
 DEPLOY_RENAME = {"bin/kiosk-launcher": "kiosk"}
@@ -269,6 +269,7 @@ ASSETS = (
     "web/vendor/xterm.css", "web/vendor/xterm.js",
 )
 SYSTEM_FILES = {
+    "/etc/firewalld/zones/pxe.xml": "deploy/firewalld/pxe.xml",
     "/etc/logrotate.d/ops-cart": "deploy/logrotate.d/ops-cart",
     "/etc/sysctl.d/90-wlan-rp-filter.conf": "deploy/sysctl.d/90-wlan-rp-filter.conf",
     "/etc/sysctl.d/91-powerloss.conf": "deploy/sysctl.d/91-powerloss.conf",
@@ -603,3 +604,20 @@ def netmode_summary(doc):
         tag = f"{'+'.join(m.get('ports') or ['?'])}={m.get('mode')}"
         parts.append(tag if st in (None, "ok") else f"{tag}({st})")
     return "托管: " + (", ".join(parts) or "无")
+
+
+PXE_PORTS = ("67/udp", "68/udp", "69/udp", "4011/udp", "80/tcp", "8000/tcp")
+
+
+def judge_pxe_zone(zone, ports):
+    """LAN1 所在 firewalld 区放没放行 PXE (#38). zone=None = firewalld 没开; 没放行时 DHCP 请求到不了服务."""
+    if zone is None:
+        return SKIP, "firewalld 没在跑"
+    fix = "修: sudo nmcli con mod <LAN1 配置> connection.zone pxe 后重新 up"
+    if not zone:
+        return FAIL, f"eno1 不在任何防火墙区. {fix}"
+    miss = [p for p in PXE_PORTS if p not in (ports or "").split()]
+    if miss:
+        return FAIL, f"eno1 在 {zone} 区, 没放行 {' '.join(miss)}, 新机器拿不到地址. {fix}"
+    return PASS, f"eno1 在 {zone} 区, PXE 端口都放行"
+

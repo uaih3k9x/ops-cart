@@ -50,26 +50,40 @@ def mpv_device(argv):
     return None
 
 
-def route(want, mpv_dev, sock):
-    """-> (怎么抓, 哪块卡). want=None 表示"现在预览的那块, 没预览就卡 1"."""
-    dev = want or mpv_dev or DEFAULT_DEV
+def route(want, mpv_dev, sock, default=DEFAULT_DEV):
+    """-> (怎么抓, 哪块卡). want=None 表示"现在预览的那块, 没预览就 default"."""
+    dev = want or mpv_dev or default
     if mpv_dev and dev == mpv_dev:
         return ("mpv" if sock else "busy"), dev
     return "ffmpeg", dev
 
 
-def running_mpv_device():
-    for pid in filter(str.isdigit, os.listdir("/proc")):
+def running_mpv_device(proc_root="/proc"):
+    """正在预览的卡 = 最晚起的那个 mpv; 残留的旧 mpv (#39) 不算."""
+    best = None
+    for pid in filter(str.isdigit, os.listdir(proc_root)):
         try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
+            with open(f"{proc_root}/{pid}/cmdline", "rb") as f:
                 argv = f.read().decode(errors="replace").split("\0")
-        except OSError:
-            continue
-        if argv and os.path.basename(argv[0]) == "mpv":
+            if not argv or os.path.basename(argv[0]) != "mpv":
+                continue
             dev = mpv_device(argv)
-            if dev:
-                return dev
-    return None
+            with open(f"{proc_root}/{pid}/stat") as f:
+                start = int(f.read().rsplit(")", 1)[1].split()[19])      # starttime, 进程名里可能带括号
+        except (OSError, ValueError, IndexError):
+            continue
+        if dev and (best is None or start > best[0]):
+            best = (start, dev)
+    return best[1] if best else None
+
+
+def default_device():
+    """没预览也没指定: 有信号的采集卡 (同车机默认画面源), 节点号会变, 不写死 video0 (#39). 探测不了才退回默认."""
+    try:
+        import kiosk_core as kc
+        return kc.default_video(kc.video_nodes(), kc.video_signal) or DEFAULT_DEV
+    except Exception:                   # noqa: BLE001  截图不能因为探测挂掉
+        return DEFAULT_DEV
 
 
 def _connect_mpv():
@@ -129,7 +143,8 @@ BUSY_TEXT = "被预览占着, 但这个 mpv 没开 IPC (kiosk 还是旧版?)"
 def grab(want=None, out=None):
     """抓一帧 -> (图片路径 或 None, 失败原因, 哪块卡). 不往 stdout 打字 (cart_mcp 的 stdio 是协议通道).
     out=None 时在 /run/ops-cart 下新建私有文件, 失败时删掉."""
-    how, dev = route(want, running_mpv_device(), os.path.exists(MPV_SOCK))
+    mpv_dev = running_mpv_device()
+    how, dev = route(want, mpv_dev, os.path.exists(MPV_SOCK), default_device() if not (want or mpv_dev) else DEFAULT_DEV)
     if how == "busy":
         return None, f"{dev} {BUSY_TEXT}", dev
     path = out or default_out(RUN_DIR)

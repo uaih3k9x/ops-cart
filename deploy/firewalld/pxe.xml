@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<zone>
+  <short>pxe</short>
+  <description>ops-cart LAN1: PXE (DHCP / TFTP / HTTP) and Samba, see netmode_core.PXE_ZONE (#38)</description>
+  <service name="samba"/>
+  <port port="67" protocol="udp"/>
+  <port port="68" protocol="udp"/>
+  <port port="69" protocol="udp"/>
+  <port port="4011" protocol="udp"/>
+  <port port="80" protocol="tcp"/>
+  <port port="8000" protocol="tcp"/>
+</zone>

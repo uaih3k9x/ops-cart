@@ -419,3 +419,25 @@ def test_default_expect_version_follows_repo_version():
     src = open(os.path.join(ROOT, "scripts", "cart_accept.py"), encoding="utf-8").read()
     want = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
     assert f'EXPECT_VERSION = "{want}"' in src
+
+
+# ---- LAN1 所在防火墙区要放行 PXE 端口 (#38)
+
+PXE_PORTS = "80/tcp 8000/tcp 67/udp 68/udp 69/udp 4011/udp"
+
+
+def test_pxe_zone_ok():
+    assert ac.judge_pxe_zone("pxe", PXE_PORTS)[0] == ac.PASS
+
+
+def test_pxe_zone_missing_ports_fails_and_says_which():
+    st, why = ac.judge_pxe_zone("public", "")
+    assert st == ac.FAIL and "public" in why and "67/udp" in why and "nmcli" in why
+
+
+def test_pxe_zone_no_zone_is_fail():
+    assert ac.judge_pxe_zone("", "")[0] == ac.FAIL
+
+
+def test_pxe_zone_firewalld_off_is_skip():
+    assert ac.judge_pxe_zone(None, None)[0] == ac.SKIP

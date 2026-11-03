@@ -64,7 +64,7 @@ def test_list_threads():
     th = _json(_call(f.server(), "list_threads"))["threads"]
     assert [t["slot"] for t in th] == [1, 2, 3, 4]
     assert th[0] == {"slot": 1, "dev": "/dev/con-1", "present": True, "service": True, "baud": "9600",
-                     "name": "SW1", "label": "槽位 1 (SW1)", "writer": None}
+                     "name": "SW1", "label": "槽位 1 (SW1)", "recent_output": True, "writer": None}
     assert th[1]["service"] is False and th[1]["name"] is None       # 插着线但没开服务: 不读日志
     assert th[2]["present"] is False and th[2]["name"] is None       # 线拔了: 名字清空
     assert th[3]["name"] is None                                     # 只有 login:, 认不出
@@ -345,3 +345,18 @@ def test_main_dispatches_serial_cli(monkeypatch):
     assert cm.main(["confirm", "3"]) == 0
     assert cm.main(["estop"]) == 0
     assert seen == [["confirm", "3"], ["estop"]]
+
+
+# ---- #40
+
+def test_list_threads_says_when_no_device_output():
+    f = Fake()
+    f.tail_text = {"/dev/con-1": "[2026-11-02 16:27:41 人 接入]\n", "/dev/con-4": "login:"}
+    out = _json(_call(f.server(), "list_threads"))["threads"]
+    assert out[0]["recent_output"] is False and "没接" in out[0]["hint"]
+    assert out[3]["recent_output"] is True and "hint" not in out[3]
+
+
+def test_list_threads_description_does_not_promise_cable_detection():
+    t = next(t for t in cm.build_tools(slots=list, tail=None, snap=None, state=None, pxe=None) if t.name == "list_threads")
+    assert "转接头" in t.description

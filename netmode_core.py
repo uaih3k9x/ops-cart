@@ -26,6 +26,7 @@ import wifi_core as wc
 LAN1, LAN2 = "eno1", "enp3s0"
 PORTS = {LAN1: "LAN1", LAN2: "LAN2"}
 CLEAN = {LAN1: "off", LAN2: "dhcp"}
+PXE_ZONE = "pxe"            # firewalld 区, deploy/firewalld/zones/pxe.xml
 MODES = {
     "off": {"title": "关闭", "ports": (LAN1,)},
     "dhcp": {"title": "DHCP 客户端", "ports": (LAN1, LAN2)},
@@ -206,9 +207,10 @@ def con_name(iface, mode):
 
 
 def _con_add(iface, mode, uuid, settings):
+    zone = ["connection.zone", PXE_ZONE] if iface == LAN1 else []       # 不写就落进 public, DHCP / TFTP 全被挡 (#38)
     return ["nmcli", "con", "add", "type", "ethernet", "ifname", iface, "con-name", con_name(iface, mode),
             "connection.uuid", uuid, "connection.autoconnect", "yes",
-            "connection.autoconnect-priority", str(AUTOCONNECT_PRIORITY)] + settings
+            "connection.autoconnect-priority", str(AUTOCONNECT_PRIORITY)] + zone + settings
 
 
 def _egress_settings(iface, egress):

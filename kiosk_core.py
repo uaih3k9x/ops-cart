@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import subprocess
+import threading
 import sys
 import time
 
@@ -703,6 +704,23 @@ def parse_input_signal(text):
 def video_signal(dev):
     rc, out = run(["v4l2-ctl", "-d", dev, "--get-input"], timeout=3)
     return parse_input_signal(out)
+
+
+def stop_proc(proc, wait_s=2.0):
+    """礼貌停一个子进程, 不卡调用方: 先 SIGTERM, 后台等 wait_s, 还不走就 SIGKILL 并回收 (#39: mpv 卡住不理 SIGTERM)."""
+    def reap():
+        try:
+            proc.wait(wait_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    t = threading.Thread(target=reap, daemon=True, name="stop-proc")
+    t.start()
+    return t
 
 
 def default_video(nodes, has_signal=video_signal):

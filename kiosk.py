@@ -722,7 +722,7 @@ class Kiosk(tk.Tk):
     def _stop_preview(self):
         self._release_passthrough()
         if self.mpv:
-            self.mpv.terminate()
+            kc.stop_proc(self.mpv)
             self.mpv = None
         if self.video_frame:
             self.video_frame.destroy()

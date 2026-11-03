@@ -60,6 +60,20 @@ def thread_name(text):
     return None
 
 
+_MARKER = re.compile(r"\[\d{4}-\d{2}-\d{2} ")
+
+
+def device_output_seen(text):
+    """这段串口日志里有没有设备自己吐的字 (conbroker 的 [时间 ...] 标记行和空行不算). 串口探测不了对端, 只能看这个."""
+    return any(ln.strip() and not _MARKER.match(ln) for ln in (text or "").splitlines())
+
+
+def snap_label(dev, friendly, signal):
+    """截图 / OCR 回给 Agent 的说明: 写清是哪块卡, 没信号明说. signal=None = 不知道."""
+    name = f"{friendly} ({dev})" if friendly else dev
+    return f"{name} 没信号 (灰屏), 换一块或查 HDMI" if signal is False else f"{name} 当前画面"
+
+
 def slot_label(slot, name):
     return f"槽位 {slot} ({name})" if name else f"槽位 {slot}"
 

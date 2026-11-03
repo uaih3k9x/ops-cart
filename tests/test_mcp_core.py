@@ -405,3 +405,21 @@ def test_check_args_boolean():
     for bad in ("true", 1, 0, None, [True]):
         with pytest.raises(mc.ArgError):
             mc.check_args(params, {"batch": bad})
+
+
+# ---- list_threads: 转接头在不等于接了设备 (#40); 截图标清是哪块卡 (#39)
+
+def test_device_output_seen_ignores_conbroker_markers():
+    assert mc.device_output_seen("[2026-11-02 16:27:41 人 接入]\n \n[2026-11-02 18:26:20 人 断开]\n") is False
+    assert mc.device_output_seen("") is False
+
+
+def test_device_output_seen_real_output():
+    assert mc.device_output_seen("[2026-11-02 16:27:41 人 接入]\n<SW1>") is True
+    assert mc.device_output_seen("[SW1-GigabitEthernet0/0/1]") is True
+
+
+def test_snap_label():
+    assert mc.snap_label("/dev/video3", "SC0710 卡2", True) == "SC0710 卡2 (/dev/video3) 当前画面"
+    assert "没信号" in mc.snap_label("/dev/video2", "SC0710 卡1", False)
+    assert mc.snap_label("/dev/video0", None, None) == "/dev/video0 当前画面"

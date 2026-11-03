@@ -69,7 +69,7 @@ SLOT_PARAM = {"type": "integer", "minimum": 1, "maximum": 4, "required": True,
 
 
 def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {}):
-    """slots() -> lamps_core.slot_status 那样的 4 项; tail(dev, n) -> 文本; snap(dev|None) -> (png, 哪块卡);
+    """slots() -> lamps_core.slot_status 那样的 4 项; tail(dev, n) -> 文本; snap(dev|None) -> (png, 哪块卡的说明);
     state() -> 快照 dict 或 None; pxe() -> dict; writer() -> {槽位: 写租约持有者}. 出错抛 mc.ToolError. 测试里全换成假的."""
 
     def _slot(n):
@@ -83,15 +83,19 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
     def list_threads(_a):
         out, writers = [], writer()
         for n, s in enumerate(slots(), 1):
-            name = None
-            if s["present"] and s["baud"]:              # 线拔了 / 没服务: 名字清空, 不读旧日志
+            name, seen = None, None
+            if s["present"] and s["baud"]:              # 转接头拔了 / 没服务: 名字清空, 不读旧日志
                 try:
-                    name = mc.thread_name(tail(s["dev"], NAME_TAIL))
+                    text = tail(s["dev"], NAME_TAIL)
+                    name, seen = mc.thread_name(text), mc.device_output_seen(text)
                 except mc.ToolError:
                     pass
-            out.append({"slot": n, "dev": s["dev"], "present": bool(s["present"]), "service": bool(s["baud"]),
-                        "baud": s["baud"], "name": name, "label": mc.slot_label(n, name),
-                        "writer": writers.get(n)})     # 写租约持有者 (#21)
+            row = {"slot": n, "dev": s["dev"], "present": bool(s["present"]), "service": bool(s["baud"]),
+                   "baud": s["baud"], "name": name, "label": mc.slot_label(n, name),
+                   "recent_output": seen, "writer": writers.get(n)}     # 写租约持有者 (#21)
+            if seen is False:
+                row["hint"] = "最近没有设备输出: 可能没接设备, 也可能只是没动静"
+            out.append(row)
         return [mc.json_content({"threads": out})]
 
     def read_output(a):
@@ -105,7 +109,7 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
         if dev and not dev.startswith("/dev/"):
             dev = "/dev/" + dev
         png, used = snap(dev)
-        return [mc.image_content(png), mc.text_content(f"{used} 当前画面 (推车锁屏也照拿)")]
+        return [mc.image_content(png), mc.text_content(used)]
 
     def cart_status(_a):
         snap_doc = state()
@@ -120,16 +124,17 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
         return [mc.json_content(pxe())]
 
     return [
-        mc.Tool("list_threads", "列出串口操作头槽位 1-4 的执行绪: 线在不在、有没有在跑的 conbroker 服务、波特率、"
+        mc.Tool("list_threads", "列出串口操作头槽位 1-4 的执行绪: present = USB 转接头在 (串口探测不了对端, 不代表接了设备), "
+                "recent_output = 最近有没有设备输出; 有没有在跑的 conbroker 服务、波特率、"
                 "从提示符认出的设备名 (华为 <名>/[名]), 写入者 (写租约持有者). 名字只是标签, 以槽位号为准.",
                 {}, list_threads),
         mc.Tool("read_output", "读某个槽位串口最近 N 行输出 (经 conbroker tail 读它的日志, 不直接开串口). 只读.",
                 {"slot": SLOT_PARAM,
                  "lines": {"type": "integer", "minimum": 1, "maximum": 500, "default": READ_LINES,
                            "description": "行数"}}, read_output),
-        mc.Tool("screenshot", "截被测机器当前画面 (HDMI 采集卡; 推车锁屏也拿得到), 返回 PNG.",
+        mc.Tool("screenshot", "截被测机器当前画面 (HDMI 采集卡; 推车锁屏也拿得到), 返回 PNG. 很占上下文: 想读字先用 screen_ocr.",
                 {"device": {"type": "string", "pattern": r"(/dev/)?video[0-9]{1,2}", "maxLength": 16,
-                            "description": "采集设备, 默认正在预览的那块, 没预览就 video0"}}, screenshot),
+                            "description": "采集设备, 默认正在预览的那块, 没预览就有信号的采集卡"}}, screenshot),
         mc.Tool("cart_status", "推车状态快照 (cart-dash 写的 state.json): UPS、网络、LAN1/LAN2 的 LLDP 对端、"
                 "操作头、锁屏、自检、温度风扇; stale=true 表示采集停了.", {}, cart_status),
         mc.Tool("pxe_status", "PXE 装机口状态 (只读): 当前模式 (rescue/install/expired)、解锁的 MAC、到期时间、"
@@ -170,7 +175,15 @@ def real_snap(dev):
             pass
     if len(data) > MAX_IMAGE:
         raise mc.ToolError(f"截图太大 ({len(data)} 字节), 不发")
-    return data, used
+    return data, describe_dev(used)
+
+
+def describe_dev(dev):
+    """哪块卡 + 有没有信号; 探测失败不影响截图."""
+    try:
+        return mc.snap_label(dev, kc.video_friendly(dev), kc.video_signal(dev))
+    except Exception:                   # noqa: BLE001
+        return mc.snap_label(dev, None, None)
 
 
 def read_pxe(mode_path=kc.PXE_MODE, root=kc.TFTP_ROOT, guard_path=None, now=None):

@@ -133,3 +133,10 @@ def test_revtunnel_example_env_has_no_real_host():
     assert set(kv) == {"JUMP_HOST", "JUMP_PORT", "JUMP_USER", "REMOTE_PORT"}
     assert kv["JUMP_HOST"].endswith(".example") or kv["JUMP_HOST"].startswith("192.0.2.")
     assert 1024 < int(kv["REMOTE_PORT"]) < 65536
+
+
+def test_pxe_firewall_zone_in_repo_opens_what_pxe_needs():
+    """#38: pxe 区以前只在车上手工建过."""
+    xml = (UNITS.parent / "firewalld" / "pxe.xml").read_text()
+    for port, proto in ((67, "udp"), (68, "udp"), (69, "udp"), (4011, "udp"), (80, "tcp"), (8000, "tcp")):
+        assert f'port="{port}" protocol="{proto}"' in xml

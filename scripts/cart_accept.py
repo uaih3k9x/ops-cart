@@ -446,7 +446,15 @@ def config_checks():
             return ac.FAIL, f"没有 {d} (tmpfiles 是旧版? systemd-tmpfiles --create)"
         return ac.judge_perm(os.stat(d), 0o700, uid=uid_of("ops-web"))
 
+    def pxe_zone():
+        if sh(["firewall-cmd", "--state"])[0] != 0:
+            return ac.judge_pxe_zone(None, None)
+        zone = sh(["firewall-cmd", "--get-zone-of-interface=eno1"])[1].strip()
+        ports = sh(["firewall-cmd", f"--zone={zone}", "--list-ports"])[1] if zone else ""
+        return ac.judge_pxe_zone(zone, ports)
+
     return [ac.Check("pxe.env", "#11", pxeenv),
+            ac.Check("LAN1 防火墙区放行 PXE", "#38", pxe_zone),
             ac.Check("theme.json (日出日落)", "#31", theme),
             ac.Check("serial-gate.json (串口写闸门)", "#21", gate),
             ac.Check("notify.json 0600 且能解析", "#4", notify),
