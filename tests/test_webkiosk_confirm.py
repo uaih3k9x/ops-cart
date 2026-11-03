@@ -42,7 +42,7 @@ def test_view_shows_pending_cards_and_no_tokens(tmp_path):
     app = _app(tmp_path)
     c = login(app)
     status, _, data = call(app, "GET", "/api/serial-write", cookie=c)
-    assert status == 200 and data["ops"] == ["estop", "reject"]
+    assert status == 200 and data["ops"] == ["estop", "reject", "kvm_reject"]
     card = data["cards"][0]
     assert card["items"][0]["head"] == "Agent 想执行：save" and card["items"][0]["danger"] == "高危词：save"
     assert data["heads"][0]["text"] == "1\n待确认 1" and data["summary"]["level"] == "warn"

@@ -155,9 +155,18 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 
 ## 十四、试用后补的工具（#38–#41）
 
-- **键鼠**（`mcp_kvm.py`）：`kvm_status`、`kvm_lease_acquire/renew/release`、`kvm_key`、`kvm_type`。一把写租约（`/run/ops-cart/kvm-lease.json`，root 0600），认令牌不认名字；全部急停时收回，解除后要重新申请。只经键鼠代理、来源固定 agent，代理不在就报错，不退回直开。没有闸门：敲进被测机的内容推车看不懂，靠人盯和急停。命令行 `ch9329.py` 不走这把租约（来源自报，能开 `dialout` 的本来就能直写串口）。
+- **键鼠**（`mcp_kvm.py`）：`kvm_status`、`kvm_lease_acquire/renew/release`、`kvm_key`、`kvm_type`。一把写租约（`/run/ops-cart/kvm-lease.json`，root 0600），认令牌不认名字；全部急停时收回，解除后要重新申请。只经键鼠代理、来源固定 agent，代理不在就报错，不退回直开。闸门和来源见第十五节。
 - **OCR**（`screen_ocr`）：看画面先用它。BIOS 和命令行读得准，彩色桌面读不出；按字数加权平均置信度低于 60 就 `readable=false`，让 Agent 改用 `screenshot`，不把噪声当结果。
 - **WOL**（`wol_send`）：只从 LAN1 发。LAN2 和无线上是别人的机器。
 - **`pxe_clients`**：`pxeserver.ClientLog` 把 DISCOVER 的 MAC、厂商串、架构记到 `/run/ops-cart/pxe-clients.json`，停发时也记。防火墙挡住的看不到。
-- **待定**：车机上还没显示“Agent 正在动键鼠”（#9 第 4 点）；键鼠操作还没进执行绪日志，只在 `kvm.log` 和审计日志里。
 
+## 十五、键鼠闸门、日志和来源（#42–#45）
+
+- **闸门**：`kvm_type` 按“从上次回车起的整行”查高危词（串口词表 + `diskpart`、`mkfs`、`Format-Volume` 等），拆成几次调用也算；`ctrl+alt+delete`、`alt+f4` 等组合键也算。命中就挂起，车机确认才发，Agent 没有确认工具，网页只能拒绝。挂起的内容随租约过期、释放、全部急停作废。往多拦的方向错，普通文字带 `write` 也会挂起。
+- **这只是减速带**：推车看不懂屏幕，鼠标点选、图形界面、脚本、编码后的命令都拦不住。兜底还是人盯和急停。
+- **`secret=true`**：内容不进审计、不进日志、不进行缓冲；命中高危词直接拒绝，也不记命中了哪个词。
+- **界面**：键鼠灯同串口配色（急停红 > 待确认黄闪 > 正在发紫闪 > 持租约紫），车机点灯开确认框。副屏只拿几个数；网页“Agent”页多一张键鼠卡片，请求走 `serial-req` 目录的 `kvm_reject`。
+- **日志**：`/var/log/ops-cart/kvm-thread.log`（JSONL：`lease_acquire` `lease_release` `lease_expired` `revoked` `pending` `confirm` `reject` `drop` `refused` `send`），确认、拒绝、收回另在 `events.log` 记 `[kvm]` 摘要。
+- **来源**：代理按 `SO_PEERCRED` 判断，只有 root 和 `ops-web` 说 human 才算，其他在解析时就按 agent 查（原始报告、鼠标、解除急停都不给），并记 `downgrade`。root 仍能自报 human：车机就是 root，分不开。
+- **插话**：有人持键鼠租约时，其他 agent 的输入一律拒绝；没人持租约时命令行和配方照旧能用。配方运行中被别人拿走租约会停下。
+- **`recent_output`**：往前多看 200 行，仍然只是日志判断。要确认对端就拿租约 `send_key enter`；推车不会自动发。

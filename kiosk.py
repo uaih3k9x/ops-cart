@@ -24,6 +24,7 @@ import kiosk_ui_core as kui
 import kvm_core as kvm
 import lamps_core as lc
 import mcp_pxe
+import mcp_kvm
 import mcp_serial
 import sun_core
 import ups_core as uc
@@ -33,7 +34,7 @@ from ks_panel import KsPanel
 from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
-from confirm_panel import ConfirmDialog
+from confirm_panel import ConfirmDialog, KvmDialog
 from pxe_req_panel import PxeRequestDialog
 import theme as th
 
@@ -87,6 +88,7 @@ class Kiosk(tk.Tk):
         self._kiosk_report = dc.KioskReporter()   # 回写锁屏/键鼠计数给副屏 (#10), 采样线程里用
         # Agent 写串口 (#23): 采样线程 peek 来的视图 (None = 还没采到), 确认框, 车机上人的动作经它改状态
         self._sw_view, self._confirm_win, self._sw_store = None, None, mcp_serial.Store()
+        self._kvm_view, self._kvm_win, self._kvm_store = None, None, mcp_kvm.LeaseStore()   # Agent 动键鼠 (#43)
         # Agent PXE 解锁申请 (#24): 采样线程 peek 来的视图 (带确认码), 申请框, 弹过的编号 (人关掉了不再弹)
         self._pxe_view, self._pxe_req_win, self._pxe_seen, self._pxe_store = None, None, set(), mcp_pxe.Store()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
@@ -299,6 +301,9 @@ class Kiosk(tk.Tk):
                 if key.startswith("con-"):      # 操作头: 有 Agent 的事 (#23) 开确认框, 没有开串口面板 (#5)
                     w.bind("<Button-1>", lambda _e, n=int(key[4:]): self._head_click(n))
                     continue
+                if key == "kvm":                # 键鼠: 有 Agent 的事开确认框, 没有开键鼠面板 (#43)
+                    w.bind("<Button-1>", lambda _e, p=pane: self._kvm_click(p))
+                    continue
                 if key == "pxe":                # #33: 到时停发时点 PXE 灯续期 (横条 10 分钟后会收起), 平时开装机面板
                     w.bind("<Button-1>", lambda _e, p=pane: self._pxe_lamp_click(p))
                     continue
@@ -341,7 +346,8 @@ class Kiosk(tk.Tk):
         slots, counters = lc.sample(sc.data_dir(conf), self._kvm_count, bells=self._bells, on_bell=on_bell)
         sw_view = mcp_serial.peek()                     # Agent 写串口 (#23): 只读, 读不懂 = 全部急停
         stopped = all(s["estop"] for s in cfc.slot_states(sw_view).values())
-        return slots, counters, sw_view, mcp_pxe.peek(stopped=lambda: stopped)   # PXE 申请 (#24) 跟全部急停走
+        return (slots, counters, sw_view, mcp_pxe.peek(stopped=lambda: stopped),   # PXE 申请 (#24) 跟全部急停走
+                mcp_kvm.peek())
 
     def _ups_sample(self):
         """后台线程: 每秒读一次 upower (命令行, 只读). 读不到就返回 None."""
@@ -448,7 +454,9 @@ class Kiosk(tk.Tk):
     def _lamp_sampled(self, res):
         if isinstance(res, Exception):
             return
-        self._lamp_slots, counters, self._sw_view, pxe_view = res
+        self._lamp_slots, counters, self._sw_view, pxe_view, self._kvm_view = res
+        if self._kvm_win is not None and self._kvm_win.winfo_exists():
+            self._kvm_win.refresh(self._kvm_view)
         if self._confirm_win is not None and self._confirm_win.winfo_exists():
             self._confirm_win.refresh(self._sw_view)
         self._pxe_req_update(pxe_view)
@@ -475,6 +483,9 @@ class Kiosk(tk.Tk):
             health = lc.health_of(self._check_rows, label)
             views[key] = dict(lc.lamp_view(health, key in self._active, on, bell=key in self._bell_active),
                               text=name)
+        if self._kvm_view is not None:
+            look = cfc.kvm_lamp(cfc.kvm_summary(self._kvm_view), on)
+            views["kvm"] = look or views["kvm"]
         for key, v in views.items():
             f, stripe, lab, last = self._lamps[key]
             text = v["text"]
@@ -540,6 +551,45 @@ class Kiosk(tk.Tk):
             self._serial_say("上一个操作还在处理中…", ok=False)
             return
         self._serial_say("发送中, 等设备回…" if op == "confirm" else "处理中…")
+
+    # ------------------------------------------------------------ Agent 动键鼠 (#42 #43)
+
+    def _kvm_click(self, pane):
+        st = cfc.kvm_summary(self._kvm_view) if self._kvm_view is not None else None
+        if st and (st["stopped"] or st["pending"] or st["writer"]):
+            self._open_kvm()
+        else:
+            self._open_pane(pane)
+
+    def _open_kvm(self):
+        w = self._kvm_win
+        if w is not None and w.winfo_exists():
+            w.lift()
+            return
+        self._kvm_win = KvmDialog(self, self._kvm_view, self._kvm_action)
+
+    def _kvm_say(self, text, ok=True):
+        w = self._kvm_win
+        if w is not None and w.winfo_exists():
+            w.say(text, ok)
+        self.banner.config(text=text)
+
+    def _kvm_action(self, op, arg):
+        """确认框按钮: 确认 / 拒绝到后台 (确认会发键); 急停和解除就是串口的全部急停, 走原来那条路."""
+        if op in ("estop", "resume"):
+            return self._serial_action(op, arg)
+        store = self._kvm_store
+
+        def work():
+            return mcp_kvm.human_action(store, op, arg, cfc.BY_KIOSK)
+
+        def done(res):
+            ok = not isinstance(res, Exception)
+            self._kvm_say(str(res) if ok else f"不行: {res}", ok)
+        if not self.ui.run_bg(work, done, key="kvm-confirm"):
+            self._kvm_say("上一个操作还在处理中…", ok=False)
+            return
+        self._kvm_say("处理中…")
 
     # ------------------------------------------------------------ Agent PXE 解锁申请 (#24)
 

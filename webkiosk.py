@@ -34,6 +34,7 @@ import kiosk_core as kc
 import kvm_broker
 import kvm_core as kvm
 import lamps_core
+import mcp_kvm
 import mcp_serial
 import pxe_log_core
 import serial_core as sc
@@ -107,6 +108,7 @@ class App:
         self._serial_tx = {}            # 同上 -> 发出去的字节数 (审计用)
         self._streams = {}              # 会话令牌 -> {关闭函数}
         # Agent 写串口 (#23): 状态只读 (CAP_DAC_READ_SEARCH), 急停 / 拒绝投请求文件
+        self.kvm_peek = mcp_kvm.peek
         self.serial_peek, self.req_dir, self.clock_wall = mcp_serial.peek, mcp_serial.REQ_DIR, time.time
         # PXE 日志 (#24 后续): 只读日志尾, 同样靠 CAP_DAC_READ_SEARCH
         self.pxe_log_paths = (pxe_log_core.REQ_LOG, pxe_log_core.EVENTS_LOG)
@@ -516,7 +518,11 @@ class App:
             cards = [cc.card(view, n) for n in states]
         except (KeyError, TypeError, StopIteration):
             cards = [cc.card(cc.stopped_view(), n) for n in states]
-        return _json(200, {"heads": heads, "cards": cards, "summary": cc.summary(states), "ops": list(cc.WEB_OPS),
+        try:
+            kvm = self.kvm_peek()
+        except Exception:                   # noqa: BLE001  看不了按急停画
+            kvm = None
+        return _json(200, {"heads": heads, "cards": cards, "kvm": cc.kvm_card(kvm), "summary": cc.summary(states), "ops": list(cc.WEB_OPS),
                            "note": "网页上只能急停和拒绝; 确认发送、解除急停要在推车车机上点"})
 
     def _serial_write_op(self, op, req, ip, tok):

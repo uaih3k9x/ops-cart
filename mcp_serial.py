@@ -506,6 +506,13 @@ def _take_request(store, path, now, force):
         _remove(path)
         return f"不认: {e}"
     _remove(path)
+    if req["op"] == "kvm_reject":
+        import mcp_kvm                  # 晚 import: mcp_kvm 也 import 本模块
+        try:
+            mcp_kvm.LeaseStore().reject(req["id"], req["by"], why="网页上拒绝")
+            return f"已拒绝键鼠 #{req['id']}"
+        except (ValueError, OSError) as e:
+            return f"不行: {e}"
     try:
         return store.run(lambda b, t: cc.apply_request(b, req, t))
     except sw.Refused as e:

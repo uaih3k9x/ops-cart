@@ -21,7 +21,7 @@ PENDING_COLOR, ESTOP_COLOR, AGENT_COLOR = th.follow(
 KEY_LABEL = {"ctrl_c": "Ctrl+C", "enter": "回车", "space": "空格"}
 BY_KIOSK = "human:kiosk@local"
 
-WEB_OPS = ("estop", "reject")
+WEB_OPS = ("estop", "reject", "kvm_reject")
 REQ_MAX = 4096              # 一个请求文件最多多少字节
 REQ_MAX_AGE_S = 60          # 请求超过这么久还没人处理 (单元没起来) 就作废, 别过后突然生效
 REQ_FUTURE_S = 5
@@ -123,6 +123,50 @@ def card(view, n):
             "stopped": bool(s["estop"]), "items": out}
 
 
+# ------------------------------------------------------------ 键鼠 (#42 #43): 同一套配色, 灯在下排
+
+def kvm_summary(view):
+    """mcp_kvm.peek 的结果 -> 只有几个数 (副屏快照 0644, 不带名字和内容). 读不懂 = 急停."""
+    try:
+        return {"stopped": bool(view["stopped"]), "pending": len(view["pending"]),
+                "writer": bool(view["writer"]), "sending": bool(view["sending"])}
+    except (KeyError, TypeError):
+        return {"stopped": True, "pending": 0, "writer": False, "sending": False}
+
+
+def kvm_lamp(st, on):
+    """键鼠灯: 急停红 > 待确认黄闪 > 正在发紫闪 > 持租约紫; 没 Agent 的事 None (走原来的健康色)."""
+    if not st:
+        return None
+    if st["stopped"]:
+        return dict(_look(ESTOP_COLOR, True), text="键鼠\n急停", blink=False)
+    if st["pending"]:
+        return dict(_look(PENDING_COLOR, on), text=f"键鼠\n待确认 {st['pending']}", blink=True)
+    if st["sending"]:
+        return dict(_look(AGENT_COLOR, on), text="键鼠\nAgent 输入", blink=True)
+    if st["writer"]:
+        return dict(_look(AGENT_COLOR, False), text="键鼠\nAgent", blink=False)
+    return None
+
+
+def kvm_card(view):
+    """键鼠确认框 -> {title, status, stopped, items}, 同 card. 读不懂当急停画."""
+    try:
+        status = []
+        if view["stopped"]:
+            status.append("全部急停中: Agent 不能动键鼠, 人不受影响")
+        if view["writer"]:
+            status.append(f"写入者 {view['writer']} 剩 {view['expires_in']} 秒")
+        if not status:
+            status.append("没有 Agent 在动键鼠")
+        items = [{"id": p["id"], "head": f"Agent 想输入：{p['what']}", "meta": f"#{p['id']} · 来自 {p['who']}",
+                  "reason": f"闸门理由：{p['reason']}" + (f"（整行：{p['line']}）" if p.get("line") else ""),
+                  "danger": ("高危：" + "、".join(p["danger"])) if p.get("danger") else ""} for p in view["pending"]]
+        return {"title": "键鼠", "status": status, "stopped": bool(view["stopped"]), "items": items}
+    except (KeyError, TypeError):
+        return {"title": "键鼠", "status": ["读不到键鼠状态, 按急停算"], "stopped": True, "items": []}
+
+
 # ------------------------------------------------------------ 前置校验
 
 def check(view, op, arg):
@@ -170,7 +214,7 @@ def make_request(op, arg, by, now):
     """网页 -> 请求 dict. op 只收 estop (arg = 槽位或 None = 全部) / reject (arg = 编号); 不合格抛 ValueError."""
     if op == "estop" and (arg is None or arg in sw.SLOTS) and (arg is None or _int(arg)):
         req = {"op": op, "slot": arg}
-    elif op == "reject" and _int(arg) and arg > 0:
+    elif op in ("reject", "kvm_reject") and _int(arg) and arg > 0:
         req = {"op": op, "id": arg}
     else:
         raise ValueError(f"网页只能急停或拒绝 ({op!r} {arg!r} 不行)")

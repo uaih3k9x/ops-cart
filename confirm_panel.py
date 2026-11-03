@@ -108,3 +108,33 @@ class ConfirmDialog(tk.Toplevel):
 
     def say(self, text, ok=True):
         self.msg.config(text=text, fg=th.OK if ok else th.BAD)
+
+
+class KvmDialog(ConfirmDialog):
+    """键鼠确认框 (#43): 确认 / 拒绝挂起的内容; 急停和解除只有全部一档 (键鼠跟全部急停走)."""
+
+    def __init__(self, master, view, on_action, ask=None):
+        super().__init__(master, "kvm", view, on_action, ask=ask)
+
+    def refresh(self, view):
+        c = cc.kvm_card(view)
+        self.title_lbl.config(text=c["title"])
+        self.status_lbl.config(text="\n".join(c["status"]), fg=th.BAD if c["stopped"] else DIM)
+        self.config(highlightbackground=cc.ESTOP_COLOR if c["stopped"] else cc.PENDING_COLOR)
+        key = (c["stopped"], tuple(it["id"] for it in c["items"]))
+        if key == self._key:
+            return
+        self._key = key
+        for w in list(self.body.winfo_children()) + list(self.foot.winfo_children()):
+            w.destroy()
+        self._meta = {}
+        if not c["items"]:
+            tk.Label(self.body, text="没有等确认的内容", font=FONT, bg=BG, fg=DIM).pack(pady=20)
+        for it in c["items"]:
+            self._item(it)
+        if c["stopped"]:
+            self._btn(self.foot, "解除全部急停", "plain", lambda: self.on_action("resume", None))
+        else:
+            self._btn(self.foot, "全部急停", "stop", lambda: self.on_action("estop", None))
+        self._btn(self.foot, "关闭", "plain", self.destroy)
+

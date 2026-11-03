@@ -437,11 +437,15 @@ function agentCard(c, n) {
   return `<div class="card"><h3>${esc(c.title)}</h3>${c.status.map((x) => `<div class="dim">${esc(x)}</div>`).join("")}
     ${c.items.map(agentItem).join("")}<div style="margin-top:8px">${foot}</div></div>`;
 }
+function kvmCard(c) {  // 键鼠 (#43): 网页只能拒绝, 确认在车机上
+  const items = c.items.map((it) => agentItem(it).replace("data-reject=", "data-kvm-reject=")).join("");
+  return `<div class="card"><h3>${esc(c.title)}</h3>${c.status.map((x) => `<div class="dim">${esc(x)}</div>`).join("")}${items}</div>`;
+}
 async function agentRefresh() {
   const v = await api("/api/serial-write");
   $("#ag-heads").innerHTML = v.heads.map((h) => `<div class="head${h.blink ? " blink" : ""}"
     style="background:${h.bg};color:${h.fg};border-color:${h.bar}">${esc(h.text)}</div>`).join("");
-  $("#ag-cards").innerHTML = v.cards.map((c, i) => agentCard(c, i + 1)).join("");
+  $("#ag-cards").innerHTML = v.cards.map((c, i) => agentCard(c, i + 1)).join("") + kvmCard(v.kvm);
   $("#ag-summary").textContent = v.summary ? v.summary.text : "Agent 没有挂起的命令";
   $("#ag-note").textContent = v.note;
   const nav = $("#nav-agent");
@@ -459,6 +463,7 @@ async function agentOp(op, body) {
 $("#ag-cards").onclick = (e) => {
   const t = e.target;
   if (t.dataset.reject) agentOp("reject", { id: Number(t.dataset.reject) });
+  if (t.dataset.kvmReject) agentOp("kvm_reject", { id: Number(t.dataset.kvmReject) });
   if (t.dataset.estop) agentOp("estop", { slot: Number(t.dataset.estop) });
 };
 $("#estop-all").onclick = () => agentOp("estop", {});

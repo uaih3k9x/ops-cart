@@ -137,4 +137,4 @@ def test_lamp_sample_passes_estop_all_to_pxe_peek(monkeypatch):
     fake = SimpleNamespace(_beeper=None, _kiosk_report=SimpleNamespace(update=lambda *a, **k: None),
                            _lock_win=None, _kvm_count=0, _bells=None, _ups_since=None)
     res = kiosk.Kiosk._lamp_sample(fake)
-    assert len(res) == 4 and res[3] == {"pending": [], "history": []} and got == [True]
+    assert len(res) == 5 and res[3] == {"pending": [], "history": []} and got == [True]

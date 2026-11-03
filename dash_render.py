@@ -209,7 +209,7 @@ def render(view, size=(PANEL_W, PANEL_H)):
     tw = (W - 2 * M - gap * 4) // 5
     for i, x in enumerate(lower[:5]):
         x0 = M + i * (tw + gap)
-        _tile(d, [x0, y0, x0 + tw, y0 + 100], x["name"], x["health"], x["active"], _font(32))
+        _tile(d, [x0, y0, x0 + tw, y0 + 100], x["name"], x["health"], x["active"], _font(32), look=x.get("look"))
     _peers(d, view.get("peers") or [], 614, W)
     d.line([M, 680, W - M, 680], fill=LINE, width=2)
 

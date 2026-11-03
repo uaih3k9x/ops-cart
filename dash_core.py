@@ -76,6 +76,7 @@ def collect(ctx):
         "pxe": _pull(ctx, "pxe", {}),               # pxe-guard.json (守卫在跑才有), 自己发地址限时 #11
         "svcs": _pull(ctx, "svcs", {}),             # {"chronyd": (enabled, active), "kiosk": ...} 开机自检用 #26
         "version": _pull(ctx, "version", ""),       # "Ver 1.08.03   Build ..." 开机自检抬头
+        "kvm_agent": _pull(ctx, "kvm_agent", None),  # 键鼠 Agent 状态 {stopped, pending, writer, sending} (#43)
         "agent": _pull(ctx, "agent", None),         # Agent 写串口每槽位 [{estop, pending, writer, sending}] #23
         "theme": _pull(ctx, "theme", dict(THEME_DARK)),  # 深浅模式 {mode, setting, next_switch} #31
     }
@@ -262,10 +263,23 @@ def _heads(slots, active, agent=None):
     return out
 
 
-def _lower(rows, active):
-    """下排: 键鼠 / PXE / LAN1 / LAN2 / Wi-Fi, 健康看自检那一行, 闪看计数器."""
-    return [{"name": name, "health": lamps_core.health_of(rows, label), "active": counter in active}
-            for name, label, counter in lamps_core.LOWER]
+def kvm_sample():
+    """键鼠 Agent 状态 (#43): 只有几个数, 快照是 0644. 看不了按急停画."""
+    try:
+        import mcp_kvm
+        return confirm_core.kvm_summary(mcp_kvm.peek())
+    except Exception:                       # noqa: BLE001
+        return confirm_core.kvm_summary(None)
+
+
+def _lower(rows, active, kvm=None):
+    """下排: 键鼠 / PXE / LAN1 / LAN2 / Wi-Fi, 健康看自检那一行, 闪看计数器; 键鼠有 Agent 的事走确认配色."""
+    out = [{"name": name, "health": lamps_core.health_of(rows, label), "active": counter in active}
+           for name, label, counter in lamps_core.LOWER]
+    look = confirm_core.kvm_lamp(kvm, True)
+    if look:
+        out[0].update(name=look["text"].replace("\n", " "), look=look)
+    return out
 
 
 def peers(snap):
@@ -320,7 +334,7 @@ def layout_view(snap, locked=False, active=(), now=None):
         "fans": snap.get("fans") or [],
         "heads": _heads(snap.get("slots"), active, agent),
         "agent": confirm_core.summary(agent) if agent is not None else None,   # 挂起数 / 急停 (#23)
-        "lower": _lower(rows, active),
+        "lower": _lower(rows, active, snap.get("kvm_agent")),
         "checks": _checks(rows),
         "todo": [] if locked else (snap.get("todo") or []),
         "dream": "" if locked else (snap.get("dream") or ""),
@@ -582,6 +596,7 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "lldp": lldp or (lambda: {}),
         "pxe": lambda: kc.pxe_guard_live(),
         "agent": lambda: agent_sample(),
+        "kvm_agent": lambda: kvm_sample(),
         "theme": theme_sampler(),
     }
     for key, period in PERIODS.items():

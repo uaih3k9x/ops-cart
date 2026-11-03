@@ -36,7 +36,7 @@ class _Lab:
 
 def _fake(view):
     calls = {"bg": [], "say": [], "pane": [], "confirm": []}
-    fake = SimpleNamespace(_sw_view=view, _sw_store=object(), _confirm_win=None,
+    fake = SimpleNamespace(_sw_view=view, _kvm_view=None, _sw_store=object(), _confirm_win=None,
                            banner=_Lab(), _lamp_slots=None, _active=set(), _bell_active=set(),
                            _check_rows=[])
     fake.ui = SimpleNamespace(run_bg=lambda work, done, key=None: calls["bg"].append((work, done, key)) or True)
