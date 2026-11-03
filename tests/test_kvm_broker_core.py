@@ -323,3 +323,29 @@ def test_human_bursts_log_start_and_end_not_every_key():
     assert b.ended(4.0) == []
     assert b.ended(5.0) == [(DEV, "kiosk", 3)]
     assert b.note(DEV, "kiosk", 6.0) is True            # 新一轮
+
+
+# ------------------------------------------------------------ 外部急停 (串口全部急停)
+
+def test_external_stop_refuses_agent_but_not_human():
+    arb = kb.Arbiter(ext_stop=lambda: True)
+    with pytest.raises(kb.Refused) as e:
+        arb.submit(job(src="agent", op="keys", keys=["a"]), 0.0)
+    assert e.value.code == "estop"
+    arb.submit(job(src="human", op="report", report="00" * 8), 0.0)      # 人不受影响
+
+
+def test_external_stop_drops_queued_agent_in_expire():
+    stop = {"on": False}
+    arb = kb.Arbiter(ext_stop=lambda: stop["on"])
+    j = job(src="agent", op="keys", keys=["a"])
+    arb.submit(j, 0.0)
+    assert arb.expire(0.0) == []
+    stop["on"] = True
+    assert arb.expire(0.0) == [j] and j.state == "dropped" and j.why == "estop"
+    assert arb.take(j.dev, 0.0) is None
+
+
+def test_external_stop_shows_in_status_and_is_stopped():
+    arb = kb.Arbiter(ext_stop=lambda: True)
+    assert arb.is_stopped("/dev/ttyACM0") and arb.stopped == set()

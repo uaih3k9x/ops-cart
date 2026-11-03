@@ -107,7 +107,7 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 
 - **确认通道**（#23 之前；#23 之后见第十节）：车机上"退出到终端"，`sudo python3 /opt/pxe/cart_mcp.py pending` 看，`confirm <编号>` 显示命令、来源、理由、高危词，敲 `yes` 才发，发的结果直接打印并进日志；`reject <编号>`、`estop [槽位]` 哪都能做；`confirm` 和 `resume <槽位|all>` 只认本机：环境里没有 `SSH_*`、stdin 是终端、祖先进程里没有 sshd / sshd-session / tailscaled / dropbear / mosh-server / cockpit，读不到 `/proc` 也不认。确认后由确认那个进程经 conbroker 发（屏幕上照样标"Claude 发送"）。
 - **急停**：状态在 `/run/ops-cart/serial-write.json`（root 0600，路径可注入）；状态文件读不懂 = 全部急停；重启推车 /run 清空 = 急停、租约、挂起都没了（挂起的命令不会在重启后冒出来）。急停事件记下被撤销的租约持有者、丢弃的编号、以及**当时在途的那条**——那条已经交给 conbroker，收不回来。
-- **已知缺口：conbroker 里排队的那条收不回**。人 3 秒内敲过键时，Agent 的字节已经进了 conbroker 的连接、在它的服务线程里等人停手；这时急停，等人停手 3 秒后它照样写进串口（我们的进程即使超时退出也一样）。要堵上得改 conbroker（另一个仓库）：服务端写串口前查一下 `/run/ops-cart/serial-write.json` 里该槽位的急停，急停就丢弃并标记。车上的判定只能保证"急停之后不再往 conbroker 交任何东西"。
+- **~~已知缺口：conbroker 里排队的那条收不回~~（已堵上，`conbroker.py` 写串口前查 `/run/ops-cart/serial-estop.json`，急停就丢）**。原文：人 3 秒内敲过键时，Agent 的字节已经进了 conbroker 的连接、在它的服务线程里等人停手；这时急停，等人停手 3 秒后它照样写进串口（我们的进程即使超时退出也一样）。要堵上得改 conbroker（另一个仓库）：服务端写串口前查一下 `/run/ops-cart/serial-write.json` 里该槽位的急停，急停就丢弃并标记。车上的判定只能保证"急停之后不再往 conbroker 交任何东西"。
 - **日志**：`/var/log/ops-cart/serial-slot<N>.log`，每槽位一份 JSONL（现成 logrotate `*.log` 规则管），每行 `t / slot / ev / src(agent|human|system) / who`，再加命令、闸门结果（verdict / layer / reason / danger / vendor）、设备回显摘要（超过 1000 字掐中间）、编号、确认人、名字。事件：`lease_acquire` `lease_release` `lease_expired` `pending` `confirm` `reject` `drop` `send` `refused` `estop` `resume`；续期不记。急停 / 解除 / 确认 / 拒绝另在 `events.log` 记 `[serial-write]` 一行摘要 + 日志路径（不写命令）。
 - **人优先**：人在车机 / 网页上敲键走 conbroker 的 human 通道，不经租约、不过闸门；人 3 秒内敲过键 Agent 排队（conbroker 原有）；人随时 estop / reject。
 - **第 2 层**：见下一节（#22）。
@@ -144,3 +144,11 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 - **日志**：`/var/log/ops-cart/pxe-req.log`（JSONL：`request` `bad_code` `confirm` `reject` `refused` `failed` `expire` `drop` `retire` `corrupt`，带编号、申请人、确认人、用途、MAC、原因，**不带码**）+ `events.log` 的 `[pxe-req]` 一行；解锁 / 上锁本身照旧 `[pxe]`；每次工具调用照旧进 `mcp-audit.log`。
 - **网页**（已定，"PXE 日志"页）：只读显示日志，按 MAC 分组。`pxe_log_core.py`（纯逻辑）读 `pxe-req.log` 和 `events.log` 的 `[pxe]` 行的尾部（各限字节数，合起来最多 300 条，坏行跳过），MAC 规范成小写冒号（`[pxe]` 行从正文里认，含 `grub.cfg-01-…` 文件名）；一条涉及几台就进几组，`bad_code` 不带 MAC 就按编号借同一申请的；没 MAC 的进"未关联"；组内新的在前，组按最近事件倒序。输出字段白名单（时间、事件、编号、申请人、确认人、用途、原因、正文、MAC），日志里就算混进 `code` / `digest` 也不出。`GET /api/pxe-log` 走现有来源过滤和登录，`ops-web` 靠 `CAP_DAC_READ_SEARCH` 只读日志，**不读 `pxe-req.json`**，所以网页**不显示在等的申请、不给确认也不给拒绝**（暂时不放）；没有任何写路径。
 - **待定**：网页要不要给拒绝 PXE 申请（拒绝属于"停"的方向，可以照 `serial-req` 的模式加；现在不放）；锁屏上要不要提示"有 PXE 申请在等"；单路急停要不要也作废 PXE 申请；`ops-web` 有 `CAP_DAC_READ_SEARCH` 读得到 `pxe-req.json` 里的码——码不是凭据（确认只有车机进程这条路），但想更紧可以把码挪到 kiosk 进程内存里（代价是 kiosk 重启后在等的申请都要重新申请）。
+
+## 十三、全部急停带上键鼠
+
+- **规则**（已定）：全部急停（一键或逐路停满四路）同时停 Agent 的键鼠；单路急停不碰键鼠。人的键鼠不受影响。
+- **做法**：`mcp_serial.Store` 在公开标记 `/run/ops-cart/serial-estop.json` 多写 `kvm` 字段，`kvm_broker` 每步发键前读它（和 conbroker 读 `all` 同一路），不走 socket 调用。所以键鼠代理没开或重启过，急停照样算数；解除也不用另外接线。
+- **解除**：全部急停后四路都解了键鼠才放，解一路不算。键鼠代理的 `resume` 解不了这个急停。`ch9329.py estop` 是键鼠自己的急停，和这个互不影响。
+- **读不懂标记 = 停**；没有标记文件 = 没停；重启推车 `/run` 清空，和串口一样。
+- **已知缺口**：代理没跑、Agent 退回直开串口时，只在打开那一下查标记；已经开着的 `recipe` 中途停不下来。车上代理是开机自启的，正常走不到这条路。

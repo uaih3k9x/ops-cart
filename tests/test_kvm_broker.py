@@ -58,12 +58,12 @@ def env():
         opened.append(dev)
         return dev
 
-    sock, log = os.path.join(d, "s"), os.path.join(d, "kvm.log")
+    sock, log, flag = os.path.join(d, "s"), os.path.join(d, "kvm.log"), os.path.join(d, "serial-estop.json")
     b = kbr.Broker(sock, log, opener=opener, quiet_s=0.3, wait_max_s=2.0,
-                   realpath=lambda p: p, group=None)
+                   realpath=lambda p: p, group=None, estop_flag=flag)
     t = threading.Thread(target=b.serve_forever, daemon=True)
     t.start()
-    yield {"b": b, "sock": sock, "log": log, "sent": sent, "opened": opened, "gone": gone, "state": state}
+    yield {"b": b, "sock": sock, "log": log, "sent": sent, "opened": opened, "gone": gone, "state": state, "flag": flag}
     b.shutdown()
     shutil.rmtree(d, ignore_errors=True)
 
@@ -227,3 +227,105 @@ def test_sock_path_env_override(monkeypatch):
     assert kbr.default_sock() == "/x/y.sock"
     monkeypatch.delenv("OPS_KVM_SOCK")
     assert kbr.default_sock() == kbr.SOCK
+
+
+# ---- 串口"全部急停"带上键鼠: 代理读公开标记 serial-estop.json (同 conbroker), 代理重启也不丢
+
+def set_flag(env, doc):
+    with open(env["flag"], "w") as f:
+        f.write(doc if isinstance(doc, str) else json.dumps(doc))
+
+
+def test_serial_all_stop_drops_waiting_agent_and_blocks_new(env):
+    h = client(env, src="human", who="kiosk")
+    a = client(env, who="claude")
+    h.send_report(bytes.fromhex("0000040000000000"))    # 人刚动过, agent 排队
+    res = {}
+
+    def agent():
+        try:
+            a.type_text("rm -rf", press_ms=0)
+        except OSError as e:
+            res["e"] = e
+    t = threading.Thread(target=agent)
+    t.start()
+    time.sleep(0.1)
+    n = len(env["sent"])
+    set_flag(env, {"slots": [1, 2, 3, 4], "all": True, "kvm": True})
+    t.join(2)
+    assert isinstance(res.get("e"), kbr.KvmStopped)
+    time.sleep(0.4)
+    assert len(env["sent"]) == n                        # 一个键都没漏, 也没插东西
+    with pytest.raises(kbr.KvmStopped):
+        a.send_keys(["a"], press_ms=0)
+    h.send_report(bytes(8))                             # 人照常
+    assert len(env["sent"]) == n + 1
+
+
+def test_serial_all_stop_clears_with_flag(env):
+    a = client(env, who="claude")
+    set_flag(env, {"slots": [2, 3], "all": False, "kvm": True})     # 全停后只解了部分: 键鼠还停着
+    with pytest.raises(kbr.KvmStopped):
+        a.send_keys(["a"], press_ms=0)
+    set_flag(env, {"slots": [], "all": False, "kvm": False})
+    a.send_keys(["a"], press_ms=0)
+
+
+def test_single_slot_estop_leaves_keyboard_alone(env):
+    set_flag(env, {"slots": [2], "all": False, "kvm": False})
+    client(env, who="claude").send_keys(["a"], press_ms=0)
+
+
+def test_keyboard_resume_cannot_override_serial_all_stop(env):
+    set_flag(env, {"slots": [1, 2, 3, 4], "all": True, "kvm": True})
+    with pytest.raises(kbr.KvmStopped):
+        client(env, src="human", who="cli").resume(all_devs=True)
+
+
+def test_flag_survives_broker_state(env):
+    """代理的内存里没有急停 (比如刚重启), 标记在就照样停."""
+    set_flag(env, {"slots": [1, 2, 3, 4], "all": True, "kvm": True})
+    assert env["b"].arb.stopped == set()
+    with pytest.raises(kbr.KvmStopped):
+        client(env, who="claude").send_keys(["a"], press_ms=0)
+
+
+@pytest.mark.parametrize("doc", ["", "not json", "[1]", '{"all": true}'])
+def test_unreadable_or_old_flag_means_stopped(env, doc):
+    set_flag(env, doc)
+    with pytest.raises(kbr.KvmStopped):
+        client(env, who="claude").send_keys(["a"], press_ms=0)
+
+
+def test_missing_flag_means_not_stopped(env):
+    client(env, who="claude").send_keys(["a"], press_ms=0)
+
+
+def test_direct_fallback_refuses_agent_during_all_stop(monkeypatch, tmp_path):
+    """代理不在时退回直开, 不能成了绕过急停的后门; 人不受影响."""
+    flag = tmp_path / "serial-estop.json"
+    flag.write_text(json.dumps({"slots": [1, 2, 3, 4], "all": True, "kvm": True}))
+    monkeypatch.setattr(kbr, "ESTOP_FLAG", str(flag))
+    monkeypatch.setattr(kbr.ch9329, "Ch9329", lambda port, baud=115200, **kw: "direct")
+    with pytest.raises(kbr.KvmStopped):
+        kbr.open_ch(PORT, src="agent", who="recipe", sock_path="/nonexistent/kvm.sock")
+    assert kbr.open_ch(PORT, src="human", who="kiosk", sock_path="/nonexistent/kvm.sock") == "direct"
+
+
+def test_real_store_all_stop_reaches_broker_and_resume_frees_it(env):
+    """真 Store 写的标记, 真代理读: 防两边字段名走样."""
+    import mcp_serial as ms
+    d = os.path.dirname(env["flag"])
+    store = ms.Store(path=os.path.join(d, "serial-write.json"), log_dir=d, event=None, on_estop_all=None)
+    a = client(env, who="claude")
+    store.run(lambda b, now: b.estop(2, "人", "human", now))
+    a.send_keys(["a"], press_ms=0)                      # 单路不碰键鼠
+    store.run(lambda b, now: b.estop(None, "人", "human", now))
+    with pytest.raises(kbr.KvmStopped):
+        a.send_keys(["a"], press_ms=0)
+    store.run(lambda b, now: b.resume(1, "人", now))
+    with pytest.raises(kbr.KvmStopped):                 # 解一路不算
+        a.send_keys(["a"], press_ms=0)
+    store.run(lambda b, now: b.resume(None, "人", now))
+    a.send_keys(["a"], press_ms=0)
+

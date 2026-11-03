@@ -26,6 +26,7 @@ import ch9329
 import kvm_broker_core as kbc
 
 SOCK = "/run/ops-kvm/kvm.sock"
+ESTOP_FLAG = "/run/ops-cart/serial-estop.json"  # mcp_serial 写的公开急停标记 (0644); kvm=真 = 串口全部急停, 键鼠也停
 LOG = "/var/log/ops-cart/kvm.log"
 GROUP = "dialout"           # socket 给哪个组: 能直接写 ttyACM 的人, 才能经代理发键
 CLIENT_TIMEOUT_S = kbc.AGENT_WAIT_MAX_S + kbc.HOLD_MAX_MS / 1000.0 + 10
@@ -55,13 +56,25 @@ def _peer_uid(sock):
         return None
 
 
+def serial_all_stopped(path=None):
+    """串口全部急停是否带着键鼠. 没文件 = 没停; 读不了 / 读不懂 = 停 (同 conbroker). 只管 agent, 人不受影响."""
+    try:
+        with open(path or ESTOP_FLAG, encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return not isinstance(doc, dict) or bool(doc.get("kvm") or doc.get("all"))
+
+
 class Broker:
     def __init__(self, sock_path=SOCK, log_path=LOG, opener=None, quiet_s=kbc.QUIET_S,
                  wait_max_s=kbc.AGENT_WAIT_MAX_S, realpath=os.path.realpath, group=GROUP,
-                 clock=time.monotonic):
+                 clock=time.monotonic, estop_flag=None):
         self.opener = opener or (lambda dev: ch9329.Ch9329(dev, log=lambda *a: None))
         self.realpath, self.clock, self.port_ok = realpath, clock, kbc.port_ok
-        self.arb = kbc.Arbiter(quiet_s, wait_max_s)
+        self.arb = kbc.Arbiter(quiet_s, wait_max_s, ext_stop=lambda: serial_all_stopped(estop_flag))
         self.bursts = kbc.HumanBursts(quiet_s)
         self.idle_wait = min(1.0, quiet_s / 2)
         self.cv = threading.Condition()
@@ -204,6 +217,8 @@ class Broker:
                 return {"ok": True, "status": self.arb.status(self.clock())}
             if r["op"] == "resume" and r["src"] != "human":
                 return {"ok": False, "err": "human_only", "msg": MSG["human_only"]}
+            if r["op"] == "resume" and self.arb.ext_stop():
+                return {"ok": False, "err": "estop", "msg": "串口全部急停还没解除; 要在推车车机上解除全部急停"}
             if r["op"] == "estop":
                 dropped = self.arb.estop(dev)
                 for j in dropped:
@@ -392,6 +407,8 @@ def open_ch(port, src="agent", who="cli", baud=115200, sock_path=None):
     try:
         return BrokerCh(port, src=src, who=who, sock_path=sock_path)
     except (FileNotFoundError, ConnectionRefusedError):
+        if src != "human" and serial_all_stopped():     # 直开不能成了绕过急停的后门; 只查开的那一下
+            raise KvmStopped("串口全部急停中, agent 不能发键; 要人在推车上解除") from None
         return ch9329.Ch9329(port, baud, log=lambda *a: None)
 
 

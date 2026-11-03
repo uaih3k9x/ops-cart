@@ -531,12 +531,53 @@ def test_estop_flag_file_tracks_stopped_slots(tmp_path):
     rig = Rig(tmp_path)
     flag = os.path.join(os.path.dirname(rig.store.path), "serial-estop.json")
     rig.store.run(lambda b, now: None)
-    assert json.load(open(flag)) == {"slots": [], "all": False}
+    assert json.load(open(flag)) == {"slots": [], "all": False, "kvm": False}
     assert stat.S_IMODE(os.stat(flag).st_mode) == 0o644
     rig.store.run(lambda b, now: b.estop(2, "人", "human", now))
-    assert json.load(open(flag)) == {"slots": [2], "all": False}
+    assert json.load(open(flag)) == {"slots": [2], "all": False, "kvm": False}
     rig.store.run(lambda b, now: b.estop(None, "人", "human", now))
-    assert json.load(open(flag)) == {"slots": [1, 2, 3, 4], "all": True}
+    assert json.load(open(flag)) == {"slots": [1, 2, 3, 4], "all": True, "kvm": True}
     rig.store.run(lambda b, now: b.resume(None, "人", now))
-    assert json.load(open(flag)) == {"slots": [], "all": False}
+    assert json.load(open(flag)) == {"slots": [], "all": False, "kvm": False}
     assert "token" not in open(flag).read()                             # 只写槽位, 不漏令牌和命令
+
+
+def _flag(rig):
+    import json
+    with open(os.path.join(os.path.dirname(rig.store.path), "serial-estop.json")) as f:
+        return json.load(f)
+
+
+def test_flag_kvm_stays_until_every_slot_resumed(tmp_path):
+    """全部急停带上键鼠: 只解一路不算解键鼠, 四路都解了才放."""
+    rig = Rig(tmp_path)
+    rig.store.run(lambda b, now: b.estop(None, "人", "human", now))
+    assert _flag(rig)["kvm"] is True
+    for n, left in ((1, True), (2, True), (3, True), (4, False)):
+        rig.store.run(lambda b, now: b.resume(n, "人", now))
+        assert _flag(rig)["kvm"] is left
+
+
+def test_flag_kvm_untouched_by_single_slot_estop(tmp_path):
+    rig = Rig(tmp_path)
+    rig.store.run(lambda b, now: b.estop(2, "人", "human", now))
+    rig.store.run(lambda b, now: b.resume(2, "人", now))
+    assert _flag(rig)["kvm"] is False
+
+
+def test_flag_kvm_when_slots_stopped_one_by_one(tmp_path):
+    """逐路停满四路也算全部, 和 PXE 的规则一致."""
+    rig = Rig(tmp_path)
+    for n in (1, 2, 3, 4):
+        rig.store.run(lambda b, now, n=n: b.estop(n, "人", "human", now))
+    assert _flag(rig)["kvm"] is True
+
+
+def test_flag_kvm_sticky_when_old_flag_unreadable(tmp_path):
+    """旧标记读不懂、还有槽位停着: 往停的方向算."""
+    rig = Rig(tmp_path)
+    rig.store.run(lambda b, now: b.estop(2, "人", "human", now))
+    with open(os.path.join(os.path.dirname(rig.store.path), "serial-estop.json"), "w") as f:
+        f.write("{bad")
+    rig.store.run(lambda b, now: None)
+    assert _flag(rig)["kvm"] is True

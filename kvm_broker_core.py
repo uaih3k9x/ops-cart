@@ -194,8 +194,9 @@ class Arbiter:
 
     ALL = "*"
 
-    def __init__(self, quiet_s=QUIET_S, wait_max_s=AGENT_WAIT_MAX_S, lease=None):
+    def __init__(self, quiet_s=QUIET_S, wait_max_s=AGENT_WAIT_MAX_S, lease=None, ext_stop=None):
         self.quiet_s, self.wait_max_s = quiet_s, wait_max_s
+        self.ext_stop = ext_stop or (lambda: False)     # 代理外面的急停 (串口全部急停), 不进 self.stopped, 外面解了就解了
         self.lease = lease or (lambda who, dev, now: True)
         self.prio, self.agent = {}, {}          # dev -> deque[Job]
         self.last_human = {}                    # dev -> 人最后一次有效输入的时刻
@@ -205,7 +206,7 @@ class Arbiter:
     # ---- 状态
 
     def is_stopped(self, dev):
-        return self.ALL in self.stopped or dev in self.stopped
+        return self.ALL in self.stopped or dev in self.stopped or self.ext_stop()
 
     def human_active(self, dev, now):
         t = self.last_human.get(dev)
@@ -270,13 +271,18 @@ class Arbiter:
                 q.remove(job)
 
     def expire(self, now):
-        """agent 干等太久的丢掉 -> 丢了哪些."""
+        """agent 干等太久的丢掉, 外面急停了排着的全丢 -> 丢了哪些. 发送线程每步前都来, 所以打字打一半也停得下."""
         out = []
-        for q in self.agent.values():
-            for j in list(q):
-                if now - j.t_last > self.wait_max_s:
-                    self.fail(j, "timeout")
-                    out.append(j)
+        queued = [j for q in self.agent.values() for j in q]
+        stopped = bool(queued) and self.ext_stop()
+        for j in queued:
+            if stopped:
+                self.fail(j, "estop")
+            elif now - j.t_last > self.wait_max_s:
+                self.fail(j, "timeout")
+            else:
+                continue
+            out.append(j)
         return out
 
     def wait_hint(self, dev, now):

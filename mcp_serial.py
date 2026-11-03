@@ -41,6 +41,7 @@ import time
 import atomicfile
 import cartlog
 import confirm_core as cc
+import kvm_broker
 import lamps_core
 import mcp_core as mc
 import serial_core
@@ -136,9 +137,11 @@ class Store:
     def _flag(self, book):
         """给 conbroker 的公开急停标记 (0644, 只有槽位号): 排队等人停手的那条, 写串口前它看这个丢掉."""
         stopped = [n for n in sw.SLOTS if book.stopped(n)]
-        doc = {"slots": stopped, "all": len(stopped) == len(sw.SLOTS)}
+        path = os.path.join(os.path.dirname(self.path), ESTOP_FLAG)
+        everything = len(stopped) == len(sw.SLOTS)      # 键鼠: 全部急停才带上, 四路都解了才放, 解一路不算
+        doc = {"slots": stopped, "all": everything, "kvm": everything or (bool(stopped) and kvm_broker.serial_all_stopped(path))}
         try:
-            atomicfile.write_text(os.path.join(os.path.dirname(self.path), ESTOP_FLAG), json.dumps(doc), mode=0o644)
+            atomicfile.write_text(path, json.dumps(doc), mode=0o644)
         except OSError:
             pass
 
@@ -389,7 +392,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "只看这个槽位, 不给 = 全部"}},
              pending_list, read_only=True),
         Tool("estop", "急停: 撤销写租约、丢弃挂起的命令, 之后谁都不能写这个槽位, 直到人在推车上解除. "
-             "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位, 同时作废在等确认的 PXE 解锁申请. "
+             "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位, 同时停键鼠、作废在等确认的 PXE 解锁申请. "
              "觉得自己要出错时就用它.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "槽位; 不给 = 全部"}},
              estop),
@@ -446,7 +449,7 @@ def human_action(store, op, arg, by, slots, send):
         return f"已拒绝 #{arg}"
     if op == "estop":
         dropped = store.run(lambda b, now: b.estop(arg, by, "human", now))
-        return f"已急停 {where}; 丢弃挂起 {[d['id'] for d in dropped]}; 没往设备发任何东西"
+        return f"已急停 {'全部槽位和键鼠' if arg is None else where}; 丢弃挂起 {[d['id'] for d in dropped]}; 没往设备发任何东西"
     if op == "resume":
         store.run(lambda b, now: b.resume(arg, by, now))
         return f"已解除 {where} 的急停; Agent 要重新申请租约"
