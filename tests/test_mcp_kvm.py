@@ -596,3 +596,32 @@ def test_lease_reacquire_resets_unknown(rig):
     rig.call("kvm_lease_release", lease=tok)
     tok = rig.lease()
     assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]
+
+
+# ---- #64 追加: 组合键超集也算, SysRq 是 alt+printscreen
+
+@pytest.mark.parametrize("keys", [["ctrl", "alt", "delete"], ["ctrl", "alt", "del"], ["CTRL", "Alt", "Del"],
+                                  ["ctrl", "shift", "alt", "del"], ["alt", "f4"], ["ctrl", "alt", "f4"],
+                                  ["shift", "alt", "f4"], ["alt", "printscreen"], ["alt", "printscreen", "b"],
+                                  ["ctrl", "alt", "printscreen", "o"]])
+def test_danger_combo_superset_matches(keys):
+    assert mk.danger_keys(keys)
+
+
+@pytest.mark.parametrize("keys", [["ctrl", "alt"], ["alt"], ["f4"], ["printscreen"], ["ctrl", "delete"],
+                                  ["alt", "f5"], ["ctrl", "c"]])
+def test_harmless_combos_not_danger(keys):
+    assert not mk.danger_keys(keys)
+
+
+def test_no_sysrq_entry_that_cannot_be_sent():
+    import ch9329
+    for combo in mk.DANGER_KEYS:
+        assert all(k in ch9329.MOD or k in ch9329.KEYS for k in combo), combo
+
+
+@pytest.mark.parametrize("keys", ["ctrl+shift+alt+del", "alt+printscreen+b"])
+def test_superset_combo_held(rig, keys):
+    tok = rig.lease()
+    err, r = rig.call("kvm_key", keys=keys, lease=tok)
+    assert r["status"] == "pending" and rig.sent == []

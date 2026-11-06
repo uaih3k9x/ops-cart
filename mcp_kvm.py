@@ -46,8 +46,9 @@ OCR_HINT = "OCR 读不出 (没信号、纯图形画面都这样; 退回 Tesserac
 # 串口闸门的词表之外, 操作系统上常见的清盘 / 引导命令 (子串匹配: mkfs.ext4、Format-Volume 都算)
 DANGER_SUB = ("diskpart", "bcdedit", "mkfs", "wipefs", "fdisk", "sgdisk", "parted", "shred", "dd if=", "cipher /w",
               "format-volume", "clear-disk", "remove-item", "reg delete")
+# 高危组合键: 按下的键里包含其中一组就算 (多带 shift 等也算). SysRq 在 HID 上就是 alt+printscreen (+字母, Linux 魔术键).
 DANGER_KEYS = {frozenset(k) for k in (("ctrl", "alt", "delete"), ("ctrl", "alt", "del"), ("alt", "f4"),
-                                      ("alt", "sysrq"))}
+                                      ("alt", "printscreen"))}
 
 
 def danger_of(text):
@@ -57,7 +58,8 @@ def danger_of(text):
 
 
 def danger_keys(keys):
-    return frozenset(k.lower() for k in keys) in DANGER_KEYS
+    pressed = {k.lower() for k in keys}
+    return any(combo <= pressed for combo in DANGER_KEYS)
 
 
 # ---- 行缓冲 (#64): 推车对"当前这一行"知道多少
