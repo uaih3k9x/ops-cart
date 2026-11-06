@@ -205,6 +205,13 @@ sudo bluetoothctl
 属性（读不到才退回路径里的地址）：secure-write 记录、通知闸门、去重来源、审计里的 `dev=` 都是它。理由：`Address`
 在配对后和 bluetoothd 重启前后都不变，路径会变（用路径当去重来源，bluetoothd 重启后手机重发会重复投递）。
 
+## 已知限制
+
+- **通知闸门不是原子的**：推车先查设备列表（谁连着、谁受信、谁最近 secure-write 过）再交给 BlueZ 发通知，BlueZ 实际
+  分发时按当时各设备的 CCC 发。这两步之间、以及同地址断开重连的 `PropertiesChanged` 信号还在 D-Bus 上排队时，有毫秒级
+  窗口，期间新连上的设备可能收到这一条通知。BlueZ 的 D-Bus 接口没法"检查并发送"一步完成，这是残余风险；能收到的只是
+  回执（序号 + CRC）或大肥鱼回复摘要，不涉及能动手的操作。
+
 ## 单元
 
 `cart-ble-input.service`：root（BlueZ 的 D-Bus 策略只让 root 注册 GATT 服务），没有能力、没有网络（只用 D-Bus 的
