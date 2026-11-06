@@ -13,7 +13,7 @@ import android.os.IBinder
 
 /**
  * 前台服务: 切到后台、锁屏也保持和推车的连接. 界面经 [link] / [listener] 拿连接和消息;
- * 最近的消息留在 [lines], 界面重开时补上.
+ * 最近的消息留在 [lines], 界面重开时补上; 等用户确认的推车在 link.core.pending.
  */
 class LinkService : Service() {
     companion object {
@@ -30,8 +30,7 @@ class LinkService : Service() {
         val lines = ArrayList<String>()
 
         fun start(ctx: Context) {
-            val i = Intent(ctx, LinkService::class.java)
-            ctx.startForegroundService(i)
+            ctx.startForegroundService(Intent(ctx, LinkService::class.java))
         }
     }
 
@@ -46,6 +45,11 @@ class LinkService : Service() {
             lines += text
             if (lines.size > KEEP_LINES) lines.removeAt(0)
             listener?.onLine(text)
+        }
+
+        override fun onConfirm(name: String?, addr: String) {
+            notifyState("找到推车, 打开 App 确认是不是这台")
+            listener?.onConfirm(name, addr)
         }
     }
 

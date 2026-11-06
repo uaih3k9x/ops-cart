@@ -6,7 +6,7 @@ import java.nio.charset.CodingErrorAction
 import java.util.zip.CRC32
 
 /**
- * 推车 BLE 输入协议的分包编解码 (#52), 和推车侧 ble_input_core.py 同一套规矩, 见 docs/BLE_INPUT.md.
+ * 推车 BLE 输入协议 v2 的分包编解码 (#52), 和推车侧 ble_input_core.py 同一套规矩, 见 docs/BLE_INPUT.md.
  * 纯逻辑, 不碰安卓 API, 本地单元测试直接跑.
  *
  * START: 01 | 序号 u16 | 总长 u16 | CRC32 u32 | 正文开头
@@ -18,6 +18,7 @@ object FrameCodec {
     const val START_HDR = 9
     const val CONT_HDR = 5
     const val ATT_OVERHEAD = 3
+    const val ATT_MAX_ATTR = 512      // ATT 属性值最多 512 字节: 单帧 = min(MTU-3, 512)
     const val MAX_LEN = 4096
 
     const val SERVICE_UUID = "c7fa50cf-d4f6-4e23-a71d-7b725c250660"
@@ -29,7 +30,7 @@ object FrameCodec {
     fun encode(msgId: Int, payload: ByteArray, mtu: Int): List<ByteArray> {
         require(msgId in 0..0xFFFF) { "序号是 16 位" }
         require(payload.isNotEmpty() && payload.size <= MAX_LEN) { "消息长度要在 1..$MAX_LEN 字节" }
-        val room = mtu - ATT_OVERHEAD
+        val room = minOf(mtu - ATT_OVERHEAD, ATT_MAX_ATTR)
         require(room - START_HDR >= 1) { "MTU $mtu 太小" }
         val first = minOf(room - START_HDR, payload.size)
         val out = ArrayList<ByteArray>()
@@ -47,16 +48,25 @@ object FrameCodec {
         return out
     }
 
-    /** 正文有问题返回错误码 (ctrl / empty), 没问题 null. 只收可见字符加换行 / 制表. */
+    private val BAD_TYPES = setOf(
+        Character.CONTROL, Character.FORMAT, Character.SURROGATE, Character.UNASSIGNED,
+        Character.PRIVATE_USE, Character.LINE_SEPARATOR, Character.PARAGRAPH_SEPARATOR,
+    ).map { it.toInt() }.toSet()
+    private val INVISIBLE = setOf(0x115F, 0x1160, 0x3164, 0xFFA0)    // 韩文填充字: 字母类但看不见
+    private const val ZWJ = 0x200D
+
+    /**
+     * 正文有问题返回错误码 (ctrl / empty), 没问题 null. 和推车一样: 拒控制字符 (换行 / 制表除外)、格式字符 Cf
+     * (只放行 ZWJ)、标签字符 U+E0000..E007F、Zl / Zp、未分配、私用区、代理、看不见的填充字.
+     */
     fun textProblem(text: String): String? {
         if (text.isEmpty()) return "empty"
         var i = 0
         while (i < text.length) {
             val cp = text.codePointAt(i)
-            val bidi = cp in 0x202A..0x202E || cp in 0x2066..0x2069
-            val ctrl = Character.getType(cp) == Character.CONTROL.toInt() && cp != '\n'.code && cp != '\t'.code
-            if (bidi || ctrl) return "ctrl"
             i += Character.charCount(cp)
+            if (cp == '\n'.code || cp == '\t'.code || cp == ZWJ) continue
+            if (Character.getType(cp) in BAD_TYPES || cp in 0xE0000..0xE007F || cp in INVISIBLE) return "ctrl"
         }
         return null
     }
@@ -77,7 +87,7 @@ object FrameCodec {
 class Reassembler {
     sealed class Event {
         data class Text(val id: Int, val text: String) : Event()
-        data class Dup(val id: Int) : Event()
+        data class Dup(val id: Int) : Event()   // 去重键 (序号, 总长, CRC), 同序号不同内容当新消息
         data class Error(val id: Int?, val code: String) : Event()
     }
 
@@ -94,7 +104,9 @@ class Reassembler {
     }
 
     private val partial = LinkedHashMap<Int, Partial>()
-    private val done = LinkedHashMap<Int, Long>()
+    private data class Key(val id: Int, val total: Int, val crc: Long)
+
+    private val done = LinkedHashMap<Key, Long>()
 
     fun expire(now: Long): List<Event> {
         val out = ArrayList<Event>()
@@ -115,9 +127,9 @@ class Reassembler {
         val off: Int
         val chunk: ByteArray
         if (isStart) {
-            if (id in done) return out + Event.Dup(id)
-            partial.remove(id)
             val total = FrameCodec.u16(frame, 3)
+            if (Key(id, total, FrameCodec.u32(frame, 5)) in done) return out + Event.Dup(id)
+            partial.remove(id)
             chunk = frame.copyOfRange(FrameCodec.START_HDR, frame.size)
             if (total == 0 || total > FrameCodec.MAX_LEN || chunk.size > total) return out + Event.Error(id, "len")
             while (partial.size >= MAX_PARTIAL) {
@@ -128,7 +140,7 @@ class Reassembler {
             p = Partial(total, FrameCodec.u32(frame, 5), now).also { partial[id] = it }
             off = 0
         } else {
-            p = partial[id] ?: return if (id in done) out else out + Event.Error(id, "nostart")
+            p = partial[id] ?: return if (done.keys.any { it.id == id }) out else out + Event.Error(id, "nostart")
             off = FrameCodec.u16(frame, 3)
             chunk = frame.copyOfRange(FrameCodec.CONT_HDR, frame.size)
         }
@@ -154,29 +166,31 @@ class Reassembler {
         if (FrameCodec.crc32(data) != p.crc) return out + Event.Error(id, "crc")
         val text = FrameCodec.decodeUtf8(data) ?: return out + Event.Error(id, "utf8")
         FrameCodec.textProblem(text)?.let { return out + Event.Error(id, it) }
-        done[id] = now
+        done[Key(id, p.total, p.crc)] = now
         while (done.size > DEDUP_KEEP) done.remove(done.keys.first())
         return out + Event.Text(id, text)
     }
 }
 
-/** 推车 notify 回来的 JSON. */
+/** 推车 notify 回来的 JSON. crc 是被确认消息 START 里的 CRC32: 通知是广播, 只认和自己发件箱对得上的. */
 sealed class Status {
-    data class Ack(val id: Int, val dup: Boolean) : Status()
-    data class Err(val id: Int?, val code: String) : Status()
+    data class Ack(val id: Int, val crc: Long?, val dup: Boolean) : Status()
+    data class Err(val id: Int?, val crc: Long?, val code: String) : Status()
     data class Reply(val text: String) : Status()
 
     companion object {
         fun parse(s: String): Status? = try {
             val o = org.json.JSONObject(s)
             when (o.optString("t")) {
-                "ack" -> Ack(o.getInt("id"), o.optBoolean("dup", false))
-                "err" -> Err(if (o.isNull("id")) null else o.getInt("id"), o.getString("code"))
+                "ack" -> Ack(o.getInt("id"), crcOf(o), o.optBoolean("dup", false))
+                "err" -> Err(if (o.isNull("id")) null else o.getInt("id"), crcOf(o), o.getString("code"))
                 "reply" -> Reply(o.getString("text"))
                 else -> null
             }
         } catch (e: org.json.JSONException) {
             null
         }
+
+        private fun crcOf(o: org.json.JSONObject): Long? = if (o.has("crc") && !o.isNull("crc")) o.getLong("crc") else null
     }
 }

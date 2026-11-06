@@ -8,7 +8,7 @@
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" tools:targetApi="s" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <!-- Android 11 及以下 -->
+    <!-- Android 11 及以下: 8–9 只申请粗略定位, 10–11 扫 BLE 要精确定位 -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="30" />
@@ -25,8 +25,11 @@
         </intent>
     </queries>
 
+    <!-- 12 以下 allowBackup=false 就关掉了所有备份; 12+ 另用 dataExtractionRules 挡住换机迁移 -->
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        tools:ignore="DataExtractionRules"
         android:icon="@android:drawable/stat_sys_data_bluetooth"
         android:label="@string/app_name"
         android:supportsRtl="true"

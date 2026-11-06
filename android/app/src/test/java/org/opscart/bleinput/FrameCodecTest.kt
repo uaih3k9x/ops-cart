@@ -112,11 +112,66 @@ class FrameCodecTest {
 
     @Test
     fun statusParsing() {
-        assertEquals(Status.Ack(5, false), Status.parse("""{"t":"ack","id":5}"""))
-        assertEquals(Status.Ack(5, true), Status.parse("""{"t":"ack","id":5,"dup":true}"""))
-        assertEquals(Status.Err(5, "crc"), Status.parse("""{"t":"err","id":5,"code":"crc"}"""))
-        assertEquals(Status.Err(null, "frame"), Status.parse("""{"t":"err","id":null,"code":"frame"}"""))
+        assertEquals(Status.Ack(5, 0xDEADBEEFL, false), Status.parse("""{"t":"ack","id":5,"crc":3735928559}"""))
+        assertEquals(Status.Ack(5, 7L, true), Status.parse("""{"t":"ack","id":5,"crc":7,"dup":true}"""))
+        assertEquals(Status.Err(5, 9L, "crc"), Status.parse("""{"t":"err","id":5,"crc":9,"code":"crc"}"""))
+        assertEquals(Status.Err(null, null, "frame"), Status.parse("""{"t":"err","id":null,"crc":null,"code":"frame"}"""))
         assertEquals(Status.Reply("好的"), Status.parse("""{"t":"reply","text":"好的"}"""))
         assertEquals(null, Status.parse("not json"))
+    }
+
+    // ------------------------------------------------------------ 审查意见 (#63, 协议 v2)
+
+    @Test
+    fun frameNeverExceedsAttMax() {
+        val frames = FrameCodec.encode(1, ByteArray(FrameCodec.MAX_LEN) { 'x'.code.toByte() }, 517)
+        assertEquals(512, frames.maxOf { it.size })
+        assertEquals(FrameCodec.MAX_LEN, (feedAll(Reassembler(), frames).single() as Reassembler.Event.Text).text.length)
+    }
+
+    @Test
+    fun sameIdDifferentContentIsNew() {
+        val rx = Reassembler()
+        feedAll(rx, FrameCodec.encode(0, "first".toByteArray(), 185))
+        assertEquals(listOf<Reassembler.Event>(Reassembler.Event.Text(0, "DIFFERENT")),
+            feedAll(rx, FrameCodec.encode(0, "DIFFERENT".toByteArray(), 185)))
+    }
+
+    @Test
+    fun sharedTextVectors() {
+        val v = vectors()
+        assertTrue(v.getString("protocol").startsWith("ops-cart BLE input v2"))
+        val rj = v.getJSONArray("text_rejects")
+        assertTrue(rj.length() >= 8)
+        for (i in 0 until rj.length()) {
+            val r = rj.getJSONObject(i)
+            val text = String(unhex(r.getString("utf8_hex")), Charsets.UTF_8)
+            assertEquals(r.getString("name"), r.getString("code"), FrameCodec.textProblem(text))
+        }
+        val ok = v.getJSONArray("text_accepts")
+        for (i in 0 until ok.length()) {
+            val r = ok.getJSONObject(i)
+            assertEquals(r.getString("name"), null, FrameCodec.textProblem(String(unhex(r.getString("utf8_hex")), Charsets.UTF_8)))
+        }
+    }
+
+    @Test
+    fun sharedStatusVectors() {
+        val st = vectors().getJSONArray("status")
+        for (i in 0 until st.length()) {
+            val v = st.getJSONObject(i)
+            val crc = if (v.isNull("crc")) null else v.getLong("crc")
+            val want = when (v.getString("kind")) {
+                "text" -> Status.Ack(v.getInt("id"), crc, false)
+                "dup" -> Status.Ack(v.getInt("id"), crc, true)
+                else -> Status.Err(v.getInt("id"), crc, v.getString("code"))
+            }
+            assertEquals(v.getString("name"), want, Status.parse(v.getString("json")))
+        }
+    }
+
+    @Test
+    fun crcOfMatchesCart() {
+        assertEquals(0xd8932aacL, FrameCodec.crc32("hi".toByteArray()))
     }
 }
