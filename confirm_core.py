@@ -11,6 +11,7 @@
 """
 
 import json
+import re
 
 import lamps_core as lc
 import serial_write_core as sw
@@ -134,19 +135,27 @@ def _entry(e):
     return f"  #{e['id']} 「{cmd}」{by}{mark}"
 
 
+# 进入对象 / 子视图的命令 (各厂商合集, 小写比首词; int 是 interface 的常用缩写). 只用来单独标出"最近进的是哪个对象".
+ENTER_VIEW = re.compile(r"(?i)^\s*(?:interface|int|vlan|router|line|vrf|policy-map|class-map|route-map|controller"
+                        r"|user-interface|aaa|bgp|ospf|ospfv3|isis|rip|acl|port-group|ip\s+vpn-instance|cd)\b")
+LOST_WARN = ("  ！！更早的可能改变视图 / 对象的记录已被挤掉，无法确认作用对象 —— 建议拒绝，"
+             "让 Agent 重新进入目标视图后再提交")
+
+
 def _trusted(slot_view):
-    """推车自己记的本槽位实际发出的命令 (#65): 可信, 和设备输出分开显示; 没有记录也明说."""
+    """推车自己记的本槽位实际发出的命令 (#65): 可信, 和设备输出分开显示; 没有记录也明说.
+    留着的可能改视图的命令全显示 (最多 CHANGE_KEEP 条), 另单独标出最近一条进入对象 / 视图的命令 (第五轮)."""
     tr = slot_view.get("trusted") or {}
     changes, recent = tr.get("changes") or [], tr.get("recent") or []
     head = "可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）："
     lost = "  （更早的记录已被挤掉，无法确认作用对象）"
     if not changes and not recent:
-        return head + ("\n" + lost if tr.get("lost") else "无记录")
+        return head + ("\n" + lost + "\n" + LOST_WARN if tr.get("lost") else "无记录")
     rows = [head]
     if tr.get("lost"):
-        rows.append(lost)
-    if tr.get("more"):
-        rows.append(f"  更早还有 {tr['more']} 条可能改变视图 / 对象的命令（没显示）")
+        rows += [lost, LOST_WARN]
+    view = next((e for e in reversed(changes) if e.get("kind") == "line" and ENTER_VIEW.match(str(e.get("cmd", "")))), None)
+    rows.append("  最近一条进入对象 / 视图的命令：" + (_entry(view).strip().split(" ", 1)[1] if view else "没有记录"))
     rows += [_entry(e) for e in changes] if changes else \
         ([] if tr.get("lost") else ["  （无可能改变视图 / 对象的命令记录）"])
     if tr.get("after"):

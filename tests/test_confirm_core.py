@@ -321,14 +321,15 @@ def test_lost_records_say_so_instead_of_no_record():
     assert "更早的记录已被挤掉，无法确认作用对象" in t and "无记录" not in t
 
 
-def test_more_than_five_changes_says_how_many_earlier():
+def test_more_than_five_changes_all_shown():
+    """第五轮: 留着的改视图命令 (最多 CHANGE_KEEP 条) 全显示, 不再只显示 5 条 + "更早还有 N 条"."""
     b = _book()
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
     for i in range(sw.RECENT_MAX + 3):
         _sent(b, tok, f"conf{i}")
     b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
     t = cc.card(b.view(T0), 1)["trusted"]
-    assert "更早还有 3 条" in t and "「conf0」" not in t and f"「conf{sw.RECENT_MAX + 2}」" in t
+    assert all(f"「conf{i}」" in t for i in range(sw.RECENT_MAX + 3)) and "更早还有" not in t
 
 
 @pytest.mark.parametrize("gate,note", [(_gate("huawei", True), False), (_gate("huawei", False), True),
@@ -338,3 +339,43 @@ def test_prompt_note_omitted_only_for_registered_huawei(gate, note):
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
     b.submit(1, tok, "stdio:ops@x", "line", "shutdown", gate, T0, 30, context="<SW1>")
     assert ("提示符不能证明作用对象" in cc.card(b.view(T0), 1)["items"][0]["note"]) is note
+
+
+# ------------------------------------------------------------ #68 第五轮
+
+def test_all_retained_changes_shown_oldest_visible():
+    """interface Gi0/2 之后 5 条模型放行的 do sh run: 最早那条 interface 仍要看得见."""
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    _sent(b, tok, "interface Gi0/2")
+    for _ in range(5):
+        _sent(b, tok, "do sh run int Gi0/1")
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="SW1(config-if)#")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert t.count("「do sh run int Gi0/1」") == 5 and "「interface Gi0/2」" in t
+    assert "最近一条进入对象 / 视图的命令：「interface Gi0/2」" in t
+    assert "建议拒绝" not in t
+
+
+@pytest.mark.parametrize("cmd,view", [("int g0/1", True), ("vlan 10", True), ("router ospf 1", True),
+                                      ("line vty 0 4", True), ("user-interface vty 0 4", True),
+                                      ("do sh run int Gi0/1", False), ("description x", False), ("shutdown", False)])
+def test_enter_view_detection(cmd, view):
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    _sent(b, tok, cmd)
+    _sent(b, tok, "description later")
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="SW1#")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert (f"最近一条进入对象 / 视图的命令：「{cmd}」" in t) is view
+
+
+def test_lost_records_warn_to_reject():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    for i in range(sw.CHANGE_KEEP + 1):
+        _sent(b, tok, f"conf{i}")
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert "建议拒绝" in t and t.count("「conf") == sw.CHANGE_KEEP
+    assert "最近一条进入对象" in t and "没有记录" in t.split("最近一条进入对象", 1)[1]

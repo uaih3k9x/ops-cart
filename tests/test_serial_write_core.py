@@ -1157,7 +1157,7 @@ def test_trusted_log_capped_per_slot():
     assert len(doc["slots"]["1"]["log"]) == sw.CHANGE_KEEP           # 第四轮: 改视图的最多留 CHANGE_KEEP 条
     assert doc["slots"]["1"]["log_lost"] is True
     tr = b.view(T0)["slots"][0]["trusted"]
-    assert len(tr["changes"]) == sw.RECENT_MAX and tr["changes"][-1]["cmd"] == f"conf{sw.TRUST_LOG_MAX + 4}"
+    assert len(tr["changes"]) == sw.CHANGE_KEEP and tr["changes"][-1]["cmd"] == f"conf{sw.TRUST_LOG_MAX + 4}"
 
 
 def test_trusted_log_includes_human_confirmed_and_status():
@@ -1249,7 +1249,7 @@ def test_change_entries_capped_and_loss_flagged():
     log = json.loads(b.dumps())["slots"]["1"]["log"]
     assert [e["cmd"] for e in log] == [f"conf{i}" for i in range(3, sw.CHANGE_KEEP + 3)]
     tr = b.view(T0)["slots"][0]["trusted"]
-    assert tr["lost"] is True and tr["more"] == sw.CHANGE_KEEP - sw.RECENT_MAX
+    assert tr["lost"] is True and len(tr["changes"]) == sw.CHANGE_KEEP            # 第五轮: 留着的全给
     assert [x["cmd"] for x in tr["changes"]][-1] == f"conf{sw.CHANGE_KEEP + 2}"
 
 
@@ -1313,3 +1313,28 @@ def test_wrapped_cipher_like_line_masked(line):
                                   "https://example.com/doc", "abcdefghijklmnopqrstu"])
 def test_ordinary_unspaced_lines_not_masked(line):
     assert sw.device_context(line)["lines"] == [line]
+
+
+# ------------------------------------------------------------ #68 第五轮
+
+@pytest.mark.parametrize("line,secret", [
+    ("PrivateKey = AAAAhunter2", "AAAAhunter2"), ('"privateKey": "S3cr3tVal"', "S3cr3tVal"),
+    ("secretKey: S3cr3tVal", "S3cr3tVal"), ("accessKey=AKIAEXAMPLE1", "AKIAEXAMPLE1"),
+    ("preshared_key = S3cr3tVal", "S3cr3tVal"), ("DB_PASS=Hunter2", "Hunter2"), ("PASS=Hunter2", "Hunter2"),
+    ("sshpass -p hunter2 ssh root@h", "hunter2"), ("mysql -u root -p Hunter2x", "Hunter2x"),
+    ("CREATE USER 'a'@'%' IDENTIFIED BY 'Hunter2';", "Hunter2"), ("alter user x identified by Hunter2", "Hunter2"),
+])
+def test_round5_secret_forms_masked(line, secret):
+    blob = "\n".join(sw.device_context(line)["lines"])
+    assert secret not in blob, blob
+
+
+@pytest.mark.parametrize("line", ["mkdir -p /tmp/x", "ssh -p 22 host", "3 passed, 0 failed", "passive-interface Gi0/1",
+                                  "compass heading", "keyboard-layout us"])
+def test_round5_plain_lines_not_masked(line):
+    assert sw.device_context(line)["lines"] == [line]
+
+
+def test_prompt_with_secret_assignment_not_exempt():
+    blob = "\n".join(sw.device_context("admin@db:/srv/token=Hunter2$")["lines"])
+    assert "Hunter2" not in blob

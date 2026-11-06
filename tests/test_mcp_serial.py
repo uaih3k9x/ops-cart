@@ -764,3 +764,13 @@ def test_cli_confirm_prefixes_device_output(rig):
     head, after = text.split("输入 yes", 1)
     assert "    | fake: ok" in head and "    | SW1(config-if)#" in head
     assert "| 已确认: 全部完成" in after and "\n已确认" not in after
+
+
+def test_cli_confirm_prints_trusted_change_before_yes(rig):
+    rig.model()
+    tok = rig.lease(1)
+    assert rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok}).get("sent") is not False
+    rig.model(on=False)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
+    assert "「system-view」" in text.split("输入 yes")[0]

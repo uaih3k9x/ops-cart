@@ -45,7 +45,7 @@ LEASE_TTL_MAX_S = 300
 PENDING_MAX = 5             # 一个槽位最多挂几条等人确认
 PENDING_MAX_S = 900         # 挂起超过 15 分钟没人理就作废 (现场早变了)
 INFLIGHT_GRACE_S = 90       # 在途标记超过 发送超时 + 这么久还没回来 = 发送进程死了
-RECENT_MAX = 5              # 审批界面"可信记录": 本槽位最近几条可能改变视图的命令
+RECENT_MAX = 5              # 审批界面"可信记录": 最后一条改视图命令之后的只读命令 / 按键显示几条
 HISTORY_MAX = 30            # 状态文件里留最近多少条结果给 pending_list 看 (完整的在执行绪日志里)
 ECHO_MAX = 1000             # 日志里设备回显摘要的长度
 HASH_LINES = 8              # 指纹取最后几行有效行 (调用方 tail 多读, 给标记行和空行留余量)
@@ -317,11 +317,14 @@ def echo_summary(text):
 
 # 口令类字段 (只管显示; 比对用没打码的原文). 短词前后都不能是字母数字 (下划线、连字符算断开: pre_shared_key);
 # 长词只要后边界, 前面可以接字母 (PGPASSWORD= / htpasswd / GITHUB_TOKEN= / psksecret). 打码从词后面开始.
-_SECRET_SHORT = re.compile(r"(?i)(?<![a-z0-9])(?P<k>key|md5|auth|priv|psk|community|cipher)(?![a-z0-9])")
-_SECRET_LONG = re.compile(r"(?i)(?P<k>passw(?:or)?d|passphrase|pwd|secret|token|bearer|api[-_]?key"
+_SECRET_SHORT = re.compile(r"(?i)(?<![a-z0-9])(?P<k>key|md5|auth|priv|psk|community|cipher|pass)(?![a-z0-9])")
+_SECRET_LONG = re.compile(r"(?i)(?P<k>(?:private|pre-?shared|secret|access)[-_]?key|passw(?:or)?d|passphrase|pwd|secret"
+                          r"|token|bearer|api[-_]?key"
                           r"|authentication-mode)(?![a-z0-9])")
 _SECRET_DASH = re.compile(r"(?<!\S)(?P<k>-p)(?=\S)|(?<!\S)(?P<u>(?:-u|--user)[\s=]+)(?=\S+:\S)")   # mysql -pX / curl -u a:b
 _SECRET_URL = re.compile(r"(?P<k>)[\w.%+-]+:[^\s@/]+@")                                        # https://user:pass@
+_SECRET_SPACED = re.compile(r"(?i)(?<![\w-])(?:sshpass|mysql\w*|mariadb\w*)\b(?:.*?\s)?(?P<k>-p\s+)(?=\S)"   # sshpass -p x
+                            r"|(?P<u>identified\s+by\s+)(?=\S)")                               # IDENTIFIED BY 'x' 
 _SECRET_WHOLE = re.compile(r"(?i)chpasswd|^\s*[\w.-]+:\$[0-9a-z]{1,3}\$")                       # chpasswd / shadow 行
 _SECRET_CONT = re.compile(r"\s*(?:%\^%#|%\$%\^|\$[0-9a-z]{1,3}\$)")                             # 折行后的密文续行
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?")
@@ -397,7 +400,7 @@ def _ctx_line(ln, in_key=False, vendor=None):
     if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest) or _cipher_like(rest):
         return _show(head) + MASK, in_key
     cut = None
-    for rx in (_SECRET_SHORT, _SECRET_LONG, _SECRET_DASH, _SECRET_URL):
+    for rx in (_SECRET_SHORT, _SECRET_LONG, _SECRET_DASH, _SECRET_URL, _SECRET_SPACED):
         for hit in rx.finditer(rest):
             grp = "k" if hit.group("k") is not None else "u"
             keep = hit.end(grp)
@@ -855,15 +858,16 @@ class Book:
 
     def _trusted(self, slot):
         """可信信息 (#65): 推车自己记的这个槽位实际交给 conbroker 的命令 (Agent 直发和人确认的都算; 人在车机 /
-        网页直接敲的键不在这里). changes = 最近 RECENT_MAX 条可能改变视图 / 对象的 (不是第 1 层只读放行的);
+        网页直接敲的键不在这里). changes = 留着的全部可能改变视图 / 对象的 (不是第 1 层只读放行的, 最多 CHANGE_KEEP 条,
+        第五轮起全给, 不再只给最近 5 条);
         after = 最后一条 changes 之后又发了几条只读命令 / 按键, recent = 这几条里最近的 RECENT_MAX 条;
-        more = 记录里还留着、但没显示的更早的改视图条数; lost = 改视图的记录被裁掉过 (更早的看不到了)."""
+        lost = 改视图的记录被裁掉过 (更早的看不到了)."""
         log = self._s(slot).get("log", [])
         pub = [{k: e[k] for k in ("id", "kind", "cmd", "status", "who", "by", "t", "count") if k in e} for e in log]
         idx = [i for i, e in enumerate(log) if not e["ro"]]
         tail = pub[idx[-1] + 1:] if idx else pub
-        return {"changes": [pub[i] for i in idx][-RECENT_MAX:], "more": max(0, len(idx) - RECENT_MAX),
-                "lost": bool(self._s(slot).get("log_lost")), "after": len(tail), "recent": tail[-RECENT_MAX:]}
+        return {"changes": [pub[i] for i in idx], "lost": bool(self._s(slot).get("log_lost")),
+                "after": len(tail), "recent": tail[-RECENT_MAX:]}
 
     def view(self, now, slot=None):
         self.tick(now)
