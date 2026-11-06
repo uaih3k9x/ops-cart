@@ -133,8 +133,8 @@ def load_rules(path=RULES_PATH):
     """规则文件 -> {slots: {槽位: 厂商}, auto_huawei, vendors: {厂商: {extra_verbs, model, notes}},
     danger: [...], model: {enabled, timeout_s, budget_usd, context_chars, model}}.
 
-    只能收紧或加只读动词: 只读动词只能加给内置有只读规则的厂商 (survey_core: huawei / cisco); 锐捷 / Linux
-    没有第 1 层白名单, 登记了槽位只走第 2 层或人确认; 高危词只加不减. vendors.<厂商>.model=false 关掉该厂商的
+    只能收紧或加只读动词: 只读动词只能加给内置有只读规则的厂商 (survey_core: huawei / h3c / cisco / ruijie);
+    Linux 没有第 1 层白名单, 登记了槽位只走第 2 层或人确认; 高危词只加不减. vendors.<厂商>.model=false 关掉该厂商的
     第 2 层, notes 是给模型的补充说明. 文件不在 / 坏了 = 内置默认 (没有额外动词, 槽位不登记, 华为提示符自动认,
     模型不开)."""
     vendors = sorted(_PROMPT)

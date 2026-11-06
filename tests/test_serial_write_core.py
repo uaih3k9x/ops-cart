@@ -668,3 +668,43 @@ def test_events_have_timestamps_and_slot():
     b.acquire(2, "agentA", T0, token="tokA")
     e = b.events[0]
     assert e["slot"] == 2 and e["t"].startswith("20") and e["src"] == "agent"
+
+
+def test_ruijie_gets_layer1_whitelist_from_survey_rules():
+    """#56: survey_core 给锐捷加了只读规则, 登记成锐捷的槽位 show 命令第 1 层放行; 写命令照旧要人确认."""
+    assert sw.classify("show version", "ruijie", True, RULES)["verdict"] == "pass"
+    assert sw.classify("terminal length 0", "ruijie", True, RULES)["verdict"] == "pass"
+    for cmd in ("configure terminal", "write memory", "reload", "terminal length 0 ; reload"):
+        assert sw.classify(cmd, "ruijie", True, RULES)["verdict"] == "confirm", cmd
+
+
+
+@pytest.mark.parametrize("vendor,ok,bad", [
+    ("huawei", "screen-length 0 temporary", ["screen-length 0", "screen-length 0 temporary ; save",
+                                              "screen-length  0 temporary", "Screen-length 0 temporary"]),
+    ("cisco", "terminal length 0", ["terminal length 0 x", "terminal length 24", "TERMINAL length 0",
+                                    "terminal monitor"]),
+])
+def test_paging_layer1_exact_only(vendor, ok, bad):
+    assert sw.classify(ok, vendor, True, RULES)["verdict"] == "pass"
+    for cmd in bad:
+        assert sw.classify(cmd, vendor, True, RULES)["verdict"] == "confirm", cmd
+
+
+def test_ruijie_extra_verbs_take_effect(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"vendors": {"ruijie": {"extra_verbs": ["ping"]}}}))
+    r = sw.load_rules(str(p))
+    assert r["vendors"]["ruijie"]["extra_verbs"] == ["ping"]
+    assert sw.classify("ping 192.0.2.1", "ruijie", True, r)["verdict"] == "pass"
+    assert sw.classify("ping 192.0.2.1", "ruijie", True, RULES)["verdict"] == "confirm"
+
+
+
+@pytest.mark.parametrize("vendor,cmd", [
+    ("cisco", "show tech-support"), ("cisco", "show tech"), ("ruijie", "show tech-support"),
+    ("cisco", "show ?"), ("ruijie", "show ?"), ("cisco", "show run ?"),
+    ("huawei", 'display "diagnostic-information" flash:/a.txt'), ("huawei", "display ?"),
+])
+def test_gate_confirms_tech_support_question_and_quotes(vendor, cmd):
+    assert sw.classify(cmd, vendor, True, RULES)["verdict"] == "confirm"
