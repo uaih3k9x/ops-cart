@@ -347,8 +347,8 @@ def test_events_carry_crc_for_receipts():
     assert ev.crc == bc.crc32(data)
     (dup,) = _feed_all(rx, bc.encode(4, data, 23))
     assert dup.kind == "dup" and dup.crc == bc.crc32(data)
-    (u,) = rx.feed(DEV, bc.encode(5, data, 23)[0], T0, False)          # 未配对也带上 START 里的 CRC
-    assert (u.code, u.msg_id, u.crc) == ("unpaired", 5, bc.crc32(data))
+    (u,) = rx.feed(DEV, bc.encode(5, data, 23)[0], T0, False)
+    assert (u.code, u.msg_id, u.crc) == ("unpaired", 5, None)           # 不带 crc: 广播出去会成指纹
     (n,) = rx.feed(DEV, bytes([2, 0, 6, 0, 1]) + b"x", T0, True)
     assert (n.code, n.crc) == ("nostart", None)
     rx.feed(DEV, bc.encode(7, b"y" * 50, 23)[0], T0, True)

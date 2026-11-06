@@ -58,9 +58,9 @@ def addr_of(props, path):
 
 
 def device_changed(handler, iface, changed, path, lookup):
-    """org.bluez.Device1 的 PropertiesChanged: Connected 变 false 立刻删掉它的 secure-write 记录 (同地址冒充者
-    重连时不能沿用). lookup(path) -> Device1 属性 (读不到 None)."""
-    if iface != "org.bluez.Device1" or "Connected" not in changed or bool(changed["Connected"]):
+    """org.bluez.Device1 的 PropertiesChanged: Connected 一变 (true 或 false) 就删掉它的 secure-write 记录 (同地址
+    冒充者重连时不能沿用; BlueZ 可能把断开 + 重连合并成一次 Connected=true). lookup(path) -> Device1 属性."""
+    if iface != "org.bluez.Device1" or "Connected" not in changed:
         return
     try:
         props = lookup(path)
@@ -165,6 +165,12 @@ class Handler:
             del self.recent[a]
         return devs
 
+    def _only_writer(self, src):
+        """连着的设备只有写入方自己 (通知是广播, 别人也会收到)."""
+        devs = self._prune()
+        on = {str(d.get("Address") or "").upper() for d in devs or () if d.get("Connected") is True}
+        return bool(src) and on == {str(src).upper()}
+
     def _all_trusted(self, now):
         """通知是广播: 连着的设备全受信、且本次连接内最近 FRESH_S 秒 secure-write 过, 才发回执 (带 crc,
         短文本可被反推) 和回复. 断开的设备清掉记录, 同地址再连上要重新写过才算."""
@@ -190,13 +196,16 @@ class Handler:
                     self.rx.forget(ev)
                     ev = bc.Event("err", ev.src, ev.msg_id, size=ev.size, code="full", crc=ev.crc)
                 self._save_dedup()
-            if ev.code != "unpaired":       # unpaired 回的是陌生设备自己的帧, 照发, 它才知道要配对
+            if ev.code == "unpaired":
+                ok = self._only_writer(ev.src)   # 未 trust 的写入方: 只有它自己连着时才告诉它
+            else:
                 if open_air is None:
                     open_air = self._all_trusted(now)
-                if not open_air:
-                    result = (result or ev.kind) + ",receipt-withheld"
-                    self.log(bc.audit(ev, result=result))
-                    continue
+                ok = open_air
+            if not ok:
+                result = (result or ev.kind) + ",receipt-withheld"
+                self.log(bc.audit(ev, result=result))
+                continue
             self.log(bc.audit(ev, result=result))
             self._send(bc.status_for(ev))
 

@@ -381,7 +381,7 @@ def test_send_reply_checks_connected_devices():
 
 
 def test_receipts_withheld_while_stranger_connected(tmp_path):
-    """6: 回执带 crc, 短文本可被反推; 有不受信设备连着时不发回执 (unpaired 除外, 那是陌生设备自己的帧)."""
+    """6: 回执带 crc, 短文本可被反推; 有不受信设备连着时不发回执; unpaired 也只在写入方是唯一连着的设备时发."""
     sent, logged = [], []
     devs = [[CONN_OK, STRANGER]]
     h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=logged.append, devices=lambda: devs[0])
@@ -390,7 +390,7 @@ def test_receipts_withheld_while_stranger_connected(tmp_path):
     assert sent == [] and len(list((tmp_path / "in").iterdir())) == 1  # 照样投递, 只是不回执
     assert "withheld" in logged[-1]
     h.on_write("02:00:00:00:00:09", None, bc.encode(4, b"x", 23)[0], now=1.0)
-    assert [d["code"] for d in _acks(sent)] == ["unpaired"]
+    assert sent == [] and "withheld" in logged[-1]                     # 受信手机也连着: unpaired 不广播
     sent.clear()
     devs[0] = [CONN_OK]
     for f in bc.encode(3, b"1234", 23):                               # 陌生设备走了, 手机重发拿到 dup 回执
@@ -589,7 +589,6 @@ def test_disconnect_signal_ignores_other_changes():
     path = "/org/bluez/hci0/dev_02_00_00_00_00_01"
     bi.device_changed(h, "org.bluez.Device1", {"RSSI": -40}, path, lambda p: {"Address": DEV})
     bi.device_changed(h, "org.bluez.Adapter1", {"Connected": False}, path, lambda p: {"Address": DEV})
-    bi.device_changed(h, "org.bluez.Device1", {"Connected": True}, path, lambda p: {"Address": DEV})
     assert DEV in h.recent
     bi.device_changed(h, "org.bluez.Device1", {"Connected": False}, path, lambda p: None)   # 属性读不到: 按路径地址清
     assert DEV not in h.recent
@@ -613,3 +612,38 @@ def test_tick_prune_failure_clears_all():
     h.saw_secure_write(DEV, now=10.0)
     h.tick(now=11.0)
     assert h.recent == {}
+
+
+# ------------------------------------------------------------ 第四轮审查 (#61)
+
+def test_unpaired_withheld_when_another_trusted_but_silent_device_connected(tmp_path):
+    """中: unpaired 也过闸门; 另有受信但本次连接没写过的设备连着 (正是闸门要挡的) 时不发."""
+    sent, logged = [], []
+    writer = "02:00:00:00:00:09"
+    devs = [[OTHER_OK, {"Address": writer, "Paired": True, "Trusted": False, "Connected": True}]]
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=logged.append, devices=lambda: devs[0])
+    h.on_write(writer, {"Paired": True, "Trusted": False}, bc.encode(4, b"x", 23)[0], now=1.0)
+    assert sent == [] and "withheld" in logged[-1]
+    devs[0] = [devs[0][1]]                                            # 只剩写入方自己
+    h.on_write(writer, {"Paired": True, "Trusted": False}, bc.encode(4, b"x", 23)[0], now=2.0)
+    assert _acks(sent) == [{"t": "err", "id": 4, "crc": None, "code": "unpaired"}]   # 不带 crc
+
+
+def test_unpaired_withheld_when_device_list_fails(tmp_path):
+    sent = []
+
+    def boom():
+        raise RuntimeError("dbus")
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None, devices=boom)
+    h.on_write(DEV, None, bc.encode(4, b"x", 23)[0], now=1.0)
+    assert sent == []
+
+
+def test_connected_true_also_clears_record():
+    """低: BlueZ 可能把断开 + 重连合并成一次 Connected=true; 无论变 true 还是 false 都清."""
+    h = bi.Handler(None, notify=lambda f: None, log=lambda s: None, devices=OK_DEVS)
+    h.saw_secure_write(DEV, now=10.0)
+    path = "/org/bluez/hci0/dev_02_00_00_00_00_01"
+    bi.device_changed(h, "org.bluez.Device1", {"Connected": _FakeDbus.Boolean(1)}, path, lambda p: {"Address": DEV})
+    assert DEV not in h.recent
+    assert h.send_reply("好", now=11.0) is False

@@ -105,7 +105,8 @@ D-Bus 方法（`WriteValue` / `StartNotify` / `StopNotify`）只认 `org.bluez` 
 
 **回执归属**：`crc` 是被确认消息 START 里声明的 CRC32。通知是广播，同时连着两台手机时都会收到；手机只认
 `(id, crc)` 和自己发件箱对得上的回执。`crc` 为 null 的错误手机只能按序号猜：错误码属于可重发的（`full`/`busy`/`timeout`/`nostart`/`crc`）时
-最多安排一次重发（推车会去重）；其他（例如 `frame`，以及 crc 为 null 的 `unpaired`）一律忽略，不改发件箱里任何状态。
+最多安排一次重发（推车会去重）；`unpaired` 一律不带 crc，手机按序号认领（推车只在写入方是唯一连着的设备时才发，
+收到的就是写入方自己）；其他（例如 `frame`）一律忽略，不改发件箱里任何状态。
 
 **通知闸门（回执和回复共用）**：BlueZ 的通知发给所有订阅者，分不了设备；而且它发通知只看各设备保存的 CCC 值、
 发前不查链路安全等级，已绑定设备的 CCC 跨连接保存。冒充已 trust 手机地址、**没加密**的连接可能靠恢复的 CCC
@@ -113,11 +114,16 @@ D-Bus 方法（`WriteValue` / `StartNotify` / `StopNotify`）只认 `org.bluez` 
 
 1. 连着的每台设备都受信（Paired + Trusted，有 Bonded 时还要 Bonded）；
 2. 连着的每台设备在**本次连接内最近 300 秒**里有过一次受信的 secure-write（写能到推车就说明 BlueZ 认可了链路安全）。
-   设备一断开记录就清掉：订阅 `org.bluez.Device1` 的 `PropertiesChanged`，`Connected` 变 false 立刻删；每秒 tick
+   设备一断开记录就清掉：订阅 `org.bluez.Device1` 的 `PropertiesChanged`，`Connected` 一变（不管变 true 还是 false，
+   BlueZ 可能把断开 + 重连合并成一次 true）立刻删；每秒 tick
    再按设备列表无条件剪一次兜底（读不到设备列表就全清）。同地址再连上要重新写过才算。
 
 不满足就照常投递、只是不回执（审计记 `receipt-withheld`），回复丢弃并写审计。回执带 `crc`，短文本（例如 PIN）可以从
-CRC 暴力反推，这也是回执要过闸门的原因。读不到设备列表也当不满足。例外是 `unpaired`：它回的是陌生设备自己写的帧，照发。
+CRC 暴力反推，这也是回执要过闸门的原因。读不到设备列表也当不满足。
+
+`unpaired` 的闸门放宽一点：**连着的设备只有写入方自己**时才发，否则不发、审计记 `receipt-withheld`；而且不带 `crc`
+（`"crc":null`）。它只对"已用 LE Secure Connections 配对、还没在车机上 trust"的手机有用（secure-write 在 ATT 层
+就要求最高安全等级，没配对的写不进来），用来提示"去车机上 trust"。
 手机整条写完 20 秒没收到回执会同序号重发，最多 2 次，条件满足后推车回 `ack dup`；10 分钟还没确认的从发件箱拿掉，
 提示"推车可能已收到但没确认"（不叫用户重新输入，免得重复投递）。手机 300 秒没写过东西时大肥鱼的回复会被丢掉
 （手机再发一条就恢复）。
@@ -131,7 +137,8 @@ CRC 暴力反推，这也是回执要过闸门的原因。读不到设备列表�
 不会把新推车的回执当成旧的重复丢掉。
 
 **手机发件箱**：没收到回执的留着，重连后同序号重发；超过 10 分钟（推车去重时效）还没送达的丢掉并提示用户
-（再发可能重复投递，让用户自己决定）；`unpaired` 留在发件箱，等配对和 trust 后重发；同一条的定时重发同时只安排一次。
+（再发可能重复投递，让用户自己决定）；`unpaired` 留在发件箱，每 30 秒重发等 trust，最多 10 次（之后等重连或过期）；
+同一条的定时重发同时只安排一次。
 
 ## 投递和回复
 
@@ -243,7 +250,7 @@ sudo systemctl enable --now cart-ble-input.service
 | 回执 | `id` | `id` + `crc`（错误也带，读不出是 null） |
 | 通知分包 | 跟最后一次写的 MTU | 固定 23 |
 | 正文过滤 | Cc、双向覆盖符 | Cc、Cf（放行 ZWJ）、标签字符、Zl/Zp、非字符、Co、Cs、填充字（Cn 不整类拒） |
-| 回执 / 回复 | 照发 / 连着的全受信 | 连着的全受信且本次连接 300 秒内 secure-write 过才发（`unpaired` 除外） |
+| 回执 / 回复 | 照发 / 连着的全受信 | 连着的全受信且本次连接 300 秒内 secure-write 过才发；`unpaired` 只在写入方是唯一连着的设备时发、不带 crc |
 | 投递 JSON | 5 个字段 | 加 `multiline` |
 | GATT 标志 | `encrypt-authenticated-*` | `secure-*`（目标 LE Secure Connections，待实机验证） |
 
