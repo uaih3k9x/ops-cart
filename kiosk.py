@@ -113,7 +113,7 @@ class Kiosk(tk.Tk):
         self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
         self.after(50, self._boot_selftest)
         self._last_input = time.time()
-        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
+        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>", "<<OpsCartImeInput>>"):   # 最后一个: 中文输入吃掉的键 (#54)
             self.bind_all(seq, self._note_input, add="+")
         # 透传的键盘走全局: Tk 把按键投给有焦点的窗口, 不是嵌着 mpv 的那个 Frame
         self.bind_all("<KeyPress>", lambda e: self.passthrough and self._on_key(e, True), add="+")

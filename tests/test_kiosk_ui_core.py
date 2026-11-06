@@ -505,7 +505,7 @@ def test_kiosk_has_no_lan1_config_and_no_cross_thread_after():
 
 
 @pytest.mark.parametrize("name", ["kiosk.py", "wifi_panel.py", "ks_panel.py", "netmode_panel.py", "wol_panel.py",
-                                  "kiosk_ui_core.py"])
+                                  "kiosk_ui_core.py", "ime_tk.py"])
 def test_ui_sources_have_no_emoji_or_symbols(name):
     hits = [(i, ln.strip()) for i, ln in enumerate(_src(name).splitlines(), 1) if ui.is_symbol_char(ln)]
     assert hits == []
