@@ -4,6 +4,11 @@
 BlueZ D-Bus 上注册一个 GATT 服务 + LE 广播: 手机往 RX 特征写分包, 这里重组后投到投递目标 (默认是
 /run/ops-cart/ble-input/in/ 下一条一个 JSON 文件, root 0600), 由车机 / 大肥鱼去取; 回执、错误和
 /run/ops-cart/ble-input/reply/ 下的回复摘要经 TX 特征 notify 回去. **不执行任何命令**.
+契约: 文字只进输入框, 换行不得触发提交; 送往 HID 或串口必须再走现有危险操作确认.
+
+RX 用 secure-write、TX 用 secure-notify: BlueZ 只在 LE Secure Connections 加密的连接上放行; 外壳再查一遍
+设备属性 (Paired + Trusted, 有 Bonded 时还要 Bonded), 并只认 org.bluez 属主的 D-Bus 调用. 启动时把适配器的
+Pairable 关掉; bluetoothd 换了属主 (重启) 就退出, 交给 systemd 重拉.
 
 依赖 python3-dbus、python3-gobject (推车上不一定装了); 没装时 import 本模块照样行, main() 说清楚缺什么.
 配对 / trust 用 bluetoothctl 在车机上确认, 见 docs/BLE_INPUT.md.
@@ -12,8 +17,8 @@ BlueZ D-Bus 上注册一个 GATT 服务 + LE 广播: 手机往 RX 特征写分�
 """
 
 import argparse
-import json
 import os
+import random
 import re
 import sys
 import time
@@ -28,7 +33,8 @@ REPLY = f"{BASE}/reply"
 INBOX_MAX = 64              # 队列里最多压多少条没人取的
 REPLY_READ_MAX = 64 * 1024
 LOCAL_NAME = "ops-cart"
-DEFAULT_MTU = 23
+TX_MTU = 23                 # 通知是广播, 分不了设备: 一律按最小 MTU 切, 哪台手机都收得下
+BLUEZ = "org.bluez"
 
 _DEV_PATH = re.compile(r"/dev_([0-9A-Fa-f]{2}(?:_[0-9A-Fa-f]{2}){5})$")
 
@@ -59,7 +65,8 @@ class DirSink:
             name = f"{int(now * 1000):013d}-{(src or 'unknown').replace(':', '')}-{msg_id:05d}.json"
             atomicfile.write_json(os.path.join(self.path, name),
                                   {"v": 1, "t": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
-                                   "src": src, "id": msg_id, "text": text}, mode=0o600, ensure_ascii=False)
+                                   "src": src, "id": msg_id, "text": text, "multiline": "\n" in text},
+                                  mode=0o600, ensure_ascii=False)
             return True
         except OSError:
             return False
@@ -93,12 +100,11 @@ class Handler:
 
     def __init__(self, sink, notify, log):
         self.sink, self.notify, self.log = sink, notify, log
-        self.rx, self.tx = bc.Receiver(), bc.Sender()
-        self.mtu = DEFAULT_MTU
+        self.rx, self.tx = bc.Receiver(), bc.Sender(random.getrandbits(16))
 
     def _send(self, payload):
         try:
-            frames = self.tx.frames(payload, self.mtu)
+            frames = self.tx.frames(payload, TX_MTU)
         except ValueError:
             return
         for f in frames:
@@ -111,14 +117,12 @@ class Handler:
                 if self.sink.put(ev.text, ev.src, ev.msg_id):
                     result = "queued"
                 else:
-                    self.rx.forget(ev.src, ev.msg_id)
-                    ev = bc.Event("err", ev.src, ev.msg_id, size=ev.size, code="full")
+                    self.rx.forget(ev)
+                    ev = bc.Event("err", ev.src, ev.msg_id, size=ev.size, code="full", crc=ev.crc)
             self.log(bc.audit(ev, result=result))
             self._send(bc.status_for(ev))
 
-    def on_write(self, src, props, frame, mtu=None, now=None):
-        if mtu:
-            self.mtu = int(mtu)
+    def on_write(self, src, props, frame, now=None):
         now = time.time() if now is None else now
         self._handle(self.rx.feed(src, frame, now, bc.device_trusted(props)))
 
@@ -134,6 +138,34 @@ class Handler:
         return True
 
 
+# ------------------------------------------------------------ 适配器 / bluetoothd 看门
+
+def ensure_not_pairable(get, set_, log):
+    """推车平时不可配对 (L5): 启动时 Pairable 开着就关掉并记事件; 关不掉记 WARN. 返回 ok / turned-off / warn."""
+    try:
+        if not get("Pairable"):
+            return "ok"
+        set_("Pairable", False)
+    except Exception as e:                  # noqa: BLE001 — D-Bus 错误种类多, 一律只告警不退出
+        log(cartlog.fields(kind="adapter", result="WARN", reason="pairable-on", error=type(e).__name__))
+        return "warn"
+    log(cartlog.fields(kind="adapter", result="pairable-turned-off"))
+    return "turned-off"
+
+
+class OwnerWatch:
+    """bus.watch_name_owner('org.bluez', ...) 的回调 (L6): 先报当前属主; 之后属主没了或换了就 on_lost()."""
+
+    def __init__(self, on_lost):
+        self.owner, self.on_lost = None, on_lost
+
+    def __call__(self, owner):
+        if self.owner is None and owner:
+            self.owner = owner
+        elif owner != self.owner:
+            self.on_lost()
+
+
 # ------------------------------------------------------------ BlueZ
 
 def _load_dbus():
@@ -146,18 +178,27 @@ def _load_dbus():
 
 def _build(dbus, service, GLib, bus, adapter, handler_box):
     """GATT 应用 + 广播的 D-Bus 对象. 照 BlueZ test/example-gatt-server 的写法."""
-    BLUEZ, OM = "org.bluez", "org.freedesktop.DBus.ObjectManager"
+    OM = "org.freedesktop.DBus.ObjectManager"
     PROPS, CHRC, SVC, ADV = ("org.freedesktop.DBus.Properties", "org.bluez.GattCharacteristic1",
                              "org.bluez.GattService1", "org.bluez.LEAdvertisement1")
     APP_PATH, SVC_PATH = "/org/opscart/ble", "/org/opscart/ble/service0"
+
+    owner = [None]
 
     def device_props(path):
         try:
             obj = bus.get_object(BLUEZ, path)
             return {str(k): bool(v) if isinstance(v, dbus.Boolean) else v
                     for k, v in obj.GetAll("org.bluez.Device1", dbus_interface=PROPS).items()}
-        except dbus.DBusException:
+        except Exception:                   # noqa: BLE001 — 读不到属性一律当不受信
             return None
+
+    def from_bluez(sender):
+        """只认 org.bluez 的属主调用 (L3). 属主变了进程会退出 (OwnerWatch), 这里缓存一次就够."""
+        if owner[0] is None:
+            owner[0] = bus.get_name_owner(BLUEZ)
+        if not sender or sender != owner[0]:
+            raise dbus.exceptions.DBusException("只接受 BlueZ 的调用", name="org.bluez.Error.NotPermitted")
 
     def all_devices():
         om = dbus.Interface(bus.get_object(BLUEZ, "/"), OM)
@@ -179,20 +220,22 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
         def GetAll(self, interface):
             return self.props()[CHRC]
 
-        @service.method(CHRC, in_signature="aya{sv}")
-        def WriteValue(self, value, options):
+        @service.method(CHRC, in_signature="aya{sv}", sender_keyword="sender")
+        def WriteValue(self, value, options, sender=None):
+            from_bluez(sender)
             if self.uuid != bc.RX_UUID:
-                raise dbus.exceptions.DBusException("org.bluez.Error.NotSupported")
+                raise dbus.exceptions.DBusException("只有 RX 能写", name="org.bluez.Error.NotSupported")
             path = options.get("device")
-            handler_box[0].on_write(dev_addr(path), device_props(path) if path else None,
-                                    bytes(value), mtu=options.get("mtu"))
+            handler_box[0].on_write(dev_addr(path), device_props(path) if path else None, bytes(value))
 
-        @service.method(CHRC)
-        def StartNotify(self):
+        @service.method(CHRC, sender_keyword="sender")
+        def StartNotify(self, sender=None):
+            from_bluez(sender)
             self.notifying = self.uuid == bc.TX_UUID
 
-        @service.method(CHRC)
-        def StopNotify(self):
+        @service.method(CHRC, sender_keyword="sender")
+        def StopNotify(self, sender=None):
+            from_bluez(sender)
             self.notifying = False
 
         @service.signal(PROPS, signature="sa{sv}as")
@@ -203,9 +246,9 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
             if self.notifying:
                 self.PropertiesChanged(CHRC, {"Value": dbus.Array(frame, signature="y")}, [])
 
-    # 写要求"认证过的加密" (要配对且 MITM 保护), BlueZ 在 ATT 层就拒; 外壳再查一遍 Bonded/Trusted.
-    rx = Chrc(0, bc.RX_UUID, ["encrypt-authenticated-write"])
-    tx = Chrc(1, bc.TX_UUID, ["notify", "encrypt-authenticated-notify"])
+    # secure-*: 要 LE Secure Connections 加密 (BlueZ 在 ATT 层就拒别的连接); 外壳再查一遍 Paired/Trusted/Bonded.
+    rx = Chrc(0, bc.RX_UUID, ["secure-write"])
+    tx = Chrc(1, bc.TX_UUID, ["notify", "secure-notify"])
 
     class Svc(service.Object):
         def __init__(self):
@@ -218,7 +261,7 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
     class App(service.Object):
         def __init__(self):
             service.Object.__init__(self, bus, APP_PATH)
-            self.svc = Svc()
+            self.svc, self.rx, self.tx = Svc(), rx, tx
 
         @service.method(OM, out_signature="a{oa{sa{sv}}}")
         def GetManagedObjects(self):
@@ -261,8 +304,17 @@ def main(argv=None):
     box[0] = Handler(DirSink(a.inbox), notify=tx.push, log=lambda s: cartlog.event("ble-input", s))
     os.makedirs(a.reply, mode=0o700, exist_ok=True)
     os.chmod(a.reply, 0o700)
-    ad = bus.get_object("org.bluez", f"/org/bluez/{a.adapter}")
+    ad = bus.get_object(BLUEZ, f"/org/bluez/{a.adapter}")
     loop = GLib.MainLoop()
+    adapter_props = dbus.Interface(ad, "org.freedesktop.DBus.Properties")
+    ensure_not_pairable(lambda k: adapter_props.Get("org.bluez.Adapter1", k),
+                        lambda k, v: adapter_props.Set("org.bluez.Adapter1", k, dbus.Boolean(v)),
+                        lambda s: cartlog.event("ble-input", s))
+
+    def bluez_gone():
+        print("ble_input: org.bluez 属主变了 (bluetoothd 重启?), 退出交给 systemd 重拉", file=sys.stderr)
+        loop.quit()
+    bus.watch_name_owner(BLUEZ, OwnerWatch(bluez_gone))
 
     def fail(what):
         return lambda e: (print(f"ble_input: {what} 失败: {e}", file=sys.stderr), loop.quit())

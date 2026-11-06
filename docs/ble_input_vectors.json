@@ -1,6 +1,6 @@
 {
- "protocol": "ops-cart BLE input v1 (#52)",
- "note": "Python tests/test_ble_input_core.py 和 android 单元测试共用",
+ "protocol": "ops-cart BLE input v2 (#52)",
+ "note": "Python tests/test_ble_input_core.py 和 android 单元测试共用. v2: 单帧 min(MTU-3, 512); 去重键 (来源, 序号, 总长, CRC); 回执带 crc; 文字过滤加 Cf/Cn/Co/Zl/Zp/标签字符",
  "max_len": 4096,
  "vectors": [
   {
@@ -57,6 +57,17 @@
     "02ffff00ad8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69c",
     "02ffff015ebae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082"
    ]
+  },
+  {
+   "name": "capped-mtu517",
+   "msg_id": 42,
+   "mtu": 517,
+   "text": "满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载满载",
+   "payload_hex": "e6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbd",
+   "frames_hex": [
+    "01002a025824582469e6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bd",
+    "02002a01f7bde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbde6bba1e8bdbd"
+   ]
   }
  ],
  "rejects": [
@@ -103,6 +114,151 @@
    "frames_hex": [
     "0900010000000000000078"
    ]
+  }
+ ],
+ "att_max_attr": 512,
+ "text_rejects": [
+  {
+   "name": "zero-width-space",
+   "code": "ctrl",
+   "utf8_hex": "61e2808b62"
+  },
+  {
+   "name": "lrm",
+   "code": "ctrl",
+   "utf8_hex": "61e2808e62"
+  },
+  {
+   "name": "arabic-letter-mark",
+   "code": "ctrl",
+   "utf8_hex": "61d89c62"
+  },
+  {
+   "name": "bom",
+   "code": "ctrl",
+   "utf8_hex": "efbbbf6869"
+  },
+  {
+   "name": "soft-hyphen",
+   "code": "ctrl",
+   "utf8_hex": "61c2ad62"
+  },
+  {
+   "name": "line-separator",
+   "code": "ctrl",
+   "utf8_hex": "6c31e280a86c32"
+  },
+  {
+   "name": "paragraph-separator",
+   "code": "ctrl",
+   "utf8_hex": "7031e280a97032"
+  },
+  {
+   "name": "tag-chars",
+   "code": "ctrl",
+   "utf8_hex": "78f3a081a9f3a081a76e6f7265"
+  },
+  {
+   "name": "tag-cancel",
+   "code": "ctrl",
+   "utf8_hex": "78f3a081bf"
+  },
+  {
+   "name": "noncharacter-cn",
+   "code": "ctrl",
+   "utf8_hex": "efbfbf"
+  },
+  {
+   "name": "unassigned-cn",
+   "code": "ctrl",
+   "utf8_hex": "61f48fbfbe62"
+  },
+  {
+   "name": "private-use",
+   "code": "ctrl",
+   "utf8_hex": "61ee808062"
+  },
+  {
+   "name": "hangul-filler",
+   "code": "ctrl",
+   "utf8_hex": "e385a4"
+  },
+  {
+   "name": "bidi-override",
+   "code": "ctrl",
+   "utf8_hex": "61e280ae62"
+  },
+  {
+   "name": "escape",
+   "code": "ctrl",
+   "utf8_hex": "1b5b324a"
+  },
+  {
+   "name": "nul",
+   "code": "ctrl",
+   "utf8_hex": "726d00"
+  }
+ ],
+ "text_accepts": [
+  {
+   "name": "zwj-family",
+   "utf8_hex": "f09f91a8e2808df09f91a9e2808df09f91a7"
+  },
+  {
+   "name": "variation-selector",
+   "utf8_hex": "e29da4efb88f"
+  },
+  {
+   "name": "combining-acute",
+   "utf8_hex": "65cc81"
+  },
+  {
+   "name": "newline-tab",
+   "utf8_hex": "e7acace4b880e8a18c0a09e7acace4ba8ce8a18c"
+  },
+  {
+   "name": "hangul",
+   "utf8_hex": "ed959ceab5adec96b4"
+  }
+ ],
+ "status": [
+  {
+   "name": "ack",
+   "kind": "text",
+   "id": 5,
+   "crc": 3735928559,
+   "json": "{\"t\":\"ack\",\"id\":5,\"crc\":3735928559}"
+  },
+  {
+   "name": "ack-dup",
+   "kind": "dup",
+   "id": 5,
+   "crc": 7,
+   "json": "{\"t\":\"ack\",\"id\":5,\"crc\":7,\"dup\":true}"
+  },
+  {
+   "name": "err-crc",
+   "kind": "err",
+   "id": 5,
+   "code": "crc",
+   "crc": 9,
+   "json": "{\"t\":\"err\",\"id\":5,\"crc\":9,\"code\":\"crc\"}"
+  },
+  {
+   "name": "err-no-crc",
+   "kind": "err",
+   "id": 6,
+   "code": "nostart",
+   "crc": null,
+   "json": "{\"t\":\"err\",\"id\":6,\"crc\":null,\"code\":\"nostart\"}"
+  },
+  {
+   "name": "err-unpaired",
+   "kind": "err",
+   "id": 1,
+   "code": "unpaired",
+   "crc": 3640732332,
+   "json": "{\"t\":\"err\",\"id\":1,\"crc\":3640732332,\"code\":\"unpaired\"}"
   }
  ]
 }

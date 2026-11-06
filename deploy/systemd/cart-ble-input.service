@@ -1,7 +1,8 @@
 [Unit]
 Description=ops-cart 蓝牙隔空打字 (BLE GATT; 只收已配对且 trust 的手机写来的文字, 不执行命令, #52)
 After=bluetooth.service
-Requires=bluetooth.service
+# bluetoothd 停了 / 重启了这里跟着停; 进程自己也盯着 org.bluez 属主, 变了就退出交给 Restart 重拉.
+BindsTo=bluetooth.service
 # 草稿, 默认不开机自启. 要 python3-dbus python3-gobject; 配对 / trust 的做法见 docs/BLE_INPUT.md.
 # 不依赖 kiosk.service: 车机界面挂了照样收, 文字压在队列里.
 
