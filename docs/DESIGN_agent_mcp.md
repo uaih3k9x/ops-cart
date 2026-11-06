@@ -168,6 +168,12 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
   - 挪了光标（左右、Home/End、Delete）、Tab 补全、带修饰键的组合、空行上退格、非空行上调历史：这一行推不出来，接着打字**和回车**都要人确认，直到确认过的回车。
   - secret 碰上看不全的行直接拒绝（不能挂起给人看），先回车换行再打。
   - 残余：空行上调出历史再回车拦不住（只能重放已有的命令）；Insert 改写模式、输入法、键盘布局不同都会让推车以为的这一行和屏幕上的不一样。
+- **按模式查（#69）**：词表之外，`mcp_kvm.DANGER_PATTERNS` 对整行查模式（先小写、去引号 / 反引号 / `^` / 反斜杠、空白并成一个）：
+  - Windows：`rd`/`rmdir /s`、`del`/`erase /s /q`、`cipher /w`、`bcdedit`、`diskpart` 及其 `clean`、`convert`（`delete`、`format` 本来就在词表里）、`Format-Volume`、`Clear-Disk`、`Initialize-Disk`、`Remove-Partition`、`Remove-Item` / `ri -r`、`takeown /r`、`icacls /t` 带改权限的选项。
+  - Linux：任何命令用 `>`、`>|` 或 `tee` 把输出写到块设备（`/dev/sd*`、`nvme*`、`vd*`、`xvd*`、`mmcblk*`、`md*`、`dm-*`、`mapper/`、`disk/`、`loop*`），`of=` 块设备，`cp`/`mv` 到块设备；`chmod`/`chown`/`chgrp`/`setfacl -R` 作用于 `/`、`/*` 或顶层系统目录；`truncate`；覆盖写 `/etc`、`/boot` 下的文件；`/proc/sysrq-trigger`；`find -delete`；`shred`、`blkdiscard`、`wipefs`、`sgdisk`/`gdisk`/`sfdisk`/`fdisk`/`parted`、`mkfs.*`/`mke2fs`/`mkswap`、`lv`/`vg`/`pvremove`、`lvreduce`、`zpool destroy`/`labelclear`、`zfs destroy`、`mdadm --zero-superblock`、`cryptsetup luksFormat`/`erase`、`nvme format`/`sanitize`、`hdparm --security-erase`、`efibootmgr` 改启动项。
+  - 行尾 `\` 续行会跟下一行拼起来查（跨回车也算）。
+  - 不拦只读的看盘命令：`ls /dev/sda`、`lsblk`、`blkid`、`smartctl`、`cat /dev/sda | head`、`> /dev/null`。`fdisk -l` 还是会挂起（词表里本来就有，不放宽）。
+  - 尽力而为：变量拼接（`d=/dev/sda; cat x > $d`）、别名、函数、编码（base64）、脚本文件、`eval`、PowerShell 的字符串拼接都拦不住。
 - **这只是减速带**：推车看不懂屏幕，鼠标点选、图形界面、脚本、编码后的命令都拦不住。兜底还是人盯和急停。
 - **`secret=true`**：内容不进审计、不进日志、不进行缓冲；命中高危词直接拒绝，也不记命中了哪个词。
 - **界面**：键鼠灯同串口配色（急停红 > 待确认黄闪 > 正在发紫闪 > 持租约紫），车机点灯开确认框。副屏只拿几个数；网页“Agent”页多一张键鼠卡片，请求走 `serial-req` 目录的 `kvm_reject`。
