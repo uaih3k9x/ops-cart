@@ -2,7 +2,7 @@
 """串口一键只读巡检 (#15): 按厂商发一套只读命令, 存档, 和同设备上一份比对. 纯逻辑, 不碰 Tk.
 
 厂商: 华为 VRP / H3C Comware (display 系), 思科 IOS·NX-OS / 锐捷 RGOS (show 系) (#56).
-vendor=auto 时先发 display version, 认不出再发 show version, 按输出里的关键字认厂商.
+vendor=auto 时先发 show version, 认不出再发 display version, 按输出里的软件名认厂商.
 
 执行走 conbroker send (等提示符、自动翻页、人最近敲过键时它自己排队), 不直接开串口.
 每条命令发出前都过只读白名单 (#3 三层闸门的第 1 层); 清单里有一条不合格, 整次巡检不跑.
@@ -40,15 +40,17 @@ _RULES = {
             "session": {"screen-length disable"}},         # 用户视图下只对当前会话
     "cisco": {"verbs": {"show"},
               "pipes": {"include": True, "exclude": True, "begin": True, "section": True, "count": False},
-              "deny": set(),
+              "deny": {"tech-support"},                    # 能 redirect / 打包写文件
               "session": {"terminal length 0"}},
     "ruijie": {"verbs": {"show"},
                "pipes": {"include": True, "exclude": True, "begin": True},
-               "deny": set(),
+               "deny": {"tech-support"},                   # 同思科
                "session": {"terminal length 0"}},
 }
 _TOKEN = re.compile(r"[\x21-\x7e]+")          # 一个词: 可打印 ASCII, 不含空白
-_FORBIDDEN = set(";&<>`$#!")                     # 拼接/重定向/命令替换/注释, 出现就拒
+_FORBIDDEN = set(";&<>`$#!?")                    # 拼接/重定向/命令替换/注释/在线帮助, 出现就拒
+_KEYWORD = re.compile(r"[a-z0-9][a-z0-9-]*")     # 内置动词后紧跟的关键词
+_QUOTES = set("\"'")
 MAX_LEN = 200
 
 
@@ -61,10 +63,13 @@ def is_readonly(cmd, vendor, extra_verbs=()):
       - 厂商得有内置规则 (huawei / h3c / cisco / ruijie); 第一个词必须原样是 display (华为 / H3C) /
         show (思科 / 锐捷), 全小写. 例外只有该厂商的关分页命令 (session), 整句逐字相等才放.
       - 整条只许可打印 ASCII, 词之间恰好一个空格, 不许前后空白、制表符、换行、控制字符、全角/零宽字符.
-      - 不许 ; & < > ` $ # ! —— 多命令拼接、重定向、命令替换、注释.
+      - 不许 ; & < > ` $ # ! ? —— 多命令拼接、重定向、命令替换、注释; ? 让设备显示帮助并把残留
+        放回输入行, 发出去的字面和执行的字面就不一样了.
+      - 引号 (" ') 只许出现在管道过滤词之后的参数里; 别处 (尤其关键词) 设备会去掉引号照样执行.
       - "|" 必须单独成词, 后面只许接过滤词 include/exclude/begin/section (要带参数)、count/no-more (不带);
         save/append/redirect/tee 这类写文件的管道全拒. 过滤词同样不许缩写、不许大写.
-      - 动词后紧跟的关键词必须全小写 (后面的接口名等参数不限), 且不许是 deny 里任何一个词的前缀
+      - 内置动词后紧跟的关键词必须完整匹配 [a-z0-9][a-z0-9-]* (后面的接口名等参数不限; 规则文件加的
+        动词如 ping 只要求全小写), 且不许是 deny 里任何一个词的前缀
         (含全称): 设备按"唯一前缀、不分大小写"解析, diag / diagnostic-info 照样落到
         diagnostic-information (能把输出写进 flash), 所以黑名单按前缀拦, 宁可多拦.
       - 动词后至少要有一个词.
@@ -88,6 +93,8 @@ def is_readonly(cmd, vendor, extra_verbs=()):
     if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2:
         return False
     kw = words[1]
+    if words[0] in rules["verbs"] and not _KEYWORD.fullmatch(kw):
+        return False
     if kw != kw.lower() or any(d.startswith(kw) for d in rules["deny"]):
         return False
     segs, cur = [], []
@@ -100,10 +107,10 @@ def is_readonly(cmd, vendor, extra_verbs=()):
         else:
             cur.append(w)
     segs.append(cur)
-    if not segs[0]:
+    if not segs[0] or any(ch in _QUOTES for w in segs[0] for ch in w):
         return False
     for seg in segs[1:]:
-        if not seg or seg[0] not in rules["pipes"]:
+        if not seg or seg[0] not in rules["pipes"] or any(ch in _QUOTES for ch in seg[0]):
             return False
         if rules["pipes"][seg[0]] != (len(seg) > 1):
             return False
@@ -197,10 +204,20 @@ _PROMPTS = [re.compile(r"<([^<>\s]+)>"),                    # 华为用户视图
             re.compile(r"([A-Za-z0-9][\w.-]*)(?:\([^()\s]*\))?[#>]")]   # 思科 SW-A# SW-A> SW-A(config)#
 
 
+_CONFIRM = re.compile(r"\[(?:y/n|yes/no|confirm)\]", re.I)      # 长得像华为 [名] 的确认提示
+_MARK = re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\n]*\]")     # conbroker 自己写进日志的标记行
+
+
+def at_prompt(text):
+    """串口最近输出的最后一行 (跳过 conbroker 标记行) 是提示符 -> 设备名, 否则 None."""
+    lines = [ln for ln in (text or "").replace("\r", "").split("\n") if ln.strip() and not _MARK.fullmatch(ln.strip())]
+    return parse_device(lines[-1]) if lines else None
+
+
 def parse_device(text):
     """输出最后一行是提示符就返回设备名, 否则 None (停在 Username:/Password:/半截输出上)."""
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    if not lines:
+    if not lines or _CONFIRM.fullmatch(lines[-1]):
         return None
     for p in _PROMPTS:
         m = p.fullmatch(lines[-1])
@@ -360,17 +377,6 @@ def _vendor_hits(lines):
     return [v for v, pat in _VENDOR_KEYS if pat.search(body)]
 
 
-def detect_vendor(text):
-    """version 命令的输出 -> 厂商 或 None (认不出 / 命中多家). 和巡检同样去掉回显和最后一行提示符."""
-    if not isinstance(text, str):
-        return None
-    text = text.replace("\r", "").rstrip("\n")
-    first = text.split("\n", 1)[0].strip()
-    cmd = next((c for c in _PROBES if first.endswith(c)), "\0")
-    hits = _vendor_hits(_split_output(text, cmd))
-    return hits[0] if len(hits) == 1 else None
-
-
 def probe_vendor(send, port, timeout=DEFAULT_TIMEOUT):
     """先 show version, 认不出再 display version -> (厂商, "") 或 (None, 说明). 不抛异常.
 
@@ -448,13 +454,22 @@ def _compare(res, survey_dir, prof):
     return out
 
 
-def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None):
+def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None, tail=None):
     """跑一次巡检: 白名单预检 -> 逐条 send -> 存档 -> 和同设备上一份比. 不抛异常, 结果全在返回的 dict 里.
 
     send(port, cmd, timeout) -> conbroker send 的输出 (回显 + 正文 + 提示符); 出错可以抛异常.
     任何一条超时 / 没回提示符 / 被拒 / 提示符变了就中止, 后面的不发, 存档里逐段写明.
     """
     head = head or safe_name(os.path.basename(port))
+    if tail is not None:                                # 发第一条 (含探测) 前先看设备停没停在提示符上
+        try:
+            recent = tail(port)
+        except Exception as e:
+            return _result(head=head, summary=f"巡检没跑: 读串口最近输出失败: {str(e) or type(e).__name__}")
+        if not at_prompt(recent):
+            last = next((ln.strip() for ln in reversed((recent or "").split("\n")) if ln.strip()), "")
+            return _result(head=head, summary="巡检没跑: 设备不在提示符上 (可能停在 Username / Password / [Y/N] / "
+                                              f"翻页或半截输出上), 最后一行: {last[:60]!r}; 先在面板里处理好再巡检")
     if vendor == "auto":
         vendor, why = probe_vendor(send, port)
         if not vendor:
@@ -547,6 +562,15 @@ def conbroker_send(port, cmd, timeout):
     return r.stdout
 
 
+def conbroker_tail(port, n=5):
+    """conbroker tail <口> -n N: 串口最近几行 (不发任何东西). 失败抛 RuntimeError."""
+    r = subprocess.run(_conbroker_cmd() + ["tail", port, "-n", str(n)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(serve_error(r.returncode, r.stderr))
+    return r.stdout.rstrip("\n")
+
+
 def _list_services():
     return parse_list(_run(["list"]))[1]
 
@@ -556,17 +580,24 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="串口一键只读巡检 (走 conbroker, 只发白名单里的只读命令)")
     ap.add_argument("head", nargs="?", help="操作头, 如 con-1 或 /dev/con-1")
     ap.add_argument("--vendor", default="auto", choices=["auto"] + list(_RULES),
-                    help="auto = 先 display version 再 show version 认厂商")
+                    help="auto = 先 show version 再 display version 认厂商")
     ap.add_argument("--profiles", default=None, help=f"命令清单 JSON (默认 {PROFILES_PATH}, 没有就用内置)")
     ap.add_argument("--dir", default=SURVEY_DIR, help="存档目录")
     ap.add_argument("--export-topo", metavar="存档", help="不巡检, 把一份存档转成拓扑脚本读的 ######## 分段格式")
-    ap.add_argument("-o", "--out", help="--export-topo 的输出文件 (默认打到标准输出)")
+    ap.add_argument("-o", "--out", help="--export-topo 的输出文件 (默认打到标准输出; 已存在不覆盖, 除非 --force)")
+    ap.add_argument("--force", action="store_true", help="-o 的文件已存在时覆盖 (输入文件本身永远不覆盖)")
     a = ap.parse_args(argv)
     if a.export_topo:
         try:
             with open(a.export_topo, encoding="utf-8") as f:
                 out = export_topo(f.read())
             if a.out:
+                if os.path.exists(a.out) and os.path.samefile(a.out, a.export_topo):
+                    print("导出失败: 输出文件就是输入的存档, 不覆盖")
+                    return 2
+                if os.path.exists(a.out) and not a.force:
+                    print(f"导出失败: {a.out} 已存在, 要覆盖加 --force")
+                    return 2
                 with open(a.out, "w", encoding="utf-8") as f:
                     f.write(out)
             else:
@@ -582,7 +613,7 @@ def main(argv=None):
     if not name:
         print(f"{port} 上没有在跑的 conbroker 服务, 先在串口面板开服务")
         return 2
-    r = run_survey(name, a.vendor, send=conbroker_send, head=safe_name(os.path.basename(port)),
+    r = run_survey(name, a.vendor, send=conbroker_send, tail=conbroker_tail, head=safe_name(os.path.basename(port)),
                    survey_dir=a.dir, profiles=load_profiles(a.profiles))
     print(r["summary"])
     record(r)

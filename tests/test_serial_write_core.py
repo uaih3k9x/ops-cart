@@ -698,3 +698,13 @@ def test_ruijie_extra_verbs_take_effect(tmp_path):
     assert r["vendors"]["ruijie"]["extra_verbs"] == ["ping"]
     assert sw.classify("ping 192.0.2.1", "ruijie", True, r)["verdict"] == "pass"
     assert sw.classify("ping 192.0.2.1", "ruijie", True, RULES)["verdict"] == "confirm"
+
+
+
+@pytest.mark.parametrize("vendor,cmd", [
+    ("cisco", "show tech-support"), ("cisco", "show tech"), ("ruijie", "show tech-support"),
+    ("cisco", "show ?"), ("ruijie", "show ?"), ("cisco", "show run ?"),
+    ("huawei", 'display "diagnostic-information" flash:/a.txt'), ("huawei", "display ?"),
+])
+def test_gate_confirms_tech_support_question_and_quotes(vendor, cmd):
+    assert sw.classify(cmd, vendor, True, RULES)["verdict"] == "confirm"

@@ -415,7 +415,8 @@ class SerialPanel(tk.Frame):
         """#15 一键只读巡检: 后台跑 survey_core (走 conbroker send), 摘要经 self.ui 回主线程写进控制台.
 
         选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor
-        (huawei / h3c / cisco / ruijie), 默认 auto (#56 先 display version 再 show version 自动认).
+        (huawei / h3c / cisco / ruijie), 默认 auto (#56 先 show version 再 display version 自动认).
+        发第一条前先 conbroker tail 看最后一行, 不在提示符上 (Username / Password / [Y/N] ...) 就不跑.
         """
         if self._surveying:
             return
@@ -431,7 +432,8 @@ class SerialPanel(tk.Frame):
 
         def work():
             try:
-                r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head)
+                r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head,
+                                           tail=survey_core.conbroker_tail)
             except Exception as e:                 # run_survey 本不抛; 兜住, 免得按钮一直锁着
                 r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
             survey_core.record(r)
