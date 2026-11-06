@@ -3,7 +3,7 @@
   "_slots": "槽位 -> 厂商 (huawei / cisco / ruijie / linux). 没登记的槽位: auto_huawei=true 时最后一行是华为 <名>/[名] 提示符才按华为算; 思科 / 锐捷式 名# 和 Linux 的 bash# 分不开, 要用就在这里登记. 登记了的槽位也得停在该厂商的提示符上才放行. ruijie 用 survey_core 的 show 只读白名单 (#56); linux 没有第 1 层只读白名单, 只走第 2 层或人确认.",
   "slots": {},
   "auto_huawei": true,
-  "_vendors": "extra_verbs: 第 1 层追加只读动词 (只认 huawei / h3c / cisco / ruijie; 写闸门暂不认 H3C 提示符, h3c 槽位还登记不了). model: false 关掉这个厂商的第 2 层. notes: 给决策模型的现场补充说明 (最多 500 字).",
+  "_vendors": "extra_verbs: 第 1 层追加只读动词 (只认 huawei / h3c / cisco / ruijie). 只加动词: 动词后面的参数不受只读关键词字符集约束, 只受通用规则 (禁 ; & < > ` $ # ! ? [ ] { }、不许写文件参数和带冒号的词), 所以别加会写东西的动词. H3C 设备的 <名> / [名] 提示符会被按华为规则处理 (自动认或登记成 huawei), 写闸门里不能登记成 h3c. model: false 关掉这个厂商的第 2 层. notes: 给决策模型的现场补充说明 (最多 500 字).",
   "vendors": {
     "huawei": {"extra_verbs": ["ping", "tracert"]},
     "cisco": {"extra_verbs": ["ping", "traceroute"]},

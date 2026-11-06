@@ -708,3 +708,39 @@ def test_ruijie_extra_verbs_take_effect(tmp_path):
 ])
 def test_gate_confirms_tech_support_question_and_quotes(vendor, cmd):
     assert sw.classify(cmd, vendor, True, RULES)["verdict"] == "confirm"
+
+
+
+@pytest.mark.parametrize("cmd", ["show version [exec reload]", "show version [exec {write memory}]",
+                                 "show version [exec {wr}]", "show version [ios_config {hostname X}]",
+                                 "show version | include [exec reload]"])
+def test_gate_tcl_substitution_needs_human(cmd):
+    g = sw.classify(cmd, "cisco", True, RULES)
+    assert g["verdict"] == "confirm"
+
+
+@pytest.mark.parametrize("cmd,word", [("show version [exec reload]", "reload"), ("x [exec {wr}]", "write"),
+                                      ("show version {save}", "save")])
+def test_danger_words_split_on_tcl_brackets(cmd, word):
+    assert word in sw.danger_words(cmd)
+
+
+def test_gate_brackets_not_sent_to_model():
+    seen = []
+    judge = lambda cmd, vendor: seen.append(cmd) or {"allow": True, "reason": "x", "model": {}}   # noqa: E731
+    rules = dict(RULES, model=dict(RULES["model"], enabled=True))
+    g = sw.classify("show ip bgp regexp [0-9]", "cisco", True, rules, judge=judge)
+    assert g["verdict"] == "confirm" and seen == []
+
+
+@pytest.mark.parametrize("text", ["Router(tcl)#", "switch-tcl#", "[startup-config]", "[Y/N]", "[confirm]",
+                                  "[running-config]"])
+def test_slot_vendor_tcl_and_confirm_not_at_prompt(text):
+    assert sw.slot_vendor(1, RULES, text) == (None, False)                         # 华为自动认也不认
+    for v in ("cisco", "ruijie", "huawei"):
+        assert sw.slot_vendor(1, dict(RULES, slots={1: v}), text) == (v, False), (v, text)
+
+
+def test_h3c_prompt_auto_recognized_as_huawei_rules():
+    """写闸门不单独认 H3C: <名> / [名] 按华为处理 (display 系规则一样); 文档里写明."""
+    assert sw.slot_vendor(1, RULES, "<H3C>") == ("huawei", True)

@@ -193,6 +193,7 @@ def test_safe_name_has_no_separator_or_slash():
 # ------------------------------------------------------------ 执行
 
 T0 = time.mktime((2026, 10, 30, 14, 3, 0, 0, 0, -1))
+_AT = lambda port: "x\n<SW-A>"                   # noqa: E731  conbroker tail: 设备停在提示符上
 T1 = time.mktime((2026, 10, 31, 9, 0, 0, 0, 0, -1))
 
 
@@ -225,7 +226,7 @@ def fake_send(log, prompt="<SW-A>", n=0, misbehave=None):
 
 
 def _run(tmp_path, log, now=T0, **kw):
-    return sv.run_survey("/dev/con-1", "huawei", send=fake_send(log, **kw), now=lambda: now,
+    return sv.run_survey("/dev/con-1", "huawei", tail=_AT, send=fake_send(log, **kw), now=lambda: now,
                          survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/nonexistent"))
 
 
@@ -250,7 +251,7 @@ def test_refused_profile_sends_nothing(tmp_path):
     prof = sv.load_profiles(path="/x")
     prof["huawei"]["commands"].insert(3, {"cmd": "dis cur", "timeout": 5})
     prof["huawei"]["commands"].append({"cmd": "display version | save", "timeout": 5})
-    r = sv.run_survey("/dev/con-1", "huawei", send=fake_send(log), now=lambda: T0,
+    r = sv.run_survey("/dev/con-1", "huawei", tail=_AT, send=fake_send(log), now=lambda: T0,
                       survey_dir=str(tmp_path), profiles=prof)
     assert log == [] and not r["ok"] and r["path"] is None
     assert r["refused"] == ["dis cur", "display version | save"]
@@ -260,7 +261,7 @@ def test_refused_profile_sends_nothing(tmp_path):
 
 def test_unknown_vendor_refused(tmp_path):
     log = []
-    r = sv.run_survey("/dev/con-1", "juniper", send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
+    r = sv.run_survey("/dev/con-1", "juniper", tail=_AT, send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
                       profiles=sv.load_profiles(path="/x"))
     assert log == [] and not r["ok"] and "juniper" in r["summary"]
 
@@ -294,7 +295,7 @@ def test_prompt_changes_midway_aborts(tmp_path):
     def send(port, cmd, timeout):
         out = send0(port, cmd, timeout)
         return out.replace("<SW-A>", "<SW-B>") if cmd == "display arp" else out
-    r = sv.run_survey("/dev/con-1", "huawei", send=send, now=lambda: T0, survey_dir=str(tmp_path),
+    r = sv.run_survey("/dev/con-1", "huawei", tail=_AT, send=send, now=lambda: T0, survey_dir=str(tmp_path),
                       profiles=sv.load_profiles(path="/x"))
     assert not r["ok"] and "SW-B" in r["summary"]
     assert "display current-configuration" not in [c for _p, c, _t in log]
@@ -575,14 +576,17 @@ def test_probe_vendor_send_error_and_unknown():
     v, note = sv.probe_vendor(boom, "/dev/con-1")
     assert v is None and "没有在跑的服务" in note
     log = []
-    v, note = sv.probe_vendor(_vendor_send(log, "x", "SW-A#"), "/dev/con-1")
+    v, note = sv.probe_vendor(_vendor_send(log, "x", "<SW-A>"), "/dev/con-1")
     assert v is None and log == ["show version", "display version"] and "认不出" in note and "--vendor" in note
+    log = []
+    v, note = sv.probe_vendor(_vendor_send(log, "x", "SW-A#"), "/dev/con-1")     # show 系提示符: 不再发 display
+    assert v is None and log == ["show version"] and "认不出" in note
 
 
 @pytest.mark.parametrize("vendor,prompt", [("h3c", "<SW-A>"), ("ruijie", "SW-A#")])
 def test_run_survey_auto_detects_and_runs_vendor_profile(tmp_path, vendor, prompt):
     log = []
-    r = sv.run_survey("/dev/con-1", "auto", send=_vendor_send(log, vendor, prompt), now=lambda: T0,
+    r = sv.run_survey("/dev/con-1", "auto", tail=_AT, send=_vendor_send(log, vendor, prompt), now=lambda: T0,
                       survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
     prof = sv.load_profiles(path="/x")[vendor]
     assert r["ok"] and r["vendor"] == vendor and r["device"] == "SW-A"
@@ -594,7 +598,7 @@ def test_run_survey_auto_detects_and_runs_vendor_profile(tmp_path, vendor, promp
 
 def test_run_survey_auto_unknown_refuses(tmp_path):
     log = []
-    r = sv.run_survey("/dev/con-1", "auto", send=_vendor_send(log, "x", "SW-A#"), now=lambda: T0,
+    r = sv.run_survey("/dev/con-1", "auto", tail=_AT, send=_vendor_send(log, "x", "<SW-A>"), now=lambda: T0,
                       survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
     assert not r["ok"] and r["path"] is None and "--vendor" in r["summary"]
     assert log == ["show version", "display version"] and list(tmp_path.iterdir()) == []
@@ -613,7 +617,7 @@ def test_profile_without_paging_skips_it(tmp_path):
     log = []
     prof = sv.load_profiles(path="/x")
     del prof["huawei"]["paging"]
-    r = sv.run_survey("/dev/con-1", "huawei", send=fake_send(log), now=lambda: T0,
+    r = sv.run_survey("/dev/con-1", "huawei", tail=_AT, send=fake_send(log), now=lambda: T0,
                       survey_dir=str(tmp_path), profiles=prof)
     assert r["ok"] and log[0][1] == "display version"
 
@@ -873,3 +877,73 @@ def test_export_topo_out_not_input(tmp_path):
     for target in (r["path"], os.path.join(os.path.dirname(r["path"]), ".", os.path.basename(r["path"]))):
         assert sv.main(["--export-topo", r["path"], "-o", target, "--force"]) == 2
     assert open(r["path"], encoding="utf-8").read() == before
+
+
+# ------------------------------------------------------------ #56 第三轮审查
+
+@pytest.mark.parametrize("vendor,cmd", [
+    # Tcl 命令替换 (IOS tclsh / 部分平台的 show 参数里会被展开)
+    ("cisco", "show version [exec reload]"), ("cisco", "show version [ios_config {hostname PWNED}]"),
+    ("cisco", "show version [exec {wr}]"), ("cisco", "show version | include [exec reload]"),
+    ("cisco", "show clock [ios_config {interface Gi0/1} {no ip address}]"), ("ruijie", "show version [x]"),
+    ("huawei", "display version {x}"), ("h3c", "display current-configuration | include [0-9]"),
+    # 任意位置的写文件参数 / 文件系统或 URL 目标
+    ("cisco", "show logging process smd to-file bootflash:x.log"),
+    ("cisco", "show logging profile wireless to-file bootflash:ra.log"),
+    ("cisco", "show logging process smd to-file x"), ("cisco", "show running-config | include x:y"),
+    ("cisco", "show tech-x file flash:a"), ("cisco", "show archive log config filename x"),
+    ("huawei", "display current-configuration file x"), ("huawei", "display x flash:/a"),
+    ("h3c", "display x cfa0:/a"), ("ruijie", "show x tftp://192.0.2.1/a"), ("cisco", "show x scp:"),
+    ("cisco", "show x usbflash0:a"), ("cisco", "show x disk0:"), ("cisco", "show x nvram:"),
+])
+def test_round3_rejected(vendor, cmd):
+    assert not sv.is_readonly(cmd, vendor)
+
+
+@pytest.mark.parametrize("vendor,cmd", [
+    ("cisco", "show running-config | include hostname"), ("huawei", "display interface GigabitEthernet0/0/1"),
+    ("ruijie", "show interfaces status"), ("cisco", "show logging"),
+])
+def test_round3_still_allowed(vendor, cmd):
+    assert sv.is_readonly(cmd, vendor)
+
+
+@pytest.mark.parametrize("text", ["Router(tcl)#", "switch-tcl#", "x\nRouter(TCL)#", "bash-4.4#", "sh-5.1#",
+                                  "[startup-config]", "[running-config]", "[Y/N]", "[confirm]", "[yes/no]"])
+def test_not_device_prompts(text):
+    assert sv.parse_device(text) is None and sv.at_prompt(text) is None
+
+
+@pytest.mark.parametrize("text,name", [("Router#", "Router"), ("Router(config)#", "Router"), ("<SW-A>", "SW-A"),
+                                       ("[SW-A-ui-console0]", "SW-A-ui-console0"), ("tcl-lab#", "tcl-lab")])
+def test_still_device_prompts(text, name):
+    assert sv.at_prompt(text) == name
+
+
+def test_run_survey_requires_tail():
+    with pytest.raises(TypeError):
+        sv.run_survey("/dev/con-1", "huawei", send=fake_send([]))
+
+
+def test_parse_archive_keeps_duplicate_commands():
+    meta = {"head": "con-1", "device": "SW", "vendor": "huawei", "time": "t", "result": "r"}
+    secs = [{"cmd": "display arp", "status": "ok", "note": "", "lines": ["a"]},
+            {"cmd": "display arp", "status": "timeout", "note": "", "lines": ["b"]}]
+    parsed = sv.parse_archive(sv.format_archive(meta, secs))
+    assert parsed["display arp"] == ("ok", ["a"])
+    assert parsed["display arp (第2次)"] == ("timeout", ["b"])
+
+
+def test_export_topo_force_does_not_follow_symlink(tmp_path):
+    r = _run(tmp_path, [])
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    link.symlink_to(victim)
+    assert sv.main(["--export-topo", r["path"], "-o", str(link), "--force"]) == 2
+    assert victim.read_text(encoding="utf-8") == "keep"
+    assert sv.main(["--export-topo", r["path"], "-o", str(link)]) == 2           # 不带 --force: 已存在不覆盖
+    dangling = tmp_path / "dangling.txt"
+    dangling.symlink_to(tmp_path / "nowhere.txt")
+    assert sv.main(["--export-topo", r["path"], "-o", str(dangling)]) == 2        # 悬空链接也不跟
+    assert not (tmp_path / "nowhere.txt").exists()

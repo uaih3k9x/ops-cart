@@ -8,6 +8,8 @@ vendor=auto 时先发 show version, 认不出再发 display version, 按输出�
 每条命令发出前都过只读白名单 (#3 三层闸门的第 1 层); 清单里有一条不合格, 整次巡检不跑.
 界面在 serial_panel.py 的"巡检"按钮; 命令行: python3 survey_core.py <操作头> [--vendor auto|huawei|h3c|cisco|ruijie]
 存档转成拓扑脚本读的 "######## <命令>" 分段格式: python3 survey_core.py --export-topo <存档> [-o 输出]
+存档里正文行以 ===== 或 ######## 开头的, 写入时前面加一个空格 (不当段头, 读和导出都不还原);
+同一条命令跑了多次, 读出来第 n 次记成 "命令 (第n次)". 发第一条前要先 tail 一眼, 设备不在提示符上就不跑.
 """
 
 import difflib
@@ -48,7 +50,10 @@ _RULES = {
                "session": {"terminal length 0"}},
 }
 _TOKEN = re.compile(r"[\x21-\x7e]+")          # 一个词: 可打印 ASCII, 不含空白
-_FORBIDDEN = set(";&<>`$#!?")                    # 拼接/重定向/命令替换/注释/在线帮助, 出现就拒
+_FORBIDDEN = set(";&<>`$#!?[]{}")                # 拼接/重定向/命令替换/注释/在线帮助/Tcl 替换, 出现就拒
+# 写文件的参数: 出现在任何位置都拒 (IOS-XE show logging ... to-file bootflash:x 这类); 加上任何带 ":" 的词
+# (flash: bootflash: disk0: usbflash0: nvram: cfa0: tftp:// scp: ...), 宁可多拦, 过滤词参数里也算
+_FILE_WORDS = {"to-file", "file", "filename", "tftp", "ftp", "sftp", "scp", "http", "https"}
 _KEYWORD = re.compile(r"[a-z0-9][a-z0-9-]*")     # 内置动词后紧跟的关键词
 _QUOTES = set("\"'")
 MAX_LEN = 200
@@ -63,8 +68,12 @@ def is_readonly(cmd, vendor, extra_verbs=()):
       - 厂商得有内置规则 (huawei / h3c / cisco / ruijie); 第一个词必须原样是 display (华为 / H3C) /
         show (思科 / 锐捷), 全小写. 例外只有该厂商的关分页命令 (session), 整句逐字相等才放.
       - 整条只许可打印 ASCII, 词之间恰好一个空格, 不许前后空白、制表符、换行、控制字符、全角/零宽字符.
-      - 不许 ; & < > ` $ # ! ? —— 多命令拼接、重定向、命令替换、注释; ? 让设备显示帮助并把残留
-        放回输入行, 发出去的字面和执行的字面就不一样了.
+      - 不许 ; & < > ` $ # ! ? [ ] { } —— 多命令拼接、重定向、命令替换、注释; ? 让设备显示帮助并把残留
+        放回输入行, 发出去的字面和执行的字面就不一样了; [ ] { } 在思科 tclsh 等环境里是 Tcl 命令替换
+        (show version [exec reload]). include 正则要字符类的, 走人确认.
+      - 任何位置 (含过滤词参数) 都不许出现写文件参数: to-file / file / filename / tftp / ftp / sftp / scp /
+        http / https, 以及任何带 ":" 的词 (文件系统或 URL 目标). IPv6 地址也因此不放, 走人确认.
+      - 规则文件加的动词 (extra_verbs, 如 ping) 后面的参数不受关键词字符集约束, 只受上面这些通用规则.
       - 引号 (" ') 只许出现在管道过滤词之后的参数里; 别处 (尤其关键词) 设备会去掉引号照样执行.
       - "|" 必须单独成词, 后面只许接过滤词 include/exclude/begin/section (要带参数)、count/no-more (不带);
         save/append/redirect/tee 这类写文件的管道全拒. 过滤词同样不许缩写、不许大写.
@@ -89,6 +98,8 @@ def is_readonly(cmd, vendor, extra_verbs=()):
         return False
     words = cmd.split(" ")
     if not all(_TOKEN.fullmatch(w) for w in words):       # 空词 = 前后空白或连续空格
+        return False
+    if any(w in _FILE_WORDS or ":" in w for w in words):
         return False
     if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2:
         return False
@@ -204,7 +215,9 @@ _PROMPTS = [re.compile(r"<([^<>\s]+)>"),                    # 华为用户视图
             re.compile(r"([A-Za-z0-9][\w.-]*)(?:\([^()\s]*\))?[#>]")]   # 思科 SW-A# SW-A> SW-A(config)#
 
 
-_CONFIRM = re.compile(r"\[(?:y/n|yes/no|confirm)\]", re.I)      # 长得像华为 [名] 的确认提示
+# 不算设备提示符的最后一行: 长得像华为 [名] 的确认 / 补齐提示, 思科 tclsh, Linux shell
+_CONFIRM = re.compile(r"\[(?:y/n|yes/no|confirm|startup-config|running-config)\]", re.I)
+_NOT_PROMPT = re.compile(r".*(?:\(tcl\)|-tcl)[#>]|[a-z]{0,4}sh-\d+(?:\.\d+)*[#$]", re.I)
 _MARK = re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\n]*\]")     # conbroker 自己写进日志的标记行
 
 
@@ -217,7 +230,7 @@ def at_prompt(text):
 def parse_device(text):
     """输出最后一行是提示符就返回设备名, 否则 None (停在 Username:/Password:/半截输出上)."""
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    if not lines or _CONFIRM.fullmatch(lines[-1]):
+    if not lines or _CONFIRM.fullmatch(lines[-1]) or _NOT_PROMPT.fullmatch(lines[-1]):
         return None
     for p in _PROMPTS:
         m = p.fullmatch(lines[-1])
@@ -278,7 +291,9 @@ def _split_output(out, cmd):
     return lines
 
 
-_HEAD_LIKE = ("=====", "########")                # 撞存档段头 / 拓扑段头的正文行, 写存档时前面加一个空格
+# 转义规则: 正文行以 "=====" 或 "########" 开头的, 写存档时前面加一个空格, 这样不会被当成存档段头或拓扑段头;
+# 读存档 / 导出都不去掉这个空格 (导出时还原就又能伪造拓扑段了).
+_HEAD_LIKE = ("=====", "########")
 
 
 def _esc(ln):
@@ -301,12 +316,15 @@ def format_archive(meta, sections):
 
 
 def parse_archive(text):
-    """存档 -> {命令: (状态, 正文行)}; 认不出的文件给空 dict."""
+    """存档 -> {命令: (状态, 正文行)}; 认不出的文件给空 dict. 同一条命令出现多次, 第 n 次记成 "命令 (第n次)"."""
     secs, cur = {}, None
     for ln in text.split("\n"):                     # 只按 \n 切: splitlines 会把正文里的 \x0c \x1c 也当换行
         m = _SECTION.fullmatch(ln)
         if m:
-            cur = m.group(3)
+            cur, n = m.group(3), 1
+            while cur in secs:
+                n += 1
+                cur = f"{m.group(3)} (第{n}次)"
             secs[cur] = (m.group(4) or "ok", [])
         elif cur is not None:
             secs[cur][1].append(ln)
@@ -381,8 +399,13 @@ def probe_vendor(send, port, timeout=DEFAULT_TIMEOUT):
     """先 show version, 认不出再 display version -> (厂商, "") 或 (None, 说明). 不抛异常.
 
     每条探测和巡检命令一样判状态: 超时 / 被 conbroker 拒 / 没回提示符 / 发送失败就中止, 说明里写真实原因."""
+    seen = {}
+
+    def keep(p, c, t):
+        seen["out"] = send(p, c, t)
+        return seen["out"]
     for cmd in _PROBES:
-        st, note, lines, _dev = _send_one(send, port, cmd, timeout, None)
+        st, note, lines, _dev = _send_one(keep, port, cmd, timeout, None)
         if st != "ok":
             return None, f"认厂商时 {cmd} {_STATUS[st]}: {note}"
         hits = _vendor_hits(lines)
@@ -390,7 +413,16 @@ def probe_vendor(send, port, timeout=DEFAULT_TIMEOUT):
             return None, f"{cmd} 的输出命中多个厂商 ({' / '.join(hits)}), 认不准; 用 --vendor 指定"
         if hits:
             return hits[0], ""
+        if cmd == "show version" and _show_family(seen.get("out")):
+            return None, "show version 的输出里认不出厂商 (停在 名#/名> 式提示符, 不再试 display); 用 --vendor 指定"
     return None, "show version / display version 的输出里认不出厂商; 用 --vendor 指定"
+
+
+def _show_family(out):
+    """最后一行是 名# / 名> (思科 / 锐捷式), 不是华为的 <名> / [名]."""
+    lines = [ln.strip() for ln in (out or "").replace("\r", "").split("\n") if ln.strip()]
+    return bool(lines) and parse_device(lines[-1]) is not None and bool(_PROMPTS[2].fullmatch(lines[-1])) \
+        and not any(p.fullmatch(lines[-1]) for p in _PROMPTS[:2])
 
 
 # ------------------------------------------------------------ 执行
@@ -454,22 +486,23 @@ def _compare(res, survey_dir, prof):
     return out
 
 
-def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None, tail=None):
+def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None):
     """跑一次巡检: 白名单预检 -> 逐条 send -> 存档 -> 和同设备上一份比. 不抛异常, 结果全在返回的 dict 里.
 
     send(port, cmd, timeout) -> conbroker send 的输出 (回显 + 正文 + 提示符); 出错可以抛异常.
+    tail(port) -> 串口最近几行 (必填, 真机用 conbroker_tail): 最后一行不是设备提示符就一条都不发.
     任何一条超时 / 没回提示符 / 被拒 / 提示符变了就中止, 后面的不发, 存档里逐段写明.
     """
     head = head or safe_name(os.path.basename(port))
-    if tail is not None:                                # 发第一条 (含探测) 前先看设备停没停在提示符上
-        try:
-            recent = tail(port)
-        except Exception as e:
-            return _result(head=head, summary=f"巡检没跑: 读串口最近输出失败: {str(e) or type(e).__name__}")
-        if not at_prompt(recent):
-            last = next((ln.strip() for ln in reversed((recent or "").split("\n")) if ln.strip()), "")
-            return _result(head=head, summary="巡检没跑: 设备不在提示符上 (可能停在 Username / Password / [Y/N] / "
-                                              f"翻页或半截输出上), 最后一行: {last[:60]!r}; 先在面板里处理好再巡检")
+    # 发第一条 (含探测) 前先看设备停没停在提示符上
+    try:
+        recent = tail(port)
+    except Exception as e:
+        return _result(head=head, summary=f"巡检没跑: 读串口最近输出失败: {str(e) or type(e).__name__}")
+    if not at_prompt(recent):
+        last = next((ln.strip() for ln in reversed((recent or "").split("\n")) if ln.strip()), "")
+        return _result(head=head, summary="巡检没跑: 设备不在提示符上 (可能停在 Username / Password / [Y/N] / "
+                                          f"翻页或半截输出上), 最后一行: {last[:60]!r}; 先在面板里处理好再巡检")
     if vendor == "auto":
         vendor, why = probe_vendor(send, port)
         if not vendor:
@@ -595,10 +628,14 @@ def main(argv=None):
                 if os.path.exists(a.out) and os.path.samefile(a.out, a.export_topo):
                     print("导出失败: 输出文件就是输入的存档, 不覆盖")
                     return 2
-                if os.path.exists(a.out) and not a.force:
+                flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                flags |= os.O_TRUNC if a.force else os.O_EXCL      # 不带 --force: 已存在 (含链接) 一律不碰
+                try:
+                    fd = os.open(a.out, flags, 0o644)
+                except FileExistsError:
                     print(f"导出失败: {a.out} 已存在, 要覆盖加 --force")
                     return 2
-                with open(a.out, "w", encoding="utf-8") as f:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(out)
             else:
                 sys.stdout.write(out)

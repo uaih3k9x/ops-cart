@@ -71,20 +71,26 @@ def check_line(cmd):
 # 只增不减: 规则文件能往里加, 删不掉. 认的是整词, 以及整词的缩写 (VRP / IOS 认唯一前缀: sav = save, wr = write).
 DANGER = ("save", "reboot", "reload", "reset", "format", "delete", "erase", "rmdir", "rm", "write", "copy",
           "startup", "shutdown", "poweroff", "halt", "init", "mkfs", "fdisk", "wipefs", "dd", "upgrade")
-_SPLIT = re.compile(r"[\s|;&<>()`$]+")         # Linux shell 的拼接 / 重定向 / 命令替换也当分隔
+_SPLIT = re.compile(r"[\s|;&<>()`$\[\]{}]+")     # Linux shell 的拼接 / 重定向 / 命令替换、Tcl 的 [ ] { } 也当分隔
+_TOK = re.compile(r"[\s|;&<>()`$\[\]{}]+|[^\s|;&<>()`$\[\]{}]+")   # 词和分隔串交替
 _QUOTE = re.compile(r"['\"\\]")                  # r'm' "reboot" \rm: 去掉引号反斜杠再切词
 
 
 def danger_words(cmd, extra=()):
     """命令里出现的高危词 (规范写法, 按出现顺序, 不重复).
-    第一个词 2 个字符起、后面的词 3 个字符起, 是高危词的前缀也算 (缩写); 往"多拦"的方向错."""
+    处在命令开头的词 (整行第一个, 以及 [ { ( ` ; 后面第一个: Tcl / shell 里这里又是一条命令) 2 个字符起、
+    其余的词 3 个字符起, 是高危词的前缀也算 (缩写); 往"多拦"的方向错."""
     words = tuple(DANGER) + tuple(w for w in extra if w not in DANGER)
-    out = []
-    for i, tok in enumerate(t for t in _SPLIT.split(_QUOTE.sub("", (cmd or "").lower())) if t):
+    out, first = [], True
+    for tok in _TOK.findall(_QUOTE.sub("", (cmd or "").lower())):
+        if _SPLIT.fullmatch(tok):
+            first = first or any(c in tok for c in "[{(`;")
+            continue
         for w in words:
-            if tok == w or (len(tok) >= (2 if i == 0 else 3) and w.startswith(tok)):
+            if tok == w or (len(tok) >= (2 if first else 3) and w.startswith(tok)):
                 if w not in out:
                     out.append(w)
+        first = False
     return out
 
 
@@ -197,9 +203,13 @@ def last_line(text):
 def slot_vendor(slot, rules, text):
     """-> (厂商 或 None, 是否停在该厂商的提示符上).
     规则文件给槽位登记了厂商就用它; 没登记且开着自动认, 最后一行是华为 <名>/[名] 才算华为 (思科式 名# 和
-    Linux 的 bash-4.4# 分不开, 只能登记). 停在密码 / [Y/N] / 翻页 / 半截输出上一律不算在提示符上."""
+    Linux 的 bash-4.4# 分不开, 只能登记). 停在密码 / [Y/N] / [startup-config] / 翻页 / 半截输出上、思科 tclsh
+    (名(tcl)# / 名-tcl#) 里一律不算在提示符上. H3C 不单独认: <名> / [名] 按华为处理 (display 系规则相同).
+    登记成 linux 的槽位, shell 提示符照常算 (只排除没登记 / 登记成网络设备时的 shell)."""
     ln = last_line(text)
     v = rules.get("slots", {}).get(slot)
+    if survey_core._CONFIRM.fullmatch(ln) or (v != "linux" and survey_core._NOT_PROMPT.fullmatch(ln)):
+        return v or None, False             # [Y/N] [startup-config] 确认 / 补齐, 思科 tclsh, Linux shell
     if v:
         return v, bool(_PROMPT[v].fullmatch(ln))
     if rules.get("auto_huawei") and _PROMPT["huawei"].fullmatch(ln):
@@ -217,6 +227,7 @@ def _gate(verdict, reason, danger=(), vendor=None, layer=None, model=None):
     return g
 
 
+_TCL = re.compile(r"[\[\]{}]")
 _SHELL_META = re.compile(r"[;&<>`\\!]|\$\(")   # Linux: 拼接 / 后台 / 重定向 / 命令替换 / 续行 / 历史展开
 
 
@@ -232,6 +243,8 @@ def classify(cmd, vendor, at_prompt, rules, judge=None):
         return _gate("confirm", "认不出设备厂商 (规则文件没登记这个槽位, 最后一行也不是华为 <名>/[名] 提示符), 要人确认")
     if not at_prompt:
         return _gate("confirm", "设备不在提示符上 (可能停在密码、[Y/N]、翻页或半截输出上), 要人确认", vendor=vendor)
+    if _TCL.search(cmd):
+        return _gate("confirm", "带 [ ] { } (思科 tclsh 等环境里是 Tcl 命令替换), 不送模型, 要人确认", vendor=vendor)
     extra = rules.get("vendors", {}).get(vendor, {}).get("extra_verbs", ())
     if survey_core.is_readonly(cmd, vendor, extra_verbs=extra):
         return _gate("pass", f"{vendor} 只读命令 (第 1 层放行)", vendor=vendor)
