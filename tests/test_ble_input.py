@@ -256,7 +256,7 @@ def _built(devices=None, owner=":1.7"):
 
 
 def test_build_flags_require_le_secure_connections():
-    """L2: RX 只能 secure-write、TX 用 secure-notify (BlueZ 只在 LE Secure Connections 加密下放行)."""
+    """L2: RX 只能 secure-write、TX 用 secure-notify (BlueZ 要最高一级链路安全)."""
     _rec, _app, rx, tx, objs = _built()
     flags = {o["org.bluez.GattCharacteristic1"]["UUID"]: o["org.bluez.GattCharacteristic1"]["Flags"]
              for o in objs.values() if "org.bluez.GattCharacteristic1" in o}

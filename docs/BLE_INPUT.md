@@ -30,7 +30,8 @@
 | RX（手机写） | `d0b9f7e0-8914-4d78-9501-69062f225d38` | `secure-write`（带回应的写） |
 | TX（推车通知） | `a1e1ae6b-abf5-4e3d-9e69-19bafa051e86` | `notify`、`secure-notify` |
 
-`secure-*` 要求 **LE Secure Connections** 加密（BlueZ 在 ATT 层就拒掉老式配对和没配对的连接）。另外建议在
+`secure-*` 是 BlueZ 的 Server 端标志，单独就设了写 / 通知属性，并要求最高一级的链路安全（BlueZ 文档没明说是否等于
+**LE Secure Connections**，待实机验证；目标是 ATT 层就拒掉老式配对和没配对的连接）。另外建议在
 `/etc/bluetooth/main.conf` 的 `[General]` 里写 `SecureConnections = only`，适配器层面就不接受老式配对。
 
 外壳另外查 `org.bluez.Device1` 属性（`device_trusted`）：要 `Paired` 和 `Trusted`，不能 `Blocked`；BlueZ 有
@@ -210,6 +211,6 @@ sudo systemctl enable --now cart-ble-input.service
 | 通知分包 | 跟最后一次写的 MTU | 固定 23 |
 | 正文过滤 | Cc、双向覆盖符 | Cc、Cf（放行 ZWJ）、标签字符、Zl/Zp、Cn、Co、Cs、填充字 |
 | 投递 JSON | 5 个字段 | 加 `multiline` |
-| GATT 标志 | `encrypt-authenticated-*` | `secure-*`（LE Secure Connections） |
+| GATT 标志 | `encrypt-authenticated-*` | `secure-*`（目标 LE Secure Connections，待实机验证） |
 
 帧格式本身没变，v1 手机解析回执时忽略多出来的 `crc` 照样能用，只是没有回执归属保护；两边一起升级。
