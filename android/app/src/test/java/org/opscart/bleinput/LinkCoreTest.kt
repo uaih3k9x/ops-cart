@@ -315,7 +315,7 @@ class LinkCoreTest {
         core.send("等 trust")
         drainWrites(core, c)
         val n = c.writes.size
-        FakeCart().notify("""{"t":"err","id":100,"crc":${crcOf("等 trust")},"code":"unpaired"}""").forEach { core.onNotify(c, it) }
+        FakeCart().notify("""{"t":"err","id":100,"crc":null,"code":"unpaired"}""").forEach { core.onNotify(c, it) }   // 推车不再带 crc
         assertEquals(1, f.saved.size)
         assertTrue(f.lines.any { it.contains("trust") })
         f.advance(LinkCore.UNPAIRED_RETRY_MS)
@@ -753,7 +753,7 @@ class LinkCoreTest {
 
     @Test
     fun weakNonRetryErrorsTouchNothing() {
-        // 低3: crc 为 null 且不是可重发码 (含 unpaired): 只按序号猜不许改受信手机的状态, 回执等待照旧
+        // 低3: crc 为 null 且不是可重发码 (unpaired 除外, 推车只在写入方独自连着时发): 不许改状态, 回执等待照旧
         val f = bondedFake()
         val core = LinkCore(f, f, f)
         core.start()
@@ -762,7 +762,6 @@ class LinkCoreTest {
         drainWrites(core, c)
         val before = f.lines.size
         val cs = FakeCart()
-        cs.notify("""{"t":"err","id":100,"crc":null,"code":"unpaired"}""").forEach { core.onNotify(c, it) }
         cs.notify("""{"t":"err","id":100,"crc":null,"code":"frame"}""").forEach { core.onNotify(c, it) }
         assertEquals(before, f.lines.size)
         f.advance(LinkCore.ACK_WAIT_MS)                       // 回执等待没被取消: 照样重发
@@ -798,5 +797,25 @@ class LinkCoreTest {
         f.adapter = false
         core.onDisconnected(c)
         assertTrue(f.states.last(), f.states.last().contains("蓝牙关"))
+    }
+
+    @Test
+    fun unpairedRetriesCapped() {
+        // 第四轮: unpaired 不带 crc 按序号认领; 每 30 秒重发, 最多 UNPAIRED_RETRIES 次, 不无限广播
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f)
+        core.send("一直没 trust")
+        val cs = FakeCart()
+        repeat(LinkCore.UNPAIRED_RETRIES + 5) {
+            drainWrites(core, c)
+            cs.notify("""{"t":"err","id":100,"crc":null,"code":"unpaired"}""").forEach { core.onNotify(c, it) }
+            f.advance(LinkCore.UNPAIRED_RETRY_MS)
+        }
+        drainWrites(core, c)
+        assertEquals(1 + LinkCore.UNPAIRED_RETRIES, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+        assertEquals(1, f.saved.size)                         // 留在发件箱, 重连或过期再说
+        assertEquals(f.lines.toString(), 1, f.lines.count { it.startsWith("✗ 推车还没 trust") })
     }
 }

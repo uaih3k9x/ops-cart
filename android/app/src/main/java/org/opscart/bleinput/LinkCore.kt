@@ -58,6 +58,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         var retryToken = 0
         var retrying = false
         var ackToken = 0
+        var unpairedRetries = 0           // unpaired 后的定时重发次数, 最多 UNPAIRED_RETRIES
         var ackResends = 0                // 等不到回执的重发次数, 最多 ACK_RESENDS
         var sent = false                  // 整条写完过至少一次: 过期时推车可能已经收到
         var lastCode: String? = null      // 同一个错误码只提示一次, 免得 unpaired 每 30 秒刷屏
@@ -80,6 +81,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         const val ACK_RESENDS = 2
         const val RETRY_MS = 3_000L
         const val UNPAIRED_RETRY_MS = 30_000L
+        const val UNPAIRED_RETRIES = 10
         const val OUTBOX_TTL_MS = 600_000L      // = 推车去重时效, 过了再发可能重复投递
         const val TICK_MS = 30_000L
         val RETRY_CODES = setOf("full", "busy", "timeout", "nostart", "crc")
@@ -491,7 +493,9 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
 
     private fun onErr(s: Status.Err) {
         // crc 为 null: 推车读不出是哪条, 只能按序号猜 -> 只许重发 (推车去重), 不许删
-        if (s.crc == null && s.code !in RETRY_CODES) return   // 只能按序号猜的, 除了"重发一次"什么都不许动
+        // crc 为 null 只能按序号猜: 除了"重发一次"什么都不许动. unpaired 例外: 推车一律不给它带 crc (防指纹),
+        // 而且只在写入方是唯一连着的设备时才发, 收到的就是写这条的手机.
+        if (s.crc == null && s.code !in RETRY_CODES && s.code != "unpaired") return
         val m = outbox.firstOrNull { it.id == s.id && (s.crc == null || it.crc == s.crc) } ?: return
         m.ackToken++                      // 推车回话了, 不用再等回执超时
         val fresh = m.lastCode != s.code
@@ -499,7 +503,10 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         when {
             s.code == "unpaired" -> {
                 if (fresh) ui.line("✗ 推车还没 trust 这台手机: 在车机上 trust 后自动重发")
-                retry(m, UNPAIRED_RETRY_MS)
+                if (!m.retrying && m.unpairedRetries < UNPAIRED_RETRIES) {
+                    m.unpairedRetries++
+                    retry(m, UNPAIRED_RETRY_MS)
+                }
             }
             s.code in RETRY_CODES -> {
                 if (fresh) ui.line("✗ 推车回 ${s.code}, ${RETRY_MS / 1000} 秒后重发")
