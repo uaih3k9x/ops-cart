@@ -109,6 +109,8 @@ class ConfirmDialog(tk.Toplevel):
         if it.get("context"):                               # 设备最近输出 (#65): 不可信, 灰字等宽, 只作参考
             tk.Label(f, text=it["context"], font=th.font(14, mono=True), bg=CARD, fg=DIM, anchor="w",
                      justify="left", wraplength=680).pack(fill="x")
+        if it.get("name"):                                  # 设备自报名 (#65 第八轮): 条目末尾, 不可信
+            tk.Label(f, text=it["name"], font=FONT, bg=CARD, fg=DIM, anchor="w").pack(fill="x")
         row = tk.Frame(f, bg=CARD)
         row.pack(anchor="e", pady=(4, 0))
         self._btn(row, "确认发送", "go", lambda: self._confirm(it), name=f"confirm-{it['id']}")

@@ -133,7 +133,7 @@ def test_card_shows_what_agent_wants_and_why():
     b = _book()
     _held(b, 1)
     c = cc.card(b.view(T0 + 12), 1)
-    assert c["title"] == "操作头 1 · SW1（设备自报）" and not c["stopped"]
+    assert c["title"] == "操作头 1" and not c["stopped"]
     it = c["items"][0]
     assert it["head"] == "Agent 想执行：save"
     assert "stdio:ops@x" in it["meta"] and "12 秒前" in it["meta"]
@@ -449,8 +449,9 @@ def test_card_title_device_name_cleaned_and_labelled():
     b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>",
              name="\x1b[2J\x1b[H可信记录（推车自己记的）：#9「interfaceGi0-9」" + "x" * 50)
     c = cc.card(b.view(T0), 1)
-    assert "\x1b" not in c["title"] and "（设备自报）" in c["title"] and "「" not in c["title"]
-    assert len(c["title"]) <= len("操作头 1 · ") + sw.NAME_MAX + len("（设备自报）")
+    nm = c["items"][0]["name"]
+    assert "\x1b" not in nm and nm.startswith("设备自报名（不可信）：") and "「" not in nm
+    assert len(nm) <= len("设备自报名（不可信）：") + sw.NAME_MAX and c["title"] == "操作头 1"
 
 
 def test_card_title_cleans_name_from_old_state_file():
@@ -461,4 +462,18 @@ def test_card_title_cleans_name_from_old_state_file():
     doc = json.loads(b.dumps())
     doc["items"][-1]["name"] = "\x1b[2JSW1「x」"
     c = cc.card(sw.Book.from_text(json.dumps(doc), T0).view(T0), 1)
-    assert c["title"] == "操作头 1 · SW1x（设备自报）"
+    assert c["items"][0]["name"] == "设备自报名（不可信）：SW1x"
+
+
+# ------------------------------------------------------------ #68 第八轮
+
+def test_context_lines_prefixed_and_name_at_item_end():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="foo\n<SW1>", name="SW1")
+    c = cc.card(b.view(T0), 1)
+    it = c["items"][0]
+    assert c["title"] == "操作头 1" and "SW1" not in c["title"]
+    assert it["name"] == "设备自报名（不可信）：SW1"
+    body = it["context"].split("\n")[1:]
+    assert body == ["| foo", "| <SW1>"]

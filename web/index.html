@@ -432,6 +432,7 @@ function agentItem(it) {
     ${it.note ? `<div class="bad">${esc(it.note)}</div>` : ""}
     ${it.model ? `<div class="dim">${esc(it.model)}</div>` : ""}${it.intent ? `<div class="dim">${esc(it.intent)}</div>` : ""}
     ${it.context ? `<pre class="dim" style="white-space:pre-wrap;margin:4px 0">${esc(it.context)}</pre>` : ""}
+    ${it.name ? `<div class="dim">${esc(it.name)}</div>` : ""}
     <button class="btn danger" data-reject="${it.id}">拒绝</button></div>`;
 }
 function agentCard(c, n) {

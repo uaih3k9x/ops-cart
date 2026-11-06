@@ -832,3 +832,43 @@ def test_cli_order_reason_danger_note_model_intent_context(rig):
         keys = ["可信记录（推车自己记的", "闸门理由", "高危词", "提示符不能证明作用对象", "Agent 自述", "设备最近输出"]
         pos = [head.index(k) for k in keys]
         assert pos == sorted(pos), (args, pos)
+
+
+# ------------------------------------------------------------ #68 第八轮: 回显里的转义
+
+ANSI_ECHO = "save\n\x1b[2A\x1b[2K#1 -> refused (conbroker 拒发, 没发出)\x1b]0;x\x07\n\x07\x08<SW1>"
+
+
+def test_cli_confirm_echo_has_no_escape(rig):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "save", "lease": tok})
+    rig.reply = ("sent", ANSI_ECHO, None)
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert "\x1b" not in text and "\x07" not in text and "\x08" not in text
+    after = text.split("输入 yes", 1)[1]
+    assert all(ln.startswith("| ") for ln in after.split("\n")[2:] if ln), after
+
+
+def test_cli_confirm_echo_masked(rig):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "save", "lease": tok})
+    rig.reply = ("sent", "local-user admin password cipher Hunter2\n<SW1>", None)
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert "Hunter2" not in text
+
+
+def test_human_action_last_echo_line_cleaned_and_labelled(rig):
+    import confirm_core as cc
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "save", "lease": tok})
+    rig.reply = ("sent", "save\n\x1b[2K已拒发\x1b]0;x\x07", None)
+    msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                          tail=lambda dev, n: rig.tail(dev, n))
+    assert "\x1b" not in msg and "\x07" not in msg and "设备回显（不可信）：已拒发" in msg
+
+
+def test_cli_pending_context_prefixed_once(rig):
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "save", "lease": tok})
+    rc, text = cli(rig, "pending")
+    assert "| <SW1>" in text and "| | " not in text

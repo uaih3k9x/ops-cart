@@ -66,7 +66,8 @@ def test_dialog_shows_what_agent_wants(root):
     d, _acts, _asked = _dlg(root, _view())
     text = "\n".join(_labels(d))
     assert "Agent 想执行：save" in text and "Agent 想执行：undo shutdown" in text
-    assert "高危词：save" in text and "闸门理由：不在只读白名单里" in text and "操作头 1 · SW1" in text
+    assert "高危词：save" in text and "闸门理由：不在只读白名单里" in text and "操作头 1" in text
+    assert "设备自报名（不可信）：SW1" in text and "操作头 1 · SW1" not in text
     b = _buttons(d)
     assert len(b["确认发送"]) == 2 and len(b["拒绝"]) == 2 and "急停本路" in b and "全部急停" in b
 
@@ -149,5 +150,11 @@ def test_dialog_item_order(root):
     d, _acts, _asked = _dlg(root, _view(items=(("save", gate),)))
     labels = _labels(d)[::-1]          # _labels 是栈序, 反过来近似 pack 顺序
     order = [next(i for i, x in enumerate(labels) if x.startswith(k))
-             for k in ("闸门理由", "高危词", "注意", "模型理由", "Agent 自述", "设备最近输出")]
+             for k in ("闸门理由", "高危词", "注意", "模型理由", "Agent 自述", "设备最近输出", "设备自报名")]
     assert order == sorted(order), labels
+
+
+def test_dialog_context_lines_prefixed(root):
+    d, _acts, _asked = _dlg(root, _view())
+    ctx = next(x for x in _labels(d) if x.startswith("设备最近输出"))
+    assert ctx.split("\n")[1:] == ["| <SW1>"]

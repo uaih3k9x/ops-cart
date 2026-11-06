@@ -1381,3 +1381,23 @@ def test_human_confirmed_send_clears_log_lost():
     p = b.submit(1, "tokA", "agentA", "line", "interface g2", _gate_confirm(), T0, timeout=5, context="<SW1>")
     b.confirm(p["id"], "human:ops", T0, current="<SW1>")
     assert not b.view(T0)["slots"][0]["trusted"]["lost"]
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("echo Hunter2 | passwd --stdin root", "Hunter2"), ("echo 'Hunter2' | sudo -S reboot", "Hunter2"),
+    ("printf 'root:Hunter2' | chpasswd", "Hunter2"), ("docker login -u bob -p Hunter2 registry", "Hunter2"),
+    ("podman login -p Hunter2 r", "Hunter2"), ("smbclient //h/s -U bob%Hunter2", "Hunter2"),
+])
+def test_round8_secret_forms_masked(line, secret):
+    blob = "\n".join(sw.device_context(line)["lines"])
+    assert secret not in blob, blob
+
+
+@pytest.mark.parametrize("line", ["docker run -p 8080:80 nginx", "smbclient -L //h -U bob",
+                                  "sudo -i"])
+def test_round8_plain_not_masked(line):
+    assert sw.device_context(line)["lines"] == [line]
+
+
+def test_device_lines_cleans_each_line():
+    assert sw.device_lines("a\x1b[2Kb\n\x1b]0;t\x07c\x08\nkey abc") == ["ab", "c?", "key ******"]

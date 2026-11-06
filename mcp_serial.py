@@ -472,9 +472,9 @@ def human_action(store, op, arg, by, slots, send, tail=None):
     (槽位, None = 全部). Book 不让抛 sw.Refused. 调用方保证是本机人 (车机进程), 放后台线程调."""
     if op == "confirm":
         it, status, output, note = send_confirmed(store, arg, by, slots, send, tail)
-        last = sw.echo_summary(output).strip().splitlines()[-1:] if output else []
+        last = [ln for ln in sw.device_lines(sw.echo_summary(output)) if ln.strip()][-1:] if output else []
         return f"#{it['id']} {it['cmd']} -> {status}" + (f" ({note})" if note else "") + \
-            (f": {last[0]}" if last and not note else "")
+            (f"; 设备回显（不可信）：{last[0][:sw.CONTEXT_LINE_MAX]}" if last and not note else "")
     where = "全部槽位" if arg is None else f"槽位 {arg}"
     if op == "reject":
         store.run(lambda b, now: b.reject(arg, by, now, why="车机上拒绝"))
@@ -619,26 +619,15 @@ def local_human(env, pid, stat=read_stat, tty=False):
 CLI_CMDS = ("pending", "confirm", "reject", "estop", "resume", "requests")
 
 
-def _context(item):
-    ctx = item.get("context") or {}
-    lines = ctx.get("lines") or []
-    if not lines:
-        return ""
-    body = "".join(f"\n        | {ln}" for ln in lines)
-    return f"\n      设备最近输出 (来自设备, 不可信, 仅供参考):{body}"
-
-
-def _untrusted_tail(shown, item):
-    """一条挂起项除可信记录、设备输出外要显示的几行, 三处显示面同一个顺序 (#65 第七轮):
-    闸门理由 -> 高危词 -> 提示 -> 模型理由 -> Agent 自述 -> 设备自报名."""
-    name = sw.clean_name(item.get("name"))
-    return (shown["reason"], shown["danger"], shown.get("note"), shown["model"], shown["intent"],
-            f"设备自报名（不可信）：{name}" if name else "")
+def _untrusted_tail(shown):
+    """一条挂起项在设备输出之前要显示的几行, 三处显示面同一个顺序 (#65 第七 / 八轮):
+    闸门理由 -> 高危词 -> 提示 -> 模型理由 -> Agent 自述 (后面是设备输出、设备自报名)."""
+    return shown["reason"], shown["danger"], shown.get("note"), shown["model"], shown["intent"]
 
 
 def _device_lines(text):
-    """设备输出 -> 每行前加 "| " (命令行上和推车自己的话分开)."""
-    return "\n".join("| " + ln for ln in (text or "").split("\n"))
+    """设备输出 -> 每行先清洗打码 (sw.device_lines: 删转义 / 控制字符) 再加 "| " (命令行上和推车自己的话分开)."""
+    return "\n".join("| " + ln for ln in sw.device_lines(text))
 
 
 def _print_view(v, out):
@@ -655,9 +644,10 @@ def _print_view(v, out):
             print(f"  槽位 {s['slot']} " + cc.card(v, s["slot"])["trusted"].replace("\n", "\n    "), file=out)
     for p in v["pending"]:              # 可信记录已在上面; 顺序同车机 / 网页: 理由 -> 高危词 -> 提示 -> 模型 -> 自述 -> 设备
         shown = next(x for x in cc.card(v, p["slot"])["items"] if x["id"] == p["id"])
-        extra = "".join(f"\n      {x}" for x in _untrusted_tail(shown, p) if x)
+        extra = "".join("\n      " + x.replace("\n", "\n        ")
+                        for x in (*_untrusted_tail(shown), shown["context"], shown["name"]) if x)
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前)"
-              f"{extra}{_context(p)}", file=out)
+              f"{extra}", file=out)
     for h in v["history"][-5:]:
         print(f"  最近 #{h['id']} 槽位 {h['slot']} {h['cmd']!r} -> {h['status']}"
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)
@@ -728,12 +718,9 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
     warn = ""
     card = cc.card(store.view(), item["slot"])
     shown = next(x for x in card["items"] if x["id"] == a.id)
-    ctx = shown.get("context")
-    if ctx:                             # 设备输出每行前加 "| ": 设备打出来的字不能伪装成推车自己的提示 (#65 第四轮)
-        head_line, _, body = ctx.partition("\n")
-        ctx = head_line + "\n" + _device_lines(body)
+    ctx = shown.get("context")          # 卡片里设备输出每行已带 "| " (#65 第八轮, 三处一致)
     # 顺序 (#65 第六轮): 推车自己的 (可信记录、提示、闸门理由) 在前, Agent / 模型 / 设备给的 (都不可信) 在后
-    for extra in (card["trusted"], *_untrusted_tail(shown, item), ctx):
+    for extra in (card["trusted"], *_untrusted_tail(shown), ctx, shown["name"]):
         if extra:
             warn += "\n  " + ("!!! " if extra == shown["danger"] else "") + extra.replace("\n", "\n    ")
     print(f"槽位 {item['slot']} 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"

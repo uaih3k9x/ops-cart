@@ -120,6 +120,12 @@ def _reasons(item):
     return reason, ""
 
 
+def _name(item):
+    """设备自报的名字 (提示符里认的): 显示前再洗一遍 (旧状态文件里的没洗过), 放条目末尾, 标不可信 (#65 第八轮)."""
+    name = sw.clean_name(item.get("name"))
+    return f"设备自报名（不可信）：{name}" if name else ""
+
+
 def _want(item):
     if item.get("kind") == "key":
         return f"Agent 想按：{KEY_LABEL.get(item['cmd'], item['cmd'])}"
@@ -129,7 +135,7 @@ def _want(item):
 def _context(item):
     """挂起时设备最近输出 (#65): 来自被测设备, 不可信, 只给审批的人参考."""
     lines = ((item.get("context") or {}).get("lines")) or []
-    return ("设备最近输出（来自设备，不可信，仅供参考）：\n" + "\n".join(lines)) if lines else ""
+    return ("设备最近输出（来自设备，不可信，仅供参考）：\n" + "\n".join("| " + ln for ln in lines)) if lines else ""
 
 
 
@@ -191,7 +197,6 @@ def card(view, n):
     """槽位 n 的确认框 -> {title, status, stopped, items}. items 每条 {id, head, meta, reason, danger}."""
     s = next(x for x in view["slots"] if x["slot"] == n)
     items = [p for p in view["pending"] if p["slot"] == n]
-    name = next((p.get("name") for p in items if p.get("name")), None)
     status = []
     if s["estop"]:
         e = s["estop"]
@@ -209,9 +214,8 @@ def card(view, n):
                     "reason": f"闸门理由：{one_line(_reasons(p)[0], 300)}", "model": _reasons(p)[1],
                     "intent": _intent(p),
                     "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else "",
-                    "context": _context(p), "note": _note(p)})
-    name = sw.clean_name(name)                       # 设备自报的, 显示前再洗一遍 (旧状态文件里的没洗过)
-    return {"title": f"操作头 {n}" + (f" · {name}（设备自报）" if name else ""), "status": status,
+                    "context": _context(p), "note": _note(p), "name": _name(p)})
+    return {"title": f"操作头 {n}", "status": status,
             "stopped": bool(s["estop"]), "items": out, "trusted": _trusted(s) if out else ""}
 
 

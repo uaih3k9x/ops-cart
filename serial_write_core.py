@@ -335,9 +335,11 @@ _SECRET_LONG = re.compile(r"(?i)(?P<k>(?:private|pre-?shared|secret|access)[-_]?
                           r"|authentication-mode)(?![a-z0-9])")
 _SECRET_DASH = re.compile(r"(?<!\S)(?P<k>-p)(?=\S)|(?<!\S)(?P<u>(?:-u|--user)[\s=]+)(?=\S+:\S)")   # mysql -pX / curl -u a:b
 _SECRET_URL = re.compile(r"(?P<k>)[\w.%+-]+:[^\s@/]+@")                                        # https://user:pass@
-_SECRET_SPACED = re.compile(r"(?i)(?<![\w-])(?:sshpass|mysql\w*|mariadb\w*|usermod|useradd)\b(?:.*?\s)?(?P<k>-p\s+)(?=\S)"   # sshpass -p x
+_SECRET_SMB = re.compile(r"(?<!\S)(?P<k>-U\s+[^\s%]+%)(?=\S)")                             # smbclient -U user%pass
+_SECRET_SPACED = re.compile(r"(?i)(?<![\w-])(?:sshpass|mysql\w*|mariadb\w*|usermod|useradd|(?:docker|podman)\s+login)\b(?:.*?\s)?(?P<k>-p\s+)(?=\S)"   # sshpass -p x
                             r"|(?P<u>identified\s+by\s+)(?=\S)")                               # IDENTIFIED BY 'x' 
-_SECRET_WHOLE = re.compile(r"(?i)chpasswd|^\s*[\w.-]+:\$[0-9a-z]{1,3}\$")                       # chpasswd / shadow 行
+_SECRET_WHOLE = re.compile(r"(?i)chpasswd|^\s*[\w.-]+:\$[0-9a-z]{1,3}\$"
+                           r"|\|\s*(?:sudo\s+(?:-\w+\s+)*-\w*S|passwd\b)")          # echo x | passwd --stdin / sudo -S                       # chpasswd / shadow 行
 _SECRET_CONT = re.compile(r"\s*(?:%\^%#|%\$%\^|\$[0-9a-z]{1,3}\$)")                             # 折行后的密文续行
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?")
 _PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY")
@@ -412,7 +414,7 @@ def _ctx_line(ln, in_key=False, vendor=None):
     if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest) or _cipher_like(rest):
         return _show(head) + MASK, in_key
     cut = None
-    for rx in (_SECRET_SHORT, _SECRET_LONG, _SECRET_DASH, _SECRET_URL, _SECRET_SPACED):
+    for rx in (_SECRET_SHORT, _SECRET_LONG, _SECRET_DASH, _SECRET_URL, _SECRET_SPACED, _SECRET_SMB):
         for hit in rx.finditer(rest):
             grp = "k" if hit.group("k") is not None else "u"
             keep = hit.end(grp)
@@ -431,6 +433,16 @@ def _tail_hash(text):
     lines = [_norm(ln).rstrip() for ln in (text or "").replace("\r", "").split("\n")]
     lines = [ln for ln in lines if ln.strip() and not _MARK.fullmatch(ln.strip())][-HASH_LINES:]
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def device_lines(text):
+    """设备输出 (回显等) -> 给终端 / 界面看的行: 每行删 ANSI/OSC、控制字符换成 ?, 并照常打码 (私钥块跨行).
+    命令行打印设备回显前必须过这里 (#65 第八轮: 否则 ESC[2A ESC[2K 能擦掉推车自己的结果行)."""
+    out, in_key = [], False
+    for ln in (text or "").replace("\r", "").split("\n"):
+        ln, in_key = _ctx_line(ln, in_key)
+        out.append(ln)
+    return out
 
 
 def device_context(text, vendor=None):
