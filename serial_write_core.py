@@ -23,6 +23,7 @@ import re
 import secrets
 import time
 
+import serial_core
 import survey_core
 
 SLOTS = (1, 2, 3, 4)
@@ -183,15 +184,52 @@ _PROMPT = {
                         r"|[a-z]{0,4}sh-\d+(?:\.\d+)*)?[#$]"),
 }
 _MARK = re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\n]*\]")                       # conbroker 自己写进日志的标记行
+_ESC = re.compile(r"\x1b\][^\x07\x1b\n]{0,512}(?:\x07|\x1b\\)"                  # OSC (改窗口标题等) 整段剥掉, 不跨行
+                  "|" + serial_core._CSI.pattern.decode("ascii") + r"|\x1b.?")    # ANSI 转义 (同 serial_core), 再兜底孤立 ESC
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")                                    # 其余控制字符 (\t \n 之外)
+_PAGER = re.compile(r"-{2,}\s*More\s*-{2,}(?:\s*\(\d{1,3}%\))?", re.I)               # --More-- / ---- More ----
+
+
+def clean(text):
+    """剥 ANSI 转义和控制字符 (#74 审查: \x1b[0m、\x07、\x00 不能把确认提示挤出"最后一行")."""
+    return _CTRL.sub("", _ESC.sub("", (text or "").replace("\r", "\n").replace("\t", " ")))
 
 
 def last_line(text):
-    """串口输出最后一行有内容的 (跳过 conbroker 的 [时间 Claude 断开] 这类标记)."""
-    for ln in reversed((text or "").replace("\r", "").split("\n")):
+    """串口输出最后一行有内容的 (先剥转义 / 控制字符; 跳过只剩空白的行和 conbroker 的 [时间 Claude 断开] 标记)."""
+    for ln in reversed(clean(text).split("\n")):
         ln = ln.strip()
         if ln and not _MARK.fullmatch(ln):
             return ln
     return ""
+
+
+# 提示符里的"名字"是这些的不算提示符 (#74 第二轮): 回答词 ([Y] [yes] [continue] y# Continue> OK>) 和
+# 引导程序 (U-Boot> boot> grub>): 回车在这些上面等于回答问题或往引导程序里敲, 不是在设备命令行上.
+_ANSWER_NAMES = {"y", "n", "yes", "no", "ok", "continue", "confirm", "proceed", "cancel", "abort", "retry", "skip",
+                 "delete", "all", "none", "default", "quit", "exit"}
+_BOOT_NAMES = {"u-boot", "uboot", "boot", "grub", "loader", "bootloader", "bootrom", "rommon", "cfe", "pmon",
+               "redboot", "ipxe", "efi", "shell"}
+_NAME = re.compile(r"[<\[][~*]?(.*?)[>\]]|(.*?)(?:\(([^()]*)\))?[#>$]")
+
+
+def _prompt_names(line):
+    """提示符的名字和括号里的部分 (Reboot(y)> -> {"reboot", "y"}), 都小写."""
+    m = _NAME.fullmatch(line)
+    return {(g or "").strip().lower() for g in m.groups() if g is not None} if m else {""}
+
+
+def at_any_prompt(line, vendor=None):
+    """这一行是不是命令提示符或翻页提示 (回车 / 空格的放行白名单). vendor = 槽位登记的厂商: 只认它的提示符,
+    没登记才认所有厂商的合集. 确认类提示、名字是回答词或引导程序的先排除."""
+    if not line or is_confirm_prompt(line):
+        return False
+    if _PAGER.fullmatch(line):
+        return True
+    pats = [_PROMPT[vendor]] if vendor in _PROMPT else list(_PROMPT.values())
+    if not any(p.fullmatch(line) for p in pats):
+        return False
+    return not (_prompt_names(line) & (_ANSWER_NAMES | _BOOT_NAMES))
 
 
 def slot_vendor(slot, rules, text):
@@ -200,6 +238,8 @@ def slot_vendor(slot, rules, text):
     Linux 的 bash-4.4# 分不开, 只能登记). 停在密码 / [Y/N] / 翻页 / 半截输出上一律不算在提示符上."""
     ln = last_line(text)
     v = rules.get("slots", {}).get(slot)
+    if is_confirm_prompt(ln):           # 单独一行 [Y/N] / [confirm] 长得像华为 [名], 不算提示符 (#74 审查)
+        return v or None, False
     if v:
         return v, bool(_PROMPT[v].fullmatch(ln))
     if rules.get("auto_huawei") and _PROMPT["huawei"].fullmatch(ln):
@@ -209,9 +249,11 @@ def slot_vendor(slot, rules, text):
 
 # ------------------------------------------------------------ 闸门
 
-def _gate(verdict, reason, danger=(), vendor=None, layer=None, model=None):
+def _gate(verdict, reason, danger=(), vendor=None, layer=None, model=None, line=None):
     g = {"verdict": verdict, "layer": layer or (1 if verdict == "pass" else 3), "reason": reason,
          "danger": list(danger), "vendor": vendor}
+    if line is not None:
+        g["line"] = line[-LINE_SHOWN:]  # 发键时设备停在哪一行: 人确认时看 (设备输出, 只当数据显示)
     if model is not None:
         g["model"] = model          # 第 2 层的原始判断 / 出错说明, 随闸门结果整个进执行绪日志
     return g
@@ -270,13 +312,66 @@ KEYS = {
 }
 
 
-def classify_key(key):
+# 确认类提示 (#73): 设备停在这些上面时, 回车 / 空格就是替人回答. 不分大小写.
+# 回车 / 空格放行走白名单 (at_any_prompt), 这张表只用来: 理由写清楚、slot_vendor 不把 [Y/N] 认成华为 [名].
+# 注: survey_core 也有一份确认提示识别 (PR #57 在改), 这里先独立实现, 合并后再统一成一份.
+_YN = r"\[?(?:y(?:es)?|n(?:o)?)\]?"
+_CONFIRM_PROMPT = re.compile(
+    r"\[confirm\]"                                     # 思科 Proceed with reload? [confirm]
+    rf"|[\[(（<]\s*{_YN}\s*[/|,]\s*{_YN}\s*(?:[/|,][^\])）>]*)?[\])）>]"   # [Y/N] [N/y] (y/n) (yes|no) (y,N) ([y]/n) (yes/no/[fingerprint])
+    r"|\[y\]es\s*/\s*\[n\]o"                           # [Y]es/[N]o
+    r"|\by\s+or\s+n\b|\byes\s+or\s+no\b|是\s*[/|]\s*否"   # y or n / Save(yes or no)> / 是/否
+    r"|\bare\s+you\s+sure\b|\btype\s+['\"]?yes\b"       # Are you sure / Type 'yes' to continue
+    r"|\[[^\[\]]{1,64}\]\s*[:：]\s*$",                  # 带默认值: ...[vrpcfg.zip]: / [no]:
+    re.I)
+CONFIRM_SCAN = 512          # 只在最后这么多字里找确认提示: 长行上的 \s*$ 会退化成平方
+LINE_SHOWN = 200
+KEY_ANSWERS = ("enter", "space")    # 可能替人回答确认提示的键
+
+
+def is_answer(kind, cmd):
+    """这一条会不会是在回答确认提示: 回车 / 空格, 或者 y / yes / n / no / continue 这类回答词、单个字符 (#74 第三轮)."""
+    if kind == "key":
+        return cmd in KEY_ANSWERS
+    c = (cmd or "").strip().lower()
+    return len(c) <= 1 or c in _ANSWER_NAMES - {"quit", "exit"}
+HUMAN_QUIET_S = 5           # 设备日志这么多秒内动过 = 可能有人在敲 (conbroker 人类优先窗口 3 秒, 取长)
+
+
+def is_confirm_prompt(line):
+    """这一行是不是在等人回答 (确认 / 是否 / 带默认值的问句). --More-- 翻页不算.
+    问号收尾 (Destination filename [x]? / 继续吗？：) 用 rstrip + endswith 判, 不用正则."""
+    tail = (line or "")[-CONFIRM_SCAN:]
+    t = tail.rstrip()
+    if t[-1:] in (":", "："):
+        t = t[:-1].rstrip()
+    return t[-1:] in ("?", "？") or bool(_CONFIRM_PROMPT.search(tail))
+
+
+def classify_key(key, text=None, quiet_s=None, vendor=None):
+    """回车 / 空格的闸门 (#73, #74 审查). text = 设备最近的输出 (tail); quiet_s = 设备日志多少秒没动 (None = 不知道).
+    白名单: 最后一个有效行是某厂商的命令提示符或翻页提示, 且 HUMAN_QUIET_S 秒内没动静, 才放行;
+    其余 (确认提示、确认提示后又刷了一行日志、半截输出、看不到、可能有人在敲) 一律要人确认."""
     k = KEYS.get(key)
     if k is None:
         raise Refused("bad", f"只给这几个键: {', '.join(KEYS)}")
     if k["confirm"]:
         return _gate("confirm", f"{k['label']} 是打断键, 要人确认")
-    return _gate("pass", f"固定特殊键 {k['label']} (第 1 层放行)")
+    ln = last_line(text)
+    if not ln:
+        return _gate("confirm", f"看不到设备最后一行 (读不到输出或日志是空的), 不知道 {k['label']} 会回答什么, 要人确认")
+    if is_confirm_prompt(ln):
+        return _gate("confirm", f"设备停在确认提示上 ({ln[-80:]}), {k['label']} 等于替人回答, 要人确认", line=ln)
+    if not at_any_prompt(ln, vendor):
+        return _gate("confirm", f"设备不在提示符或翻页上 (最后一行: {ln[-80:]}; 可能是确认提示后又刷了日志、"
+                                f"半截输出或开机滚屏), {k['label']} 可能替人回答, 要人确认", line=ln)
+    if key == "space" and _PAGER.fullmatch(ln):        # 翻页空格不会回答确认提示, 不等 5 秒 (#74 第二轮)
+        return _gate("pass", f"固定特殊键 {k['label']} (第 1 层放行, 翻页)", line=ln)
+    if quiet_s is None or quiet_s < HUMAN_QUIET_S:
+        when = "不知道设备最近有没有动静" if quiet_s is None else f"设备日志 {max(0, quiet_s):.0f} 秒前还有动静"
+        return _gate("confirm", f"{when}, 可能有人正在敲 (conbroker 会让 Agent 的键排队到人停手), "
+                                f"{k['label']} 可能替人回答, 要人确认; 没人时等 {HUMAN_QUIET_S} 秒再发", line=ln)
+    return _gate("pass", f"固定特殊键 {k['label']} (第 1 层放行)", line=ln)
 
 
 # ------------------------------------------------------------ 日志行
@@ -494,10 +589,21 @@ class Book:
         if inf:
             raise Refused("inflight", f"槽位 {slot} 上一条 ({inf['cmd']!r}) 还没回来, 一次一条")
 
-    def begin(self, slot, token, who, kind, cmd, gate, now, timeout, name=None):
-        """闸门放行的直接发: 标在途 -> 调用方交给 conbroker -> finish."""
+    def touched(self, slot):
+        """槽位上人确认 / 发送结果的次数 (直发先判后占用, #74 第三轮). 只在内存和状态文件里, 不对外."""
+        return self._s(slot).get("touch", 0)
+
+    def _touch(self, slot):
+        s = self._s(slot)
+        s["touch"] = s.get("touch", 0) + 1
+
+    def begin(self, slot, token, who, kind, cmd, gate, now, timeout, name=None, snap=None):
+        """闸门放行的直接发: 标在途 -> 调用方交给 conbroker -> finish.
+        snap = 判闸门之前 touched() 的值: 之后槽位上有过人确认或发送结果 (设备可能变了), 不发."""
         if gate.get("verdict") != "pass":
             raise ValueError("闸门没放行的只能 submit 挂起")
+        if snap is not None and self.touched(slot) != snap:
+            raise Refused("changed", f"槽位 {slot} 在推车看设备之后有人确认过或刚发完一条, 设备可能变了, 没发; 重新发一次")
         self.writer(slot, token, now)
         self._idle(slot)
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "sending")
@@ -505,8 +611,13 @@ class Book:
         return _public(it)
 
     def submit(self, slot, token, who, kind, cmd, gate, now, timeout, name=None):
-        """挂起等人确认."""
+        """挂起等人确认. 同槽位已有挂起项时不收新的回车 / 空格 (#74 第二轮: 先挂 reload 再挂 enter,
+        人批了 reload 后 enter 会替人回答 [confirm]); 打断键和命令行照旧能排."""
         self.writer(slot, token, now)
+        if is_answer(kind, cmd) and self._pending(slot):
+            what = KEYS[cmd]["label"] if kind == "key" else repr(cmd)
+            raise Refused("busy", f"槽位 {slot} 前面还有 {len(self._pending(slot))} 条等人确认, "
+                                  f"{what} 不能排在后面 (前面那条批了以后它可能替人回答), 等前面处理完再发")
         if len(self._pending(slot)) >= PENDING_MAX:
             raise Refused("busy", f"槽位 {slot} 已经有 {PENDING_MAX} 条等人确认, 先等人处理")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "pending")
@@ -528,6 +639,7 @@ class Book:
             raise Refused("lease", "提交它的 Agent 租约已失效, 这条作废")
         self._idle(slot)
         it["by"] = by
+        self._touch(slot)
         self._start(it, now)
         self._ev("confirm", slot, now, src="human", who=by, id=it["id"], kind=it["kind"], cmd=it["cmd"],
                  agent=it["who"], name=it.get("name"))
@@ -549,6 +661,7 @@ class Book:
         s = self._s(slot)
         if s["inflight"] and s["inflight"]["id"] == iid:
             s["inflight"] = None
+        self._touch(slot)
         it["status"] = result.get("status") or "error"
         it["echo"] = echo_summary(result.get("echo"))
         if result.get("note"):

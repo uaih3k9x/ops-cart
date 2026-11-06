@@ -518,7 +518,8 @@ class Kiosk(tk.Tk):
         def serial():
             self._close_confirm()
             self._open_pane("serial", lc.slot_for_lamp(f"con-{n}"))
-        self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial)
+        self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial,
+                                          live=lambda k: mcp_serial.log_last_line(lc.SLOTS[k - 1]))
 
     def _close_confirm(self):
         if self._confirm_win is not None and self._confirm_win.winfo_exists():

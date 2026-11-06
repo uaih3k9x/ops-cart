@@ -231,3 +231,27 @@ def test_apply_request_estop_and_reject():
                                  for s in b.view(T0)["slots"])
     with pytest.raises(sw.Refused):
         cc.apply_request(b, cc.make_request("reject", 999, "web:a", T0), T0)
+
+
+def test_card_shows_device_last_line_for_held_key():
+    """#74 审查: 人确认挂起的按键时, 看得到当时设备停在哪一行."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", "Proceed with reload? [confirm]", 60), T0, 10)
+    c = cc.card(b.view(T0), 2)
+    reason = c["items"][0]["reason"]
+    assert "Proceed with reload? [confirm]" in reason
+    assert "挂起时（0 秒前）设备最后一行" in reason                        # 第二轮: 写明是挂起那一刻的, 不是现在的
+
+
+def test_card_shows_pending_and_live_line_for_commands():
+    """第三轮: 命令条目也显示挂起时最后一行, 给了 live 就显示当前最后一行."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    g = dict(sw._gate("confirm", "x"), line="Router#")
+    b.submit(2, tok, "a", "line", "y", g, T0, 10)
+    c = cc.card(b.view(T0), 2, live="Proceed with reload? [confirm]")
+    reason = c["items"][0]["reason"]
+    assert "挂起时（0 秒前）设备最后一行：Router#" in reason
+    assert "当前最后一行：Proceed with reload? [confirm]" in reason
+    assert "当前最后一行" not in cc.card(b.view(T0), 2)["items"][0]["reason"]

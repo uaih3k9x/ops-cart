@@ -129,3 +129,23 @@ def test_every_text_readable(root, stop, mode):
         assert not th.unreadable(d)
     finally:
         th.use("dark")
+
+
+def test_dialog_shows_live_last_line(root):
+    """#74 第三轮: 确认框附设备当前最后一行 (live 回调), 刷新时跟着变."""
+    lines = {"v": "Router#"}
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=lambda n: lines["v"])
+    d.update_idletasks()
+    assert any("当前最后一行：Router#" in t for t in _labels(d))
+    lines["v"] = "Proceed with reload? [confirm]"
+    d.refresh(_view())
+    d.update_idletasks()
+    assert any("当前最后一行：Proceed with reload? [confirm]" in t for t in _labels(d))
+
+
+def test_dialog_live_failure_is_ignored(root):
+    def boom(n):
+        raise OSError("x")
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=boom)
+    d.update_idletasks()
+    assert not any("当前最后一行" in t for t in _labels(d))
