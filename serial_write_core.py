@@ -327,14 +327,6 @@ _CONFIRM_PROMPT = re.compile(
 CONFIRM_SCAN = 512          # 只在最后这么多字里找确认提示: 长行上的 \s*$ 会退化成平方
 LINE_SHOWN = 200
 KEY_ANSWERS = ("enter", "space")    # 可能替人回答确认提示的键
-
-
-def is_answer(kind, cmd):
-    """这一条会不会是在回答确认提示: 回车 / 空格, 或者 y / yes / n / no / continue 这类回答词、单个字符 (#74 第三轮)."""
-    if kind == "key":
-        return cmd in KEY_ANSWERS
-    c = (cmd or "").strip().lower()
-    return len(c) <= 1 or c in _ANSWER_NAMES - {"quit", "exit"}
 HUMAN_QUIET_S = 5           # 设备日志这么多秒内动过 = 可能有人在敲 (conbroker 人类优先窗口 3 秒, 取长)
 
 
@@ -589,6 +581,14 @@ class Book:
         if inf:
             raise Refused("inflight", f"槽位 {slot} 上一条 ({inf['cmd']!r}) 还没回来, 一次一条")
 
+    def _no_queue(self, slot, kind, cmd):
+        """同槽位有挂起项时, 除了打断键一律不收 (挂起或直发都不收, #74 第四轮).
+        前面那条批了以后设备可能停在 [confirm] 上, 排在后面的任何一条都可能替人回答; 不再判"像不像回答词"."""
+        n = len(self._pending(slot))
+        if n and not (kind == "key" and cmd == "ctrl_c"):
+            raise Refused("busy", f"槽位 {slot} 前面还有 {n} 条等人确认, 这条不收 (前面那条批了以后它可能替人回答); "
+                                  f"等前面处理完再发, 用 pending_list 看结果")
+
     def touched(self, slot):
         """槽位上人确认 / 发送结果的次数 (直发先判后占用, #74 第三轮). 只在内存和状态文件里, 不对外."""
         return self._s(slot).get("touch", 0)
@@ -602,6 +602,7 @@ class Book:
         snap = 判闸门之前 touched() 的值: 之后槽位上有过人确认或发送结果 (设备可能变了), 不发."""
         if gate.get("verdict") != "pass":
             raise ValueError("闸门没放行的只能 submit 挂起")
+        self._no_queue(slot, kind, cmd)
         if snap is not None and self.touched(slot) != snap:
             raise Refused("changed", f"槽位 {slot} 在推车看设备之后有人确认过或刚发完一条, 设备可能变了, 没发; 重新发一次")
         self.writer(slot, token, now)
@@ -611,13 +612,10 @@ class Book:
         return _public(it)
 
     def submit(self, slot, token, who, kind, cmd, gate, now, timeout, name=None):
-        """挂起等人确认. 同槽位已有挂起项时不收新的回车 / 空格 (#74 第二轮: 先挂 reload 再挂 enter,
-        人批了 reload 后 enter 会替人回答 [confirm]); 打断键和命令行照旧能排."""
+        """挂起等人确认. 同槽位已有挂起项时除了打断键一律不收 (#74 第二至四轮: 先挂 reload 再挂 enter / y,
+        人批了 reload 后它们会替人回答 [confirm])."""
         self.writer(slot, token, now)
-        if is_answer(kind, cmd) and self._pending(slot):
-            what = KEYS[cmd]["label"] if kind == "key" else repr(cmd)
-            raise Refused("busy", f"槽位 {slot} 前面还有 {len(self._pending(slot))} 条等人确认, "
-                                  f"{what} 不能排在后面 (前面那条批了以后它可能替人回答), 等前面处理完再发")
+        self._no_queue(slot, kind, cmd)
         if len(self._pending(slot)) >= PENDING_MAX:
             raise Refused("busy", f"槽位 {slot} 已经有 {PENDING_MAX} 条等人确认, 先等人处理")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "pending")

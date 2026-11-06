@@ -618,8 +618,9 @@ def test_confirm_refused_after_lease_expired():
 def test_confirm_needs_slot_idle():
     b = book()
     b.acquire(1, "agentA", T0, token="tokA")
-    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=30)
-    b.begin(1, "tokA", "agentA", "line", "display version", _gate_pass(), T0, timeout=30)
+    first = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=30)
+    p = b.submit(1, "tokA", "agentA", "key", "ctrl_c", _gate_confirm(), T0, timeout=30)   # 有挂起时只有打断键能排
+    b.confirm(first["id"], "human", T0)                       # 第一条在途
     with pytest.raises(sw.Refused) as e:
         b.confirm(p["id"], "human", T0 + 1)
     assert e.value.code == "inflight"
@@ -648,10 +649,11 @@ def test_pending_needs_lease_and_is_capped():
     with pytest.raises(sw.Refused):
         b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=30)
     b.acquire(1, "agentA", T0, token="tokA")
-    for i in range(sw.PENDING_MAX):
-        b.submit(1, "tokA", "agentA", "line", f"x{i}", _gate_confirm(), T0, timeout=30)
+    b.submit(1, "tokA", "agentA", "line", "x0", _gate_confirm(), T0, timeout=30)
+    for i in range(sw.PENDING_MAX - 1):                        # 有挂起时只有打断键能排 (#74 第四轮)
+        b.submit(1, "tokA", "agentA", "key", "ctrl_c", _gate_confirm(), T0, timeout=30)
     with pytest.raises(sw.Refused) as e:
-        b.submit(1, "tokA", "agentA", "line", "y", _gate_confirm(), T0, timeout=30)
+        b.submit(1, "tokA", "agentA", "key", "ctrl_c", _gate_confirm(), T0, timeout=30)
     assert e.value.code == "busy"
 
 
@@ -760,7 +762,7 @@ def test_roundtrip():
     assert b2.events == []                                     # 读进来不算事件
     assert b2.holder(1, T0 + 1) == "agentA" and b2.stopped(4)
     assert b2.view(T0 + 1)["pending"][0]["id"] == p["id"]
-    nxt = b2.submit(1, "tokA", "agentA", "line", "reboot", _gate_confirm(), T0 + 1, timeout=30)
+    nxt = b2.submit(1, "tokA", "agentA", "key", "ctrl_c", _gate_confirm(), T0 + 1, timeout=30)
     assert nxt["id"] > p["id"]                                 # 编号接着走
 
 
@@ -907,11 +909,18 @@ def test_chain_enter_after_pending_reload_refused():
             b.submit(1, tok, "agent", "key", key, sw.classify_key(key, "Router#", 1), 1001.0, 5)
 
 
-def test_ctrl_c_and_lines_still_queue_behind_pending():
+def test_only_ctrl_c_queues_behind_pending():
+    """第四轮: 同槽位有挂起项时一律不收新的命令和按键 (挂起或直发), 只有打断键能排."""
     b, tok = _book_with_lease()
     b.submit(1, tok, "agent", "line", "reload", sw._gate("confirm", "x"), 1000.0, 30)
-    b.submit(1, tok, "agent", "key", "ctrl_c", sw.classify_key("ctrl_c"), 1001.0, 5)    # 打断键照旧能挂
+    b.submit(1, tok, "agent", "key", "ctrl_c", sw.classify_key("ctrl_c"), 1001.0, 5)
     assert len(b.view(1002.0)["pending"]) == 2
+    for kind, cmd in (("line", "display version"), ("line", "interface g0/1"), ("key", "enter")):
+        with pytest.raises(sw.Refused) as e:
+            b.submit(1, tok, "agent", kind, cmd, sw._gate("confirm", "x"), 1001.0, 30)
+        assert e.value.code == "busy"
+        with pytest.raises(sw.Refused):
+            b.begin(1, tok, "agent", kind, cmd, sw._gate("pass", "x"), 1001.0, 30)
 
 
 # ---- 审查 #74 第三轮: 尖括号是否选项、括号里的回答词、OSC 不跨行
@@ -936,10 +945,13 @@ def test_osc_does_not_cross_lines(text, keep):
     assert sw.classify_key("enter", text, QUIET)["verdict"] == "confirm"
 
 
-def test_answer_line_cannot_queue_behind_pending():
+@pytest.mark.parametrize("ans", ["y", "YES", "n", "no", "c", "confirm", "continue", "ye", "y.", "yes.", "yes please",
+                                 "yep", "yeah", "Y!", "ok.", "y y", "sure"])
+def test_any_line_cannot_queue_behind_pending(ans):
+    """第四轮: 不再判"像不像回答词" (ye / yes please / Y! 都能绕), 前面有挂起项就一律不收."""
     b, tok = _book_with_lease()
     b.submit(1, tok, "agent", "line", "reload", sw._gate("confirm", "x"), 1000.0, 30)
-    for ans in ("y", "YES", "n", "no", "c", "confirm", "continue"):
-        with pytest.raises(sw.Refused):
-            b.submit(1, tok, "agent", "line", ans, sw._gate("confirm", "x"), 1001.0, 30)
-    b.submit(1, tok, "agent", "line", "display version", sw._gate("confirm", "x"), 1001.0, 30)   # 普通命令照旧能排
+    with pytest.raises(sw.Refused):
+        b.submit(1, tok, "agent", "line", ans, sw._gate("confirm", "x"), 1001.0, 30)
+    with pytest.raises(sw.Refused):
+        b.begin(1, tok, "agent", "line", ans, sw._gate("pass", "x"), 1001.0, 30)

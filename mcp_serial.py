@@ -325,6 +325,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
             _run(lambda b, now: b.log_refused(n, who(), "line", cmd, e.code, str(e), now))
             raise mc.ToolError(str(e)) from None
         _run(lambda b, now: b.writer(n, a["lease"], now), n, "line", cmd)    # 没租约 / 急停的不问模型, 不白花钱
+        snap = store.run(lambda b, now: b.touched(n))     # 先判后占 (#74 第四轮): 模型判的几十秒里有人确认过就不直发
         try:
             text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
@@ -338,7 +339,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
-                         cmd, False)
+                         cmd, False, snap=snap)
 
     def send_key(a):
         n, key = a["slot"], a["key"]
@@ -379,6 +380,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              "过闸门: 认得出厂商、设备停在提示符上的只读命令 (华为 display… / 思科 show…, 全称小写) 直接发, "
              "返回设备输出; 其余的若推车开了决策模型, 由模型按命令、设备最近输出和你给的 intent 判, 判放行直接发, "
              "否则挂起 (status=pending) 等人在推车上确认; 带 save/reboot/reset/format/delete 等高危词的永远要人确认. "
+             "同槽位已有挂起项时不收新命令 (等前面处理完); "
              "人 3 秒内敲过键会排队. 要先 lease_acquire.",
              {"slot": SLOT, "command": {"type": "string", "maxLength": sw.LINE_MAX, "required": True,
                                         "description": "一行命令, 不含换行"},
@@ -390,7 +392,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              send_command, destructive=True),
         Tool("send_key", "发一个固定特殊键: enter (回车) / space (翻页空格) 只有设备最后一行是命令提示符或 --More-- 翻页、且 5 秒内没动静时"
              "才直接发 (--More-- 上的空格不用等 5 秒); 停在确认提示 ([confirm]、[Y/N] 等)、半截输出、刚刷过日志、看不到时挂起等人确认 "
-             "(要直发就等 5 秒再试); 同槽位前面还有挂起项时不收回车 / 空格; 人确认时推车会重看设备, 停在确认提示上就不发; "
+             "(要直发就等 5 秒再试); 同槽位前面还有挂起项时除了 ctrl_c 什么都不收; 人确认时推车会重看设备, 停在确认提示上就不发; "
              "ctrl_c (打断) 要人确认. "
              "需要别的按键 (BootROM 菜单、按任意键) 请人在推车屏幕上操作.",
              {"slot": SLOT, "key": {"type": "string", "enum": sorted(sw.KEYS), "required": True,
@@ -450,7 +452,7 @@ def real_tools(tail, store=None):
 def recheck(it, dev, tail, rules):
     """人确认时重看设备 -> 不发的说明; 能发 -> None.
     回车 / 空格 (#74 第二轮): 停在确认提示 / 不在白名单 / 看不到就不发; 确认的人在场, 不再看 5 秒窗口.
-    命令 (#74 第三轮): 设备现在停在确认提示上而挂起时不是 (人先批了前面那条 reload), 或者看不到, 就不发.
+    命令 (#74 第三、四轮): 当前最后一行要是本槽位厂商的提示符才发; 挂起时就停在确认提示上的 (回答它), 要还是同一行.
     打断键 (ctrl_c) 不重看."""
     if it["kind"] == "key" and it["cmd"] not in sw.KEY_ANSWERS:
         return None
@@ -460,18 +462,20 @@ def recheck(it, dev, tail, rules):
         text = None
     now_line = sw.last_line(text)
     shown = now_line[-sw.LINE_SHOWN:] or "(看不到)"
+    vendor = (rules().get("slots") or {}).get(it["slot"])
     if it["kind"] == "key":
-        vendor = (rules().get("slots") or {}).get(it["slot"])
         g = sw.classify_key(it["cmd"], text, float("inf"), vendor=vendor)
         if g["verdict"] == "pass":
             return None
         why = g["reason"]
-    else:
+    else:                               # 白名单 (#74 第四轮), 同按键
         was = (it.get("gate") or {}).get("line")
-        if now_line and not (sw.is_confirm_prompt(now_line) and not sw.is_confirm_prompt(was)):
+        if sw.at_any_prompt(now_line, vendor):
             return None
+        if was and sw.is_confirm_prompt(was) and now_line == sw.last_line(was):
+            return None                 # 挂起时就停在这个确认提示上: 人看过、明确要回答它, 还是同一行才发
         why = ("看不到设备现在停在哪" if not now_line else
-               f"设备现在停在确认提示上, 挂起时不是 (挂起时最后一行: {was or '(没记)'}), 这条发出去可能替人回答")
+               f"设备现在不在提示符上 (挂起时最后一行: {was or '(没记)'}), 这条发出去可能替人回答")
     return f"确认时重看设备, 没发: {why}; 设备现在最后一行: {shown}. 要发请让 Agent 重新挂起"
 
 

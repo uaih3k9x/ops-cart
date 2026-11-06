@@ -161,8 +161,9 @@ def test_check_confirm():
     assert cc.check(b.view(T0), "confirm", it["id"]) is None
     assert "不在挂起" in cc.check(b.view(T0), "confirm", 999)
     b2 = _book()
-    tok2, it2 = _held(b2, 1)
-    b2.begin(1, tok2, "stdio:ops@x", "line", "display x", PASS, T0, 30)
+    tok2, first = _held(b2, 1)
+    it2 = b2.submit(1, tok2, "stdio:ops@x", "key", "ctrl_c", DANGER, T0, 30)   # 有挂起时只有打断键能排
+    b2.confirm(first["id"], "human", T0)                                        # 第一条在途
     assert "还没回来" in cc.check(b2.view(T0), "confirm", it2["id"])
     assert cc.check(cc.stopped_view(), "confirm", it["id"])          # 读不懂: 什么都不让确认
 

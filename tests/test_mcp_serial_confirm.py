@@ -292,7 +292,7 @@ def test_poc_reload_then_y_chain_is_blocked(rig):
     tok = rig.lease(1)
     p1 = _sc(rig, "reload", tok)
     assert p1["status"] == "pending"
-    for ans in ("y", "yes", "n", "no", "Y", "c", "confirm"):
+    for ans in ("y", "yes", "n", "no", "Y", "c", "confirm", "yes please", "ye", "display version"):
         r = rig.call("send_command", {"slot": 1, "command": ans, "lease": tok})
         assert r["isError"] and "前面" in r["content"][0]["text"], ans
     assert rig.sent == []
@@ -387,3 +387,73 @@ def test_log_last_line_reads_conbroker_log(tmp_path):
     (tmp_path / "logs" / (ms.lamps_core._safe("/dev/con-1") + ".log")).write_bytes(b"x" * 9000 + b"\nRouter#reload\nProceed with reload? [confirm]")
     assert ms.log_last_line("/dev/con-1", ddir=str(tmp_path)) == "Proceed with reload? [confirm]"
     assert ms.log_last_line("/dev/con-2", ddir=str(tmp_path)) is None
+
+
+
+# ------------------------------------------------------------ 审查 #74 第四轮
+
+def test_poc_a_model_judging_while_human_confirms_other(rig):
+    """send_command 直发也要先判后占: 第 2 层模型判的时候人批了挂起的 reload, 模型放行的 y 不能落在 [confirm] 上."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "reload", "lease": tok, "timeout_s": 1})
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail,
+                          rules=lambda: rig.rules)
+        rig.tail_text["/dev/con-1"] = "Proceed with reload? [confirm]"
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.call("send_command", {"slot": 1, "command": "y", "lease": tok})
+    assert r["isError"] and "变" in r["content"][0]["text"]
+    assert [x[1] for x in rig.sent] == ["reload"]
+
+
+def test_poc_c_syslog_after_confirm_prompt_still_refused(rig):
+    """确认命令时重看改白名单: [confirm] 后又刷一行 syslog, 也不发."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = _sc(rig, "interface g0/1", tok)
+    rig.tail_text["/dev/con-1"] = ("Proceed with reload? [confirm]\n*Nov  6 10:00:01: %LINK-3-UPDOWN: "
+                                   "Interface Gi0/1, changed state to down")
+    _it, status, _out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "refused" and rig.sent == [] and "%LINK-3-UPDOWN" in note
+
+
+def test_confirm_line_uses_registered_vendor_whitelist(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = _sc(rig, "interface g0/1", tok)
+    rig.tail_text["/dev/con-1"] = "<SW1>"                                 # 登记了思科, 华为式提示符不算
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "refused" and rig.sent == []
+
+
+@pytest.mark.parametrize("now,want", [("<SW1>save\nContinue? [Y/N]:", "sent"),
+                                      ("<SW1>save\nContinue? [Y/N]:\nNov 6 %%01IFNET/4/LINK_STATE x", "refused"),
+                                      ("<SW1>", "sent")])                 # 回到提示符: 白名单放行
+def test_answer_pending_at_confirm_prompt_needs_same_prompt(rig, now, want):
+    """挂起时就停在确认提示上 (人明确在回答): 确认时还是同一行才发, 变了 (刷了日志 / 已经回到提示符) 不发."""
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    tok = rig.lease(1)
+    p = _sc(rig, "y", tok)
+    rig.tail_text["/dev/con-1"] = now
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == want
+
+
+def test_card_flags_answer_to_confirm_prompt():
+    import serial_write_core as sw_
+    b = sw_.Book.from_text(None, 1000.0)
+    tok = b.acquire(1, "a", 1000.0)["lease"]
+    b.submit(1, tok, "a", "line", "y", dict(sw_._gate("confirm", "x"), line="Continue? [Y/N]:"), 1000.0, 10)
+    reason = cc.card(b.view(1000.0), 1)["items"][0]["reason"]
+    assert "这条会回答设备的确认提示" in reason

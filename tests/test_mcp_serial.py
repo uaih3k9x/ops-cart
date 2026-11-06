@@ -190,7 +190,9 @@ def test_danger_word_held_even_if_display(rig):
 def test_not_at_prompt_is_held(rig):
     rig.tail_text["/dev/con-1"] = "Username:"
     tok = rig.lease(1)
-    assert rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})["status"] == "pending"
+    p = rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})
+    assert p["status"] == "pending"
+    rig.store.run(lambda b, now: b.reject(p["id"], "human", now))     # 有挂起项时不收下一条 (#74 第四轮)
     rig.tail_text.pop("/dev/con-1")                                   # 读不到输出: 一样挂起
     rig.clock.t += 1
     assert rig.ok("send_command", {"slot": 1, "command": "display clock", "lease": tok})["status"] == "pending"
@@ -285,8 +287,9 @@ def test_model_not_asked_for_readonly_danger_or_no_lease_or_estop(rig):
 
 def test_intent_without_model_still_logged(rig):
     tok = rig.lease(1)
-    rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok, "intent": "  改描述  "})
+    p = rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok, "intent": "  改描述  "})
     assert rig.log(1)[-1]["gate"]["intent"] == "改描述"
+    rig.store.run(lambda b, now: b.reject(p["id"], "human", now))
     rig.ok("send_command", {"slot": 1, "command": "quit", "lease": tok, "intent": "   "})
     assert "intent" not in rig.log(1)[-1]["gate"]
 

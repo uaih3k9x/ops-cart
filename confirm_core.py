@@ -103,6 +103,8 @@ def _line_info(p, live=None):
     挂起时那一行不代表现在: 人确认时推车会重看一次."""
     line = (p.get("gate") or {}).get("line")
     out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{line}" if line else ""
+    if line and p.get("kind") == "line" and sw.is_confirm_prompt(line):
+        out = "\n！！这条会回答设备的确认提示（挂起时设备就停在上面），确认前看清楚" + out
     return out + (f"\n当前最后一行：{live}" if live else "")
 
 
