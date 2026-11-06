@@ -231,3 +231,12 @@ def test_apply_request_estop_and_reject():
                                  for s in b.view(T0)["slots"])
     with pytest.raises(sw.Refused):
         cc.apply_request(b, cc.make_request("reject", 999, "web:a", T0), T0)
+
+
+def test_card_shows_device_last_line_for_held_key():
+    """#74 审查: 人确认挂起的按键时, 看得到当时设备停在哪一行."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", "Proceed with reload? [confirm]", 60), T0, 10)
+    c = cc.card(b.view(T0), 2)
+    assert "Proceed with reload? [confirm]" in c["items"][0]["reason"] and "设备最后一行" in c["items"][0]["reason"]

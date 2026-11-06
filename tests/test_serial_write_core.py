@@ -313,10 +313,13 @@ def test_classify_vendor_model_off_by_rules():
     assert g["verdict"] == "confirm" and calls == [] and "linux" in g["reason"]
 
 
+QUIET = 60                              # 设备 / 人一分钟没动静
+
+
 def test_classify_key():
-    assert sw.classify_key("enter", "<SW1>")["verdict"] == "pass"
-    assert sw.classify_key("space", "<SW1>")["verdict"] == "pass"
-    g = sw.classify_key("ctrl_c", "<SW1>")
+    assert sw.classify_key("enter", "<SW1>", QUIET)["verdict"] == "pass"
+    assert sw.classify_key("space", "<SW1>", QUIET)["verdict"] == "pass"
+    g = sw.classify_key("ctrl_c", "<SW1>", QUIET)
     assert g["verdict"] == "confirm" and "打断" in g["reason"]
     with pytest.raises(sw.Refused):
         sw.classify_key("ctrl_z", "<SW1>")
@@ -347,6 +350,7 @@ NOT_CONFIRM = [
     "ruijie(config-if-range)#", "ops@host:~$", "[root@host ~]#", "bash-4.4#",
     "--More--", "  ---- More ----", " --More-- ", "Password:", "Username:", "login:",
 ]
+PASSES = [ln for ln in NOT_CONFIRM if not ln.rstrip().endswith(":")]   # 白名单: 只有提示符和翻页放行
 
 
 @pytest.mark.parametrize("line", CONFIRM_PROMPTS)
@@ -354,31 +358,108 @@ NOT_CONFIRM = [
 def test_key_on_confirm_prompt_needs_human(key, line):
     text = f"display current\nsome output\n{line}"
     assert sw.is_confirm_prompt(line), line
-    g = sw.classify_key(key, text)
+    g = sw.classify_key(key, text, QUIET)
     assert g["verdict"] == "confirm" and g["layer"] == 3 and "确认提示" in g["reason"], line
 
 
 @pytest.mark.parametrize("line", NOT_CONFIRM)
-def test_key_on_normal_prompt_passes(line):
+def test_not_confirm_prompt(line):
     assert not sw.is_confirm_prompt(line), line
+
+
+@pytest.mark.parametrize("line", PASSES)
+def test_key_on_normal_prompt_passes(line):
     for key in ("enter", "space"):
-        assert sw.classify_key(key, f"output\n{line}")["verdict"] == "pass", (key, line)
+        assert sw.classify_key(key, f"output\n{line}", QUIET)["verdict"] == "pass", (key, line)
 
 
 def test_key_skips_conbroker_marker_lines():
     text = "Proceed with reload? [confirm]\n[2026-11-06 10:00:00 Claude 断开]\n"
-    assert sw.classify_key("enter", text)["verdict"] == "confirm"
+    assert sw.classify_key("enter", text, QUIET)["verdict"] == "confirm"
 
 
-@pytest.mark.parametrize("text", [None, "", "\n\n", "[2026-11-06 10:00:00 Claude 接入]"])
+@pytest.mark.parametrize("text", [None, "", "\n\n", "[2026-11-06 10:00:00 Claude 接入]", "\x1b[0m\n\x07\n"])
 def test_key_without_last_line_is_unknown(text):
     for key in ("enter", "space"):
-        g = sw.classify_key(key, text)
+        g = sw.classify_key(key, text, QUIET)
         assert g["verdict"] == "confirm" and "看不到" in g["reason"], (key, text)
 
 
-def test_classify_key_text_is_required_positionally_safe():
+def test_classify_key_defaults_are_unknown():
     assert sw.classify_key("enter")["verdict"] == "confirm"           # 没给设备输出 = 未知, 要人确认
+    assert sw.classify_key("enter", "<SW1>")["verdict"] == "confirm"  # 不知道最近有没有人在敲 = 可能有人
+
+
+# ---- 审查 #74: 白名单 / 控制字符 / 人最近在敲
+
+@pytest.mark.parametrize("text", [
+    "R1#reload\nProceed with reload? [confirm]\n*Nov  6 09:00:01.123: %LINK-3-UPDOWN: Interface "
+    "GigabitEthernet0/1, changed state to up",
+    "<HUAWEI>save\nWarning: The current configuration will be written to the device. Continue? [Y/N]:\n"
+    "Nov  6 2026 09:00:01 HUAWEI %%01IFNET/4/LINK_STATE(l)[0]:The line protocol IP on the interface "
+    "GigabitEthernet0/0/1 has entered the UP state.",
+    "Proceed with reload? [confirm]\n.",
+    "display interface\n  Input:  1234 packets, 5678 bytes",                       # 半截输出
+    "%Mar  1 00:00:05.123: %SYS-5-RESTART: System restarted --",                    # 开机日志滚屏
+])
+def test_key_after_async_log_or_half_output_needs_human(text):
+    for key in ("enter", "space"):
+        g = sw.classify_key(key, text, QUIET)
+        assert g["verdict"] == "confirm" and "不在提示符" in g["reason"], (key, text)
+
+
+@pytest.mark.parametrize("text", [
+    "R1#reload\nProceed with reload? [confirm]\n\x1b[0m",
+    "R1#reload\nProceed with reload? [confirm]\n\x07",
+    "Continue?\x1b[0m", "Continue? \x1b[K", "Continue?\x00", "Continue?\x1b[1;32m\r\n",
+])
+def test_control_chars_do_not_hide_confirm(text):
+    for key in ("enter", "space"):
+        assert sw.classify_key(key, text, QUIET)["verdict"] == "confirm", (key, text)
+
+
+@pytest.mark.parametrize("text", ["<SW1>\x1b[K", "display x\n  ---- More ----\x1b[16D", "R1#\x07", "\x1b[1mR1#\x1b[0m"])
+def test_prompt_with_control_chars_still_passes(text):
+    assert sw.classify_key("enter", text, QUIET)["verdict"] == "pass", text
+
+
+def test_last_line_strips_escapes():
+    assert sw.last_line("a\nContinue?\x1b[0m\n\x07\n") == "Continue?"
+
+
+@pytest.mark.parametrize("quiet", [None, 0, 2.5, sw.HUMAN_QUIET_S - 0.1])
+def test_key_held_when_someone_may_be_typing(quiet):
+    for key in ("enter", "space"):
+        g = sw.classify_key(key, "<SW1>", quiet)
+        assert g["verdict"] == "confirm" and "动静" in g["reason"], (key, quiet)
+    assert sw.HUMAN_QUIET_S >= 3                                         # 不短于 conbroker 的人类优先窗口
+
+
+EXTRA_CONFIRM = [
+    "继续吗？", "是否继续（是/否）", "Overwrite? [Y|N]", "Overwrite? y or n", "是/否", "Delete? [N/y]",
+    "Continue (yes|no)", "Erase (y,N)", "[Y]es/[N]o:", "Type 'yes' to continue",
+    "Info: Please input the file name(*.cfg, *.zip, *.dat)[vrpcfg.zip]:", "Save running config [no]:",
+]
+
+
+@pytest.mark.parametrize("line", EXTRA_CONFIRM)
+def test_more_confirm_prompt_forms(line):
+    assert sw.is_confirm_prompt(line), line
+    for key in ("enter", "space"):
+        assert sw.classify_key(key, f"x\n{line}", QUIET)["verdict"] == "confirm", (key, line)
+
+
+@pytest.mark.parametrize("line", ["[Y/N]", "[confirm]", "[y/n]:", "[yes/no]"])
+def test_slot_vendor_does_not_take_confirm_line_as_huawei_prompt(line):
+    rules = dict(sw.load_rules(None), auto_huawei=True)
+    assert sw.slot_vendor(1, rules, f"save\n{line}") == (None, False)
+    rules["slots"] = {1: "huawei"}
+    assert sw.slot_vendor(1, rules, f"save\n{line}") == ("huawei", False)
+
+
+def test_key_gate_carries_last_line():
+    g = sw.classify_key("enter", "x\nProceed with reload? [confirm]\x1b[0m", QUIET)
+    assert g["line"] == "Proceed with reload? [confirm]"
 
 
 # ------------------------------------------------------------ 写租约

@@ -17,7 +17,7 @@ PROMPT = "display clock\n2026-10-30\n<SW1>"
 
 
 def _slots(present=(True, True, False, True), baud=("9600", "9600", None, None)):
-    return [{"dev": f"/dev/con-{n}", "present": p, "baud": b, "count": 0}
+    return [{"dev": f"/dev/con-{n}", "present": p, "baud": b, "count": 0, "mtime": T0 - 60}   # 一分钟没动静
             for n, p, b in zip(range(1, 5), present, baud)]
 
 
@@ -327,6 +327,17 @@ def test_enter_on_confirm_prompt_is_held(rig, line):
 def test_enter_held_when_tail_unreadable(rig):
     tok = rig.lease(1)
     rig.tail_text.pop("/dev/con-1")
+    assert rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})["status"] == "pending"
+    assert rig.sent == []
+
+
+def test_enter_held_while_log_is_fresh(rig):
+    """#74 审查: 人正在敲 (设备日志几秒内还在动), Agent 的回车进 conbroker 排队, 人停手后可能正好替他确认."""
+    tok = rig.lease(1)
+    rig.slots[0]["mtime"] = T0 - 1
+    out = rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert out["status"] == "pending" and "动静" in out["reason"]
+    rig.slots[0]["mtime"] = None                                       # 取不到: 按可能有人在用
     assert rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})["status"] == "pending"
     assert rig.sent == []
 

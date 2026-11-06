@@ -98,6 +98,12 @@ def _want(item):
     return f"Agent 想执行：{item['cmd']}"
 
 
+def _key_line(p):
+    """挂起的按键: 附上挂起时设备停在哪一行 (#74 审查), 人确认前看清回车会回答什么."""
+    line = (p.get("gate") or {}).get("line") if p.get("kind") == "key" else None
+    return f"\n设备最后一行：{line}" if line else ""
+
+
 def card(view, n):
     """槽位 n 的确认框 -> {title, status, stopped, items}. items 每条 {id, head, meta, reason, danger}."""
     s = next(x for x in view["slots"] if x["slot"] == n)
@@ -117,7 +123,7 @@ def card(view, n):
     for p in items:
         out.append({"id": p["id"], "head": _want(p),
                     "meta": f"#{p['id']} · 来自 {p['who']} · {p.get('age_s', 0)} 秒前",
-                    "reason": f"闸门理由：{p.get('reason') or '-'}",
+                    "reason": f"闸门理由：{p.get('reason') or '-'}" + _key_line(p),
                     "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else ""})
     return {"title": f"操作头 {n}" + (f" · {name}" if name else ""), "status": status,
             "stopped": bool(s["estop"]), "items": out}
