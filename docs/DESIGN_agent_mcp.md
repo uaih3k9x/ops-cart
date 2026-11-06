@@ -181,20 +181,37 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 - **标注**：每个工具构造时必须给 `kind=mc.READONLY` 或 `kind=mc.ACT`，不给就构造失败（`TypeError`），给错值也失败。`mc.select_tools` 遇到标注不认识的工具直接报错；`mc.Server` 只收档位允许的工具，收到别的就报错，绕开 `select_tools` 也塞不进去。`readOnlyHint` 由标注推出来。`estop` 和 `pxe_retire` 只收紧，但它们会撤别人的租约、删菜单，按会动手算，不进只读档。
 - **默认档位**：现在是 `act`。现有接法（Claude Code 的 `cart_mcp.py stdio`、开机验收按工具表核对）依赖全部工具，改默认会把它们弄坏。新接法一律写明 `--profile`。默认改不改成 `readonly` 待拍板。
 - **HTTP**：两档各起一个进程。动手档用 `mcp.json` 顶层 `port` / `tokens`，和以前一样；只读档用 `readonly.port`（默认 8766）/ `readonly.tokens`。没有 `readonly` 段时只读档谁都进不来，不借用动手令牌。动手档不认和任何只读令牌同值的令牌：手抖把只读令牌也填进顶层，也拿不到动手权限。只读令牌拿到动手档是 401，反过来也是。
-- **stdio**：没有令牌，边界是 ssh 那一层。给只读 Agent 的 ssh 身份要锁死命令行，否则它能自己把 `--profile` 改成 `act`。比如 sudoers 只放这一条（用户名是示例）：
-  `agent-ro ALL=(root) NOPASSWD: /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly`
-  或者在 `authorized_keys` 里给这把钥匙配 `command="sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly",restrict`。
+- **stdio**：没有令牌，边界在 ssh 那一层。只读 Agent 要用**专用身份**（下面叫 `agent-ro`，是示例名）。不能和动手档共用那个能 sudo、甚至能拿 root shell 的身份，否则它自己把 `--profile` 改成 `act` 就绕过去了。下面四条**都要配**，不是挑一条：
+  1. **sudoers 只放一条精确命令**（参数也写全，sudo 会按整条命令行比对，多一个少一个参数都不放）：
+     `agent-ro ALL=(root) NOPASSWD: /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly`
+  2. **`authorized_keys` 把这把钥匙钉死在这条命令上**：
+     `command="sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly",restrict ssh-ed25519 AAAA…示例… agent-ro`
+     `command=` 会忽略客户端要跑的命令；`restrict` 关掉端口转发、X11 / agent 转发和 pty。
+  3. **这个账号没有密码**（`passwd -l agent-ro`），不能用密码登录，也不能 `su`。
+  4. **不进设备组**（`dialout` `video` `lp`，也不进 `wheel`），也不进 serial.conf 里那个 user 的组。
+  - **为什么要同时配**：只配 sudoers 的话，钥匙还能拿普通 shell、开端口转发，去连本机的键鼠代理 socket、conbroker、动手档 HTTP 口；只配 `command=` 的话，哪天这把钥匙或 `command=` 配错了，sudo 也不会再兜底。不进设备组是最后一道：就算拿到 shell，也碰不到串口、采集卡和打印机。
 - **审计**：`mcp-audit.log` 每行多一个 `profile`。HTTP 认证失败那行也带。
 - **协议**：只读档 `serverInfo.name` 是 `ops-cart-readonly`，说明文字里不提租约和写工具；动手档还是 `ops-cart`。
 - **Agent 接法示例**（地址、令牌、名字都是示例值）：
 
 ```
-# 只读档, 走 ssh (推荐先只接这个)
-claude mcp add cart-ro -- ssh agent-ro@cart sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly
-# 只读档, 走 HTTP (推车上: python3 /opt/pxe/cart_mcp.py http --profile readonly)
+# 只读档, 走 ssh (推荐先只接这个; 要跑什么由 authorized_keys 的 command= 决定, 客户端不用写)
+claude mcp add cart-ro -- ssh agent-ro@192.0.2.10
+# 只读档, 走 HTTP (推车上: sudo python3 /opt/pxe/cart_mcp.py http --profile readonly)
 claude mcp add --transport http cart-ro http://192.0.2.10:8766/mcp --header "Authorization: Bearer <只读令牌>"
 # 动手档 (人盯着的会话才接)
 claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
 ```
 
   其他 MCP 客户端照同样的命令行 / URL 配，两个服务用不同的服务名（如 `cart-ro` / `cart`），可以分别启用。
+- **只读档不碰状态文件**（审查后补）：只读档的 `list_threads`（写入者）、`pending_list`、`kvm_status`、`pxe_requests` 走 `mcp_serial.peek` / `mcp_kvm.peek` / `mcp_pxe.Store.public_view`。这几个入口不加锁、不写盘、不写日志，过期和读不懂只在视图里算掉。动手档的工具读状态时照旧加锁落盘，比如过期租约要作废、状态读不懂要全部急停并落盘。所以只读调用不会因为状态文件坏了就触发全部急停，也不会作废别人在等的命令或 PXE 申请。`public_view` 固定 `secret=False`，确认码和清单摘要不会出现在 Agent 的回包里。`tests/test_mcp_readonly_invariant.py` 用真的 Store 在临时目录里覆盖几种情况：状态文件坏了、租约过期、PXE 申请过期、空目录。逐个调用只读档的每个工具，断言没拿锁、没写事件、文件内容和 mtime 都不变。
+- **共享设备**：
+  - `label_printer_status` 和 `label_print` 用进程间锁 `/run/ops-cart/printer.lock`（flock，等 10 秒拿不到就报忙），两档各起一个进程也不会抢 `ESC !?` 的回字节；进程内原来的锁还在。
+  - 截图和 OCR 走 ffmpeg 那一路时用 `/run/ops-cart/snap.lock`：同时只有一个 ffmpeg，上次抓完 3 秒内不再开卡，免得只读 Agent 连着截图把采集卡一直占着。
+  - 走 mpv 那一路的截图命令带 `no-osd`，预览画面上不闪提示字。
+  - `kvm_status` 探测键鼠代理时只发 `status` 控制操作，不 `open` 设备。
+- **`destructiveHint`**：只读工具一律 `false`。动手工具按实际标：
+  - `true`：`send_command` `send_key` `kvm_key` `kvm_type` `pxe_request` `pxe_retire`。
+  - `false`：`estop`（只停、不动设备；标成破坏性的话，客户端会先问人，急停不能等）、`label_print`（最坏废一张）、各个租约工具（只是记账）。
+  - 不写：`wol_send`。客户端按"可能有破坏"处理。
+

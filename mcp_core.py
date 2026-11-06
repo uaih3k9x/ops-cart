@@ -299,9 +299,11 @@ class Tool:
         self.name, self.description, self.params, self.fn, self.kind = name, description, params, fn, kind
 
     def spec(self):
+        ann = {"readOnlyHint": self.kind == READONLY, "openWorldHint": False}
+        if self.kind == READONLY:
+            ann["destructiveHint"] = False      # 动手工具不默认写 False: 不写 = 客户端按可能有破坏处理 (#49)
         return {"name": self.name, "description": self.description, "inputSchema": input_schema(self.params),
-                "annotations": {"readOnlyHint": self.kind == READONLY, "destructiveHint": False,
-                                "openWorldHint": False}}
+                "annotations": ann}
 
 
 def _error(rid, code, msg):

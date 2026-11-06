@@ -8,7 +8,7 @@ import cart_snap as cs
 def test_mpv_request_takes_raw_video_frame():
     req = json.loads(cs.mpv_request("/tmp/a.png", 7))
     # "video" = 只要视频帧本身, 不带 OSD/字幕; 锁屏盖在窗口上也不影响
-    assert req == {"command": ["screenshot-to-file", "/tmp/a.png", "video"], "request_id": 7}
+    assert req["command"]["flags"] == "video" and req["command"]["filename"] == "/tmp/a.png"
 
 
 def test_ffmpeg_grabs_one_frame():
@@ -55,7 +55,7 @@ def _fake_mpv(reply_error="success", write=True, extra_lines=()):
         for ln in extra_lines:
             b.sendall(ln.encode() + b"\n")
         if write:
-            with open(req["command"][1], "wb") as f:
+            with open(req["command"]["filename"], "wb") as f:
                 f.write(b"PNG")
         b.sendall(json.dumps({"request_id": req["request_id"] + 1, "error": "success"}).encode() + b"\n")
         b.sendall(json.dumps({"request_id": req["request_id"], "error": reply_error}).encode() + b"\n")
@@ -190,3 +190,47 @@ def test_default_device_falls_back_when_probe_fails(monkeypatch):
         raise OSError("no v4l2")
     monkeypatch.setattr(kc, "video_nodes", boom)
     assert cs.default_device() == cs.DEFAULT_DEV
+
+
+# ------------------------------------------------------------ #49 审查: 不闪 OSD, ffmpeg 进程间互斥 + 冷却
+
+def test_mpv_request_no_osd():
+    req = json.loads(cs.mpv_request("/run/x.png", 7))
+    assert req == {"command": {"name": "screenshot-to-file", "filename": "/run/x.png", "flags": "video",
+                               "_flags": ["no-osd"]}, "request_id": 7}
+
+
+def test_ffmpeg_slot_mutex_and_cooldown(tmp_path):
+    import fcntl
+    import os
+    import pytest
+    p = str(tmp_path / "snap.lock")
+    t = [1000.0]
+    with cs.ffmpeg_slot(p, cooldown=3, clock=lambda: t[0]):         # 第一次: 文件刚建也不算冷却中
+        pass
+    t[0] += 1
+    with pytest.raises(cs.SnapBusy, match="刚抓过"):
+        with cs.ffmpeg_slot(p, cooldown=3, clock=lambda: t[0]):
+            pass
+    t[0] += 3
+    fd = os.open(p, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)                                  # 别的进程正在抓
+    try:
+        with pytest.raises(cs.SnapBusy, match="正在"):
+            with cs.ffmpeg_slot(p, cooldown=3, clock=lambda: t[0]):
+                pass
+    finally:
+        os.close(fd)
+    with cs.ffmpeg_slot(p, cooldown=3, clock=lambda: t[0]):
+        pass
+
+
+def test_grab_reports_busy_instead_of_running_ffmpeg(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(cs, "running_mpv_device", lambda: None)
+    monkeypatch.setattr(cs, "via_ffmpeg", lambda dev, out: ran.append(dev) or (True, ""))
+    monkeypatch.setattr(cs, "SNAP_LOCK", str(tmp_path / "snap.lock"))
+    out = str(tmp_path / "a.png")
+    assert cs.grab("/dev/video0", out)[0] == out
+    path, why, _ = cs.grab("/dev/video0", out)
+    assert path is None and "刚抓过" in why and len(ran) == 1

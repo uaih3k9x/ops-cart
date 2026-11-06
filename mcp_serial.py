@@ -161,8 +161,12 @@ class Store:
     def view(self, slot=None):
         return self.run(lambda b, now: b.view(now, slot))
 
+    def peek(self, slot=None):
+        """只读档用 (#49): 不加锁不写盘不写日志; 过期 / 读不懂只在视图里算."""
+        return peek(self.path, self.clock, slot)
 
-def peek(path=STATE_PATH, clock=time.time):
+
+def peek(path=STATE_PATH, clock=time.time, slot=None):
     """只读看一眼 (车机 / 网页 / 副屏): 不加锁不写盘, 过期的在内存里算掉. 读不了 / 读不懂 = 全部急停.
     写状态的一方都是原子改名, 不加锁也读不到半个文件."""
     now = clock()
@@ -173,13 +177,13 @@ def peek(path=STATE_PATH, clock=time.time):
         text = None
     except (OSError, UnicodeDecodeError):
         return cc.stopped_view("读不到状态文件")
-    return sw.Book.from_text(text, now).view(now)
+    return sw.Book.from_text(text, now).view(now, slot)
 
 
-def writers(store):
-    """{槽位: 写入者 或 None} 给 list_threads; 读不到状态就全是 None, 不抛."""
+def writers(store, readonly=False):
+    """{槽位: 写入者 或 None} 给 list_threads; 读不到状态就全是 None, 不抛. readonly: 走 peek, 不碰状态文件."""
     try:
-        return {s["slot"]: s["writer"] for s in store.view()["slots"]}
+        return {s["slot"]: s["writer"] for s in (store.peek() if readonly else store.view())["slots"]}
     except Exception:                   # noqa: BLE001  列执行绪不能因为这个挂
         return {n: None for n in sw.SLOTS}
 
@@ -235,7 +239,7 @@ class Server(mc.Server):
 class Tool(mc.Tool):
     """kind 必填 (mc.READONLY / mc.ACT, #49): 只读档按它决定注册不注册."""
 
-    def __init__(self, name, description, params, fn, *, kind, destructive=False, redact=None):
+    def __init__(self, name, description, params, fn, *, kind, destructive=None, redact=None):
         super().__init__(name, description, params, fn, kind=kind)
         self.destructive, self.redact = destructive, redact
 
@@ -245,8 +249,10 @@ class Tool(mc.Tool):
 
     def spec(self):
         d = super().spec()
-        d["annotations"] = {"readOnlyHint": self.read_only, "destructiveHint": self.destructive,
-                            "openWorldHint": False}
+        d["annotations"] = {"readOnlyHint": self.read_only, "openWorldHint": False}
+        dh = False if self.read_only else self.destructive      # 动手工具没写 = 不写, 客户端按可能有破坏处理 (#49)
+        if dh is not None:
+            d["annotations"]["destructiveHint"] = dh
         return d
 
 
@@ -254,10 +260,11 @@ SLOT = {"type": "integer", "minimum": 1, "maximum": 4, "required": True, "descri
 LEASE = {"type": "string", "maxLength": 64, "required": True, "description": "lease_acquire 给的令牌"}
 
 
-def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, llm=None):
+def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, llm=None, readonly=False):
     """slots() -> lamps_core.slot_status 那样的 4 项; tail(dev, n) -> 文本 (出错抛 mc.ToolError);
     send(dev, text, timeout, raw) -> (status, 输出, 说明); rules() -> load_rules 的结果;
-    llm(指令, 数据, model 配置) -> claude 输出 (第 2 层决策模型, None = serial_gate_model.claude_llm). 测试里全换成假的."""
+    llm(指令, 数据, model 配置) -> claude 输出 (第 2 层决策模型, None = serial_gate_model.claude_llm). 测试里全换成假的.
+    readonly (#49): 只回只读工具, pending_list 走 store.peek (不加锁不写盘); 动手档照旧走 store.run."""
 
     def _slot(n):
         s = slots()[n - 1]
@@ -356,6 +363,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"])
 
     def pending_list(a):
+        if readonly:
+            return [mc.json_content(store.peek(a.get("slot")))]
         return [mc.json_content(_run(lambda b, now: b.view(now, a.get("slot"))))]
 
     def estop(a):
@@ -365,16 +374,16 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                                  "dropped": [d["id"] for d in dropped],
                                  "note": "已撤销写租约、丢弃挂起的命令, 没往设备发任何东西. 解除要人在推车本机上操作."})]
 
-    return [
+    tools = [
         Tool("lease_acquire", "申请某个槽位的写租约 (一条执行绪同时只有一个写入者). 返回令牌, 发命令时带上. "
              "租约有期限要续期, 过期自动释放, 挂着的命令一起作废. 急停中拿不到.",
              {"slot": SLOT, "ttl_s": {"type": "integer", "minimum": sw.LEASE_TTL_MIN_S,
                                       "maximum": sw.LEASE_TTL_MAX_S, "default": sw.LEASE_TTL_S,
-                                      "description": "期限秒数"}}, lease_acquire, kind=mc.ACT),
+                                      "description": "期限秒数"}}, lease_acquire, kind=mc.ACT, destructive=False),
         Tool("lease_renew", "续写租约 (从现在起再给一个期限). 过期了不能续, 要重新申请.",
-             {"slot": SLOT, "lease": LEASE}, lease_renew, kind=mc.ACT),
+             {"slot": SLOT, "lease": LEASE}, lease_renew, kind=mc.ACT, destructive=False),
         Tool("lease_release", "用完交还写租约; 自己还挂着等确认的命令一起作废.",
-             {"slot": SLOT, "lease": LEASE}, lease_release, kind=mc.ACT),
+             {"slot": SLOT, "lease": LEASE}, lease_release, kind=mc.ACT, destructive=False),
         Tool("send_command", "往某个槽位的串口发一行命令 (自动补回车, 只收一行可打印 ASCII, 不给原始字节). "
              "过闸门: 认得出厂商、设备停在提示符上的只读命令 (华为 display… / 思科 show…, 全称小写) 直接发, "
              "返回设备输出; 其余的若推车开了决策模型, 由模型按命令、设备最近输出和你给的 intent 判, 判放行直接发, "
@@ -401,17 +410,18 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位, 同时停键鼠、作废在等确认的 PXE 解锁申请. "
              "觉得自己要出错时就用它.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "槽位; 不给 = 全部"}},
-             estop, kind=mc.ACT),
+             estop, kind=mc.ACT, destructive=False),   # 只停不动设备; 标成破坏性客户端会先问人, 急停不能等
     ]
+    return [t for t in tools if t.kind == mc.READONLY] if readonly else tools
 
 
 def real_slots():
     return lamps_core.slot_status(serial_core.data_dir(serial_core.serial_conf_read()))
 
 
-def real_tools(tail, store=None):
+def real_tools(tail, store=None, readonly=False):
     """cart_mcp 用: tail 用它的 conbroker_tail."""
-    return build_tools(store or Store(), slots=real_slots, tail=tail, send=conbroker_send)
+    return build_tools(store or Store(), slots=real_slots, tail=tail, send=conbroker_send, readonly=readonly)
 
 
 # ------------------------------------------------------------ 人确认后发送 / 网页请求

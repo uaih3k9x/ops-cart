@@ -5,13 +5,16 @@
 
 - kiosk 开着预览: 让 mpv 经 IPC 存当前视频帧 (取的是解码后的帧, 不是屏幕, 锁屏盖住也照拿),
   等到 mpv 对这条命令的回包 (request_id 对上) 才算数;
-- 没开预览: 采集卡空着, ffmpeg 直接抓一帧;
+- 没开预览: 采集卡空着, ffmpeg 直接抓一帧. 进程间互斥 + 冷却 (#49): 同时只一个 ffmpeg, 上次抓完
+  FFMPEG_COOLDOWN_S 秒内不再开卡, 免得 Agent 连着截图把采集卡长期占住;
 - 要 root (采集卡是 root:video, mpv 的 socket 属 root). 不给 -o 时输出到 /run/ops-cart 下
   新建的私有文件 (mkstemp, 0600), 不写 /tmp 里的固定文件名 (root 写固定名会被符号链接坑).
 成功时打印图片路径, 退出码 0; 抓图失败 1; 用法/设备状态问题 2.
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import socket
@@ -24,10 +27,18 @@ MPV_SOCK = "/run/ops-cart/mpv.sock"     # kiosk 起 mpv 时带 --input-ipc-serve
 RUN_DIR = "/run/ops-cart"
 DEFAULT_DEV = "/dev/video0"
 FFMPEG_TIMEOUT = 20
+SNAP_LOCK = "/run/ops-cart/snap.lock"   # ffmpeg 抓帧的进程间锁, 内容是上次抓完的时刻
+FFMPEG_COOLDOWN_S = 3
+
+
+class SnapBusy(Exception):
+    """采集卡正被别的 ffmpeg 抓, 或刚抓过还在冷却."""
 
 
 def mpv_request(path, rid=1):
-    return json.dumps({"command": ["screenshot-to-file", path, "video"], "request_id": rid}) + "\n"
+    """命名参数形式才能带前缀: no-osd = 截图时预览画面上不闪提示字."""
+    return json.dumps({"command": {"name": "screenshot-to-file", "filename": path, "flags": "video",
+                                   "_flags": ["no-osd"]}, "request_id": rid}) + "\n"
 
 
 def default_out(run_dir=RUN_DIR):
@@ -121,6 +132,37 @@ def via_mpv(out, timeout=5.0, connect=_connect_mpv):
     return False
 
 
+@contextlib.contextmanager
+def ffmpeg_slot(path=None, cooldown=FFMPEG_COOLDOWN_S, clock=time.time):
+    """拿到才开卡: 别人在抓 / 冷却中抛 SnapBusy. 锁文件开不了 (不在推车上, 没有 /run/ops-cart) 就不限."""
+    try:
+        fd = os.open(path or SNAP_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SnapBusy("别的进程正在用 ffmpeg 抓这块卡, 过几秒再试") from None
+        try:
+            last = float(os.pread(fd, 64, 0).decode() or 0)
+        except (OSError, ValueError):
+            last = 0.0
+        now = clock()
+        left = cooldown - (now - last) if last <= now else 0      # 时钟往回拨: 不算冷却
+        if left > 0:
+            raise SnapBusy(f"采集卡刚抓过, {left:.0f} 秒后再试 (screen_ocr 也走这里)")
+        try:
+            yield
+        finally:
+            stamp = repr(clock()).encode()
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, stamp, 0)
+    finally:
+        os.close(fd)
+
+
 def via_ffmpeg(dev, out):
     """-> (成功?, 失败原因)."""
     try:
@@ -151,7 +193,11 @@ def grab(want=None, out=None):
     if how == "mpv":
         ok, why = via_mpv(path), "mpv 没回成功 (预览刚关? 再试一次)"
     else:
-        ok, why = via_ffmpeg(dev, path)
+        try:
+            with ffmpeg_slot():
+                ok, why = via_ffmpeg(dev, path)
+        except SnapBusy as e:
+            ok, why = False, str(e)
     if ok:
         return path, "", dev
     if not out:                                 # 自己建的空文件别留着

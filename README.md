@@ -163,7 +163,8 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 #   sudo systemctl enable --now cart-mcp.service
 #   claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
 #   只读档 (给不审批 MCP 调用的 Agent 底座; 边界在服务端, 见 docs/DESIGN_agent_mcp.md 第十六节):
-#   claude mcp add cart-ro -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile readonly
+#   只读档用专用身份 agent-ro (不能和上面能 sudo 跑动手档的身份共用), sudoers 和 authorized_keys 的 command= 要同时配, 见第十六节:
+#   claude mcp add cart-ro -- ssh agent-ro@<推车地址>
 # 标签工具 (#20) 要缩写对照表: sudo install -m 0644 examples/label_abbrev.json /etc/ops-cart/   (真实资产名的缩写只加在这份里)
 # 串口写闸门规则 (可选; 不放就是内置: 华为提示符自动认, 只放行 display / show, 决策模型不开;
 #   开第 2 层把 model.enabled 改 true, 模型走 serial.conf 那个 user 的 ~/.claude 线路, 同 cart-dream):

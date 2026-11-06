@@ -9,7 +9,9 @@ HTTP 两档各起一个进程: 动手档用 mcp.json 顶层 port/tokens, 只读�
 
 Claude Code 接法 (地址、令牌换成自己的):
     claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
-    claude mcp add cart-ro -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile readonly
+    # 只读档要专用 ssh 身份 (sudoers + authorized_keys command= 同时锁死, 见 docs/DESIGN_agent_mcp.md 第十六节);
+    # 别用上面那个能 sudo 跑动手档的身份:
+    claude mcp add cart-ro -- ssh agent-ro@<推车地址>
     claude mcp add --transport http cart http://<推车 tailnet 地址>:8765/mcp --header "Authorization: Bearer <令牌>"
 
 工具: list_threads (槽位 1-4) / read_output (走 conbroker tail, 不直开串口) / screenshot (cart_snap) /
@@ -205,14 +207,14 @@ def read_pxe(mode_path=kc.PXE_MODE, root=kc.TFTP_ROOT, guard_path=None, now=None
 
 def real_tools(profile=mc.DEFAULT_PROFILE):
     """按档位挑好的工具; 档位不认识抛 ValueError."""
-    mc.check_profile(profile)
+    ro = mc.check_profile(profile) == mc.READONLY       # 只读档: 各模块只给只读工具, 读状态走 peek (不加锁不写盘)
     store = mcp_serial.Store()
     tools = (build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap, state=dash_core.read, pxe=read_pxe,
-                         writer=lambda: mcp_serial.writers(store))
-             + mcp_serial.real_tools(conbroker_tail, store)     # 写串口 (#21)
-             + mcp_pxe.real_tools()                             # PXE 解锁申请 (#24): 只挂起, 人在车机上确认
-             + mcp_kvm.real_tools()                             # 键鼠 / OCR / WOL (#41)
-             + mcp_label.real_label_tools())                    # 标签 (#20)
+                         writer=lambda: mcp_serial.writers(store, readonly=ro))
+             + mcp_serial.real_tools(conbroker_tail, store, readonly=ro)    # 写串口 (#21)
+             + mcp_pxe.real_tools(readonly=ro)          # PXE 解锁申请 (#24): 只挂起, 人在车机上确认
+             + mcp_kvm.real_tools(readonly=ro)          # 键鼠 / OCR / WOL (#41)
+             + mcp_label.real_label_tools(readonly=ro))     # 标签 (#20)
     return mc.select_tools(tools, profile)                      # 只读档: 动手工具不注册 (#49)
 
 

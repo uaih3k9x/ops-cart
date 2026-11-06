@@ -8,8 +8,10 @@
 打印机写入和状态读取都是注入的函数, 测试不碰 /dev/usb/lp0.
 """
 
+import contextlib
 import copy
 import difflib
+import fcntl
 import json
 import os
 import secrets
@@ -22,6 +24,8 @@ import mcp_core as mc
 import tspl_preview as tp
 
 PRINTER = "/dev/usb/lp0"
+PRINTER_LOCK = "/run/ops-cart/printer.lock"     # 进程间: 两档各一个进程, 查状态和打印要串行 (#49)
+PRINTER_LOCK_WAIT_S = 10
 ABBREV_PATHS = ("/etc/ops-cart/label_abbrev.json",          # 推车本地 (可含真实资产名), 有就用它
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "label_abbrev.json"))
 MAX_LABELS = 30                 # 一次最多这么多张; 再多分几次打
@@ -163,8 +167,7 @@ class LabelTool(mc.Tool):
 
     def spec(self):
         s = super().spec()
-        s["annotations"] = {"readOnlyHint": self.read_only, "destructiveHint": False,
-                            "idempotentHint": self.read_only, "openWorldHint": False}
+        s["annotations"].update(idempotentHint=self.read_only, destructiveHint=False)    # 打印最坏废一张, 不碰设备配置
         props = s["inputSchema"]["properties"]
         if "labels" in props:
             props["labels"]["items"] = LABEL_ITEM
@@ -187,9 +190,11 @@ LABELS = {"type": "array", "required": True,
           "description": f"每张一个对象, 1~{MAX_LABELS} 张. 只认 ASCII (打印机内置字体没有中文)"}
 
 
-def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secrets.token_urlsafe(12), guides=None):
+def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secrets.token_urlsafe(12), guides=None,
+                      xlock=contextlib.nullcontext, readonly=False):
     """write(bytes) 发给打印机; status() -> 状态字节 int; abbrev() -> (对照表 dict, 路径).
-    都可以抛 mc.ToolError. guides 默认 tspl_preview.cable_guides(). 测试里全换成假的."""
+    都可以抛 mc.ToolError. guides 默认 tspl_preview.cable_guides(). 测试里全换成假的.
+    xlock() -> 进程间打印机锁 (上下文); readonly (#49): 只回只读工具 (不含 label_print)."""
     guides = guides or tp.cable_guides()
     proofs, lock = {}, threading.Lock()         # proof -> (版面, 发出时刻); 进程内, 重启就没了
 
@@ -237,7 +242,7 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
         probs, data, _ = render(kind, labels, guides)
         if probs:
             raise mc.ToolError("不打, 校验没过: " + "; ".join(probs))
-        with lock:                              # 一台打印机: 查令牌、查状态、写、发令牌整段串行
+        with lock, xlock():                     # 一台打印机: 查令牌、查状态、写、发令牌整段串行 (进程内 + 进程间)
             t = now()
             why = _take_proof(kind, a.get("proof"), a.get("confirmed"), t) if batch else None
             for p in [p for p, (_, t0) in proofs.items() if t - t0 > PROOF_TTL]:
@@ -259,7 +264,8 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
         return [mc.json_content(out)]
 
     def printer_status(_a):
-        return [mc.json_content(decode_status(status()))]
+        with lock, xlock():                     # ESC !? 的回字节别被别的进程的查询 / 打印抢走
+            return [mc.json_content(decode_status(status()))]
 
     def abbrev_propose(a):
         cat, entries = a["category"], a["entries"]
@@ -269,7 +275,7 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
         table, path = abbrev()
         return [mc.json_content(propose_abbrev(table, path, cat, entries))]
 
-    return [
+    tools = [
         LabelTool("label_preview",
                   "标签预览 (不打印): 查仅 ASCII、长度上限 (cable 对端<=12/本端<=23, text 大字<=11/小字<=23)、"
                   "出界和对折对称, 回检查结果 JSON + 前几张的 SVG (文本). abbrev=true 先按缩写对照表把中文/长名缩短, "
@@ -295,6 +301,7 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
                    "entries": {"type": "object", "required": True, "description": "{原文: 缩写}, 1~20 条"}},
                   abbrev_propose, kind=mc.READONLY),
     ]
+    return [t for t in tools if t.kind == mc.READONLY] if readonly else tools
 
 
 # ------------------------------------------------------------ 真设备 (推车上)
@@ -346,5 +353,28 @@ def real_abbrev(paths=ABBREV_PATHS):
     raise mc.ToolError(f"没有缩写对照表 (找过 {', '.join(paths)})")
 
 
-def real_label_tools():
-    return build_label_tools(write=real_write, status=real_status, abbrev=real_abbrev)
+@contextlib.contextmanager
+def printer_lock(path=PRINTER_LOCK, wait_s=PRINTER_LOCK_WAIT_S, sleep=time.sleep):
+    """进程间打印机锁 (flock). 等 wait_s 秒还拿不到就报忙, 不无限等."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        raise mc.ToolError(f"打印机锁 {path} 打不开: {e}") from None
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise mc.ToolError(f"打印机忙 (别的进程在查状态或打印, 等了 {wait_s:g} 秒), 稍后再试") from None
+                sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def real_label_tools(readonly=False):
+    return build_label_tools(write=real_write, status=real_status, abbrev=real_abbrev, xlock=printer_lock,
+                             readonly=readonly)
