@@ -88,6 +88,7 @@
 | [`sun_core.py`](sun_core.py) | 按日出日落判断深色 / 浅色(#31,NOAA 算法、不联网):档位 auto / dark / light,auto 下日出日落后留缓冲(默认 20 分钟)不来回跳,没配经纬度或配置读不懂按深色;配置 `/etc/ops-cart/theme.json`(样例 [`examples/theme.example.json`](examples/theme.example.json),坐标是格林尼治天文台,推车位置在车上配);结果由 cart-dash 写进快照 `theme` |
 | [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;车机 kiosk 没就绪(kiosk.json 里的 pid 不在了)画开机自检,逐行出结果;`--once --preview` 导出画面不推屏;每帧按快照里的 `theme.mode` 切配色,模式一变下一帧整帧换(#32) |
 | [`pet_core.py`](pet_core.py) · [`pet_render.py`](pet_render.py) · [`pet_sprites.py`](pet_sprites.py) | 副屏桌宠(#35):原创像素猫,只在锁屏且没事时出现,能在公告字、分隔线和底部空地之间跑(有红灯不上分隔线),路人猫(奶牛、大橘、梨花)随机来,靠近才哈气,偶尔打成一团烟,动时整帧 8 fps、睡着 2 fps,不在就不推;行为、绘制、精灵分开,猫出错只摘猫不影响状态板;`--no-pet` 关掉;`/etc/ops-cart/pet-skin.json` 可换主猫的样子(纯数据,现场自备,不进仓库) |
+| [`ble_input.py`](ble_input.py) · [`ble_input_core.py`](ble_input_core.py) | 蓝牙隔空打字(#52):BlueZ 上的 BLE GATT 服务,只收已配对且 trust 的手机写来的 UTF-8 文字(分包重组、CRC、限长 4096、去重、半包超时),一条一个文件排进 `/run/ops-cart/ble-input/in/`(root 0600),**不执行命令**;审计只记长度和来源设备。单元 `cart-ble-input.service` 默认不开。协议和配对见 [`docs/BLE_INPUT.md`](docs/BLE_INPUT.md) |
 | [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
 | [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;低电量两段式的判断 `shutdown_stage`(预告 / 倒计时 / 关机,车机和副屏共用) |
 | [`theme.py`](theme.py) | 车机 / 副屏的颜色、字体、斜边都在这里,业务代码只引用名字(测试扫描兜底);两套同名配色 `DARK` / `LIGHT`(CDE 深色 #28、CDE 浅色 #30),`use(mode)` 切换(默认深色),模块级别名用 `follow()` 跟着换;`setup(root)` 启动时(和换配色后)挑字体(Unifont,没有退回 Noto)、设 Tk 默认控件的 option 数据库;`unreadable(w)` 查控件树里字和底够不够 4.5:1 |
@@ -101,7 +102,7 @@
 | [`fonts/`](fonts/) | 车机和副屏的界面字体 Unifont 16px 点阵(OTF + 授权原文),部署装到 `/usr/local/share/fonts/ops-cart/`;取不到车机退回 Noto,自检 `UI FONT` 一行变 WARN |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查,`cart_accept.py` 推车只读验收(逐项 PASS / FAIL / SKIP / 人工,纯逻辑在 `accept_core.py`);`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
-| [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md)、[备用远程通道](docs/REMOTE_TUNNEL.md) |
+| [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md)、[备用远程通道](docs/REMOTE_TUNNEL.md)、[蓝牙隔空打字](docs/BLE_INPUT.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |

@@ -1,0 +1,108 @@
+{
+ "protocol": "ops-cart BLE input v1 (#52)",
+ "note": "Python tests/test_ble_input_core.py 和 android 单元测试共用",
+ "max_len": 4096,
+ "vectors": [
+  {
+   "name": "ascii-one-frame",
+   "msg_id": 1,
+   "mtu": 23,
+   "text": "hi",
+   "payload_hex": "6869",
+   "frames_hex": [
+    "0100010002d8932aac6869"
+   ]
+  },
+  {
+   "name": "chinese-multi-frame",
+   "msg_id": 258,
+   "mtu": 23,
+   "text": "你好，推车",
+   "payload_hex": "e4bda0e5a5bdefbc8ce68ea8e8bda6",
+   "frames_hex": [
+    "010102000f521299aae4bda0e5a5bdefbc8ce68e",
+    "020102000ba8e8bda6"
+   ]
+  },
+  {
+   "name": "emoji-zwj",
+   "msg_id": 48879,
+   "mtu": 23,
+   "text": "👨‍👩‍👧✅",
+   "payload_hex": "f09f91a8e2808df09f91a9e2808df09f91a7e29c85",
+   "frames_hex": [
+    "01beef001501dd43d5f09f91a8e2808df09f91a9",
+    "02beef000be2808df09f91a7e29c85"
+   ]
+  },
+  {
+   "name": "newline-tab",
+   "msg_id": 7,
+   "mtu": 23,
+   "text": "第一行\n\t第二行",
+   "payload_hex": "e7acace4b880e8a18c0a09e7acace4ba8ce8a18c",
+   "frames_hex": [
+    "01000700141d8ed42ae7acace4b880e8a18c0a09",
+    "020007000be7acace4ba8ce8a18c"
+   ]
+  },
+  {
+   "name": "long-mtu185",
+   "msg_id": 65535,
+   "mtu": 185,
+   "text": "装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。装机完成。",
+   "payload_hex": "e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082",
+   "frames_hex": [
+    "01ffff01c2c2e5fa41e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae",
+    "02ffff00ad8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69c",
+    "02ffff015ebae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082e8a385e69cbae5ae8ce68890e38082"
+   ]
+  }
+ ],
+ "rejects": [
+  {
+   "name": "crc-mismatch",
+   "code": "crc",
+   "frames_hex": [
+    "010003000940b722bfe6a0a1e9aa8ce5928d"
+   ]
+  },
+  {
+   "name": "declared-too-long",
+   "code": "len",
+   "frames_hex": [
+    "01000410010000000078"
+   ]
+  },
+  {
+   "name": "escape-sequence",
+   "code": "ctrl",
+   "frames_hex": [
+    "0100050004bdcc322c1b5b324a"
+   ]
+  },
+  {
+   "name": "conflicting-overlap",
+   "code": "overlap",
+   "frames_hex": [
+    "010006001e6bc1d3c16161616161616161616161",
+    "020006000b616161616161616161616161616161",
+    "020006000b626262626262626262626262626262"
+   ]
+  },
+  {
+   "name": "cont-without-start",
+   "code": "nostart",
+   "frames_hex": [
+    "020006000b616161616161616161616161616161"
+   ]
+  },
+  {
+   "name": "unknown-type",
+   "code": "frame",
+   "frames_hex": [
+    "0900010000000000000078"
+   ]
+  }
+ ]
+}

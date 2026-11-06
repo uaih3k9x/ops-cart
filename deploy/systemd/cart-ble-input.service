@@ -1,0 +1,40 @@
+[Unit]
+Description=ops-cart 蓝牙隔空打字 (BLE GATT; 只收已配对且 trust 的手机写来的文字, 不执行命令, #52)
+After=bluetooth.service
+Requires=bluetooth.service
+# 草稿, 默认不开机自启. 要 python3-dbus python3-gobject; 配对 / trust 的做法见 docs/BLE_INPUT.md.
+# 不依赖 kiosk.service: 车机界面挂了照样收, 文字压在队列里.
+
+[Service]
+# root: BlueZ 的 D-Bus 策略只让 root 注册 GATT 服务和广播. 收到的文字一条一个文件放
+# /run/ops-cart/ble-input/in/ (0700 目录, 0600 文件), 回复摘要从 /run/ops-cart/ble-input/reply/ 取;
+# 审计只写长度和来源设备, 进 /var/log/ops-cart/events.log. 重启单元不清队列 (RuntimeDirectoryPreserve).
+ExecStart=/usr/bin/python3 /opt/pxe/ble_input.py
+WorkingDirectory=/opt/pxe
+RuntimeDirectory=ops-cart/ble-input ops-cart/ble-input/in ops-cart/ble-input/reply
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/var/log/ops-cart
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryMax=128M
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
