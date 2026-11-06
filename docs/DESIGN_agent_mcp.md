@@ -126,7 +126,9 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
   - **主动发包**：`display ntp-service trace` 会向上游发 NTP 报文；带主机名参数的 show（如 `show ip route <名字>`、`show hosts <名字>`）在开了域名解析的设备上会发 DNS 查询。前者已进小黑名单，后者没有，靠设备上 `no ip domain-lookup` 之类的现场配置兜底。
   - **巨量输出**：`show memory`、`show running-config all`、`show platform software trace ...` 已进小黑名单；别的大输出命令（如 `show logging`、`show ip bgp` 在大表上）照样放行，会占住串口很久。
   - 带 `clear` / `reset` 的词在任何位置都拒（有的 show 末尾带 `clear` 会清计数器）。
-  - 规则文件加的只读动词（extra_verbs）有写死的禁用表：`terminal` `debugging` `undo` `no` `clear` `test` `telnet` `ssh` `system-view` `configure` `reload` `copy` `write` `save` `delete` `format` `reset` `erase` 等及其缩写一律加不进来；样例不再开 ping 类。样例里 `linux.model=false`。
+  - 规则文件加的只读动词（extra_verbs）有写死的禁用表：`terminal` `debugging` `undo` `no` `clear` `test` `telnet` `ssh` `system-view` `configure` `reload` `copy` `write` `save` `delete` `format` `reset` `erase` 等及其缩写一律加不进来（禁用表是尽力而为，列不全）；加的动词只在用户视图（华为 `<名>`、思科 / 锐捷不带括号的 `名#` / `名>`）生效；样例不再开 ping 类。H3C 按华为处理：登记和 vendors 配置都写进 `huawei`，写在 `h3c` 下会被忽略。
+  - 巡检遇到设备不认的命令（`% Invalid input` 等，比如路由器没有交换机命令）：这一段标失败，接着跑后面的，整体结果记"部分失败"；超时 / 没回提示符 / 提示符变了照旧中止。
+  - 范围外的残余风险：回车替人确认 `[confirm]` 的问题由 #73（PR #74）处理；设备上已有的 EEM（思科）/ OPS（华为）事件订阅可能被只读命令或登录事件触发、执行别的动作，第 1 层管不到，靠现场配置排查。样例里 `linux.model=false`。
 
 ## 十一、P4 落地记录（#23）
 

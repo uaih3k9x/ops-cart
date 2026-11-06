@@ -332,7 +332,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         r = rules()
         vendor, at = sw.slot_vendor(n, r, text)
         judge = gm.make_judge(r, lambda: tail(s["dev"], CONTEXT_LINES), intent, llm=llm)
-        gate = sw.classify(cmd, vendor, at, r, judge=judge)
+        gate = sw.classify(cmd, vendor, at, r, judge=judge, user_view=sw.user_view(vendor, text))
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),

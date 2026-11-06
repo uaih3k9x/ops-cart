@@ -989,7 +989,8 @@ def test_device_rejected_command_is_failure(tmp_path, out):
     r = sv.run_survey("/dev/con-1", "cisco", send=send, tail=lambda p: "SW-A#", now=lambda: T0,
                       survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
     assert not r["ok"] and r["sections"][0]["status"] == "invalid" and "不认" in r["summary"]
-    assert all(s["status"] == "skipped" for s in r["sections"][1:])
+    assert all(s["status"] == "invalid" for s in r["sections"])        # 每条都报错: 每条都标失败, 但都跑了
+    assert "部分失败" in r["summary"]
 
 
 def test_survey_refuses_config_mode(tmp_path):
@@ -1010,3 +1011,86 @@ def test_probe_skips_rejected_show_on_huawei():
         return "display version\nHuawei Versatile Routing Platform Software\n<SW-A>"
     assert sv.probe_vendor(send, "/dev/con-1") == ("huawei", "")
     assert log == ["show version", "display version"]
+
+
+# ------------------------------------------------------------ #56 第五轮审查
+
+def _router_send(log):
+    """思科路由器: 交换机命令 (端口状态 / MAC 表 / LLDP) 回 % Invalid input, 其余正常."""
+    def send(port, cmd, timeout):
+        log.append(cmd)
+        if cmd in ("show interfaces status", "show mac address-table", "show lldp neighbors"):
+            return f"{cmd}\n                   ^\n% Invalid input detected at '^' marker.\n\nR1#"
+        if cmd == "show version":
+            return f"{cmd}\nCisco IOS XE Software, Version 17.03\nR1 uptime is 1 day\nR1#"
+        return f"{cmd}\nsome output\nR1#"
+    return send
+
+
+def test_router_partial_failure_keeps_going(tmp_path):
+    log = []
+    r = sv.run_survey("/dev/con-1", "auto", send=_router_send(log), tail=lambda p: "R1#", now=lambda: T0,
+                      survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
+    st = {x["cmd"]: x["status"] for x in r["sections"]}
+    assert st["show interfaces status"] == st["show mac address-table"] == st["show lldp neighbors"] == "invalid"
+    assert st["show running-config"] == "ok" and st["show arp"] == "ok"       # 后面的照常跑完
+    assert not r["ok"] and "部分失败" in r["summary"] and "show lldp neighbors" in r["summary"]
+    text = open(r["path"], encoding="utf-8").read()
+    assert "部分失败" in text and "(invalid: 设备不认这条命令" in text
+    # 两次都 invalid 的段不算"无法比对"的噪音
+    r2 = sv.run_survey("/dev/con-1", "cisco", send=_router_send([]), tail=lambda p: "R1#", now=lambda: T1,
+                       survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
+    assert "无法比对" not in r2["summary"]
+
+
+def test_partial_failure_still_stops_on_prompt_change(tmp_path):
+    def send(port, cmd, timeout):
+        if cmd == "show interfaces status":
+            return f"{cmd}\n% Invalid input detected at '^' marker.\nR1#"
+        if cmd == "show arp":
+            return f"{cmd}\nx\nR2#"
+        return f"{cmd}\nok\nR1#"
+    r = sv.run_survey("/dev/con-1", "cisco", send=send, tail=lambda p: "R1#", now=lambda: T0,
+                      survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
+    st = [x["status"] for x in r["sections"]]
+    assert "changed" in st and st[-1] == "skipped" and "中止" in r["summary"]
+
+
+@pytest.mark.parametrize("name", ["SH", "SH-01", "ZJSH-3", "Mesh-2", "Flash", "Bash-core", "ASH-1"])
+def test_hostnames_like_shells_are_prompts(name):
+    assert sv.at_prompt(name + "#") == name
+
+
+@pytest.mark.parametrize("text", ["sh#", "bash#", "bash-4.2#", "ash#", "zsh#", "dash#", "busybox#", "sh-4.4$",
+                                  "rbash-5.0#", "Ctrl>"])
+def test_shells_and_boot_not_prompts(text):
+    assert sv.at_prompt(text) is None
+
+
+@pytest.mark.parametrize("vendor,cmd", [("huawei", "display ntp trace"), ("ruijie", "show ntp trace"),
+                                        ("cisco", "show ntp trace x")])
+def test_ntp_trace_denied(vendor, cmd):
+    assert not sv.is_readonly(cmd, vendor)
+
+
+@pytest.mark.parametrize("vendor,cmd", [("cisco", "show version | include"), ("huawei", "display arp | exclude"),
+                                        ("huawei", "display arp | begin"), ("cisco", "show arp | count x"),
+                                        ("huawei", "display arp | no-more x")])
+def test_pipe_filter_argument_rules(vendor, cmd):
+    assert not sv.is_readonly(cmd, vendor)
+
+
+def test_max_len_boundary():
+    base = "display interface "
+    ok = base + "a" * (sv.MAX_LEN - len(base))
+    assert len(ok) == sv.MAX_LEN and sv.is_readonly(ok, "huawei")
+    assert not sv.is_readonly(ok + "a", "huawei")
+
+
+def test_archive_never_overwrites_existing_file(tmp_path, monkeypatch):
+    victim = tmp_path / "con-1_SW-A_20261030-1403.txt"
+    victim.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(sv, "archive_path", lambda d, h, dev, t: str(victim))     # 算好路径后别人抢先建了
+    r = _run(tmp_path, [])
+    assert not r["ok"] and r["path"] is None and "存档写不进去" in r["summary"]
+    assert victim.read_text(encoding="utf-8") == "keep"

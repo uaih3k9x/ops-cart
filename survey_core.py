@@ -56,7 +56,7 @@ _FORBIDDEN = set(";&<>`$#!?[]{}")                # 拼接/重定向/命令替换
 _FILE_WORDS = {"to-file", "file", "filename", "tftp", "ftp", "sftp", "scp", "http", "https",
                "clear", "reset"}                 # 有的 show 末尾带 clear 会顺手清计数器 (show platform ... drop clear)
 # 主动发包 / 巨量输出的只读命令: 不放 (连续几个词出现就拒), 要看走人确认
-_DENY_PHRASES = (("ntp-service", "trace"), ("memory",), ("running-config", "all"), ("platform", "software", "trace"))
+_DENY_PHRASES = (("ntp-service", "trace"), ("ntp", "trace"), ("memory",), ("running-config", "all"), ("platform", "software", "trace"))
 _KEYWORD = re.compile(r"[a-z0-9][a-z0-9-]*")     # 内置动词后紧跟的关键词
 _QUOTES = set("\"'")
 MAX_LEN = 200
@@ -229,8 +229,21 @@ _PROMPTS = [re.compile(r"<([^<>\s]+)>"),
 _CONFIRM = re.compile(r"\[(?:[a-z]{1,8}(?:/[a-z]{1,8})+|y|n|yes|no|ok|cancel|default|enter|more|bootrom|bootload|confirm"
                       r"|startup-config|running-config)\]|<(?:bootload|bootrom)>", re.I)
 # 思科 tclsh、引导程序 (rommon / loader / switch(boot) / grub / u-boot / bootloader)、Linux shell
-_NOT_PROMPT = re.compile(r".*(?:\(tcl\)|-tcl|\(boot\))[#>]|rommon(?: \d+ ?)?>|loader>|grub>|u-boot>|bootloader>|=>"
-                         r"|switch:|root[#$]|(?:[a-z]{0,4}sh|busybox)(?:-\d+(?:\.\d+)*)?[#$]", re.I)
+_BOOT_PROMPT = re.compile(r".*(?:\(tcl\)|-tcl|\(boot\))[#>]|rommon(?: \d+ ?)?>|loader>|grub>|u-boot>|bootloader>"
+                          r"|=>|switch:|ctrl>", re.I)
+# shell: 只认这几个精确的名字 (可带版本号), 区分大小写 —— SH# / SH-01# / Mesh-2# 这种主机名照样是设备提示符
+_SHELL_PROMPT = re.compile(r"(?:sh|bash|rbash|ash|dash|zsh|ksh|busybox)(?:-\d+(?:\.\d+)*)?[#$]|root[#$]")
+
+
+class _NotPrompt:
+    """引导程序 / tclsh 或 shell 提示符 (写闸门对登记成 linux 的槽位只用 _BOOT_PROMPT)."""
+
+    @staticmethod
+    def fullmatch(ln):
+        return _BOOT_PROMPT.fullmatch(ln) or _SHELL_PROMPT.fullmatch(ln)
+
+
+_NOT_PROMPT = _NotPrompt()
 # 设备不认这条命令 (输错 / 不支持 / 视图不对): 这一条算失败
 _INVALID = re.compile(r"^\s*(?:% ?(?:Invalid input|Incomplete command|Ambiguous command|Unknown command|"
                       r"Unrecognized command)|Error: ?(?:Unrecognized command|Wrong parameter|Incomplete command|"
@@ -390,7 +403,8 @@ def not_comparable(old, new, prof):
     def st(d, c):
         return d[c][0] if c in d else "无"
     return [(c, st(old, c), st(new, c)) for c in _order(old, new)
-            if c not in skip and (st(old, c) not in ("ok", "无") or st(new, c) not in ("ok", "无"))]
+            if c not in skip and (st(old, c) not in ("ok", "无") or st(new, c) not in ("ok", "无"))
+            and not (st(old, c) == st(new, c) == "invalid")]     # 两次都不认: 这台设备没有这条, 不算噪音
 
 
 # ------------------------------------------------------------ 认厂商 (#56)
@@ -554,16 +568,24 @@ def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir
             continue
         st, note, lines, device = _one(send, port, vendor, c["cmd"], c["timeout"], device)
         sections.append({"cmd": c["cmd"], "status": st, "note": note, "lines": lines})
-        if st != "ok":
+        if st not in ("ok", "invalid"):     # 设备不认 (路由器没有交换机命令): 这段标失败, 接着跑; 别的才中止
             stop = f"中止于 [{i}/{len(cmds)}] {c['cmd']}: {note}"
     done = sum(s["status"] == "ok" for s in sections)
-    res = _result(ok=stop is None, head=head, vendor=vendor, device=device, sections=sections, error=stop)
+    invalid = [s["cmd"] for s in sections if s["status"] == "invalid"]
+    res = _result(ok=stop is None and not invalid, head=head, vendor=vendor, device=device, sections=sections,
+                  error=stop)
+    if stop:
+        result = f"中止, 已跑 {done}/{len(cmds)}; {stop}"
+    elif invalid:
+        result = f"部分失败, 成功 {done}/{len(cmds)}; 设备不认: {', '.join(invalid)}"
+    else:
+        result = f"完成 {done}/{len(cmds)}"
 
     try:
         os.makedirs(survey_dir, exist_ok=True)
         path = archive_path(survey_dir, head, device or "unknown", t)
         meta = {"head": head, "device": device, "vendor": vendor, "time": time.strftime("%Y-%m-%d %H:%M", t),
-                "result": f"完成 {done}/{len(cmds)}" if res["ok"] else f"中止, 已跑 {done}/{len(cmds)}; {stop}"}
+                "result": result}
         with open(path, "x", encoding="utf-8") as f:
             f.write(format_archive(meta, sections))
         res["path"] = path
@@ -571,7 +593,10 @@ def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir
         res["ok"] = False
         res["error"] = (stop + "; " if stop else "") + f"存档写不进去: {e}"
 
-    lines = [f"{device or '设备未知'} 巡检{'完成' if stop is None else '中止'}, 已跑 {done}/{len(cmds)} 条"]
+    word = "中止" if stop else ("部分失败" if invalid else "完成")
+    lines = [f"{device or '设备未知'} 巡检{word}, 成功 {done}/{len(cmds)} 条"]
+    if invalid and not stop:
+        lines.append("设备不认 (这台可能没有这些命令): " + ", ".join(invalid))
     if res["error"]:
         lines.append(res["error"])
     if res["path"]:

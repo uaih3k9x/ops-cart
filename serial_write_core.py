@@ -103,7 +103,11 @@ _VERB_DENY = ("terminal", "debugging", "undebug", "undo", "no", "clear", "test",
               "system-view", "configure", "reload", "reboot", "copy", "write", "save", "delete", "format", "reset",
               "erase", "shutdown", "startup", "boot", "install", "upgrade", "license", "patch", "rename", "move",
               "mkdir", "rmdir", "tclsh", "enable", "disable", "request", "run", "bash", "start", "connect",
-              "ftp", "tftp", "sftp", "scp", "archive", "crypto", "set")
+              "ftp", "tftp", "sftp", "scp", "archive", "crypto", "set",
+              "screen-length", "super", "ssh2", "user-interface", "line", "local-user", "guestshell", "python",
+              "event", "free", "kill", "quit", "logout", "lock", "send", "monitor", "mount", "umount", "tar",
+              "gunzip", "squeeze", "fixdisk", "undelete")
+# 禁用表是尽力而为: 各厂商命令太多, 列不全; 规则文件里加动词前自己确认它只读、不进交互、参数有上限
 # 第 2 层决策模型 (#22). 默认不开: 没配就和第 1 层之外全人确认一样
 MODEL_DEFAULT = {"enabled": False, "timeout_s": 30, "budget_usd": "0.2", "context_chars": 3000, "model": None}
 MODEL_TIMEOUT_MIN_S = 5
@@ -146,6 +150,8 @@ def load_rules(path=RULES_PATH):
     danger: [...], model: {enabled, timeout_s, budget_usd, context_chars, model}}.
 
     只能收紧或加只读动词: 只读动词只能加给内置有只读规则的厂商 (survey_core: huawei / h3c / cisco / ruijie);
+    写闸门里 H3C 按华为处理 (槽位登记、vendors 配置都写进 huawei; 写 h3c 会被忽略);
+    加的动词过一张写死的禁用表 (_VERB_DENY, 尽力而为), 且只在用户视图生效 (classify 的 user_view);
     Linux 没有第 1 层白名单, 登记了槽位只走第 2 层或人确认; 高危词只加不减. vendors.<厂商>.model=false 关掉该厂商的
     第 2 层, notes 是给模型的补充说明. 文件不在 / 坏了 = 内置默认 (没有额外动词, 槽位不登记, 华为提示符自动认,
     模型不开)."""
@@ -215,7 +221,8 @@ def slot_vendor(slot, rules, text):
     登记成 linux 的槽位, shell 提示符照常算 (只排除没登记 / 登记成网络设备时的 shell)."""
     ln = last_line(text)
     v = rules.get("slots", {}).get(slot)
-    if survey_core._CONFIRM.fullmatch(ln) or (v != "linux" and survey_core._NOT_PROMPT.fullmatch(ln)):
+    not_prompt = survey_core._BOOT_PROMPT if v == "linux" else survey_core._NOT_PROMPT
+    if survey_core._CONFIRM.fullmatch(ln) or not_prompt.fullmatch(ln):
         return v or None, False             # [Y/N] [startup-config] 确认 / 补齐, 思科 tclsh, Linux shell
     if v:
         return v, bool(_PROMPT[v].fullmatch(ln))
@@ -238,7 +245,19 @@ _TCL = re.compile(r"[\[\]{}]")
 _SHELL_META = re.compile(r"[;&<>`\\!]|\$\(")   # Linux: 拼接 / 后台 / 重定向 / 命令替换 / 续行 / 历史展开
 
 
-def classify(cmd, vendor, at_prompt, rules, judge=None):
+_USER_VIEW = {"huawei": re.compile(r"<[^\s<>]{1,64}>"),
+              "cisco": re.compile(r"[A-Za-z0-9][\w.-]{0,63}[#>]"), "ruijie": re.compile(r"[A-Za-z0-9][\w.-]{0,63}[#>]")}
+
+
+def user_view(vendor, text):
+    """设备停在用户 (exec) 视图上: 华为 / H3C 的 <名>, 思科 / 锐捷不带括号的 名# / 名>. 规则文件加的动词只在这里放."""
+    pat = _USER_VIEW.get(vendor)
+    ln = last_line(text)
+    return bool(pat and pat.fullmatch(ln) and not survey_core._NOT_PROMPT.fullmatch(ln)
+                and not survey_core._CONFIRM.fullmatch(ln))
+
+
+def classify(cmd, vendor, at_prompt, rules, judge=None, user_view=False):
     """一行命令 -> 闸门结果 {verdict: pass|confirm, layer, reason, danger, vendor[, model]}. 调用方先 check_line.
 
     judge(cmd, vendor) -> {allow: bool, reason: 非空字符串, model: {...}}: 第 2 层决策模型 (serial_gate_model);
@@ -252,7 +271,8 @@ def classify(cmd, vendor, at_prompt, rules, judge=None):
         return _gate("confirm", "设备不在提示符上 (可能停在密码、[Y/N]、翻页或半截输出上), 要人确认", vendor=vendor)
     if _TCL.search(cmd):
         return _gate("confirm", "带 [ ] { } (思科 tclsh 等环境里是 Tcl 命令替换), 不送模型, 要人确认", vendor=vendor)
-    extra = rules.get("vendors", {}).get(vendor, {}).get("extra_verbs", ())
+    # 规则文件加的动词 (ping 之类) 只在用户视图放: 配置视图里同名的词可能是配置命令
+    extra = rules.get("vendors", {}).get(vendor, {}).get("extra_verbs", ()) if user_view else ()
     if survey_core.is_readonly(cmd, vendor, extra_verbs=extra):
         return _gate("pass", f"{vendor} 只读命令 (第 1 层放行)", vendor=vendor)
     return _layer2(cmd, vendor, rules, judge)
