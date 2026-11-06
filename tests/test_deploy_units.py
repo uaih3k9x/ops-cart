@@ -150,7 +150,7 @@ def test_cart_mcp_readonly_unit():
     for k in ("UMask=0077", "PrivateTmp=yes", "Restart=on-failure", "ProtectKernelTunables=yes",
               "WantedBy=multi-user.target"):
         assert k in body, k
-    for k in ("ProtectSystem=strict", "ReadWritePaths=/run/ops-cart /var/log/ops-cart /run/sudo",
+    for k in ("ProtectSystem=strict", "ReadWritePaths=/run/ops-cart /var/log/ops-cart -/run/sudo",
               "ProtectHome=read-only"):                       # #60 第三轮: 文件系统只读, 只放开这三处
         assert k in body, k
     assert "NoNewPrivileges" not in body                       # 读串口要 sudo -u 跑 conbroker tail (setuid), 不能加

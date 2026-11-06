@@ -202,9 +202,11 @@ Match User agent-ro
     PermitTunnel no
     PasswordAuthentication no
     PermitUserRC no
+    MaxSessions 1
 ```
 
      `ForceCommand` 由 sshd 强制执行，不看 `authorized_keys`。`DisableForwarding` 一次关掉端口转发、X11 和 agent 转发。
+     `MaxSessions 1`：一条 ssh 连接里只开一个会话（不让一条连接复用出多个只读进程）。**连接数**sshd 这里不好按用户限，靠应用层的槽位：只读档进程启动时抢 `/run/ops-cart/mcp-ro-slot{0,1}.lock`（flock，不等），同时最多 2 个只读进程（stdio 会话和 `cart-mcp-ro` 单元一起算），抢不到就退出（退出码 3，stderr 说明）。
      `PermitUserRC no` 让 sshd 不跑 `~/.ssh/rc`（`PermitUserEnvironment` 默认就是 no，`~/.ssh/environment` 也不读）。
      账号要有**真的登录 shell**：sshd 是用登录 shell 去跑 `ForceCommand`（`<shell> -c "<命令>"`）的，设成 `nologin` 的话服务根本起不来。用 `/bin/sh`（`usermod -s /bin/sh agent-ro`）：非交互的 `sh -c` 不读 `~/.profile`、`~/.bashrc` 这类 rc 文件，`ForceCommand` 和 `authorized_keys` 的 `command=` 都是这样跑的，所以两者都照常能用（Rocky 上 `/bin/sh` 是 bash 的 sh 模式，非交互时也不读 `$ENV`）。
      **家目录归 root、账号自己不能写**：`chown root:root ~agent-ro && chmod 0755 ~agent-ro`（`.ssh` 同样），这样它没法自己放 rc 文件、改 `authorized_keys`。别的口子已经由上面这几条堵住。
@@ -213,8 +215,9 @@ Match User agent-ro
     - 只配 `command=`：哪天这把钥匙或 `command=` 配错了，sudo 也不会再兜底。
     - sshd 的 `Match`：哪怕 `authorized_keys` 被改了，它也照样生效。
     - 不进设备组是最后一道：就算拿到 shell，也碰不到串口、采集卡和打印机。
+- **已知限制：stdio 只读档不受 systemd 单元收紧保护**。`cart-mcp-ro.service` 里的 `ProtectSystem=strict`、`ProtectHome=read-only` 只管 HTTP 那个进程；stdio 只读档是 sshd → sudo 起的 root 进程，不在这个单元里，文件系统不是只读的。它的边界是：只注册只读工具（代码层）、sudoers 只放一条命令、ssh 身份锁死（上面几条）、进程槽位。要同样的收紧，可以改成用 `systemd-run --pipe --wait -p ProtectSystem=strict …` 包一层，待拍板。
 - **审计**：`mcp-audit.log` 每行多一个 `profile`。HTTP 认证失败那行也带。
-- **只读档限速**（第三轮审查）：只读档不接受 JSON-RPC 批量请求（一个请求塞 2000 条调用以前能绕开所有冷却之外的节流），整个请求回一条错误，一条都不跑；`tools/call` 过一个进程内的令牌桶（每秒补 3 次，一口气最多 10 次），超出的回"调用太频繁"。被限速的调用审计合并：1 秒内只记一条，下一条带上中间没逐条记的次数。动手档不限速、批量照旧（那边有租约、闸门和人确认）。
+- **只读档限速**（第三轮审查）：只读档不接受 JSON-RPC 批量请求（一个请求塞 2000 条调用以前能绕开所有冷却之外的节流），整个请求回一条错误，一条都不跑；`tools/call` 过一个进程内的令牌桶（每秒补 3 次，一口气最多 10 次），超出的回"调用太频繁"。被限速的调用审计合并：1 秒内只记一条，下一条带上中间没逐条记的次数。令牌桶在查工具名之前（第四轮）：乱填工具名、被拒的批量请求也先扣令牌，审计行数一样封顶，写不满磁盘，也冲不掉轮转里的真实审计。令牌桶是进程内的，靠上面 sshd 段说的进程槽位（同时最多 2 个只读进程）把总量封顶在 2 倍；没做跨进程令牌桶，是因为每次调用都要拿文件锁读写状态，只为把 2 倍压回 1 倍不值得。动手档不限速、批量照旧（那边有租约、闸门和人确认）。
 - **协议**：只读档 `serverInfo.name` 是 `ops-cart-readonly`，说明文字里不提租约和写工具；动手档还是 `ops-cart`。
 - **Agent 接法示例**（地址、令牌、名字都是示例值）：
 
@@ -249,7 +252,8 @@ claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profil
   - **截图 / OCR** 用 `/run/ops-cart/snap.lock`，两档规则不一样：
     - 动手档只在走 ffmpeg 时排队：等锁，上次抓完 3 秒内就等冷却过去，最多等 25 秒，不直接拒。
     - 只读档不管走 mpv 还是 ffmpeg、是截图还是 OCR，都要过这把锁：两次之间至少 10 秒，有人在抓或者还在冷却就直接拒（回"刚抓过，N 秒后再试"），免得只读 Agent 把采集卡和 CPU 一直占着，挤掉人盯着的会话。
-    - 冷却时刻两档共用，所以只读档会让着动手档。
+    - 冷却时刻写在 `snap.lock` 里：动手档**走 ffmpeg** 抓完、只读档任何一次抓完都会写；只读档看到动手档刚用 ffmpeg 抓过也会等冷却，所以让着动手档。动手档走 mpv 不占采集卡、不拿锁，也不写时刻，只读档的冷却不把它算进去。
+    - 只读档先拿锁、过冷却，再去看是哪块卡、预览开没开（冷却期内不读 `/proc`、不起探测子进程）。
   - **mpv 截图**先发命名参数形式，带 `"_flags": ["no-osd"]`，预览画面上不闪提示字。mpv 明确回错误时（老版本不认命名参数），退回旧的数组形式再试一次。取舍：老 mpv 上截图照样能用，代价是预览上可能闪一下提示字。超时、连不上不重试。
   - **`kvm_status`** 探测键鼠代理时只发 `status` 控制操作，不 `open` 设备。
 - **只读 `pxe_requests`**：在内存里的那份状态上算一次过期和急停作废（事件丢掉、不落盘），所以过期或作废的申请会出现在 `history` 里，和动手档看到的一致。

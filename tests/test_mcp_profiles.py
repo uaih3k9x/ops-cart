@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import os
 import threading
 
 import pytest
@@ -64,7 +65,8 @@ def test_readonly_registry_has_no_act_tool():
     assert _listed(server) == READONLY_NAMES
 
 
-def test_readonly_server_does_not_know_act_tools():
+def test_readonly_server_does_not_know_act_tools(monkeypatch):
+    monkeypatch.setattr(mc, "RO_BURST", 100)                        # 一口气调十几个工具, 不测限速
     a = ListAudit()
     server = cm.make_server("readonly", a)
     for name in sorted(ACT_NAMES):
@@ -312,3 +314,100 @@ def test_doc_sshd_match_block_locks_rc_and_shell():
               "DisableForwarding yes", "PermitTTY no"):
         assert k in block, k
     assert "/bin/sh" in doc and "usermod -s /bin/sh agent-ro" in doc and "chown root:root ~agent-ro" in doc
+
+
+# ------------------------------------------------------------ #60 第四轮: 审计也受限速; 跨进程槽位
+
+@pytest.fixture(autouse=True)
+def _ro_slots(tmp_path, monkeypatch):
+    monkeypatch.setattr(mc, "RO_SLOT_DIR", str(tmp_path / "ro-slots"))
+
+
+def _audit_lines_after(s, audit, msgs):
+    audit.lines.clear()
+    for m in msgs:
+        s.handle(m)
+    return len(audit.lines)
+
+
+def test_unknown_tool_and_batch_spam_audit_bounded():
+    """不存在的工具名、被拒的批量: 先过令牌桶, 审计跟限速调用一样合并 (中1)."""
+    n = 1000
+    bound = mc.RO_BURST + 2
+    clk, audit = _Mono(), _Audit()
+    s, _ = _ro_server(clock=clk, audit=audit)
+    unknown = [{"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": "nope"}} for i in range(n)]
+    assert _audit_lines_after(s, audit, unknown) <= bound
+    clk.t += 100
+    s2, calls = _ro_server(clock=clk, audit=audit)
+    assert _audit_lines_after(s2, audit, [[_call_req(i)] for i in range(n)]) <= bound and calls == []
+    r = s2.handle([_call_req(1)])
+    assert r["error"]["code"] == -32600
+
+
+def test_unknown_tool_still_says_no_such_tool_when_tokens_left():
+    s, _ = _ro_server()
+    r = s.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "nope"}})
+    assert "没有这个工具" in r["error"]["message"]
+
+
+def test_ro_slots_limit_processes(tmp_path):
+    d = str(tmp_path / "slots")
+    held = [mc.take_ro_slot(d) for _ in range(mc.RO_SLOTS)]
+    with pytest.raises(mc.SlotBusy, match="只读档"):
+        mc.take_ro_slot(d)
+    os.close(held[0])
+    os.close(mc.take_ro_slot(d))                                     # 放掉一个就能再进
+    for fd in held[1:]:
+        os.close(fd)
+
+
+def test_ro_slots_shared_across_processes(tmp_path):
+    """别的进程占满槽位, 这个进程进不来."""
+    import subprocess
+    import sys
+    import time
+    d = str(tmp_path / "slots")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = ("import sys,time; sys.path.insert(0, %r); import mcp_core as mc; "
+            "fds=[mc.take_ro_slot(%r) for _ in range(mc.RO_SLOTS)]; print('ok', flush=True); time.sleep(30)" % (root, d))
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().strip() == "ok"
+        with pytest.raises(mc.SlotBusy):
+            mc.take_ro_slot(d)
+    finally:
+        p.kill()
+        p.wait()
+    time.sleep(0.05)
+    os.close(mc.take_ro_slot(d))
+
+
+def test_ro_slot_dir_unusable_fails_closed(tmp_path):
+    f = tmp_path / "file"
+    f.write_text("x")
+    with pytest.raises(mc.SlotBusy, match="打不开"):
+        mc.take_ro_slot(str(f / "sub"))
+
+
+def test_main_readonly_refuses_when_slots_full(monkeypatch, capsys, tmp_path):
+    d = str(tmp_path / "full")
+    monkeypatch.setattr(mc, "RO_SLOT_DIR", d)
+    held = [mc.take_ro_slot(d) for _ in range(mc.RO_SLOTS)]
+    seen = []
+    monkeypatch.setattr(cm, "serve_stdio", lambda *a: seen.append(1))
+    try:
+        assert cm.main(["stdio", "--profile", "readonly", "--audit", "/dev/null"]) == 3
+        assert seen == [] and "只读档" in capsys.readouterr().err
+        assert cm.main(["stdio", "--profile", "act", "--audit", "/dev/null"]) == 0      # 动手档不占槽位
+    finally:
+        for fd in held:
+            os.close(fd)
+
+
+def test_doc_match_block_max_sessions():
+    import pathlib
+    doc = (pathlib.Path(__file__).resolve().parent.parent / "docs" / "DESIGN_agent_mcp.md").read_text(encoding="utf-8")
+    block = doc[doc.index("Match User agent-ro"):]
+    assert "MaxSessions 1" in block[:block.index("```")]
+    assert "stdio 只读档不受" in doc

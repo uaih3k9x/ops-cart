@@ -12,10 +12,11 @@ Wants=network-online.target
 ExecStart=/usr/bin/python3 /opt/pxe/cart_mcp.py http --profile readonly
 WorkingDirectory=/opt/pxe
 # 文件系统只读 (#60 第三轮), 只放开: /run/ops-cart (设备锁、标签机状态缓存、临时截图、mpv socket),
-# /var/log/ops-cart (审计), /run/sudo (sudo 的时间戳目录). 家目录只读.
+# /var/log/ops-cart (审计), /run/sudo (sudo 的时间戳目录; 前面的 - = 不存在也照起: root 跑 sudo -u 不验密码,
+# 通常不写时间戳). 家目录只读.
 # 不加 NoNewPrivileges: 读串口输出要 sudo -u <serial.conf 的 user> 跑 conbroker tail, sudo 是 setuid, 加了就跑不起来.
 ProtectSystem=strict
-ReadWritePaths=/run/ops-cart /var/log/ops-cart /run/sudo
+ReadWritePaths=/run/ops-cart /var/log/ops-cart -/run/sudo
 ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelTunables=yes

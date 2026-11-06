@@ -365,3 +365,19 @@ def test_via_mpv_timeout_connects_once(tmp_path):
     finally:
         for b in peers:
             b.close()
+
+
+def test_grab_readonly_checks_cooldown_before_probing(tmp_path, monkeypatch):
+    """#60 第四轮: 只读档先拿锁、过冷却, 再探设备 (冷却期内不看 /proc、不起探测子进程)."""
+    import time
+    p = str(tmp_path / "snap.lock")
+    monkeypatch.setattr(cs, "SNAP_LOCK", p)
+    probes = []
+    monkeypatch.setattr(cs, "running_mpv_device", lambda: probes.append("proc") or None)
+    monkeypatch.setattr(cs, "default_device", lambda: probes.append("probe") or "/dev/video0")
+    monkeypatch.setattr(cs, "via_ffmpeg", lambda dev, out: (True, ""))
+    _stamp(p, time.time() - 1)
+    path, why, _ = cs.grab(None, str(tmp_path / "a.png"), readonly=True)
+    assert path is None and "刚抓过" in why and probes == []
+    _stamp(p, time.time() - cs.READONLY_COOLDOWN_S - 1)
+    assert cs.grab(None, str(tmp_path / "a.png"), readonly=True)[0] is not None and probes

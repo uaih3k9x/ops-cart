@@ -214,14 +214,26 @@ def _slot_for(how, readonly):
 
 def grab(want=None, out=None, readonly=False):
     """抓一帧 -> (图片路径 或 None, 失败原因, 哪块卡). 不往 stdout 打字 (cart_mcp 的 stdio 是协议通道).
-    out=None 时在 /run/ops-cart 下新建私有文件, 失败时删掉. readonly: 只读档的限速 (见模块说明)."""
+    out=None 时在 /run/ops-cart 下新建私有文件, 失败时删掉. readonly: 只读档的限速 (见模块说明);
+    只读档先拿锁、过冷却, 再探设备 (#60: 冷却期内不看 /proc、不起探测子进程)."""
+    if not readonly:
+        return _grab(want, out, lambda how: _slot_for(how, False))
+    try:
+        with _slot_for(None, True):
+            return _grab(want, out, lambda how: contextlib.nullcontext())
+    except SnapBusy as e:
+        dev = want or DEFAULT_DEV
+        return None, f"截图失败 ({dev}): {e}", dev
+
+
+def _grab(want, out, slot):
     mpv_dev = running_mpv_device()
     how, dev = route(want, mpv_dev, os.path.exists(MPV_SOCK), default_device() if not (want or mpv_dev) else DEFAULT_DEV)
     if how == "busy":
         return None, f"{dev} {BUSY_TEXT}", dev
     path = None
     try:
-        with _slot_for(how, readonly):          # 拿到才建临时文件: 被拒时什么都不写
+        with slot(how):                         # 拿到才建临时文件: 被拒时什么都不写
             path = out or default_out(RUN_DIR)
             if how == "mpv":
                 ok, why = via_mpv(path), "mpv 没回成功 (预览刚关? 再试一次)"

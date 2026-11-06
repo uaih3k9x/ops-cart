@@ -9,6 +9,7 @@
 
 import base64
 import hmac
+import fcntl
 import json
 import os
 import re
@@ -319,6 +320,33 @@ RO_BURST = 10       # 桶容量: 一口气最多几次
 RO_AUDIT_EVERY_S = 1.0  # 被限速的调用审计合并: 这么久最多记一条, 带上中间没逐条记的次数
 
 
+RO_SLOTS = 2        # 只读档同时最多几个进程 (stdio 每个 ssh 会话一个 + HTTP 单元一个), 见 take_ro_slot
+RO_SLOT_DIR = "/run/ops-cart"
+
+
+class SlotBusy(Exception):
+    """只读档进程槽位满了 / 槽位文件打不开."""
+
+
+def take_ro_slot(d=None, n=None):
+    """只读档进程启动时抢一个跨进程槽位 (flock, 不等): 拿到返回 fd (进程活着就一直拿着, 退出自动放);
+    满了或文件打不开抛 SlotBusy (fail-closed). 令牌桶是进程内的, 槽位把"多开会话成倍放大"封顶在 n 倍 (#60)."""
+    d, n = d or RO_SLOT_DIR, n or RO_SLOTS
+    for i in range(n):
+        path = os.path.join(d, f"mcp-ro-slot{i}.lock")
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as e:
+            raise SlotBusy(f"只读档槽位文件 {path} 打不开 ({e}), 不起服务") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            os.close(fd)
+    raise SlotBusy(f"只读档已经有 {n} 个进程在跑 (stdio 会话或 cart-mcp-ro), 同时最多 {n} 个; 先关掉一个再连")
+
+
 class _Bucket:
     """令牌桶; clock 单调时钟. 线程安全 (HTTP 多线程共用一个 Server)."""
 
@@ -364,7 +392,10 @@ class Server:
 
     def handle(self, msg, who="-"):
         if isinstance(msg, list) and self.profile == READONLY:
-            self._log(who, None, {"batch": len(msg)}, False, error="只读档不接受批量请求")
+            if not self.bucket.take():                  # 被拒的批量也先扣令牌, 审计跟限速合并 (#60 第四轮)
+                self._limited(who, None)
+            else:
+                self._log(who, None, {"batch": len(msg)}, False, error="只读档不接受批量请求")
             return _error(None, -32600, "只读档不接受 JSON-RPC 批量请求, 一次发一条")
         if isinstance(msg, list) and msg:
             outs = [r for r in (self._one(m, who) for m in msg) if r is not None]
@@ -411,14 +442,14 @@ class Server:
 
     def _call(self, rid, params, who):
         name, args = params.get("name"), params.get("arguments", {})
+        if self.bucket is not None and not self.bucket.take():     # 先限速再查工具名: 乱填名字也写不满审计
+            self._limited(who, name)
+            return _result(rid, {"content": [text_content(
+                f"调用太频繁 (只读档每秒最多 {RO_RATE:g} 次, 一口气最多 {RO_BURST} 次), 稍后再试")], "isError": True})
         tool = self.tools.get(name) if isinstance(name, str) else None
         if tool is None:
             self._log(who, name, args, False, error="没有这个工具")
             return _error(rid, -32602, f"没有这个工具: {name!r}")
-        if self.bucket is not None and not self.bucket.take():
-            self._limited(who, name)
-            return _result(rid, {"content": [text_content(
-                f"调用太频繁 (只读档每秒最多 {RO_RATE:g} 次, 一口气最多 {RO_BURST} 次), 稍后再试")], "isError": True})
         t0 = self.clock()
         try:
             content, err = tool.fn(check_args(tool.params, args)), None

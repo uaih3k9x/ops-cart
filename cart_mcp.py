@@ -358,6 +358,13 @@ def main(argv=None):
     ap.add_argument("--conf", default=MCP_CONF, help="令牌/端口配置")
     ap.add_argument("--audit", default=mc.AUDIT_PATH, help="审计日志 (JSONL)")
     a = ap.parse_args(argv)
+    slot = None
+    if a.profile == mc.READONLY:                # 只读档: 跨进程槽位, 多开会话不能成倍放大限速 (#60)
+        try:
+            slot = mc.take_ro_slot()
+        except mc.SlotBusy as e:
+            print(f"cart_mcp: {e}", file=sys.stderr)
+            return 3
     audit = mc.Audit(a.audit)
     server = make_server(a.profile, audit)
     if a.mode == "stdio":
@@ -368,6 +375,7 @@ def main(argv=None):
         return 0
     conf = lambda: conf_read(a.conf)        # noqa: E731
     serve_http(server, a.port or mc.profile_port(conf(), a.profile), audit, conf=conf)
+    del slot                                    # 槽位跟进程走, 退出时内核放锁
     return 0
 
 
