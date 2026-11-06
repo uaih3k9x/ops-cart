@@ -40,6 +40,7 @@ DEDUP = f"{BASE}/dedup.json"   # /run 下, 单元 RuntimeDirectoryPreserve: 服�
 PAIRING = f"{BASE}/pairing"    # root touch 它之后 PAIR_WINDOW_S 内允许 Pairable 开着
 PAIR_WINDOW_S = 180
 PAIRABLE_CHECK_S = 10
+FRESH_S = 300                  # 回执 / 回复只发给最近这么多秒内 secure-write 成功过的连接
 
 _DEV_PATH = re.compile(r"/dev_([0-9A-Fa-f]{2}(?:_[0-9A-Fa-f]{2}){5})$")
 
@@ -109,6 +110,7 @@ class Handler:
         self.devices = devices or (lambda: [])
         self.dedup_path, self.clock = dedup_path, clock
         self.rx, self.tx = bc.Receiver(), bc.Sender(random.getrandbits(16))
+        self.recent = {}            # 大写地址 -> 最近一次受信写入 (secure-write 能到这里就说明链路加密了)
         if dedup_path:
             try:
                 with open(dedup_path, encoding="utf-8") as f:
@@ -124,12 +126,21 @@ class Handler:
         for f in frames:
             self.notify(f)
 
-    def _all_trusted(self):
-        """通知是广播: 连着的设备全受信才发回执 (带 crc, 短文本可被反推) 和回复."""
+    def saw_secure_write(self, src, now=None):
+        if src:
+            self.recent[str(src).upper()] = self.clock() if now is None else now
+
+    def _all_trusted(self, now):
+        """通知是广播: 连着的设备全受信、且本次连接内最近 FRESH_S 秒 secure-write 过, 才发回执 (带 crc,
+        短文本可被反推) 和回复. 断开的设备清掉记录, 同地址再连上要重新写过才算."""
         try:
-            return bc.may_broadcast(self.devices())
+            devs = self.devices()
         except Exception:                   # noqa: BLE001 — 读不到设备列表就当有陌生人
             return False
+        on = {str(d.get("Address") or "").upper() for d in devs if d.get("Connected") is True}
+        for a in [a for a in self.recent if a not in on]:
+            del self.recent[a]
+        return bc.may_notify(devs, self.recent, now, FRESH_S)
 
     def _save_dedup(self):
         if not self.dedup_path:
@@ -139,7 +150,7 @@ class Handler:
         except OSError:
             pass
 
-    def _handle(self, evs):
+    def _handle(self, evs, now):
         open_air = None
         for ev in evs:
             result = None
@@ -152,7 +163,7 @@ class Handler:
                 self._save_dedup()
             if ev.code != "unpaired":       # unpaired 回的是陌生设备自己的帧, 照发, 它才知道要配对
                 if open_air is None:
-                    open_air = self._all_trusted()
+                    open_air = self._all_trusted(now)
                 if not open_air:
                     result = (result or ev.kind) + ",receipt-withheld"
                     self.log(bc.audit(ev, result=result))
@@ -162,17 +173,17 @@ class Handler:
 
     def on_write(self, src, props, frame, now=None):
         now = self.clock() if now is None else now
-        self._handle(self.rx.feed(src, frame, now, bc.device_trusted(props)))
+        trusted = bc.device_trusted(props)
+        if trusted:
+            self.saw_secure_write(src, now)
+        self._handle(self.rx.feed(src, frame, now, trusted), now)
 
     def tick(self, now=None):
-        self._handle(self.rx.expire(self.clock() if now is None else now))
+        now = self.clock() if now is None else now
+        self._handle(self.rx.expire(now), now)
 
-    def send_reply(self, text):
-        try:
-            devices = self.devices()
-        except Exception:                   # noqa: BLE001
-            devices = []
-        if not bc.may_broadcast(devices):
+    def send_reply(self, text, now=None):
+        if not self._all_trusted(self.clock() if now is None else now):
             self.log(cartlog.fields(kind="reply", result="dropped", reason="untrusted-connected",
                                     len=len(text.encode("utf-8"))))
             return False
@@ -299,8 +310,9 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
             pass
 
         def push(self, frame):
-            if self.notifying:
-                self.PropertiesChanged(CHRC, {"Value": dbus.Array(frame, signature="y")}, [])
+            # 不看 notifying: BlueZ 的 StartNotify / StopNotify 计数不可靠 (已绑定设备断开不减, 恢复 CCC 也不调).
+            # 发不发由 Handler 的闸门 (may_notify) 决定, 这里只交给 BlueZ, 它按各设备的 CCC 分发.
+            self.PropertiesChanged(CHRC, {"Value": dbus.Array(frame, signature="y")}, [])
 
     # secure-*: 单独就设了 write / notify 属性并要最高一级链路安全 (目标 LE Secure Connections, 待实机验证);
     # "notify" 是多写的, 无害. 外壳再查一遍 Paired/Trusted/Bonded.
