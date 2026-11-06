@@ -173,9 +173,9 @@ def test_check_confirm():
     assert cc.check(b.view(T0), "confirm", it["id"]) is None
     assert "不在挂起" in cc.check(b.view(T0), "confirm", 999)
     b2 = _book()
-    tok2 = b2.acquire(1, "stdio:ops@x", T0)["lease"]
-    b2.begin(1, tok2, "stdio:ops@x", "line", "display x", PASS, T0, 30)      # 先直发在途, 再挂起 (#65 挂起后不许直发)
-    it2 = b2.submit(1, tok2, "stdio:ops@x", "line", "save", DANGER, T0, 30, name="SW1")
+    tok2, first = _held(b2, 1)
+    it2 = b2.submit(1, tok2, "stdio:ops@x", "line", "reboot", DANGER, T0, 30, name="SW1")
+    b2.confirm(first["id"], "human", T0, current="")                     # 同槽位先确认的那条在途 (#65 不许直发 / 在途挂起)
     assert "还没回来" in cc.check(b2.view(T0), "confirm", it2["id"])
     assert cc.check(cc.stopped_view(), "confirm", it["id"])          # 读不懂: 什么都不让确认
 

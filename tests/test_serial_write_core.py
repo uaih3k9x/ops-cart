@@ -454,7 +454,7 @@ def test_submit_then_confirm_then_finish():
     view = b.view(T0 + 2)
     assert [x["id"] for x in view["pending"]] == [p["id"]]
     assert "tokA" not in json.dumps(view)                   # 令牌不给别人看
-    item = b.confirm(p["id"], "human:ops", T0 + 5)
+    item = b.confirm(p["id"], "human:ops", T0 + 5, current="")
     assert item["status"] == "sending" and item["cmd"] == "save" and item["timeout"] == 60
     assert b.view(T0 + 5)["pending"] == []
     b.finish(p["id"], {"status": "sent", "echo": "ok"}, T0 + 6)
@@ -469,7 +469,7 @@ def test_confirm_refused_after_lease_expired():
     b.acquire(1, "agentA", T0, ttl=30, token="tokA")
     p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0 + 1, timeout=30)
     with pytest.raises(sw.Refused) as e:
-        b.confirm(p["id"], "human", T0 + 40)                 # Agent 卡死, 租约过期: 它的命令作废
+        b.confirm(p["id"], "human", T0 + 40, current="")                 # Agent 卡死, 租约过期: 它的命令作废
     assert e.value.code in ("lease", "nope")
     assert b.view(T0 + 40)["pending"] == []
     assert b.view(T0 + 40)["history"][-1]["status"] == "dropped"
@@ -478,12 +478,19 @@ def test_confirm_refused_after_lease_expired():
 def test_confirm_needs_slot_idle():
     b = book()
     b.acquire(1, "agentA", T0, token="tokA")
-    b.begin(1, "tokA", "agentA", "line", "display version", _gate_pass(), T0, timeout=30)
-    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=30)
-    with pytest.raises(sw.Refused) as e:
-        b.confirm(p["id"], "human", T0 + 1)
+    b.begin(1, "tokA", "agentA", "line", "interface GigabitEthernet0/0/2", _gate_pass(), T0, timeout=30)
+    with pytest.raises(sw.Refused) as e:                     # 在途那条还没生效, 现在挂起的上下文是假的 (#68 审查)
+        b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0, timeout=30)
     assert e.value.code == "inflight"
-    assert b.view(T0 + 1)["pending"][0]["id"] == p["id"]      # 还挂着, 等会儿再确认
+    assert b.view(T0)["pending"] == []
+    b.finish(1, {"status": "sent", "echo": ""}, T0 + 1)
+    p = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0 + 2, timeout=30)
+    a2 = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0 + 2, timeout=30)
+    b.confirm(p["id"], "human", T0 + 3, current="")
+    with pytest.raises(sw.Refused) as e:                     # 确认另一条在途时, 这条等着
+        b.confirm(a2["id"], "human", T0 + 4, current="")
+    assert e.value.code == "inflight"
+    assert [x["id"] for x in b.view(T0 + 4)["pending"]] == [a2["id"]]      # 还挂着, 等会儿再确认
 
 
 def test_reject():
@@ -494,12 +501,12 @@ def test_reject():
     assert b.view(T0 + 1)["pending"] == []
     assert b.view(T0 + 1)["history"][-1]["status"] == "rejected"
     with pytest.raises(sw.Refused):
-        b.confirm(p["id"], "human:ops", T0 + 2)
+        b.confirm(p["id"], "human:ops", T0 + 2, current="")
 
 
 def test_confirm_unknown_id():
     with pytest.raises(sw.Refused) as e:
-        book().confirm(42, "human", T0)
+        book().confirm(42, "human", T0, current="")
     assert e.value.code == "nope"
 
 
@@ -524,7 +531,7 @@ def test_pending_expires():
     b.tick(T0 + sw.PENDING_MAX_S + 1)
     assert b.view(T0 + sw.PENDING_MAX_S + 1)["pending"] == []
     with pytest.raises(sw.Refused):
-        b.confirm(p["id"], "human", T0 + sw.PENDING_MAX_S + 2)
+        b.confirm(p["id"], "human", T0 + sw.PENDING_MAX_S + 2, current="")
 
 
 def test_release_drops_own_pending():
@@ -564,7 +571,7 @@ def test_estop_one_slot_revokes_and_drops():
     assert b.stopped(1) and not b.stopped(2)
     assert b.holder(1, T0 + 1) is None and b.holder(2, T0 + 1) == "agentB"
     with pytest.raises(sw.Refused) as e:
-        b.confirm(p1["id"], "human", T0 + 2)                # 急停后排队命令都不会发出
+        b.confirm(p1["id"], "human", T0 + 2, current="")                # 急停后排队命令都不会发出
     assert e.value.code == "nope"
     for fn in (lambda: b.acquire(1, "agentA", T0 + 2, token="x"),
                lambda: b.writer(1, "tokA", T0 + 2),
@@ -707,10 +714,10 @@ def test_confirm_voided_if_slot_sent_something_after_submit():
     b.acquire(1, "agentA", T0, token="tokA")
     a = b.submit(1, "tokA", "agentA", "line", "interface GigabitEthernet0/0/2", _gate_confirm(), T0, timeout=30)
     s = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(["shutdown"]), T0, timeout=30)
-    b.confirm(a["id"], "human", T0 + 1)
+    b.confirm(a["id"], "human", T0 + 1, current="")
     b.finish(a["id"], {"status": "sent", "echo": ""}, T0 + 2)
     with pytest.raises(sw.Refused) as e:
-        b.confirm(s["id"], "human", T0 + 3)
+        b.confirm(s["id"], "human", T0 + 3, current="")
     assert e.value.code == "stale"
     last = b.view(T0 + 3)["history"][-1]
     assert last["id"] == s["id"] and last["status"] == "dropped" and "重新提交" in last["why"]
@@ -722,7 +729,7 @@ def test_confirm_ok_when_nothing_sent_since_submit():
     b.begin(1, "tokA", "agentA", "line", "display version", _gate_pass(), T0, timeout=30)
     b.finish(1, {"status": "sent", "echo": ""}, T0 + 1)
     p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0 + 2, timeout=30)
-    assert b.confirm(p["id"], "human", T0 + 3)["status"] == "sending"
+    assert b.confirm(p["id"], "human", T0 + 3, current="")["status"] == "sending"
 
 
 def test_old_state_item_without_send_mark_is_voided():
@@ -735,7 +742,7 @@ def test_old_state_item_without_send_mark_is_voided():
         it.pop("sent_mark", None)
     b2 = sw.Book.from_text(json.dumps(doc), T0 + 1)
     with pytest.raises(sw.Refused) as e:
-        b2.confirm(p["id"], "human", T0 + 2)
+        b2.confirm(p["id"], "human", T0 + 2, current="")
     assert e.value.code == "stale"
 
 
@@ -746,7 +753,7 @@ def test_pending_records_device_context_untrusted_and_bounded():
     p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30, context=text)
     ctx = b.view(T0)["pending"][0]["context"]
     assert ctx["src"] == "device" and ctx["untrusted"] is True
-    assert len(ctx["lines"]) <= sw.CONTEXT_LINES and ctx["lines"][-1] == "?[2J<SW1>"
+    assert len(ctx["lines"]) <= sw.CONTEXT_LINES and ctx["lines"][-1] == "<SW1>"
     assert all(len(ln) <= sw.CONTEXT_LINE_MAX for ln in ctx["lines"])
     assert sum(len(ln) for ln in ctx["lines"]) <= sw.CONTEXT_MAX
     assert "context" not in json.dumps([e for e in b.events if e["ev"] == "pending"])   # 不进执行绪日志
@@ -778,3 +785,158 @@ def test_pending_without_context_has_none():
     b.acquire(1, "agentA", T0, token="tokA")
     b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30)
     assert b.view(T0)["pending"][0].get("context") is None
+
+
+# ------------------------------------------------------------ #68 审查: 时序缺口 / 确认时重读提示符 / 打码
+
+GE1 = "interface GigabitEthernet0/0/1\n[~SW1-GigabitEthernet0/0/1]"
+GE2 = "interface GigabitEthernet0/0/2\n[~SW1-GigabitEthernet0/0/2]"
+
+
+def test_submit_refused_if_slot_sent_since_output_was_read():
+    """读完设备输出、等第 2 层模型的时候另一路直发完了: 挂起时用的上下文已经旧了, 不挂."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    mark = b.send_mark(1, "tokA", T0)
+    b.begin(1, "tokA", "agentA", "line", "interface GigabitEthernet0/0/2", _gate_pass(), T0, timeout=30)
+    b.finish(1, {"status": "sent", "echo": ""}, T0 + 0.5)
+    with pytest.raises(sw.Refused) as e:
+        b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0 + 1, timeout=30, context=GE1, mark=mark)
+    assert e.value.code == "stale"
+    assert b.view(T0 + 1)["pending"] == []
+    ok = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0 + 2, timeout=30, context=GE2,
+                  mark=b.send_mark(1, "tokA", T0 + 2))
+    assert ok["status"] == "pending"
+
+
+def test_send_mark_needs_lease():
+    with pytest.raises(sw.Refused) as e:
+        book().send_mark(1, "nope", T0)
+    assert e.value.code == "lease"
+
+
+def test_confirm_voided_if_prompt_changed():
+    """人用通道 / conbroker 超时后迟到的字节改了设备视图: 确认时重读最后一行, 和挂起时不同就作废."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0, timeout=30, context=GE1)
+    with pytest.raises(sw.Refused) as e:
+        b.confirm(p["id"], "human", T0 + 1, current=GE2)
+    assert e.value.code == "stale"
+    last = b.view(T0 + 1)["history"][-1]
+    assert last["status"] == "dropped" and "[~SW1-GigabitEthernet0/0/1]" in last["why"] \
+        and "[~SW1-GigabitEthernet0/0/2]" in last["why"]
+
+
+def test_confirm_ok_when_prompt_same():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0, timeout=30, context=GE1)
+    assert b.confirm(p["id"], "human", T0 + 1, current="\r\n[~SW1-GigabitEthernet0/0/1]\r\n")["status"] == "sending"
+
+
+def test_confirm_unreadable_output_refused_but_kept():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0, timeout=30, context=GE1)
+    with pytest.raises(sw.Refused) as e:
+        b.confirm(p["id"], "human", T0 + 1, current=None)
+    assert e.value.code == "prompt"
+    assert [x["id"] for x in b.view(T0 + 1)["pending"]] == [p["id"]]
+
+
+@pytest.mark.parametrize("bad", [-1, "x", True, 1.5, None])
+def test_from_text_bad_send_counter_means_all_stopped(bad):
+    b = book()
+    doc = json.loads(b.dumps())
+    doc["slots"]["2"]["sent"] = bad
+    b2 = sw.Book.from_text(json.dumps(doc), T0)
+    assert all(b2.stopped(n) for n in sw.SLOTS)
+
+
+def test_from_text_old_slots_without_counter_ok():
+    doc = json.loads(book().dumps())
+    for v in doc["slots"].values():
+        v.pop("sent")
+    assert not sw.Book.from_text(json.dumps(doc), T0).stopped(1)
+
+
+def test_old_pending_without_mark_has_own_reason():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30)
+    doc = json.loads(b.dumps())
+    doc["items"][-1].pop("sent_mark")
+    b2 = sw.Book.from_text(json.dumps(doc), T0 + 1)
+    with pytest.raises(sw.Refused) as e:
+        b2.confirm(p["id"], "human", T0 + 2, current="")
+    assert e.value.code == "stale" and "升级前" in str(e.value)
+
+
+def test_context_dropped_when_item_leaves_pending():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    a = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=30, context=GE1)
+    r = b.submit(1, "tokA", "agentA", "line", "reboot", _gate_confirm(), T0, timeout=30, context=GE1)
+    b.reject(r["id"], "human", T0 + 1)
+    b.confirm(a["id"], "human", T0 + 2, current=GE1)
+    assert all("context" not in it for it in b.view(T0 + 2)["history"])
+    assert all("context" not in it for it in json.loads(b.dumps())["items"])
+
+
+@pytest.mark.parametrize("line,secrets", [
+    ("snmp-server user u1 g1 v3 auth sha Auth#Pass1 priv aes 128 Priv#Pass2", ["Auth#Pass1", "Priv#Pass2"]),
+    ("tacacs-server key 7 0822455D0A16", ["0822455D0A16"]),
+    ("radius-server host 192.0.2.1 key S3cretKey", ["S3cretKey"]),
+    ("crypto isakmp key MyPSK123 address 192.0.2.4", ["MyPSK123"]),
+    (" ip ospf message-digest-key 1 md5 OspfKey9", ["OspfKey9"]),
+    ("set psksecret ENC abcdef", ["abcdef"]),
+    ("set admin_password Foo", ["Foo"]),
+    ("wpa-passphrase hunter2", ["hunter2"]),
+    ("local-user admin password irreversible-cipher $1c$abc", ["$1c$abc"]),
+    ("snmp-agent community read cipher %^%#abc", ["%^%#abc"]),
+    (" key 1 md5 BgpKey", ["BgpKey"]),
+    ("username admin privilege 15 secret 9 $9$xyz", ["$9$xyz"]),
+    ("neighbor 192.0.2.9 password BgpPw", ["BgpPw"]),
+    ('set system root-authentication encrypted-password "$6$abc"', ["$6$abc"]),
+    ("PASS\u200bWORD cipher Xy9", ["Xy9"]),
+    ("pass\x1b[0mword Foo", ["Foo"]),
+    ("pa\u00adssword Foo", ["Foo"]),
+    ("\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44 Foo", ["Foo"]),
+    ("user-password=Foo", ["Foo"]),
+    ("login-password Foo", ["Foo"]),
+    ("pre_shared_key=Foo", ["Foo"]),
+])
+def test_context_masks_review_samples(line, secrets):
+    ctx = sw.device_context(line + "\n<SW1>")
+    blob = "\n".join(ctx["lines"])
+    for sec in secrets:
+        assert sec not in blob, (line, blob)
+    assert ctx["lines"][-1] == "<SW1>"
+
+
+def test_context_masks_private_key_block_and_base64():
+    text = ("display current\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAxyzSECRET\nAbCdEfGh\n"
+            "-----END RSA PRIVATE KEY-----\nZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFy\n<SW1>")
+    blob = "\n".join(sw.device_context(text)["lines"])
+    for sec in ("MIIEowIBAAKCAQEAxyzSECRET", "AbCdEfGh", "Zm9vYmFyZm9vYmFy"):
+        assert sec not in blob
+    assert blob.endswith("<SW1>")
+
+
+def test_context_block_start_outside_window_still_masked():
+    text = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(f"k{i}secretline" for i in range(20)) + "\n"
+    blob = "\n".join(sw.device_context(text)["lines"])
+    assert "secretline" not in blob
+
+
+def test_context_plain_words_not_masked():
+    ctx = sw.device_context("interface GigabitEthernet0/0/1\n description uplink-keyboard\n<SW1>")
+    assert ctx["lines"] == ["interface GigabitEthernet0/0/1", " description uplink-keyboard", "<SW1>"]
+
+
+@pytest.mark.parametrize("raw,shown", [("a b", "a b"), ("a\u2028b", "a?b"), ("a\u2029b", "a?b"), ("a\u3000b", "a?b"),
+                                       ("a\u00a0b", "a?b"), ("a\u0085b", "a?b"), ("x\u202ey", "x?y"),
+                                       ("\x1b[31mred\x1b[0m", "red")])
+def test_context_separators_and_escapes(raw, shown):
+    assert sw.device_context(raw)["lines"] == [shown]

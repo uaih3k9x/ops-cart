@@ -392,7 +392,7 @@ def cli(rig, *argv, stdin="yes\n", local=True):
     out = io.StringIO()
     rc = ms.cli(list(argv), store=rig.store, send=rig.send, slots=lambda: rig.slots,
                 local=lambda: (local, "测试" if local else "经 sshd 进来的"), stdin=io.StringIO(stdin), out=out,
-                env={"SUDO_USER": "ops"})
+                env={"SUDO_USER": "ops"}, tail=lambda dev, n: rig.tail(dev, n))
     return rc, out.getvalue()
 
 
@@ -608,3 +608,51 @@ def test_pending_carries_device_context_for_reviewer(rig):
     assert all("context" not in r for r in rig.log(1))                # 执行绪日志照旧不带
     rc, text = cli(rig, "pending")
     assert "设备最近输出" in text and "不可信" in text and "[SW1-GigabitEthernet0/0/1]" in text
+
+
+# ------------------------------------------------------------ #68 审查: 时序缺口
+
+GE1 = "interface GigabitEthernet0/0/1\n[~SW1-GigabitEthernet0/0/1]"
+GE2 = "interface GigabitEthernet0/0/2\n[~SW1-GigabitEthernet0/0/2]"
+
+
+def test_hold_refused_if_other_send_lands_while_reading_and_judging(rig):
+    """一路读完输出、等第 2 层模型时, 另一路 (同令牌) 直发完了: 这一路不挂起, 让 Agent 重新看现场."""
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    real_tail = rig.tail
+
+    def tail_then_other_sends(dev, n):
+        out = real_tail(dev, n)
+        if n == ms.TAIL_LINES and not getattr(rig, "_raced", False):
+            rig._raced = True
+            rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface GigabitEthernet0/0/2",
+                                                 {"verdict": "pass", "layer": 1, "reason": "x", "danger": []},
+                                                 now, 30))
+            rig.store.run(lambda b, now: b.finish(1, {"status": "sent", "echo": ""}, now))
+        return out
+    rig.tail = tail_then_other_sends
+    msg = rig.err("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert "旧了" in msg
+    assert rig.ok("pending_list")["pending"] == []
+
+
+def test_confirm_rereads_prompt_and_voids_if_changed(rig):
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rig.tail_text["/dev/con-1"] = GE2                                # 有人在网页口敲了 interface GE0/0/2
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert rc == 1 and "设备视图变了" in text
+    assert rig.sent == []
+    assert rig.ok("pending_list")["history"][-1]["status"] == "dropped"
+
+
+def test_confirm_with_unreadable_output_keeps_pending(rig):
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rig.tail_text.pop("/dev/con-1")
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert rc == 1 and "读不到" in text and rig.sent == []
+    assert [x["id"] for x in rig.ok("pending_list")["pending"]] == [p["id"]]

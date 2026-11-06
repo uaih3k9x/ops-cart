@@ -59,6 +59,7 @@ TAIL_LINES = 8                  # 发前看几行认厂商 / 提示符 / 名字
 CONTEXT_LINES = 40              # 第 2 层: 给决策模型看几行最近输出 (再按规则文件 context_chars 掐尾)
 INTENT_MAX = 500                # Agent 声明的意图
 SEND_TIMEOUT = 30
+TAIL_TIMEOUT = 10
 SEND_TIMEOUT_MAX = 300
 KEY_TIMEOUT = 10
 SUMMARY_EVS = ("estop", "resume", "confirm", "reject")
@@ -186,6 +187,18 @@ def writers(store):
 
 # ------------------------------------------------------------ conbroker send
 
+def conbroker_tail(dev, n):
+    """conbroker tail <口> -n N (以 serial.conf 的 user 身份); 失败抛 ToolError. cart_mcp 也用这个."""
+    try:
+        r = subprocess.run(serial_core._conbroker_cmd() + ["tail", dev, "-n", str(n)], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=TAIL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise mc.ToolError(f"conbroker tail 跑不起来: {e}") from None
+    if r.returncode != 0:
+        raise mc.ToolError(f"conbroker tail 失败: {serial_core.serve_error(r.returncode, r.stderr)}")
+    return r.stdout.rstrip("\n")
+
+
 def conbroker_send(dev, text, timeout, raw=False, run=subprocess.run):
     """-> (status, 输出, 说明). status: sent / refused (conbroker 发前把关没发) / timeout (发了没等到提示符) / error.
     最后一道检查: 普通行再过一遍 check_line, raw 只收固定特殊键; 不合格不起子进程."""
@@ -277,11 +290,11 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         except OSError as e:
             raise mc.ToolError(f"写状态文件失败, 不发: {e}") from None
 
-    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw, context=None):
+    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw, context, mark):
         me = who()
         if gate["verdict"] != "pass":
-            it = _run(lambda b, now: b.submit(n, lease, me, kind, cmd, gate, now, timeout, name, context=context),
-                      n, kind, cmd)
+            it = _run(lambda b, now: b.submit(n, lease, me, kind, cmd, gate, now, timeout, name, context=context,
+                                              mark=mark), n, kind, cmd)
             return [mc.json_content({
                 "status": "pending", "id": it["id"], "slot": n, "cmd": cmd, "reason": gate["reason"],
                 "danger": gate["danger"],
@@ -325,7 +338,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         except sw.Refused as e:
             _run(lambda b, now: b.log_refused(n, who(), "line", cmd, e.code, str(e), now))
             raise mc.ToolError(str(e)) from None
-        _run(lambda b, now: b.writer(n, a["lease"], now), n, "line", cmd)    # 没租约 / 急停的不问模型, 不白花钱
+        # 没租约 / 急停的不问模型, 不白花钱; 发送序号在读输出之前取, 挂起时变了就不挂 (#65)
+        mark = _run(lambda b, now: b.send_mark(n, a["lease"], now), n, "line", cmd)
         try:
             text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
@@ -337,19 +351,20 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
-                         cmd, False, context=text)
+                         cmd, False, text, mark)
 
     def send_key(a):
         n, key = a["slot"], a["key"]
         s = _slot(n)
         gate = sw.classify_key(key)
+        mark = _run(lambda b, now: b.send_mark(n, a["lease"], now), n, "key", key)
         try:
             text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
             text = ""
         k = sw.KEYS[key]
         return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, mc.thread_name(text), k["text"],
-                         k["raw"], context=text)
+                         k["raw"], text, mark)
 
     def pending_list(a):
         return [mc.json_content(_run(lambda b, now: b.view(now, a.get("slot"))))]
@@ -413,10 +428,23 @@ def real_tools(tail, store=None):
 
 # ------------------------------------------------------------ 人确认后发送 / 网页请求
 
-def send_confirmed(store, iid, by, slots, send):
-    """人确认 #iid -> 标在途 -> 经 conbroker 发 -> finish. -> (条目, status, 输出, 说明).
-    Book 不让 (急停 / 租约没了 / 在途 / 不在挂起) 抛 sw.Refused, 一个字节都不发. 会阻塞到发完, 车机放后台线程调."""
-    it = store.run(lambda b, now: b.confirm(iid, by, now))
+def _current(store, iid, slots, tail):
+    """确认前重读那个槽位设备的最近输出; 读不到 / 没这条 -> None (Book 会说不行)."""
+    item = next((p for p in store.view()["pending"] if p["id"] == iid), None)
+    if item is None:
+        return None
+    try:
+        return tail(slots()[item["slot"] - 1]["dev"], TAIL_LINES)
+    except Exception:                   # noqa: BLE001  读不到就是读不到, 不发
+        return None
+
+
+def send_confirmed(store, iid, by, slots, send, tail=None):
+    """人确认 #iid -> 重读设备最后一行 -> 标在途 -> 经 conbroker 发 -> finish. -> (条目, status, 输出, 说明).
+    Book 不让 (急停 / 租约没了 / 在途 / 不在挂起 / 设备视图变了 / 读不到) 抛 sw.Refused, 一个字节都不发.
+    会阻塞到发完, 车机放后台线程调. tail 默认 conbroker_tail."""
+    current = _current(store, iid, slots, tail or conbroker_tail)
+    it = store.run(lambda b, now: b.confirm(iid, by, now, current))
     try:
         dev = slots()[it["slot"] - 1]["dev"]
         if it["kind"] == "key":
@@ -438,14 +466,14 @@ def send_confirmed(store, iid, by, slots, send):
     return it, status, output, note
 
 
-def human_action(store, op, arg, by, slots, send):
+def human_action(store, op, arg, by, slots, send, tail=None):
     """车机上人的按钮 (#23) -> 一句结果: confirm (arg = 编号, 会阻塞到发完) / reject (编号) / estop / resume
     (槽位, None = 全部). Book 不让抛 sw.Refused. 调用方保证是本机人 (车机进程), 放后台线程调."""
     if op == "confirm":
-        it, status, output, note = send_confirmed(store, arg, by, slots, send)
-        tail = sw.echo_summary(output).strip().splitlines()[-1:] if output else []
+        it, status, output, note = send_confirmed(store, arg, by, slots, send, tail)
+        last = sw.echo_summary(output).strip().splitlines()[-1:] if output else []
         return f"#{it['id']} {it['cmd']} -> {status}" + (f" ({note})" if note else "") + \
-            (f": {tail[0]}" if tail and not note else "")
+            (f": {last[0]}" if last and not note else "")
     where = "全部槽位" if arg is None else f"槽位 {arg}"
     if op == "reject":
         store.run(lambda b, now: b.reject(arg, by, now, why="车机上拒绝"))
@@ -622,7 +650,7 @@ def _print_view(v, out):
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)
 
 
-def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None):
+def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None, tail=None):
     store = store or Store()
     send = send or conbroker_send
     slots = slots or real_slots
@@ -692,7 +720,7 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         print("没输 yes, 不发 (还挂着)", file=out)
         return 1
     try:
-        it, status, output, note = send_confirmed(store, a.id, by, slots, send)
+        it, status, output, note = send_confirmed(store, a.id, by, slots, send, tail)
     except sw.Refused as e:
         print(f"不行: {e}", file=out)
         return 1

@@ -13,6 +13,8 @@
 - 挂起期间 (#65): 槽位有挂起项时, 这个槽位的任何直发 (第 1/2 层放行的命令和键) 都拒 (pending), 和键鼠一致 ——
   否则人批准的"槽位 N · shutdown"会作用在 Agent 之后切过去的另一个接口上. 纵深: 挂起项记下提交时槽位的发送序号,
   确认时序号变了 (提交后这个槽位又发过别的, 例如人先确认了同槽位另一条) 就作废 (stale), 让 Agent 重新提交.
+  在途时不收挂起; 序号在读设备输出之前取 (send_mark), 挂起时已变就不挂. 确认前重读设备最后一行, 和挂起时
+  不同就作废 —— 人用通道不计序号, 迟到的字节也会改视图, 都靠这一步兜住; 读不到就先不发.
   挂起项带提交时设备最近几行输出 (来自设备、不可信, 限长, 口令类字段打码), 只在状态文件和审批界面, 不进执行绪日志.
 - 写租约: 每个槽位同一时间一个写入者, 认令牌不认名字; 有期限 (默认 60 秒), 要续期, 过期自动释放,
   它挂着的命令一起作废. 一条在途: 上一条没回来不发下一条.
@@ -48,7 +50,8 @@ STATE_VERSION = 1
 
 class Refused(Exception):
     """不让做. code: bad (命令不合格) / estop / lease / busy / inflight / nope (没有这条或已经不在挂起) /
-    pending (槽位有挂起项, 不许直发) / stale (挂起后槽位又发过别的, 这条作废)."""
+    pending (槽位有挂起项, 不许直发) / stale (挂起后槽位又发过别的或设备视图变了, 这条作废) /
+    prompt (确认时读不到设备输出, 先不发)."""
 
     def __init__(self, code, msg):
         super().__init__(msg)
@@ -303,24 +306,60 @@ def echo_summary(text):
     return f"{s[:half]}\n…(省略 {len(s) - 2 * half} 字)…\n{s[-half:]}"
 
 
-_CTX_SECRET = re.compile(r"(?i)\b(password|passwd|secret|community|cipher|pre-shared-key|key-string|"
-                         r"authentication-key|psk)\b.*$")
+# 口令类字段: 词前后不是字母数字 (下划线、连字符都算断开: admin_password / pre_shared_key / user-password=)
+_SECRET_WORDS = ("password", "passwd", "passphrase", "pwd", "secret", "psksecret", "community", "cipher", "psk",
+                 "key", "md5", "auth", "priv")
+_CTX_SECRET = re.compile(r"(?i)(?<![a-z0-9])(" + "|".join(_SECRET_WORDS) + r")(?![a-z0-9]).*$")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?")
+_PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY")
+_PEM_END = re.compile(r"(?i)-----END [A-Z0-9 ]*PRIVATE KEY")
+_B64 = re.compile(r"\s*[A-Za-z0-9+/=]{32,}\s*")
+MASK = "******"
 
 
-def _ctx_clean(ln):
-    """控制字符、ESC、零宽 / 双向覆盖这类格式字符 (Unicode 类别 C*) 换成 ?; 中文照留. 制表换空格."""
-    return "".join(" " if ch == "\t" else "?" if unicodedata.category(ch)[0] == "C" else ch for ch in ln)
+def _show(ln):
+    """给人看的: 普通空格和制表留成空格, 其余控制 / 格式 / 分隔字符 (Unicode 类别 C*、Z*, 含 U+2028/2029、
+    不换行空格、全角空格、零宽、双向覆盖) 换成 ?; 中文照留."""
+    return "".join(" " if ch in " \t" else "?" if unicodedata.category(ch)[0] in "CZ" else ch for ch in ln)
+
+
+def _for_match(ln):
+    """拿来认口令的: NFKC 归一 (全角 -> 半角), 再删掉控制 / 格式字符 (零宽、软连字符拆不开 password)."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", ln) if unicodedata.category(ch)[0] != "C")
+
+
+def _ctx_line(ln, in_key=False):
+    """一行设备输出 -> (给人看的一行, 是否在私钥块里). 先整体删 ANSI/CSI/OSC 转义, 再认口令 / 私钥 / 长 base64."""
+    ln = _ANSI.sub("", ln)
+    m = _for_match(ln)
+    if _PEM_BEGIN.search(m):
+        in_key = True
+    elif in_key:
+        return MASK, not _PEM_END.search(m)
+    if _B64.fullmatch(m):
+        return MASK, in_key
+    hit = _CTX_SECRET.search(m)
+    if hit:
+        return _show(m[:hit.start()]) + hit.group(1) + " " + MASK, in_key
+    return _show(ln), in_key
+
+
+def _prompt(text):
+    """设备停在哪: 最后一行 (同样清洗打码), 挂起时和确认时各取一次比对."""
+    return _ctx_line(last_line(text))[0][:CONTEXT_LINE_MAX]
 
 
 def device_context(text):
     """挂起时设备最近几行输出 -> {src, untrusted, lines}; 没有 -> None. 来自被测设备, 只给人看, 不当指令:
-    掐尾 CONTEXT_LINES 行、每行 CONTEXT_LINE_MAX 字、总共 CONTEXT_MAX 字; 控制字符换成 ?; 口令类字段后面整行打码."""
-    lines = [ln for ln in (text or "").replace("\r", "").split("\n")]
-    while lines and not lines[-1].strip():
-        lines.pop()
+    整段先过一遍 (私钥块跨行), 再掐尾 CONTEXT_LINES 行、每行 CONTEXT_LINE_MAX 字、总共 CONTEXT_MAX 字."""
+    shown, in_key = [], False
+    for ln in (text or "").replace("\r", "").split("\n"):
+        ln, in_key = _ctx_line(ln, in_key)
+        shown.append(ln[:CONTEXT_LINE_MAX])
+    while shown and not shown[-1].strip():
+        shown.pop()
     out, total = [], 0
-    for ln in reversed(lines[-CONTEXT_LINES:]):
-        ln = _CTX_SECRET.sub(lambda m: m.group(1) + " ******", _ctx_clean(ln))[:CONTEXT_LINE_MAX]
+    for ln in reversed(shown[-CONTEXT_LINES:]):
         if total + len(ln) > CONTEXT_MAX:
             break
         out.insert(0, ln)
@@ -341,6 +380,12 @@ _PUBLIC = ("id", "slot", "kind", "cmd", "who", "t", "timeout", "gate", "reason",
 
 def _public(item):
     return {k: item[k] for k in _PUBLIC if k in item}
+
+
+def _counter_ok(slot_doc):
+    """发送序号: 没有 (升级前的状态文件) 或非负整数; 别的按读不懂算."""
+    v = slot_doc.get("sent", 0)
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
 def _slot_doc():
@@ -367,7 +412,8 @@ class Book:
             doc = json.loads(text)
             ok = (isinstance(doc, dict) and doc.get("v") == STATE_VERSION and isinstance(doc.get("seq"), int)
                   and isinstance(doc.get("slots"), dict) and isinstance(doc.get("items"), list)
-                  and all(isinstance(doc["slots"].get(str(n)), dict) for n in SLOTS))
+                  and all(isinstance(doc["slots"].get(str(n)), dict) for n in SLOTS)
+                  and all(_counter_ok(doc["slots"][str(n)]) for n in SLOTS))
         except ValueError:
             ok = False
         if ok:
@@ -410,6 +456,7 @@ class Book:
     def _close(self, item, status, now, why=None, by=None, ev="drop", src="system", who=None):
         """挂起 / 在途 -> 结束 (进历史), 记一条日志."""
         item["status"] = status
+        item.pop("context", None)                       # 设备上下文只给审批时看, 不进历史
         if why:
             item["why"] = why
         if by:
@@ -523,6 +570,7 @@ class Book:
 
     def _start(self, it, now):
         it["status"] = "sending"
+        it.pop("context", None)
         s = self._s(it["slot"])
         s["sent"] = s.get("sent", 0) + 1                # 发送序号: 挂起项靠它知道"提交后有没有发过别的"
         s["inflight"] = {"id": it["id"], "cmd": it["cmd"], "since": now,
@@ -549,21 +597,34 @@ class Book:
         self._start(it, now)
         return _public(it)
 
-    def submit(self, slot, token, who, kind, cmd, gate, now, timeout, name=None, context=None):
-        """挂起等人确认. context = 提交时设备最近的输出 (原文, 这里掐短打码)."""
+    def send_mark(self, slot, token, now):
+        """读设备输出之前取下发送序号 (顺带查租约 / 急停); 挂起时带回来, 中间发过别的就不挂."""
         self.writer(slot, token, now)
+        return self._sent(slot)
+
+    def submit(self, slot, token, who, kind, cmd, gate, now, timeout, name=None, context=None, mark=None):
+        """挂起等人确认. context = 提交时设备最近的输出 (原文, 这里掐短打码); mark = 读那份输出前的 send_mark.
+        在途时不挂: 那条还没生效, 现在看到的上下文是假的."""
+        self.writer(slot, token, now)
+        self._idle(slot)
+        if mark is not None and mark != self._sent(slot):
+            raise Refused("stale", f"读设备输出之后槽位 {slot} 又发过别的命令, 那份上下文已经旧了; "
+                                   "重新看现场再提交 (一个字节都没发)")
         if len(self._pending(slot)) >= PENDING_MAX:
             raise Refused("busy", f"槽位 {slot} 已经有 {PENDING_MAX} 条等人确认, 先等人处理")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "pending")
         it["sent_mark"] = self._sent(slot)
+        it["prompt"] = _prompt(context)
         ctx = device_context(context)
         if ctx:
             it["context"] = ctx
         self._ev("pending", slot, now, who=who, id=it["id"], kind=kind, cmd=cmd, gate=gate, name=name)
         return _public(it)
 
-    def confirm(self, iid, by, now):
-        """人确认 -> 标在途, 返回要发的那条 (调用方发完 finish). 租约没了 / 急停 / 已经不在挂起: 不发."""
+    def confirm(self, iid, by, now, current):
+        """人确认 -> 标在途, 返回要发的那条 (调用方发完 finish). 租约没了 / 急停 / 已经不在挂起: 不发.
+        current = 确认前刚读的设备输出 (读不到给 None): 最后一行和挂起时不一样就作废 —— 兜住人用通道
+        (网页 / 车机直接敲, 不计发送序号) 和 conbroker 超时后迟到的字节改了设备视图."""
         self.tick(now)
         it = self._item(iid)
         if not it or it["status"] != "pending":
@@ -576,8 +637,20 @@ class Book:
             self._close(it, "dropped", now, why="提交它的 Agent 租约已失效")
             raise Refused("lease", "提交它的 Agent 租约已失效, 这条作废")
         self._idle(slot)
-        if it.get("sent_mark") != self._sent(slot):
+        why = None
+        if "sent_mark" not in it:
+            why = "升级前就挂着的条目没有发送序号, 不知道之后发没发过别的; 这条作废, 要 Agent 重新提交"
+        elif it["sent_mark"] != self._sent(slot):
             why = "提交后这个槽位又发过别的命令, 设备上下文可能变了; 这条作废, 要 Agent 看过现场后重新提交"
+        if why:
+            self._close(it, "dropped", now, why=why)
+            raise Refused("stale", why)
+        if current is None:
+            raise Refused("prompt", f"读不到槽位 {slot} 设备现在停在哪, 没法核对上下文, 不发 (还挂着, 稍后再确认)")
+        was, now_at = it.get("prompt", ""), _prompt(current)
+        if now_at != was:
+            why = (f"设备视图变了: 挂起时停在 {was!r}, 现在停在 {now_at!r} (人敲过键或有迟到的输出); "
+                   "这条作废, 要 Agent 看过现场后重新提交")
             self._close(it, "dropped", now, why=why)
             raise Refused("stale", why)
         it["by"] = by
