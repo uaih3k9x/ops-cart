@@ -11,9 +11,16 @@ BIOS: 固件 PXE ─► pxelinux.0 ─► pxelinux.cfg/default ─► 在 boot: 
 
 - 8.10 官方二进制包里每个架构只有一个文件（`mt86p_810_x86_64` / `_i586` / `_la64`），没有单独的 `.bin`。
   x86_64 文件既是 EFI 程序（`MZ`/PE）又是 Linux bzImage：头里有 `HdrS`、启动协议 2.12、7 个实模式 setup 扇区，
-  所以 pxelinux 的 `LINUX` 能按 16 位启动协议加载（不按扩展名猜类型）。**BIOS 下能否实际跑起来尚待实机验证**
-  （只核对了文件头，没找到官方对 pxelinux 的明确说明）；起不来的话改用官方 `mt86plus_8.10_x86_64.iso.zip`
-  里的 ISO 经 memdisk 或换 i586 文件，另钉 sha256。
+  所以 pxelinux 的 `LINUX` 能按 16 位启动协议加载（不按扩展名猜类型）。官方说明
+  （[README](https://github.com/memtest86plus/memtest86plus) "To build a x86-64 64-bit image"）：
+  > The result is a mt86plus binary image file which can be booted directly by a 64-bit UEFI BIOS (if named mt86plus.efi),
+  > by a legacy BIOS (in floppy mode) or by an intermediate bootloader using the Linux 16-bit boot protocol.
+
+  > If using the 16-bit boot protocol, Memtest86+ will use the display in text mode (640x400).
+
+  v8.00 / v8.10 发布说明也写了 "now ships as a single binary for both UEFI and legacy boot"。
+  官方没点名 pxelinux / syslinux，**pxelinux 下实际启动待实机验证**；起不来的话改用官方
+  `mt86plus_8.10_x86_64.iso.zip` 里的 ISO 经 memdisk，另钉 sha256。
 - 菜单模板在 `pxeserver.grub_menu`（救援菜单最后一项，**不是默认项**）和 `pxeserver.pxelinux_menu`
   （默认救援，10 秒）。自动装机菜单里没有这一项。
 - Memtest 不动硬盘，所以放在人人能取的救援菜单里，不算解锁菜单。
