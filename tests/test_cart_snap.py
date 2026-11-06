@@ -300,3 +300,68 @@ def test_via_mpv_falls_back_to_legacy_command(tmp_path):
     conn = _fake_mpv_named_unsupported()
     assert cs.via_mpv(str(out), timeout=2, connect=conn) is True
     assert out.read_bytes() == b"PNG"
+
+
+# ------------------------------------------------------------ #60 第三轮: 接线变异要能抓到
+
+def _stamp(p, t):
+    with open(p, "w") as f:
+        f.write(repr(t))
+
+
+def test_readonly_slot_uses_readonly_cooldown(tmp_path, monkeypatch):
+    """只读档按 READONLY_COOLDOWN_S (10 秒) 限: 上次抓帧 9 秒前拒, 11 秒前放 (不是动手档的 3 秒)."""
+    import time
+    import pytest
+    p = str(tmp_path / "snap.lock")
+    monkeypatch.setattr(cs, "SNAP_LOCK", p)
+    _stamp(p, time.time() - 9)
+    with pytest.raises(cs.SnapBusy, match="刚抓过"):
+        with cs._slot_for("ffmpeg", True):
+            pass
+    with pytest.raises(cs.SnapBusy):
+        with cs._slot_for("mpv", True):
+            pass
+    _stamp(p, time.time() - 11)
+    with cs._slot_for("ffmpeg", True):
+        pass
+
+
+def test_act_slot_waits_after_readonly_grab(tmp_path, monkeypatch):
+    """只读档刚抓完, 动手档 _slot_for("ffmpeg", False) 等冷却过去, 不抛."""
+    import time
+    p = str(tmp_path / "snap.lock")
+    monkeypatch.setattr(cs, "SNAP_LOCK", p)
+    monkeypatch.setattr(cs, "FFMPEG_COOLDOWN_S", 0.4)
+    with cs._slot_for("ffmpeg", True):
+        pass
+    t0 = time.monotonic()
+    with cs._slot_for("ffmpeg", False):
+        pass
+    assert time.monotonic() - t0 >= 0.3
+
+
+def test_slot_future_stamp_is_not_cooldown(tmp_path):
+    """时钟往回拨 (上次时刻在将来): 不算冷却, 放行."""
+    p = str(tmp_path / "snap.lock")
+    _stamp(p, 5000.0)
+    with cs.ffmpeg_slot(p, cooldown=10, clock=lambda: 1000.0):
+        pass
+
+
+def test_via_mpv_timeout_connects_once(tmp_path):
+    """超时 / 没回包不重试 (只有 mpv 明确回错误才换旧命令再试)."""
+    import socket
+    conns, peers = [], []
+
+    def connect():
+        a, b = socket.socketpair()
+        conns.append(a)
+        peers.append(b)
+        return a
+    try:
+        assert cs.via_mpv(str(tmp_path / "s.png"), timeout=0.2, connect=connect) is False
+        assert len(conns) == 1
+    finally:
+        for b in peers:
+            b.close()

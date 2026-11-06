@@ -201,16 +201,20 @@ Match User agent-ro
     PermitTTY no
     PermitTunnel no
     PasswordAuthentication no
+    PermitUserRC no
 ```
 
      `ForceCommand` 由 sshd 强制执行，不看 `authorized_keys`。`DisableForwarding` 一次关掉端口转发、X11 和 agent 转发。
-     账号要有**真的登录 shell**（如 `/bin/bash`）：sshd 是用登录 shell 去跑 `ForceCommand` 的，设成 `nologin` 的话服务根本起不来。别的口子已经由上面这几条堵住。
+     `PermitUserRC no` 让 sshd 不跑 `~/.ssh/rc`（`PermitUserEnvironment` 默认就是 no，`~/.ssh/environment` 也不读）。
+     账号要有**真的登录 shell**：sshd 是用登录 shell 去跑 `ForceCommand`（`<shell> -c "<命令>"`）的，设成 `nologin` 的话服务根本起不来。用 `/bin/sh`（`usermod -s /bin/sh agent-ro`）：非交互的 `sh -c` 不读 `~/.profile`、`~/.bashrc` 这类 rc 文件，`ForceCommand` 和 `authorized_keys` 的 `command=` 都是这样跑的，所以两者都照常能用（Rocky 上 `/bin/sh` 是 bash 的 sh 模式，非交互时也不读 `$ENV`）。
+     **家目录归 root、账号自己不能写**：`chown root:root ~agent-ro && chmod 0755 ~agent-ro`（`.ssh` 同样），这样它没法自己放 rc 文件、改 `authorized_keys`。别的口子已经由上面这几条堵住。
   - **为什么要同时配**：
     - 只配 sudoers：钥匙还能拿普通 shell、开端口转发，去连本机的键鼠代理 socket、conbroker、动手档 HTTP 口。
     - 只配 `command=`：哪天这把钥匙或 `command=` 配错了，sudo 也不会再兜底。
     - sshd 的 `Match`：哪怕 `authorized_keys` 被改了，它也照样生效。
     - 不进设备组是最后一道：就算拿到 shell，也碰不到串口、采集卡和打印机。
 - **审计**：`mcp-audit.log` 每行多一个 `profile`。HTTP 认证失败那行也带。
+- **只读档限速**（第三轮审查）：只读档不接受 JSON-RPC 批量请求（一个请求塞 2000 条调用以前能绕开所有冷却之外的节流），整个请求回一条错误，一条都不跑；`tools/call` 过一个进程内的令牌桶（每秒补 3 次，一口气最多 10 次），超出的回"调用太频繁"。被限速的调用审计合并：1 秒内只记一条，下一条带上中间没逐条记的次数。动手档不限速、批量照旧（那边有租约、闸门和人确认）。
 - **协议**：只读档 `serverInfo.name` 是 `ops-cart-readonly`，说明文字里不提租约和写工具；动手档还是 `ops-cart`。
 - **Agent 接法示例**（地址、令牌、名字都是示例值）：
 
@@ -232,12 +236,14 @@ claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profil
   3. **临时截图** `/run/ops-cart/cart-snap-*.png`：私有文件，抓完马上删。
   4. **往打印机写 `ESC !?`**：`label_printer_status` 读状态要先写这个查询，不出纸。
   5. **打印机锁打不开时**（`/run/ops-cart` 不在之类），在 `events.log` 记一条 `[label]`。
+  6. **标签机状态缓存** `/run/ops-cart/printer-status.json`（root 0600，只有时间和状态字节）：只读档查状态 3 秒内回缓存，两个只读进程共用。
 
   不变量测试 `tests/test_mcp_readonly_invariant.py` 分两层：
   - 直接调 `cm.real_tools("readonly")`：把真 Store 指到临时目录，把 `Store.run` / `LeaseStore._tx` / PXE `Store.run` / `BrokerCh` 打桩成"一调就记账并报错"，逐个调只读档的每个工具。断言这些一次都没走到；锁只拿了 `printer.lock` 和 `snap.lock`；目录里只有这两个文件变了，临时 PNG 没留下。
   - 用变异确认这些测试真能抓到接线错误：把接线改回动手档的入口、去掉打印机锁、`kvm_status` 改回 `open` 设备、截图 / OCR 不传只读限速，这些改法测试都会红。
 - **共享设备**：
   - **标签机**：`label_printer_status` 和 `label_print` 用进程间锁 `/run/ops-cart/printer.lock`（flock，等 10 秒拿不到就报忙），两档各起一个进程也不会抢 `ESC !?` 的回字节；进程内原来的锁还在。
+    - **只读档查状态不抢锁**（第三轮审查）：只读档 `label_printer_status` 3 秒内回缓存（`/run/ops-cart/printer-status.json`，两个只读进程共用），过了冷却才去读打印机，而且拿锁不等（拿不到就回缓存并标 `busy`，没缓存就说忙）。flock 不排队，只读 Agent 循环查状态以前能让动手档打印 10 秒都拿不到锁，现在只读档每 3 秒最多碰一次打印机，动手档一定等得到。
     - 锁文件打不开时**不拒打**：退回只用进程内锁，并在 `events.log` 记一条（打印行为和以前一样）。
     - 人手工 `cat > /dev/usb/lp0` 不经过这把锁。Agent 正在打印或查状态时手工打，可能遇到 `EBUSY` 或者内容交错，所以别同时进行。
   - **截图 / OCR** 用 `/run/ops-cart/snap.lock`，两档规则不一样：

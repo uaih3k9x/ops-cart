@@ -252,6 +252,7 @@ def test_label_status_and_print_take_printer_lock():
 # 除此之外: 不碰 Store.run / LeaseStore._tx / PXE Store.run, 不写事件, 不改任何状态文件.
 
 ALLOWED_LOCKS = {"printer.lock", "snap.lock"}
+ALLOWED_WRITES = ALLOWED_LOCKS | {"printer-status.json"}     # 只读档查标签机状态的跨进程缓存 (#60 第三轮, root 0600)
 
 
 def _wire_real_tools(d, monkeypatch, events, forbidden):
@@ -294,6 +295,7 @@ def _wire_real_tools(d, monkeypatch, events, forbidden):
     monkeypatch.setenv("OPS_KVM_SOCK", os.path.join(d, "no-broker.sock"))
     monkeypatch.setattr(mcp_label, "real_status", lambda: 0)
     monkeypatch.setattr(mcp_label, "PRINTER_LOCK", os.path.join(d, "printer.lock"))
+    monkeypatch.setattr(mcp_label, "STATUS_CACHE", os.path.join(d, "printer-status.json"))
     monkeypatch.setattr(cart_snap, "SNAP_LOCK", os.path.join(d, "snap.lock"))
     monkeypatch.setattr(cart_snap, "RUN_DIR", d)
     monkeypatch.setattr(cart_snap, "running_mpv_device", lambda: None)
@@ -322,6 +324,7 @@ def test_real_tools_readonly_end_to_end(tmp_path, monkeypatch, scenario):
         return real_flock(fd, op)
     monkeypatch.setattr(fcntl, "flock", flock)
 
+    monkeypatch.setattr(mc, "RO_BURST", 100)                        # 这里一口气调 15 次, 不测限速 (test_mcp_profiles 测)
     server = cm.make_server("readonly", None)
     assert set(server.tools) == {
         "list_threads", "read_output", "screenshot", "cart_status", "pxe_status", "pending_list", "pxe_clients",
@@ -345,7 +348,8 @@ def test_real_tools_readonly_end_to_end(tmp_path, monkeypatch, scenario):
     inodes = {os.stat(p).st_ino: os.path.basename(p) for p in after}
     assert {inodes.get(i, "?") for i in locked} == ALLOWED_LOCKS      # 只拿这两把设备锁, 别的锁一把都不拿
     changed = {os.path.basename(p) for p in set(after) | set(before) if after.get(p) != before.get(p)}
-    assert changed <= ALLOWED_LOCKS, changed                        # 临时 PNG 抓完就删, 不留
+    assert changed <= ALLOWED_WRITES, changed                       # 临时 PNG 抓完就删, 不留
+    assert "printer-status.json" in changed                         # 缓存确实写到了打桩的路径 (不是推车真路径)
     assert not [p for p in after if p.endswith(".png")]
 
 

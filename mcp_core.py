@@ -314,6 +314,29 @@ def _result(rid, res):
     return {"jsonrpc": "2.0", "id": rid, "result": res}
 
 
+RO_RATE = 3.0       # 只读档 tools/call 整体限速: 每秒补几次 (#60 第三轮)
+RO_BURST = 10       # 桶容量: 一口气最多几次
+RO_AUDIT_EVERY_S = 1.0  # 被限速的调用审计合并: 这么久最多记一条, 带上中间没逐条记的次数
+
+
+class _Bucket:
+    """令牌桶; clock 单调时钟. 线程安全 (HTTP 多线程共用一个 Server)."""
+
+    def __init__(self, rate, burst, clock):
+        self.rate, self.burst, self.clock = rate, burst, clock
+        self.tokens, self.t, self.lock = float(burst), clock(), threading.Lock()
+
+    def take(self):
+        with self.lock:
+            now = self.clock()
+            self.tokens = min(self.burst, self.tokens + max(0.0, now - self.t) * self.rate)
+            self.t = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
+
+
 class Server:
     """消息进, 回包出; 不管传输 (stdio / HTTP 在 cart_mcp). 多线程 HTTP 共用一个实例, 本身无状态.
     profile 决定收哪些工具: 给了档位不允许的工具直接报错, 不是注册了再拒."""
@@ -326,6 +349,9 @@ class Server:
             raise ValueError(f"{profile} 档不收这些工具: {', '.join(extra)}")
         self.tools = {t.name: t for t in picked}
         self.audit, self.version, self.clock, self.profile = audit, version, clock, profile
+        # 只读档 (#60): 不收批量, tools/call 整体令牌桶; 动手档照旧 (那边有租约 / 闸门 / 人确认)
+        self.bucket = _Bucket(RO_RATE, RO_BURST, clock) if profile == READONLY else None
+        self._rl_lock, self._rl_logged, self._rl_quiet = threading.Lock(), None, 0
 
     def handle_text(self, text, who="-"):
         """一段 JSON 文本 -> 回包文本 (单行); 全是通知时返回 None."""
@@ -337,6 +363,9 @@ class Server:
         return None if out is None else json.dumps(out, ensure_ascii=False)
 
     def handle(self, msg, who="-"):
+        if isinstance(msg, list) and self.profile == READONLY:
+            self._log(who, None, {"batch": len(msg)}, False, error="只读档不接受批量请求")
+            return _error(None, -32600, "只读档不接受 JSON-RPC 批量请求, 一次发一条")
         if isinstance(msg, list) and msg:
             outs = [r for r in (self._one(m, who) for m in msg) if r is not None]
             return outs or None
@@ -365,6 +394,17 @@ class Server:
             return self._call(rid, params, who)
         return _error(rid, -32601, f"不支持的方法: {method}")
 
+    def _limited(self, who, name):
+        """被限速的调用: RO_AUDIT_EVERY_S 内只记一条, 下一条带上中间没逐条记的次数."""
+        with self._rl_lock:
+            now = self.clock()
+            if self._rl_logged is not None and now - self._rl_logged < RO_AUDIT_EVERY_S:
+                self._rl_quiet += 1
+                return
+            quiet, self._rl_quiet, self._rl_logged = self._rl_quiet, 0, now
+        more = f" (之前另有 {quiet} 次被限速, 没逐条记)" if quiet else ""
+        self._log(who, name, {}, False, error=f"调用太频繁, 已限速{more}")
+
     def _log(self, who, tool, args, ok, error=None, ms=None):
         if self.audit is not None:
             self.audit.write(audit_line(who, tool, args, ok, error=error, ms=ms, profile=self.profile))
@@ -375,6 +415,10 @@ class Server:
         if tool is None:
             self._log(who, name, args, False, error="没有这个工具")
             return _error(rid, -32602, f"没有这个工具: {name!r}")
+        if self.bucket is not None and not self.bucket.take():
+            self._limited(who, name)
+            return _result(rid, {"content": [text_content(
+                f"调用太频繁 (只读档每秒最多 {RO_RATE:g} 次, 一口气最多 {RO_BURST} 次), 稍后再试")], "isError": True})
         t0 = self.clock()
         try:
             content, err = tool.fn(check_args(tool.params, args)), None

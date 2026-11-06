@@ -19,6 +19,7 @@ import select
 import threading
 import time
 
+import atomicfile
 import cart_label as cl
 import cartlog
 import mcp_core as mc
@@ -27,6 +28,8 @@ import tspl_preview as tp
 PRINTER = "/dev/usb/lp0"
 PRINTER_LOCK = "/run/ops-cart/printer.lock"     # 进程间: 两档各一个进程, 查状态和打印要串行 (#49)
 PRINTER_LOCK_WAIT_S = 10
+STATUS_CACHE = "/run/ops-cart/printer-status.json"  # 只读档查状态的跨进程缓存 (root 0600)
+STATUS_COOLDOWN_S = 3           # 只读档: 这么久内再查直接回缓存, 不碰打印机 (#60: 循环查状态会饿死动手档打印)
 ABBREV_PATHS = ("/etc/ops-cart/label_abbrev.json",          # 推车本地 (可含真实资产名), 有就用它
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "label_abbrev.json"))
 MAX_LABELS = 30                 # 一次最多这么多张; 再多分几次打
@@ -191,11 +194,30 @@ LABELS = {"type": "array", "required": True,
           "description": f"每张一个对象, 1~{MAX_LABELS} 张. 只认 ASCII (打印机内置字体没有中文)"}
 
 
+def _no_lock(**_kw):
+    return contextlib.nullcontext()
+
+
+def _cache_read(path, t):
+    """-> 缓存 {t, byte} 或 None (没有 / 读不懂 / 时间在将来)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            c = json.load(f)
+        ok = (isinstance(c, dict) and isinstance(c.get("t"), (int, float)) and not isinstance(c.get("t"), bool)
+              and isinstance(c.get("byte"), int) and not isinstance(c.get("byte"), bool) and 0 <= c["byte"] <= 255
+              and c["t"] <= t)
+        return c if ok else None
+    except (OSError, ValueError):
+        return None
+
+
 def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secrets.token_urlsafe(12), guides=None,
-                      xlock=contextlib.nullcontext, readonly=False):
+                      xlock=_no_lock, readonly=False, status_cache=None, wall=time.time):
     """write(bytes) 发给打印机; status() -> 状态字节 int; abbrev() -> (对照表 dict, 路径).
     都可以抛 mc.ToolError. guides 默认 tspl_preview.cable_guides(). 测试里全换成假的.
-    xlock() -> 进程间打印机锁 (上下文); readonly (#49): 只回只读工具 (不含 label_print)."""
+    xlock(wait_s=...) -> 进程间打印机锁 (上下文); readonly (#49): 只回只读工具 (不含 label_print).
+    只读档查状态 (#60): status_cache 是跨进程缓存文件, STATUS_COOLDOWN_S 内回缓存; 拿打印机锁不等 (wait_s=0),
+    拿不到就回缓存 (标 busy) 或说忙 —— 只读 Agent 循环查状态不能让动手档打印拿不到锁."""
     guides = guides or tp.cable_guides()
     proofs, lock = {}, threading.Lock()         # proof -> (版面, 发出时刻); 进程内, 重启就没了
 
@@ -265,8 +287,28 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
         return [mc.json_content(out)]
 
     def printer_status(_a):
-        with lock, xlock():                     # ESC !? 的回字节别被别的进程的查询 / 打印抢走
-            return [mc.json_content(decode_status(status()))]
+        if not readonly:
+            with lock, xlock():                 # ESC !? 的回字节别被别的进程的查询 / 打印抢走
+                return [mc.json_content(decode_status(status()))]
+        with lock:                              # 同进程也串行 (同上)
+            t = wall()
+            c = _cache_read(status_cache, t) if status_cache else None
+            if c and t - c["t"] < STATUS_COOLDOWN_S:
+                return [mc.json_content(dict(decode_status(c["byte"]), cached=True, age_s=round(t - c["t"], 1)))]
+            try:
+                with xlock(wait_s=0):           # 只读档不排队抢锁
+                    b = status()
+            except mc.ToolError as e:
+                if c and "忙" in str(e):
+                    return [mc.json_content(dict(decode_status(c["byte"]), cached=True, busy=True,
+                                                 age_s=round(t - c["t"], 1)))]
+                raise
+            if status_cache:
+                try:
+                    atomicfile.write_json(status_cache, {"t": wall(), "byte": b}, mode=0o600)
+                except OSError:
+                    pass
+            return [mc.json_content(decode_status(b))]
 
     def abbrev_propose(a):
         cat, entries = a["category"], a["entries"]
@@ -389,4 +431,4 @@ def printer_lock(path=None, wait_s=PRINTER_LOCK_WAIT_S, sleep=time.sleep, note=_
 
 def real_label_tools(readonly=False):
     return build_label_tools(write=real_write, status=real_status, abbrev=real_abbrev, xlock=printer_lock,
-                             readonly=readonly)
+                             readonly=readonly, status_cache=STATUS_CACHE)

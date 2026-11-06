@@ -214,3 +214,101 @@ def test_http_readonly_token_cannot_reach_act(dup):
         for s in (ro, act):
             s.shutdown()
             s.server_close()
+
+
+# ------------------------------------------------------------ #60 第三轮: 只读档不收批量, 有整体限速
+
+class _Audit:
+    def __init__(self):
+        self.lines = []
+
+    def write(self, line):
+        self.lines.append(json.loads(line))
+        return True
+
+
+class _Mono:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def _ro_server(clock=None, audit=None, calls=None):
+    calls = [] if calls is None else calls
+    t = mc.Tool("look", "d", {}, lambda a: calls.append(1) or [mc.text_content("ok")], kind=mc.READONLY)
+    return mc.Server([t], audit=audit, profile="readonly", clock=clock or _Mono()), calls
+
+
+def _call_req(rid):
+    return {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": "look", "arguments": {}}}
+
+
+def test_readonly_refuses_batch_without_running_any():
+    audit = _Audit()
+    s, calls = _ro_server(audit=audit)
+    r = s.handle([_call_req(i) for i in range(2000)])
+    assert isinstance(r, dict) and r["error"]["code"] == -32600 and "批量" in r["error"]["message"]
+    assert calls == [] and len(audit.lines) == 1 and audit.lines[0]["ok"] is False
+
+
+def test_act_batch_unchanged():
+    t = mc.Tool("x", "d", {}, lambda a: [mc.text_content("ok")], kind=mc.ACT)
+    r = mc.Server([t], profile="act").handle([{"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                                              {"jsonrpc": "2.0", "id": 2, "method": "ping"}])
+    assert [x["id"] for x in r] == [1, 2]
+
+
+def test_readonly_rate_limit_token_bucket():
+    clk = _Mono()
+    s, calls = _ro_server(clock=clk)
+    outs = [s.handle(_call_req(i)) for i in range(mc.RO_BURST + 3)]
+    assert len(calls) == mc.RO_BURST
+    limited = [o for o in outs if o["result"]["isError"]]
+    assert len(limited) == 3 and "太频繁" in limited[0]["result"]["content"][0]["text"]
+    clk.t += 1.0 / mc.RO_RATE + 0.01                              # 过一个补充间隔, 能再来一次
+    assert s.handle(_call_req(99))["result"]["isError"] is False
+    assert s.handle(_call_req(100))["result"]["isError"] is True
+
+
+def test_readonly_rate_limited_calls_audited_merged():
+    clk, audit = _Mono(), _Audit()
+    s, _ = _ro_server(clock=clk, audit=audit)
+    for i in range(mc.RO_BURST + 50):
+        s.handle(_call_req(i))
+    limited = [ln for ln in audit.lines if "太频繁" in (ln.get("error") or "")]
+    assert len(limited) == 1                                         # 同一秒内被限的只记一条
+    clk.t += 1.5
+    for i in range(mc.RO_BURST + 5):
+        s.handle(_call_req(i))
+    limited = [ln for ln in audit.lines if "太频繁" in (ln.get("error") or "")]
+    assert len(limited) == 2 and "另有" in limited[1]["error"]       # 下一条带上之前没逐条记的次数
+
+
+def test_act_has_no_rate_limit():
+    t = mc.Tool("x", "d", {}, lambda a: [mc.text_content("ok")], kind=mc.ACT)
+    s = mc.Server([t], profile="act", clock=_Mono())
+    for i in range(100):
+        r = s.handle({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": "x", "arguments": {}}})
+        assert r["result"]["isError"] is False
+
+
+def test_readonly_rate_limit_thread_safe():
+    s, calls = _ro_server(clock=_Mono())
+    ts = [threading.Thread(target=lambda: [s.handle(_call_req(i)) for i in range(20)]) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(calls) == mc.RO_BURST
+
+
+def test_doc_sshd_match_block_locks_rc_and_shell():
+    """#60 第三轮: Match 块关 ~/.ssh/rc, 家目录 root 所有, 登录 shell 用不读 rc 的 /bin/sh."""
+    import pathlib
+    doc = (pathlib.Path(__file__).resolve().parent.parent / "docs" / "DESIGN_agent_mcp.md").read_text(encoding="utf-8")
+    block = doc[doc.index("Match User agent-ro"):]
+    block = block[:block.index("```")]
+    for k in ("PermitUserRC no", "ForceCommand sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly",
+              "DisableForwarding yes", "PermitTTY no"):
+        assert k in block, k
+    assert "/bin/sh" in doc and "usermod -s /bin/sh agent-ro" in doc and "chown root:root ~agent-ro" in doc
