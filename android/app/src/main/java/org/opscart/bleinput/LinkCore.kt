@@ -9,7 +9,9 @@ package org.opscart.bleinput
  * - 每个 GATT 操作有看门狗, 超时断开重来; 操作起不来按断线处理, 不跳帧.
  * - 回调带着是哪条连接, 不是当前连接的一律不理.
  * - 回执只认 (序号, CRC) 和发件箱对得上的; 回复只在已 bond 的连接上显示.
- * - 发件箱持久化 (App 私有存储); 超过推车去重时效 (10 分钟) 没送达的丢掉并提示; 同一条的定时重发同时只有一个.
+ * - 发件箱持久化 (App 私有存储); 超过推车去重时效 (10 分钟) 没送达的丢掉并提示; 同一条的定时重发同时只有一个;
+ *   发完 20 秒没回执同序号重发 (有陌生设备连着时推车不发回执).
+ * - 不自动忘记推车: 连续失败、没有推车服务、认证失败 (推车上删过这台手机) 都停下等用户; 换了推车, 旧发件箱先问用户再发.
  */
 class LinkCore(private val port: Port, private val store: Store, private val ui: Ui) {
     enum class Bond { NONE, BONDING, BONDED }
@@ -46,14 +48,16 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         fun state(text: String)
         fun line(text: String)
         fun confirm(name: String?, addr: String)
+        fun askOutbox(count: Int)          // 换了推车: 旧发件箱 count 条要不要发给新推车 -> releaseOutbox()
     }
 
-    data class Saved(val id: Int, val text: String, val created: Long)
+    data class Saved(val id: Int, val text: String, val created: Long, val held: Boolean = false)
 
-    private class Out(val id: Int, val text: String, val created: Long) {
+    private class Out(val id: Int, val text: String, val created: Long, var held: Boolean = false) {
         val crc = FrameCodec.crc32(text.toByteArray(Charsets.UTF_8))
         var retryToken = 0
         var retrying = false
+        var ackToken = 0
         var lastCode: String? = null      // 同一个错误码只提示一次, 免得 unpaired 每 30 秒刷屏
     }
 
@@ -69,6 +73,8 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         const val SCAN_WINDOW_MS = 15_000L
         const val SCAN_ROUNDS = 4
         const val MAX_FAILS = 5
+        const val AUTH_FAILS = 2
+        const val ACK_WAIT_MS = 20_000L
         const val RETRY_MS = 3_000L
         const val UNPAIRED_RETRY_MS = 30_000L
         const val OUTBOX_TTL_MS = 600_000L      // = 推车去重时效, 过了再发可能重复投递
@@ -85,6 +91,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     private var mtu = 23
     private var backoffMs = 2_000L
     private var failures = 0
+    private var authFailures = 0
     private var scanMisses = 0
     private val declined = HashSet<String>()
     private val outbox = ArrayList<Out>()
@@ -96,9 +103,10 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     var pending: Pair<String?, String>? = null
         private set
     val ready get() = phase == Phase.READY
+    val held get() = outbox.count { it.held }
 
     init {
-        for (s in store.loadOutbox()) outbox += Out(s.id, s.text, s.created)
+        for (s in store.loadOutbox()) outbox += Out(s.id, s.text, s.created, s.held)
         if (outbox.isNotEmpty()) {
             ui.line("上次有 ${outbox.size} 条未送达 (App 被关过), 连上推车后重发, 超过 10 分钟的丢弃:")
             outbox.forEach { ui.line("  未送达: ${it.text}") }
@@ -127,6 +135,8 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         if (!running) return start()
         if (phase in setOf(Phase.IDLE, Phase.WAIT, Phase.WAIT_ADAPTER, Phase.GAVE_UP)) {
             scanMisses = 0
+            failures = 0
+            authFailures = 0
             backoffMs = 2_000L
             connect()
         }
@@ -137,6 +147,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         store.cart = null
         declined.clear()
         failures = 0
+        authFailures = 0
         drop()
         ui.line("已忘记推车; 要彻底取消配对, 到系统蓝牙设置里删掉它")
         phase = Phase.IDLE
@@ -159,14 +170,34 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     }
 
     fun confirm(address: String, ok: Boolean) {
-        if (phase != Phase.CONFIRM || pending?.second != address) return
+        if (pending?.second != address) return     // pending 只在 CONFIRM 阶段非空: drop() 会清掉
         pending = null
         if (ok) {
             store.cart = address
+            if (outbox.isNotEmpty()) {         // 换了推车: 旧的先扣着, 问用户
+                outbox.forEach { it.held = true }
+                save()
+                ui.askOutbox(outbox.size)
+            }
             open(address)
         } else {
             declined += address
             scan()
+        }
+    }
+
+    /** 用户回答 askOutbox: true = 旧消息发给这台推车, false = 丢掉. */
+    fun releaseOutbox(send: Boolean) {
+        val old = outbox.filter { it.held }
+        if (old.isEmpty()) return
+        if (send) {
+            old.forEach { it.held = false }
+            save()
+            if (ready) old.forEach { write(it) }
+        } else {
+            outbox.removeAll(old.toSet())
+            save()
+            ui.line("已丢掉 ${old.size} 条给旧推车的消息")
         }
     }
 
@@ -230,21 +261,20 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         if (c.discover()) arm(OP_TIMEOUT_MS) else fail("发现服务起不来")
     }
 
-    fun onServices(c: Conn, ok: Boolean) {
+    /** ok = 发现服务成功; hasCart = 有推车的服务和两个特征. 发现失败重试; 确实没有就停下, 不自动忘记. */
+    fun onServices(c: Conn, ok: Boolean, hasCart: Boolean) {
         if (c !== conn || phase != Phase.DISCOVER) return
-        if (!ok) {
-            store.cart = null
-            ui.line("这台设备没有推车服务, 忘掉它重新找")
-            return fail("不是推车")
-        }
+        if (!ok) return fail("发现服务失败")
+        if (!hasCart) return giveUp("这台设备没有推车服务: 连错了的话点\"忘记推车\"重新找")
         phase = Phase.SUBSCRIBE
         if (c.subscribe()) arm(OP_TIMEOUT_MS) else fail("订阅起不来")
     }
 
-    fun onSubscribed(c: Conn, ok: Boolean) {
+    /** auth = 失败原因是认证 / 加密不够 (推车那边可能删过这台手机的配对). */
+    fun onSubscribed(c: Conn, ok: Boolean, auth: Boolean = false) {
         if (c !== conn || phase != Phase.SUBSCRIBE) return
         disarm()
-        if (!ok) return fail("订阅失败 (推车上配对 / trust 了吗)")
+        if (!ok) return if (auth) authFail() else fail("订阅失败 (推车上配对 / trust 了吗)")
         phase = Phase.READY
         inbound = Reassembler()           // 推车可能重启过, 它的通知序号重来
         failures = 0
@@ -258,13 +288,17 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         }
     }
 
-    fun onWritten(c: Conn, ok: Boolean) {
+    fun onWritten(c: Conn, ok: Boolean, auth: Boolean = false) {
         if (c !== conn || phase != Phase.READY) return
         val op = inFlight ?: return
         inFlight = null
         disarm()
-        if (!ok) return fail("写入失败")
-        if (op.last) queued -= op.id
+        if (!ok) return if (auth) authFail() else fail("写入失败")
+        authFailures = 0
+        if (op.last) {
+            queued -= op.id
+            outbox.firstOrNull { it.id == op.id }?.let(::awaitAck)
+        }
         pump()
     }
 
@@ -277,7 +311,9 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
             when (val s = Status.parse(ev.text)) {
                 is Status.Ack -> onAck(s)
                 is Status.Err -> onErr(s)
-                is Status.Reply -> ui.line("大肥鱼: ${s.text}")
+                is Status.Reply -> FrameCodec.clean(s.text).split("\n").forEachIndexed { i, l ->
+                    ui.line((if (i == 0) "大肥鱼: " else "大肥鱼│ ") + l)    // 每行带前缀, 冒充不了回执
+                }
                 null -> {}
             }
         }
@@ -356,12 +392,23 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     private fun fail(why: String) {
         drop()
         phase = Phase.IDLE
-        if (++failures >= MAX_FAILS && store.cart != null) {
-            store.cart = null
-            failures = 0
-            ui.line("连续 $MAX_FAILS 次连不上记住的推车, 忘掉它重新扫描 (会再让你确认)")
-        }
+        if (++failures >= MAX_FAILS) return giveUp("连续 $MAX_FAILS 次连不上推车 ($why): 靠近后点\"重连\"; 换了推车点\"忘记推车\"")
         retryLater(why)
+    }
+
+    /** 停下等用户 (重连 / 忘记推车). 不自动忘记推车, 免得给冒充者留路. */
+    private fun giveUp(why: String) {
+        drop()
+        phase = Phase.GAVE_UP
+        ui.state(why)
+    }
+
+    private fun authFail() {
+        if (++authFailures >= AUTH_FAILS) {
+            authFailures = 0
+            return giveUp("推车不认这台手机的配对了 (车机上删过?): 到系统蓝牙设置里删掉推车的配对, 再点\"重连\"")
+        }
+        fail("认证失败")
     }
 
     private fun retryLater(why: String) {
@@ -403,7 +450,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     // ------------------------------------------------------------ 收发
 
     private fun write(m: Out) {
-        if (!ready || m.id in queued) return
+        if (!ready || m.held || m.id in queued) return
         val frames = FrameCodec.encode(m.id, m.text.toByteArray(Charsets.UTF_8), mtu)
         frames.forEachIndexed { i, f -> ops.addLast(Op(m.id, f, i == frames.lastIndex)) }
         queued += m.id
@@ -419,6 +466,12 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         arm(OP_TIMEOUT_MS)
     }
 
+    /** 整条写完后等回执; 等不到 (推车有陌生设备连着时不发回执, 或通知丢了) 就同序号重发一次. */
+    private fun awaitAck(m: Out) {
+        val t = ++m.ackToken
+        later(ACK_WAIT_MS) { if (m.ackToken == t && m in outbox) write(m) }
+    }
+
     private fun onAck(s: Status.Ack) {
         val m = outbox.firstOrNull { it.id == s.id && it.crc == s.crc } ?: return   // 别的手机的回执
         outbox.remove(m)
@@ -429,6 +482,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     private fun onErr(s: Status.Err) {
         // crc 为 null: 推车读不出是哪条, 只能按序号猜 -> 只许重发 (推车去重), 不许删
         val m = outbox.firstOrNull { it.id == s.id && (s.crc == null || it.crc == s.crc) } ?: return
+        m.ackToken++                      // 推车回话了, 不用再等回执超时
         val fresh = m.lastCode != s.code
         m.lastCode = s.code
         when {
@@ -468,5 +522,5 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         old.forEach { ui.line("✗ 超过 10 分钟没送达, 不再自动发 (要发请重新输入): ${it.text}") }
     }
 
-    private fun save() = store.saveOutbox(outbox.map { Saved(it.id, it.text, it.created) })
+    private fun save() = store.saveOutbox(outbox.map { Saved(it.id, it.text, it.created, it.held) })
 }

@@ -51,6 +51,10 @@ class LinkService : Service() {
             notifyState("找到推车, 打开 App 确认是不是这台")
             listener?.onConfirm(name, addr)
         }
+
+        override fun onAskOutbox(count: Int) {
+            listener?.onAskOutbox(count)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

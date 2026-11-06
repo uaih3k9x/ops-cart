@@ -49,7 +49,7 @@ object FrameCodec {
     }
 
     private val BAD_TYPES = setOf(
-        Character.CONTROL, Character.FORMAT, Character.SURROGATE, Character.UNASSIGNED,
+        Character.CONTROL, Character.FORMAT, Character.SURROGATE,     // 不含 UNASSIGNED: 两端 Unicode 版本可能不同
         Character.PRIVATE_USE, Character.LINE_SEPARATOR, Character.PARAGRAPH_SEPARATOR,
     ).map { it.toInt() }.toSet()
     private val INVISIBLE = setOf(0x115F, 0x1160, 0x3164, 0xFFA0)    // 韩文填充字: 字母类但看不见
@@ -57,7 +57,8 @@ object FrameCodec {
 
     /**
      * 正文有问题返回错误码 (ctrl / empty), 没问题 null. 和推车一样: 拒控制字符 (换行 / 制表除外)、格式字符 Cf
-     * (只放行 ZWJ)、标签字符 U+E0000..E007F、Zl / Zp、未分配、私用区、代理、看不见的填充字.
+     * (只放行 ZWJ)、标签字符 U+E0000..E007F、Zl / Zp、非字符 (U+FDD0..FDEF、各平面 xxFFFE / xxFFFF)、私用区、代理、
+     * 看不见的填充字. 未分配 (Cn) 不整类拒: 推车的 Python 可能认得的 Unicode 比手机老.
      */
     fun textProblem(text: String): String? {
         if (text.isEmpty()) return "empty"
@@ -65,10 +66,27 @@ object FrameCodec {
         while (i < text.length) {
             val cp = text.codePointAt(i)
             i += Character.charCount(cp)
-            if (cp == '\n'.code || cp == '\t'.code || cp == ZWJ) continue
-            if (Character.getType(cp) in BAD_TYPES || cp in 0xE0000..0xE007F || cp in INVISIBLE) return "ctrl"
+            if (bad(cp)) return "ctrl"
         }
         return null
+    }
+
+    /** 推车发来的回复显示前用: 同一套规矩, 不合格的字符去掉, 换行 / 制表留着. */
+    fun clean(text: String): String {
+        val b = StringBuilder()
+        var i = 0
+        while (i < text.length) {
+            val cp = text.codePointAt(i)
+            i += Character.charCount(cp)
+            if (!bad(cp)) b.appendCodePoint(cp)
+        }
+        return b.toString()
+    }
+
+    private fun bad(cp: Int): Boolean {
+        if (cp == '\n'.code || cp == '\t'.code || cp == ZWJ) return false
+        return Character.getType(cp) in BAD_TYPES || cp in 0xE0000..0xE007F || cp in INVISIBLE ||
+            cp in 0xFDD0..0xFDEF || (cp and 0xFFFE) == 0xFFFE
     }
 
     fun decodeUtf8(b: ByteArray): String? = try {

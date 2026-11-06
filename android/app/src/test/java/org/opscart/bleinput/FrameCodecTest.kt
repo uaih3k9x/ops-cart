@@ -171,6 +171,19 @@ class FrameCodecTest {
     }
 
     @Test
+    fun newerUnicodeAllowedNoncharsRejected() {
+        assertEquals(null, FrameCodec.textProblem("a\u0378"))                  // 未分配: 不整类拒
+        assertEquals(null, FrameCodec.textProblem("\uD83E\uDEE0"))           // U+1FAE0
+        for (cp in listOf(0xFDD0, 0xFDEF, 0xFFFE, 0x1FFFF, 0x10FFFF))
+            assertEquals("ctrl", FrameCodec.textProblem("a" + String(Character.toChars(cp))))
+    }
+
+    @Test
+    fun cleanDropsBadKeepsNewlines() {
+        assertEquals("abc\n\td\u200De", FrameCodec.clean("a\u200Bb\u2028c\n\td\u200De\u0000"))
+    }
+
+    @Test
     fun crcOfMatchesCart() {
         assertEquals(0xd8932aacL, FrameCodec.crc32("hi".toByteArray()))
     }

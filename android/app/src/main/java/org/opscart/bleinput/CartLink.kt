@@ -40,6 +40,7 @@ class CartLink(private val ctx: Context, private val listener: Listener) : LinkC
         fun onState(text: String)
         fun onLine(text: String)
         fun onConfirm(name: String?, addr: String)
+        fun onAskOutbox(count: Int)
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -55,6 +56,7 @@ class CartLink(private val ctx: Context, private val listener: Listener) : LinkC
         override fun state(text: String) = listener.onState(text)
         override fun line(text: String) = listener.onLine(text)
         override fun confirm(name: String?, addr: String) = listener.onConfirm(name, addr)
+        override fun askOutbox(count: Int) = listener.onAskOutbox(count)
     })
 
     private val receiver = object : BroadcastReceiver() {
@@ -195,14 +197,14 @@ class CartLink(private val ctx: Context, private val listener: Listener) : LinkC
 
     override fun loadOutbox(): List<LinkCore.Saved> = try {
         val a = JSONArray(prefs.getString("outbox", "[]"))
-        (0 until a.length()).map { a.getJSONObject(it).let { o -> LinkCore.Saved(o.getInt("id"), o.getString("text"), o.getLong("t")) } }
+        (0 until a.length()).map { a.getJSONObject(it).let { o -> LinkCore.Saved(o.getInt("id"), o.getString("text"), o.getLong("t"), o.optBoolean("held", false)) } }
     } catch (e: JSONException) {
         emptyList()
     }
 
     override fun saveOutbox(items: List<LinkCore.Saved>) {
         val a = JSONArray()
-        items.forEach { a.put(JSONObject().put("id", it.id).put("text", it.text).put("t", it.created)) }
+        items.forEach { a.put(JSONObject().put("id", it.id).put("text", it.text).put("t", it.created).put("held", it.held)) }
         prefs.edit().putString("outbox", a.toString()).apply()
     }
 
@@ -231,15 +233,15 @@ class CartLink(private val ctx: Context, private val listener: Listener) : LinkC
                 val svc = g.getService(serviceUuid)
                 rx = svc?.getCharacteristic(rxUuid)
                 tx = svc?.getCharacteristic(txUuid)
-                core.onServices(this@GattConn, status == BluetoothGatt.GATT_SUCCESS && rx != null && tx != null)
+                core.onServices(this@GattConn, status == BluetoothGatt.GATT_SUCCESS, rx != null && tx != null)
             }
 
             override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) = on(g) {
-                if (d.uuid == cccd) core.onSubscribed(this@GattConn, status == BluetoothGatt.GATT_SUCCESS)
+                if (d.uuid == cccd) core.onSubscribed(this@GattConn, status == BluetoothGatt.GATT_SUCCESS, status in AUTH_STATUS)
             }
 
             override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) = on(g) {
-                core.onWritten(this@GattConn, status == BluetoothGatt.GATT_SUCCESS)
+                core.onWritten(this@GattConn, status == BluetoothGatt.GATT_SUCCESS, status in AUTH_STATUS)
             }
 
             @Deprecated("Android 13 以下走这个")
@@ -301,6 +303,9 @@ class CartLink(private val ctx: Context, private val listener: Listener) : LinkC
     }
 
     companion object {
+        /** 认证 / 加密不够: 5 / 8 / 15 是 ATT 错误码, 137 (0x89) 是安卓的 GATT_AUTH_FAIL. */
+        private val AUTH_STATUS = setOf(5, 8, 15, 137)     // 写数字: GATT_INSUFFICIENT_AUTHORIZATION 常量到 API 33 才有
+
         /** 定位开关 (Android 11 及以下扫 BLE 要开). */
         fun locationOn(ctx: Context): Boolean {
             if (Build.VERSION.SDK_INT >= 31) return true

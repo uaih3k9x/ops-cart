@@ -23,11 +23,13 @@ class MainActivity : Activity() {
     private lateinit var scroll: ScrollView
 
     private var asking: AlertDialog? = null
+    private var askingOutbox: AlertDialog? = null
 
     private val ui = object : CartLink.Listener {
         override fun onState(text: String) = runOnUiThread { status.text = text }
         override fun onLine(text: String) = runOnUiThread { append(text) }
         override fun onConfirm(name: String?, addr: String) = runOnUiThread { askConfirm(name, addr) }
+        override fun onAskOutbox(count: Int) = runOnUiThread { askOutbox(count) }
     }
 
     override fun onCreate(saved: Bundle?) {
@@ -63,6 +65,18 @@ class MainActivity : Activity() {
         log.text = ""
         LinkService.lines.forEach(::append)
         LinkService.link?.core?.pending?.let { (name, addr) -> askConfirm(name, addr) }
+        LinkService.link?.core?.held?.takeIf { it > 0 }?.let(::askOutbox)
+    }
+
+    /** 换了推车: 旧发件箱里的消息是给旧推车的, 先问再发. */
+    private fun askOutbox(count: Int) {
+        if (askingOutbox?.isShowing == true) return
+        askingOutbox = AlertDialog.Builder(this)
+            .setMessage("发件箱里还有 $count 条没送达的消息, 是换推车之前写的. 发给这台新推车吗?")
+            .setCancelable(false)
+            .setPositiveButton("发") { _, _ -> LinkService.link?.core?.releaseOutbox(true) }
+            .setNegativeButton("丢掉") { _, _ -> LinkService.link?.core?.releaseOutbox(false) }
+            .show()
     }
 
     /** 第一次连 (或忘记之后): 让用户核对扫到的设备名称和地址, 防连上冒充的设备. */

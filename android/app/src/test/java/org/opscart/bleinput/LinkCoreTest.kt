@@ -41,6 +41,7 @@ class LinkCoreTest {
         val states = ArrayList<String>()
         val lines = ArrayList<String>()
         val confirms = ArrayList<String>()
+        val heldAsks = ArrayList<Int>()
 
         override fun now() = t
         override fun schedule(delayMs: Long, task: () -> Unit) { timers += (t + delayMs) to task }
@@ -68,6 +69,7 @@ class LinkCoreTest {
         override fun state(text: String) { states += text }
         override fun line(text: String) { lines += text }
         override fun confirm(name: String?, addr: String) { confirms += addr }
+        override fun askOutbox(count: Int) { heldAsks += count }
     }
 
     private fun bondedFake() = Fake().apply { cart = this@LinkCoreTest.cart; bonds[this@LinkCoreTest.cart] = LinkCore.Bond.BONDED }
@@ -79,7 +81,7 @@ class LinkCoreTest {
         assertEquals(517, c.mtuAsked)
         core.onMtu(c, mtu, true)
         assertTrue(c.discovered)
-        core.onServices(c, true)
+        core.onServices(c, true, true)
         assertTrue(c.subscribed)
         core.onSubscribed(c, true)
         assertTrue(core.ready)
@@ -460,7 +462,8 @@ class LinkCoreTest {
     }
 
     @Test
-    fun repeatedFailuresForgetRememberedCart() {
+    fun repeatedFailuresGiveUpButKeepCart() {
+        // 中1: 不自动忘记推车 (那会给冒充者留路), 失败多了停下等用户
         val f = bondedFake()
         val core = LinkCore(f, f, f)
         core.start()
@@ -468,8 +471,218 @@ class LinkCoreTest {
             core.onDisconnected(f.conns.last())
             f.advance(30_000)
         }
+        assertEquals(cart, f.cart)
+        assertEquals(0, f.scans)
+        assertTrue(f.states.last().contains("重连"))
+        val n = f.conns.size
+        f.advance(10 * 60_000)
+        assertEquals(n, f.conns.size)
+        core.kick()
+        assertEquals(n + 1, f.conns.size)
+    }
+
+    @Test
+    fun discoveryFailureRetriesAndKeepsCart() {
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = f.conns.last()
+        core.onConnected(c)
+        core.onMtu(c, 517, true)
+        core.onServices(c, false, false)                     // 发现失败 != 没有推车服务
+        assertTrue(c.closed)
+        assertEquals(cart, f.cart)
+        f.advance(2_000)
+        assertEquals(2, f.conns.size)
+    }
+
+    @Test
+    fun missingServiceStopsAndKeepsCart() {
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = f.conns.last()
+        core.onConnected(c)
+        core.onMtu(c, 517, true)
+        core.onServices(c, true, false)                      // 确实没有推车服务: 停下让用户决定, 不自动忘
+        assertEquals(cart, f.cart)
+        assertTrue(f.states.last().contains("忘记推车"))
+        f.advance(10 * 60_000)
+        assertEquals(1, f.conns.size)
+    }
+
+    @Test
+    fun oldOutboxHeldAfterSwitchingCart() {
+        // 中1: 换了推车后, 旧发件箱先问用户再发
+        val other = "02:00:00:00:00:0B"
+        for (send in listOf(true, false)) {
+            val f = bondedFake().apply { adapter = false; bonds[other] = LinkCore.Bond.BONDED }
+            val core = LinkCore(f, f, f)
+            core.start()
+            core.send("给旧推车的")
+            f.adapter = true
+            core.forget()
+            core.onScanResult(other, "ops-cart")
+            core.confirm(other, true)
+            assertEquals(listOf(1), f.heldAsks)
+            assertEquals(1, core.held)
+            val c = bringUp(core, f)
+            core.send("给新推车的")
+            drainWrites(core, c)
+            assertEquals("旧的先扣着", listOf(101), FakeCart().feed(c.writes).map { it.first })
+            core.releaseOutbox(send)
+            drainWrites(core, c)
+            val got = FakeCart().feed(c.writes).map { it.first }
+            if (send) assertEquals(listOf(101, 100), got) else assertEquals(listOf(101), got)
+            assertEquals(0, core.held)
+            assertEquals(if (send) 2 else 1, f.saved.size)
+        }
+    }
+
+    @Test
+    fun heldSurvivesRestart() {
+        val other = "02:00:00:00:00:0B"
+        val f = bondedFake().apply { adapter = false }
+        LinkCore(f, f, f).apply { start(); send("旧的"); f.adapter = true; forget(); onScanResult(other, null); confirm(other, true) }
+        assertEquals(1, LinkCore(f, f, f).held)
+    }
+
+    @Test
+    fun authFailuresStopAndPointToSystemSettings() {
+        // 第 12 条: 推车上 remove 过这台手机, 手机本地还 BONDED -> 别死循环
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        repeat(LinkCore.AUTH_FAILS) {
+            val c = f.conns.last()
+            core.onConnected(c)
+            core.onMtu(c, 517, true)
+            core.onServices(c, true, true)
+            core.onSubscribed(c, false, auth = true)
+            f.advance(30_000)
+        }
+        assertTrue(f.states.last().contains("系统蓝牙设置"))
+        val n = f.conns.size
+        f.advance(10 * 60_000)
+        assertEquals(n, f.conns.size)
+    }
+
+    @Test
+    fun writeAuthFailureCounts() {
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        repeat(LinkCore.AUTH_FAILS) {
+            val c = bringUp(core, f)
+            core.send("x")
+            core.onWritten(c, false, auth = true)
+            f.advance(30_000)
+        }
+        assertTrue(f.states.last().contains("系统蓝牙设置"))
+    }
+
+    @Test
+    fun resendOnceWhenNoReceipt() {
+        // 第 6 条: 陌生设备连着时推车不发回执; 手机 20 秒没回执就同序号重发
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f)
+        core.send("等回执")
+        drainWrites(core, c)
+        f.advance(LinkCore.ACK_WAIT_MS - 1)
+        drainWrites(core, c)
+        assertEquals(1, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+        f.advance(2)
+        drainWrites(core, c)
+        assertEquals(2, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+        FakeCart().ack(100, crcOf("等回执")).forEach { core.onNotify(c, it) }
+        f.advance(LinkCore.ACK_WAIT_MS * 3)
+        drainWrites(core, c)
+        assertEquals(2, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+    }
+
+    @Test
+    fun replyLinesPrefixedAndCleaned() {
+        // 第 5 条: 回复里写"✓ 已送达"也冒充不了回执
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f)
+        FakeCart().notify("""{"t":"reply","text":"好\u200b的\n✓ 已送达"}""").forEach { core.onNotify(c, it) }
+        assertEquals(listOf("大肥鱼: 好的", "大肥鱼│ ✓ 已送达"), f.lines.filter { it.startsWith("大肥鱼") })
+        assertFalse(f.lines.any { it.startsWith("✓") })
+    }
+
+    // ------------------------------------------------------------ 变异后仍全绿的缺口
+
+    @Test
+    fun subscribeExpiresStaleBeforeFlush() {
+        val f = bondedFake().apply { adapter = false }
+        val core = LinkCore(f, f, f)
+        core.start()
+        core.send("过期了")
+        f.advance(LinkCore.OUTBOX_TTL_MS + 10)              // 刚过时效, 下一个 tick 还没到
+        assertEquals(1, f.saved.size)
+        f.adapter = true
+        core.onAdapter(true)
+        val c = bringUp(core, f)
+        assertTrue("过期的不能再发", c.writes.isEmpty())
+        assertTrue(f.saved.isEmpty())
+    }
+
+    @Test
+    fun retryWhileStillWritingDoesNotDuplicateFrames() {
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f, mtu = 23)
+        val text = "还在写".repeat(10)
+        core.send(text)
+        FakeCart().notify("""{"t":"err","id":100,"crc":${crcOf(text)},"code":"busy"}""").forEach { core.onNotify(c, it) }
+        f.advance(LinkCore.RETRY_MS)                          // 重发定时器到了, 第一遍还没写完
+        drainWrites(core, c)
+        assertEquals(1, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+    }
+
+    @Test
+    fun straySubscribedOutsidePhaseIgnored() {
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = f.conns.last()
+        core.onConnected(c)                                  // 在 MTU 阶段
+        core.onSubscribed(c, true)
+        assertFalse(core.ready)
+    }
+
+    @Test
+    fun weakNostartRetries() {
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f)
+        core.send("推车没见过开头")
+        drainWrites(core, c)
+        FakeCart().notify("""{"t":"err","id":100,"crc":null,"code":"nostart"}""").forEach { core.onNotify(c, it) }
+        f.advance(LinkCore.RETRY_MS)
+        drainWrites(core, c)
+        assertEquals(2, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+    }
+
+    @Test
+    fun confirmOutsideConfirmPhaseIgnored() {
+        val f = Fake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        core.confirm(cart, true)
         assertNull(f.cart)
-        assertTrue(f.scans >= 1)
+        core.onScanResult(cart, null)
+        f.adapter = false
+        core.onAdapter(false)                                // 等确认时蓝牙关了
+        core.confirm(cart, true)
+        assertNull(f.cart)
+        assertTrue(f.conns.isEmpty())
     }
 
     @Test
