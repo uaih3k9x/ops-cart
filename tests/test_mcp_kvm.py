@@ -421,3 +421,178 @@ def test_ocr_says_which_engine(rig):
     assert rig.call("screen_ocr")[1]["engine"] == "rapidocr"
     rig.engine = "tesseract (RapidOCR 不可用: x)"
     assert "不可用" in rig.call("screen_ocr")[1]["engine"]
+
+
+# ---- #64 闸门绕法: 只查最后一行 / 逐键不计入 / secret 前半截不计入
+
+def _keys(rig, tok, *names):
+    out = []
+    for k in names:
+        err, r = rig.call("kvm_key", keys=k, lease=tok)
+        assert not err, r
+        out.append(r)
+        if r.get("status") == "pending":
+            break
+    return out
+
+
+@pytest.mark.parametrize("text", ["echo ok\nformat c: /q /y\nok", "format c: /q /y\nok", "ok\n\ndiskpart\n"])
+def test_every_line_of_text_is_checked(rig, text):
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text=text, lease=tok)
+    assert not err and r["status"] == "pending" and rig.sent == []
+
+
+def test_first_line_joined_with_buffer_is_checked(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="for", lease=tok)[1]["status"] == "pending"   # "fo" 起就算 format 缩写
+    mk.human_action(rig.store, "reject", 1, "human:kiosk")
+    assert rig.call("kvm_type", text="dis", lease=tok)[1]["sent"]
+    err, r = rig.call("kvm_type", text="kpart\nls", lease=tok)
+    assert r["status"] == "pending" and "diskpart" in r["danger"]
+
+
+def test_multiline_harmless_goes_and_buffer_is_last_line(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="uname -r\nls\ndis", lease=tok)[1]["sent"]
+    assert rig.call("kvm_type", text="kpart", lease=tok)[1]["status"] == "pending"
+
+
+def test_key_by_key_spelling_is_caught(rig):
+    tok = rig.lease()
+    out = _keys(rig, tok, *"diskpart")
+    assert out[-1]["status"] == "pending" and "diskpart" in out[-1]["danger"]
+    assert ("keys", ("t",)) not in rig.sent
+    assert rig.store.view()["pending"][0]["line"] == "diskpart"
+
+
+def test_key_space_counts_as_char(rig):
+    tok = rig.lease()
+    _keys(rig, tok, "l", "s", "space")
+    assert rig.call("kvm_type", text="-l", lease=tok)[1]["sent"]
+    out = _keys(rig, tok, "enter", *"dis", "k", "p", "a", "r", "t")
+    assert out[-1]["status"] == "pending"
+
+
+def test_key_enter_resets_buffer(rig):
+    tok = rig.lease()
+    _keys(rig, tok, *"dis", "enter")
+    assert rig.call("kvm_type", text="kpart", lease=tok)[1]["sent"]
+
+
+def test_confirmed_key_keeps_line(rig):
+    tok = rig.lease()
+    out = _keys(rig, tok, *"diskpart")
+    mk.human_action(rig.store, "confirm", out[-1]["id"], "human:kiosk", opener=rig.opener, ports=lambda: rig.ports)
+    assert rig.sent[-2] == ("keys", ("t",))
+    # 人确认过的行还在缓冲里, 接着打的照样跟它一起查
+    assert rig.call("kvm_type", text=" x", lease=tok)[1]["status"] == "pending"
+
+
+def test_backspace_removes_one_char(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="diskx", lease=tok)[1]["sent"]
+    _keys(rig, tok, "backspace")
+    assert rig.call("kvm_type", text="part", lease=tok)[1]["status"] == "pending"
+
+
+def test_backspace_on_empty_line_makes_line_unknown(rig):
+    tok = rig.lease()
+    _keys(rig, tok, "backspace")
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["status"] == "pending"
+
+
+def test_secret_prefix_counts_toward_line(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", secret=True, lease=tok)[1]["sent"]
+    err, r = rig.call("kvm_type", text="kpart c:", lease=tok)
+    assert not err and r["status"] == "pending" and [s for s in rig.sent if s[0] != "close"] == [("type", "dis", True)]
+    assert rig.store.view()["pending"][0]["line"] == "<secret>kpart c:"
+    assert "dis" not in open(rig.store.path).read().replace("diskpart", "")
+
+
+def test_secret_then_enter_is_fine_and_resets(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="hunter2", secret=True, lease=tok)[1]["sent"]
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["sent"]
+    assert rig.call("kvm_type", text="uname -r", enter=True, lease=tok)[1]["sent"]
+
+
+def test_secret_after_secret_on_same_line_refused(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", secret=True, lease=tok)[1]["sent"]
+    err, msg = rig.call("kvm_type", text="kpart", secret=True, lease=tok)
+    assert err and [s for s in rig.sent if s[0] != "close"] == [("type", "dis", True)] and rig.store.view()["pending"] == []
+    assert "kpart" not in rig.log.read_text()
+
+
+def test_secret_completing_plain_prefix_refused(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", lease=tok)[1]["sent"]
+    err, _ = rig.call("kvm_type", text="kpart", secret=True, lease=tok)
+    assert err and rig.store.view()["pending"] == []
+
+
+def test_secret_with_danger_on_later_line_refused(rig):
+    tok = rig.lease()
+    err, _ = rig.call("kvm_type", text="ok\nformat c:", secret=True, lease=tok)
+    assert err and rig.sent == []
+
+
+@pytest.mark.parametrize("nav", ["home", "left", "right", "end", "tab", "delete", "ctrl+a", "alt+b", "shift+a"])
+def test_cursor_or_edit_keys_make_line_unknown(rig, nav):
+    """光标挪了 / 补全 / 组合键: 推车不知道这一行变成了什么, 接着打的字和回车都要人确认."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="rmat c:", lease=tok)[1]["sent"]
+    _keys(rig, tok, nav)
+    err, r = rig.call("kvm_type", text="fo", lease=tok)
+    assert r["status"] == "pending" and "看不全" in r["reason"]
+    mk.human_action(rig.store, "reject", r["id"], "human:kiosk")
+    err, r = rig.call("kvm_key", keys="enter", lease=tok)
+    assert r["status"] == "pending"
+    mk.human_action(rig.store, "confirm", r["id"], "human:kiosk", opener=rig.opener, ports=lambda: rig.ports)
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]          # 人确认过回车, 新的一行重新可知
+
+
+@pytest.mark.parametrize("text,enter", [("", True), ("\nls", False)])
+def test_newline_on_unknown_line_needs_human(rig, text, enter):
+    tok = rig.lease()
+    _keys(rig, tok, "x", "left")
+    err, r = rig.call("kvm_type", text=text, enter=enter, lease=tok)
+    assert r["status"] == "pending"
+
+
+def test_menu_navigation_on_empty_line_still_flows(rig):
+    """BIOS / 启动菜单: 空行上 F 键、上下键、esc 后回车直接发 (残余: shell 里调出历史再回车拦不住)."""
+    tok = rig.lease()
+    out = _keys(rig, tok, "f12", "down", "down", "enter", "esc", "up", "enter")
+    assert all(r.get("sent") for r in out)
+
+
+def test_recall_then_typing_needs_human(rig):
+    tok = rig.lease()
+    _keys(rig, tok, "up")
+    err, r = rig.call("kvm_type", text=" /q", lease=tok)
+    assert r["status"] == "pending"
+
+
+def test_recall_on_nonempty_line_makes_it_unknown(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]
+    _keys(rig, tok, "up")
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_neutral_keys_keep_line(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", lease=tok)[1]["sent"]
+    _keys(rig, tok, "capslock")
+    assert rig.call("kvm_type", text="kpart", lease=tok)[1]["status"] == "pending"
+
+
+def test_lease_reacquire_resets_unknown(rig):
+    tok = rig.lease()
+    _keys(rig, tok, "left")
+    rig.call("kvm_lease_release", lease=tok)
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]

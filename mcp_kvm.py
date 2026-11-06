@@ -3,8 +3,10 @@
 键鼠: 一把写租约 (/run/ops-cart/kvm-lease.json, root 0600), 有期限要续, 同时一个写入者, 认令牌不认名字; 全部急停 (kvm_broker
 读的公开标记) 时收回, 解除后要重新申请. 发键只经键鼠代理、来源固定 agent, 代理不在就报错, 不退回直开串口.
 只给整键和整行, 不给原始报告 / 鼠标 (同 kvm_broker_core.AGENT_OPS).
-闸门 (#42): 打字按"从上次回车起的整行"查高危词, 高危组合键也算, 命中就挂起等车机上的人确认; Agent 没有确认工具.
-secret=true 的内容不进审计和日志, 命中高危词直接拒绝. 这只是减速带: 推车看不懂屏幕, 鼠标 / 图形界面 / 脚本 / 编码都拦不住,
+闸门 (#42, #64): 打字按"从上次回车起的整行"查高危词, text 里每个换行切出的整行都查 (第一行跟缓冲拼起来), kvm_key 的
+可打印单键也计入这一行; 高危组合键也算, 命中就挂起等车机上的人确认; Agent 没有确认工具. 推车看不全这一行时
+(挪了光标 / 补全 / 调出历史 / 前面是 secret) 接着打的字要人确认, 推不出这一行时回车也要 (见 press / advance).
+secret=true 的内容照样计入行检查, 但不进审计、日志和状态文件 (行缓冲里只记 <secret>), 命中高危词或看不全时直接拒绝. 这只是减速带: 推车看不懂屏幕, 鼠标 / 图形界面 / 脚本 / 编码都拦不住,
 真正的兜底是人盯和急停.
 日志 (#43): /var/log/ops-cart/kvm-thread.log, JSONL; 确认 / 拒绝 / 急停收回另在 events.log 记摘要.
 这里没有一个工具能解锁 PXE, 也不碰串口写路径.
@@ -56,6 +58,76 @@ def danger_of(text):
 
 def danger_keys(keys):
     return frozenset(k.lower() for k in keys) in DANGER_KEYS
+
+
+# ---- 行缓冲 (#64): 推车对"当前这一行"知道多少
+# blind = ""       整行都看得见 (缓冲 line 就是这一行)
+#         PARTIAL  这一行前头有看不见的内容 (secret 只记成 SECRET_MARK, 或空行上调出了历史): 接着打字要人确认, 回车照发
+#         UNKNOWN  这一行变成什么推不出来 (挪了光标、补全、组合键、空行退格...): 接着打字和回车都要人确认
+# 回车 (含 text 里的换行) 之后新的一行重新可知. 往多拦的方向错.
+PARTIAL, UNKNOWN = "partial", "unknown"
+SECRET_MARK = "<secret>"
+NEUTRAL_KEYS = {"capslock", "numlock", "scrolllock", "printscreen", "pause"}
+RECALL_KEYS = {"up", "down", "pgup", "pgdn", "esc"} | {f"f{i}" for i in range(1, 25)}
+BLIND_WHY = "推车看不全这一行 (前面有 secret / 挪过光标 / 调出过历史), 接着打字或回车要人确认"
+
+
+def key_effect(keys):
+    """单次按键对行缓冲的作用: ("char", 字符) / ("enter",) / ("backspace",) / ("recall",) / ("neutral",) / ("unknown",)."""
+    if len(keys) == 1:
+        k, low = keys[0], keys[0].lower()
+        if low == "enter":
+            return ("enter",)
+        if low == "space":
+            return ("char", " ")
+        if len(k) == 1 and k.isascii() and k.isprintable():
+            return ("char", k)
+        if low == "backspace":
+            return ("backspace",)
+        if low in RECALL_KEYS:
+            return ("recall",)
+        if low in NEUTRAL_KEYS:
+            return ("neutral",)
+    return ("unknown",)
+
+
+def _hits(lines):
+    out = []
+    for ln in lines:
+        out += [w for w in danger_of(ln) if w not in out]
+    return out
+
+
+def advance(line, blind, text, secret=False):
+    """打一段字 -> (高危词, 是否因看不全要人确认, 新 line, 新 blind). text 里每个换行切出的整行都查,
+    第一行跟缓冲拼起来查. secret 的内容照样查, 但新 line 里只留 SECRET_MARK."""
+    segs = text.split("\n")
+    blocked = bool(blind) and bool(segs[0]) or (blind == UNKNOWN and len(segs) > 1)
+    hits = _hits([line + segs[0]] + segs[1:])
+    tail = segs[-1] if len(segs) > 1 else line + segs[0]
+    if secret:
+        tail = (SECRET_MARK if segs[-1] else "") if len(segs) > 1 else (line + SECRET_MARK if segs[0] else line)
+    new_blind = (PARTIAL if secret and segs[-1] else "") if len(segs) > 1 else \
+        (PARTIAL if secret and segs[0] else blind)
+    return hits, blocked, tail[-TEXT_MAX:], new_blind
+
+
+def press(line, blind, keys):
+    """按一次键 -> (高危词, 是否因看不全要人确认, 新 line, 新 blind)."""
+    if danger_keys(keys):
+        return ["+".join(keys)], False, line, blind
+    eff = key_effect(keys)
+    if eff[0] == "char":
+        return advance(line, blind, eff[1])
+    if eff[0] == "enter":
+        return [], blind == UNKNOWN, "", ""
+    if eff[0] == "backspace":
+        return ([], False, line[:-1], blind) if line and not blind else ([], False, "", UNKNOWN)
+    if eff[0] == "recall":
+        return ([], False, "", PARTIAL) if not line and blind != UNKNOWN else ([], False, "", UNKNOWN)
+    if eff[0] == "neutral":
+        return [], False, line, blind
+    return [], False, "", UNKNOWN
 
 
 def _shown(text, secret):
@@ -118,7 +190,7 @@ class LeaseStore:
             if st["lease"]:             # 认令牌不认名字: stdio 下两个 Agent 可能是同一个用户
                 raise mc.ToolError(f"键鼠写租约在 {st['lease']['who']} 手里, 还剩 {int(st['lease']['until'] - now)} 秒")
             st["lease"] = {"token": secrets.token_urlsafe(16), "who": who, "until": now + ttl, "ttl": ttl}
-            st["line"] = ""
+            st["line"], st["blind"] = "", ""
             evs.append({"ev": "lease_acquire", "src": "agent", "who": who, "ttl": ttl})
             return {"lease": st["lease"]["token"], "ttl_s": ttl, "hint": "用完 kvm_lease_release; 令牌别给别人."}
 
@@ -133,7 +205,7 @@ class LeaseStore:
             lease = self._need(st, token)
             evs.append({"ev": "lease_release", "src": "agent", "who": lease["who"]})
             _drop_all(st, evs, "租约交还")
-            st["lease"], st["line"] = None, ""
+            st["lease"], st["line"], st["blind"] = None, "", ""
             return {"released": True}
 
     def gate(self, token, kind, keys=(), text="", enter=False, secret=False, serial=None):
@@ -143,21 +215,32 @@ class LeaseStore:
             if st["pending"]:           # 键盘是一条流: 接着发的话, 人确认后顺序就乱了
                 raise mc.ToolError(f"有 {len(st['pending'])} 条在等确认, 处理完才能接着发; 一个键都没发. 用 kvm_status 看结果")
             shown = "+".join(keys) if kind == "key" else _shown(text, secret)
-            line, why = st["line"], None
+            line, blind = st["line"], st["blind"]
             if kind == "key":
-                hits = ["+".join(keys)] if danger_keys(keys) else []
-                why = "高危组合键, 要人确认" if hits else None
-                full = line
+                hits, blocked, after, after_blind = press(line, blind, keys)
+                full = line + (key_effect(keys)[1] if key_effect(keys)[0] == "char" else "")
             else:
-                full = (line + text).rsplit("\n", 1)[-1]
-                hits = danger_of(full)
+                hits, blocked, after, after_blind = advance(line, blind, text, secret)
+                if enter:
+                    blocked = blocked or after_blind == UNKNOWN
+                    after, after_blind = "", ""
+                full = line + ("" if secret else text)
+            if hits and kind == "key" and danger_keys(keys):
+                why = "高危组合键, 要人确认"
+            else:
                 why = f"这一行带高危词 {'、'.join(hits)}, 要人确认" if hits else None
-            if hits and secret:
+            if blocked:
+                why = f"{why}; {BLIND_WHY}" if why else BLIND_WHY
+            if why and secret:
                 evs.append({"ev": "refused", "src": "agent", "who": who, "text": shown})   # 命中哪个词也不记, 算泄露
-                raise mc.ToolError("secret 内容带高危词, 不能挂起给人看, 已拒绝; 一个键都没发")
-            if hits:
+                if hits:
+                    raise mc.ToolError("secret 内容带高危词, 不能挂起给人看, 已拒绝; 一个键都没发")
+                raise mc.ToolError("这一行推车看不全 (前面有 secret / 挪过光标), secret 不能挂起给人看, 已拒绝; "
+                                   "一个键都没发. 先回车换到新的一行再打")
+            if why:
                 item = {"id": st["next"], "kind": kind, "keys": list(keys), "text": text, "enter": bool(enter),
-                        "who": who, "t": now, "reason": why, "danger": hits, "line": full, "serial": serial}
+                        "who": who, "t": now, "reason": why, "danger": hits, "line": full[-TEXT_MAX:],
+                        "serial": serial, "after": after, "after_blind": after_blind}
                 st["next"] += 1
                 st["pending"].append(item)
                 evs.append({"ev": "pending", "src": "agent", "who": who, "id": item["id"], "text": shown,
@@ -165,10 +248,7 @@ class LeaseStore:
                 return {"status": "pending", "id": item["id"], "reason": why, "danger": hits,
                         "hint": "已挂起, 一个键都没发. 要人在推车上确认才发; 用 kvm_status 看结果. 等的时候继续 "
                                 "kvm_lease_renew, 租约过期这条就作废."}
-            if kind == "type" and not secret:
-                st["line"] = full[-TEXT_MAX:]
-            if enter or (kind == "key" and [k.lower() for k in keys] == ["enter"]):
-                st["line"] = ""
+            st["line"], st["blind"] = after, after_blind
             st["sending_until"] = now + max(2.0, len(text) / 20)
             return None
 
@@ -186,8 +266,10 @@ class LeaseStore:
             if item is None:
                 raise ValueError(f"#{iid} 不在等确认 (租约过期或急停时作废)")
             st["pending"].remove(item)
-            line = "" if item["enter"] else item["line"]
-            st["line"] = line[-TEXT_MAX:]
+            if isinstance(item.get("after"), str) and item.get("after_blind") in ("", PARTIAL, UNKNOWN):
+                st["line"], st["blind"] = item["after"], item["after_blind"]
+            else:                       # 旧版本挂起的条目: 没有 after, 推不出这一行, 按看不见算
+                st["line"], st["blind"] = "", ("" if item.get("enter") else UNKNOWN)
             evs.append({"ev": "confirm", "src": "human", "who": by, "id": iid, "text": _item_text(item)})
             _remember(st, item, "confirmed", by)
             return item
@@ -234,6 +316,7 @@ def read_state(path):
     return {"next": doc["next"] if isinstance(doc.get("next"), int) else 1, "lease": lease,
             "pending": [p for p in doc.get("pending") or () if isinstance(p, dict)] if isinstance(doc.get("pending"), list) else [],
             "line": doc["line"] if isinstance(doc.get("line"), str) else "",
+            "blind": doc.get("blind", "") if doc.get("blind", "") in ("", PARTIAL, UNKNOWN) else UNKNOWN,
             "sending_until": doc["sending_until"] if isinstance(doc.get("sending_until"), (int, float)) else 0,
             "history": doc["history"] if isinstance(doc.get("history"), list) else []}
 
@@ -245,11 +328,11 @@ def settle(st, now, stopped):
     if lease and stopped:
         evs.append({"ev": "revoked", "src": "system", "who": lease.get("who"), "why": "全部急停"})
         _drop_all(st, evs, "全部急停")
-        st["lease"], st["line"] = None, ""
+        st["lease"], st["line"], st["blind"] = None, "", ""
     elif lease and lease["until"] <= now:
         evs.append({"ev": "lease_expired", "src": "system", "who": lease.get("who")})
         _drop_all(st, evs, "租约过期")
-        st["lease"], st["line"] = None, ""
+        st["lease"], st["line"], st["blind"] = None, "", ""
     elif not lease and st["pending"]:
         _drop_all(st, evs, "没有租约")
     st["_evs"] = evs
