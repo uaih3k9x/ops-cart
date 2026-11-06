@@ -58,6 +58,8 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         var retryToken = 0
         var retrying = false
         var ackToken = 0
+        var ackResends = 0                // 等不到回执的重发次数, 最多 ACK_RESENDS
+        var sent = false                  // 整条写完过至少一次: 过期时推车可能已经收到
         var lastCode: String? = null      // 同一个错误码只提示一次, 免得 unpaired 每 30 秒刷屏
     }
 
@@ -75,6 +77,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         const val MAX_FAILS = 5
         const val AUTH_FAILS = 2
         const val ACK_WAIT_MS = 20_000L
+        const val ACK_RESENDS = 2
         const val RETRY_MS = 3_000L
         const val UNPAIRED_RETRY_MS = 30_000L
         const val OUTBOX_TTL_MS = 600_000L      // = 推车去重时效, 过了再发可能重复投递
@@ -204,6 +207,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     // ------------------------------------------------------------ 平台事件
 
     fun onAdapter(on: Boolean) {
+        if (phase == Phase.GAVE_UP) return    // 停下等用户的, 关开蓝牙也不自动恢复
         if (!on) {
             drop()
             phase = Phase.WAIT_ADAPTER
@@ -236,7 +240,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         when (port.bondState(a)) {
             Bond.BONDED -> askMtu(c)
             Bond.BONDING -> waitBond()
-            Bond.NONE -> if (port.createBond(a)) waitBond() else fail("配对起不来")
+            Bond.NONE -> if (port.createBond(a)) waitBond() else giveUp("配对起不来: 点\"重连\"再试")
         }
     }
 
@@ -245,7 +249,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         val c = conn ?: return
         when (state) {
             Bond.BONDED -> askMtu(c)
-            Bond.NONE -> fail("配对没成 (要在手机和车机上确认同一个六位数)")
+            Bond.NONE -> giveUp("配对没成 (要在手机和车机上确认同一个六位数): 点\"重连\"再试")   // 不自动再弹配对框
             Bond.BONDING -> {}
         }
     }
@@ -369,7 +373,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
     private fun waitBond() {
         phase = Phase.BONDING
         ui.state("配对中: 手机和车机上的六位数一致再确认")
-        arm(BOND_TIMEOUT_MS)
+        arm(BOND_TIMEOUT_MS) { giveUp("配对超时: 点\"重连\"再试") }
     }
 
     private fun askMtu(c: Conn) {
@@ -431,9 +435,9 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         port.schedule(ms) { if (g == gen) task() }
     }
 
-    private fun arm(ms: Long) {
+    private fun arm(ms: Long, onTimeout: () -> Unit = { fail("蓝牙操作超时") }) {
         val t = ++watch
-        later(ms) { if (t == watch) fail("蓝牙操作超时") }
+        later(ms) { if (t == watch) onTimeout() }
     }
 
     private fun disarm() {
@@ -468,8 +472,14 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
 
     /** 整条写完后等回执; 等不到 (推车有陌生设备连着时不发回执, 或通知丢了) 就同序号重发一次. */
     private fun awaitAck(m: Out) {
+        m.sent = true
         val t = ++m.ackToken
-        later(ACK_WAIT_MS) { if (m.ackToken == t && m in outbox) write(m) }
+        if (m.ackResends >= ACK_RESENDS) return
+        later(ACK_WAIT_MS) {
+            if (m.ackToken != t || m !in outbox) return@later
+            m.ackResends++
+            write(m)
+        }
     }
 
     private fun onAck(s: Status.Ack) {
@@ -481,6 +491,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
 
     private fun onErr(s: Status.Err) {
         // crc 为 null: 推车读不出是哪条, 只能按序号猜 -> 只许重发 (推车去重), 不许删
+        if (s.crc == null && s.code !in RETRY_CODES) return   // 只能按序号猜的, 除了"重发一次"什么都不许动
         val m = outbox.firstOrNull { it.id == s.id && (s.crc == null || it.crc == s.crc) } ?: return
         m.ackToken++                      // 推车回话了, 不用再等回执超时
         val fresh = m.lastCode != s.code
@@ -519,7 +530,12 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         if (old.isEmpty()) return
         outbox.removeAll(old.toSet())
         save()
-        old.forEach { ui.line("✗ 超过 10 分钟没送达, 不再自动发 (要发请重新输入): ${it.text}") }
+        old.forEach {
+            ui.line(
+                if (it.sent) "✗ 超过 10 分钟没收到回执, 推车可能已收到但没确认 (先看车机, 别急着重发): ${it.text}"
+                else "✗ 超过 10 分钟没送达, 不再自动发 (要发请重新输入): ${it.text}",
+            )
+        }
     }
 
     private fun save() = store.saveOutbox(outbox.map { Saved(it.id, it.text, it.created, it.held) })

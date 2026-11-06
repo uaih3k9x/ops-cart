@@ -704,4 +704,99 @@ class LinkCoreTest {
         assertFalse(core.send("a​b"))
         assertTrue(f.saved.isEmpty())
     }
+
+    // ------------------------------------------------------------ 第三轮审查 (#63)
+
+    @Test
+    fun ackResendsLimitedAndExpiryDoesNotAskToRetype() {
+        // 低1: 回执一直被扣 (陌生设备连着): 最多重发 ACK_RESENDS 次; 过期提示"可能已收到", 不叫人重新输入
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f)
+        core.send("回执被扣")
+        repeat(40) { drainWrites(core, c); f.advance(LinkCore.ACK_WAIT_MS) }
+        drainWrites(core, c)
+        assertEquals(1 + LinkCore.ACK_RESENDS, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+        val last = f.lines.last { it.contains("回执被扣") && it.startsWith("✗") }
+        assertTrue(last, last.contains("可能已收到"))
+        assertFalse(last, last.contains("重新输入"))
+    }
+
+    @Test
+    fun bondFailureGivesUpWithoutRetryingCreateBond() {
+        // 低2: 配对失败 / 用户取消, 不自动再 createBond (会反复弹框)
+        val f = Fake().apply { cart = this@LinkCoreTest.cart }
+        val core = LinkCore(f, f, f)
+        core.start()
+        core.onConnected(f.conns.last())
+        f.bonds[cart] = LinkCore.Bond.NONE
+        core.onBond(cart, LinkCore.Bond.NONE)
+        f.advance(10 * 60_000)
+        assertEquals(1, f.bondAsked.size)
+        assertEquals(1, f.conns.size)
+        assertTrue(f.states.last().contains("重连"))
+        core.kick()
+        assertEquals(2, f.conns.size)
+    }
+
+    @Test
+    fun bondTimeoutGivesUp() {
+        val f = Fake().apply { cart = this@LinkCoreTest.cart }
+        val core = LinkCore(f, f, f)
+        core.start()
+        core.onConnected(f.conns.last())
+        f.advance(LinkCore.BOND_TIMEOUT_MS + 10 * 60_000)
+        assertEquals(1, f.bondAsked.size)
+        assertEquals(1, f.conns.size)
+    }
+
+    @Test
+    fun weakNonRetryErrorsTouchNothing() {
+        // 低3: crc 为 null 且不是可重发码 (含 unpaired): 只按序号猜不许改受信手机的状态, 回执等待照旧
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f)
+        core.send("别动我")
+        drainWrites(core, c)
+        val before = f.lines.size
+        val cs = FakeCart()
+        cs.notify("""{"t":"err","id":100,"crc":null,"code":"unpaired"}""").forEach { core.onNotify(c, it) }
+        cs.notify("""{"t":"err","id":100,"crc":null,"code":"frame"}""").forEach { core.onNotify(c, it) }
+        assertEquals(before, f.lines.size)
+        f.advance(LinkCore.ACK_WAIT_MS)                       // 回执等待没被取消: 照样重发
+        drainWrites(core, c)
+        assertEquals(2, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+    }
+
+    @Test
+    fun adapterToggleDoesNotResumeGaveUp() {
+        // 低5: "没有推车服务 / 认证失败"停下后, 关开蓝牙不能自动恢复重连
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = f.conns.last()
+        core.onConnected(c)
+        core.onMtu(c, 517, true)
+        core.onServices(c, true, false)
+        f.adapter = false
+        core.onAdapter(false)
+        f.adapter = true
+        core.onAdapter(true)
+        f.advance(60_000)
+        assertEquals(1, f.conns.size)
+    }
+
+    @Test
+    fun dropWhileAdapterOffWaitsForBroadcast() {
+        // retryLater 的蓝牙开关检查: 断线时蓝牙已经关了 (广播还没到), 直接等广播, 不排重连
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f)
+        f.adapter = false
+        core.onDisconnected(c)
+        assertTrue(f.states.last(), f.states.last().contains("蓝牙关"))
+    }
 }
