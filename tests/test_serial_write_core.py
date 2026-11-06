@@ -668,3 +668,11 @@ def test_events_have_timestamps_and_slot():
     b.acquire(2, "agentA", T0, token="tokA")
     e = b.events[0]
     assert e["slot"] == 2 and e["t"].startswith("20") and e["src"] == "agent"
+
+
+def test_ruijie_gets_layer1_whitelist_from_survey_rules():
+    """#56: survey_core 给锐捷加了只读规则, 登记成锐捷的槽位 show 命令第 1 层放行; 写命令照旧要人确认."""
+    assert sw.classify("show version", "ruijie", True, RULES)["verdict"] == "pass"
+    assert sw.classify("terminal length 0", "ruijie", True, RULES)["verdict"] == "pass"
+    for cmd in ("configure terminal", "write memory", "reload", "terminal length 0 ; reload"):
+        assert sw.classify(cmd, "ruijie", True, RULES)["verdict"] == "confirm", cmd

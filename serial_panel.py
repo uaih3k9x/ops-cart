@@ -414,7 +414,8 @@ class SerialPanel(tk.Frame):
     def survey(self):
         """#15 一键只读巡检: 后台跑 survey_core (走 conbroker send), 摘要经 self.ui 回主线程写进控制台.
 
-        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor, 默认 huawei.
+        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor
+        (huawei / h3c / cisco / ruijie), 默认 auto (#56 先 display version 再 show version 自动认).
         """
         if self._surveying:
             return
@@ -424,7 +425,7 @@ class SerialPanel(tk.Frame):
             self._con_write([("text", f"\n[巡检] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
             return
         self._surveying = True
-        vendor = self.cfg.get("survey_vendor", "huawei")
+        vendor = self.cfg.get("survey_vendor", "auto")
         head = survey_core.safe_name(os.path.basename(dev))
         self._con_write([("text", f"\n[巡检] {dev} ({vendor}): 逐条发只读命令, 跑完前先别敲键\n")], "mark")
 
