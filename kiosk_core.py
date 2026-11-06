@@ -1145,7 +1145,9 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, p
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
-    只要带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu) 也一并删掉. clonezilla/ 和 win/ 一样不删. grub.cfg.bak-* 这类
+    只要带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu) 也一并删掉; pxelinux.cfg/ 下除 default 外的
+    (推车不生成按 MAC/IP 命名的 pxelinux 配置, 有就是手工放的) 同样判. default 和 grub.cfg 一起按当前 PXE_IP 重写 (#55).
+    clonezilla/ 和 win/ 一样不删. grub.cfg.bak-* 这类
     手工备份 GRUB 不会去取, 不动. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
     再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
@@ -1153,7 +1155,8 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     for d, _dirs, files in os.walk(root):
         for name in files:
             full = os.path.join(d, name)
-            fetched = name == "grub.cfg" or name.startswith("grub.cfg-")
+            pxelinux = os.path.basename(d) == "pxelinux.cfg" and name != "default"
+            fetched = name == "grub.cfg" or name.startswith("grub.cfg-") or pxelinux
             if not fetched or full == os.path.join(root, "grub.cfg"):
                 continue
             if not (name.startswith("grub.cfg-01-") and d == root):
@@ -1166,6 +1169,7 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
             os.remove(full)
             removed.append(os.path.relpath(full, root))
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
+    _write_atomic(os.path.join(root, "pxelinux.cfg", "default"), pxelinux_cfg_rescue())
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -1397,7 +1401,6 @@ def main(argv=None):
         ap.print_usage(sys.stderr)
         return 2
     pxe_disarm(root=a.root, path=a.state)
-    _write_atomic(os.path.join(a.root, "pxelinux.cfg", "default"), pxelinux_cfg_rescue())
     print(f"救援菜单已写入 {os.path.join(a.root, 'grub.cfg')} 和 pxelinux.cfg/default")
     return 0
 

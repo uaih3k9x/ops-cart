@@ -653,6 +653,14 @@ def issue_checks(expect_version):
             return ac.MANUAL, f"tftp/{d}/ 缺 {', '.join(miss)}: 克隆解锁会被拒 (见 docs/CLONE.md)"
         return ac.PASS, f"tftp/{d}/ 三个文件都在"
 
+    def memtest_file():
+        rc, out, e = py("import memtest_core as m, pxeserver as p; print(p.MEMTEST_EFI, m.MEMBER_SHA256)")
+        if rc != 0:
+            return ac.FAIL, f"memtest_core 读不了: {last_err(e)}"
+        rel, want = out.split()
+        path = f"{OPT}/tftp/{rel}"
+        return ac.judge_memtest(sha256(path) if os.path.isfile(path) else None, want)
+
     def netmode():
         doc, err = load_json("/var/lib/ops-cart/netmode.json")
         if err:
@@ -699,6 +707,7 @@ def issue_checks(expect_version):
         ac.Check("内置配方 boot-pxe", "#17", recipe_builtin),
         ac.Check("采集卡 /dev/video*", "#17", capture),
         ac.Check("Clonezilla 文件", "#18", clone_files),
+        ac.Check("Memtest86+ 文件", "#55", memtest_file),
         ac.Check("网口模式状态 netmode.json", "#13", netmode),
     ]
 

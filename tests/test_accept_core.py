@@ -450,3 +450,16 @@ def test_judge_rapid():
     assert ac.judge_rapid(True, 0, "1.4.4")[0] == ac.PASS
     st, why = ac.judge_rapid(True, 1, "ImportError: libGL")
     assert st == ac.FAIL and "libGL" in why
+
+
+# ------------------------------------------------------------ #55 Memtest86+ 文件
+
+def test_judge_memtest_missing_is_manual():
+    st, why = ac.judge_memtest(None, "a" * 64)
+    assert st == M and "setup-memtest.sh" in why
+
+
+def test_judge_memtest_match_is_pass_and_mismatch_manual():
+    assert ac.judge_memtest("a" * 64, "A" * 64)[0] == P
+    st, why = ac.judge_memtest("b" * 64, "a" * 64)
+    assert st == M and "setup-memtest.sh" in why

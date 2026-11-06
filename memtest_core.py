@@ -1,5 +1,6 @@
-"""Memtest86+ 放进 PXE 菜单 (#55): 固定官方版本, 下载后 zip 整包和解出的文件各校验一次 sha256,
-任何一步不符就中止, 什么都不写 (旧文件原样留着). 二进制不进仓库.
+"""Memtest86+ 放进 PXE 菜单 (#55): 固定官方版本, 只走 https (重定向也不许降级), 完整性靠钉死的 sha256
+(zip 整包一个, 解出的文件一个, 任何一步不符就中止, 旧文件原样留着). 官方发布包没有签名, 这是能做到的上限.
+二进制不进仓库.
 
 用法 (scripts/setup-memtest.sh 调): sudo python3 /opt/pxe/memtest_core.py --root /opt/pxe/tftp [--zip 本地包]
 写到 <root>/memtest/memtest64.efi (pxeserver.MEMTEST_EFI), GRUB 经 HTTP chainloader, pxelinux 用 LINUX 加载.
@@ -62,14 +63,33 @@ def install(zip_bytes, root):
     return path
 
 
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """跟重定向只跟到 https; https -> http 这类降级直接失败."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise ValueError(f"拒绝重定向到非 https 地址: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _opener():
+    return urllib.request.build_opener(HttpsOnlyRedirect())
+
+
+def _capped(read):
+    """read(n) -> 数据; 多读一个字节判断超限."""
+    data = read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError(f"内容超过 {MAX_BYTES} 字节, 不像官方包")
+    return data
+
+
 def fetch(url, timeout=60):
+    """只走 https (含重定向). 完整性靠钉死的 sha256, 不靠传输."""
     if not url.startswith("https://"):
         raise ValueError(f"只从 https 下载: {url}")
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        data = r.read(MAX_BYTES + 1)
-    if len(data) > MAX_BYTES:
-        raise ValueError(f"下载内容超过 {MAX_BYTES} 字节, 不像官方包")
-    return data
+    with _opener().open(url, timeout=timeout) as r:
+        return _capped(r.read)
 
 
 def main(argv=None, fetch=fetch):
@@ -80,7 +100,7 @@ def main(argv=None, fetch=fetch):
     try:
         if a.zip:
             with open(a.zip, "rb") as f:
-                blob = f.read(MAX_BYTES + 1)
+                blob = _capped(f.read)
         else:
             print(f"下载 {ZIP_URL}")
             blob = fetch(ZIP_URL)

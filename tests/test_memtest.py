@@ -65,6 +65,34 @@ def test_pxelinux_menu_default_rescue_and_memtest_label():
     assert f"LINUX {ps.MEMTEST_EFI}" in memtest          # LINUX: 不按扩展名猜类型
 
 
+def test_disarm_rewrites_pxelinux_default_with_current_ip(tmp_path, monkeypatch):
+    """#55 审查: pxelinux.cfg/default 跟 grub.cfg 一起在上锁时重写, PXE_IP 改了不会留旧地址."""
+    env = tmp_path / "pxe.env"
+    monkeypatch.setattr(kc, "PXE_ENV", str(env))
+    root = tmp_path / "tftp"
+    env.write_text("PXE_IP=198.51.100.1\n")
+    kc.pxe_disarm(root=root, path=tmp_path / "pxe-mode.json")
+    env.write_text("PXE_IP=203.0.113.9\n")
+    kc.pxe_disarm(root=root, path=tmp_path / "pxe-mode.json")
+    text = (root / "pxelinux.cfg" / "default").read_text()
+    assert ps.pxelinux_menu("203.0.113.9") in text and "198.51.100.1" not in text
+
+
+def test_disarm_scrubs_unlock_menus_under_pxelinux_cfg(tmp_path, monkeypatch):
+    """推车不生成按 MAC/IP 命名的 pxelinux 配置; 手工放进来带装机/WinPE/克隆的一律删, 别的不动."""
+    env = tmp_path / "pxe.env"
+    env.write_text("PXE_IP=198.51.100.1\n")
+    monkeypatch.setattr(kc, "PXE_ENV", str(env))
+    d = tmp_path / "pxelinux.cfg"
+    d.mkdir()
+    (d / "01-02-00-00-00-00-01").write_text("DEFAULT x\nLABEL x\n KERNEL vmlinuz\n APPEND inst.ks=http://x/ks.cfg\n")
+    (d / "C0000201").write_text("LABEL c\n KERNEL clonezilla/vmlinuz\n")
+    (d / "notes").write_text("LABEL r\n KERNEL vmlinuz\n APPEND inst.rescue\n")
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "pxe-mode.json")
+    assert sorted(p.name for p in d.iterdir()) == ["default", "notes"]
+    assert not ps.unlock_only_menu((d / "default").read_text())
+
+
 def test_write_rescue_also_writes_pxelinux_default(tmp_path, monkeypatch):
     env = tmp_path / "pxe.env"
     env.write_text("PXE_IP=198.51.100.1\n")
@@ -181,6 +209,61 @@ def test_main_aborts_on_bad_checksum(fake_release, tmp_path, capsys):
     assert "sha256" in capsys.readouterr().err
 
 
+def test_main_zip_over_limit_aborts(fake_release, tmp_path, monkeypatch, capsys):
+    z = tmp_path / "big.zip"
+    z.write_bytes(fake_release[0])
+    monkeypatch.setattr(mt, "MAX_BYTES", len(fake_release[0]) - 1)
+    assert mt.main(["--root", str(tmp_path / "t"), "--zip", str(z)]) == 1
+    assert not (tmp_path / "t").exists() and "超过" in capsys.readouterr().err
+
+
+class _Resp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+def test_fetch_over_limit_raises(monkeypatch):
+    monkeypatch.setattr(mt, "MAX_BYTES", 4)
+
+    class Opener:
+        def open(self, url, timeout):
+            return _Resp(b"12345")
+    monkeypatch.setattr(mt, "_opener", lambda: Opener())
+    with pytest.raises(ValueError, match="超过"):
+        mt.fetch("https://memtest.org/x.zip")
+
+
+def test_fetch_returns_body_within_limit(monkeypatch):
+    class Opener:
+        def open(self, url, timeout):
+            return _Resp(b"ok")
+    monkeypatch.setattr(mt, "_opener", lambda: Opener())
+    assert mt.fetch("https://memtest.org/x.zip") == b"ok"
+
+
+def test_redirect_to_http_is_refused():
+    import urllib.request
+    h = mt.HttpsOnlyRedirect()
+    req = urllib.request.Request("https://memtest.org/a.zip")
+    with pytest.raises(ValueError, match="https"):
+        h.redirect_request(req, None, 302, "Found", {}, "http://mirror.example/a.zip")
+
+
+def test_redirect_to_https_is_followed():
+    import urllib.request
+    h = mt.HttpsOnlyRedirect()
+    req = urllib.request.Request("https://memtest.org/a.zip")
+    new = h.redirect_request(req, None, 302, "Found", {}, "https://mirror.example/a.zip")
+    assert new.full_url == "https://mirror.example/a.zip"
+
+
+def test_opener_uses_https_only_redirect():
+    assert any(isinstance(h, mt.HttpsOnlyRedirect) for h in mt._opener().handlers)
+
+
 def test_fetch_refuses_non_https():
     with pytest.raises(ValueError):
         mt.fetch("http://memtest.org/x.zip")
@@ -198,3 +281,4 @@ def test_setup_script_calls_core_and_stops_on_error():
 def test_doc_mentions_secure_boot():
     doc = (ROOT / "docs" / "MEMTEST.md").read_text()
     assert "安全启动" in doc and "没有签名" in doc and mt.VERSION in doc
+    assert "MOK" in doc and "pxelinux.cfg/default" in doc
