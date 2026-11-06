@@ -319,11 +319,11 @@ def echo_summary(text):
 # 长词只要后边界, 前面可以接字母 (PGPASSWORD= / htpasswd / GITHUB_TOKEN= / psksecret). 打码从词后面开始.
 _SECRET_SHORT = re.compile(r"(?i)(?<![a-z0-9])(?P<k>key|md5|auth|priv|psk|community|cipher|pass)(?![a-z0-9])")
 _SECRET_LONG = re.compile(r"(?i)(?P<k>(?:private|pre-?shared|secret|access)[-_]?key|passw(?:or)?d|passphrase|pwd|secret"
-                          r"|token|bearer|api[-_]?key"
+                          r"|token|bearer|authorization|credentials?|api[-_]?key"
                           r"|authentication-mode)(?![a-z0-9])")
 _SECRET_DASH = re.compile(r"(?<!\S)(?P<k>-p)(?=\S)|(?<!\S)(?P<u>(?:-u|--user)[\s=]+)(?=\S+:\S)")   # mysql -pX / curl -u a:b
 _SECRET_URL = re.compile(r"(?P<k>)[\w.%+-]+:[^\s@/]+@")                                        # https://user:pass@
-_SECRET_SPACED = re.compile(r"(?i)(?<![\w-])(?:sshpass|mysql\w*|mariadb\w*)\b(?:.*?\s)?(?P<k>-p\s+)(?=\S)"   # sshpass -p x
+_SECRET_SPACED = re.compile(r"(?i)(?<![\w-])(?:sshpass|mysql\w*|mariadb\w*|usermod|useradd)\b(?:.*?\s)?(?P<k>-p\s+)(?=\S)"   # sshpass -p x
                             r"|(?P<u>identified\s+by\s+)(?=\S)")                               # IDENTIFIED BY 'x' 
 _SECRET_WHOLE = re.compile(r"(?i)chpasswd|^\s*[\w.-]+:\$[0-9a-z]{1,3}\$")                       # chpasswd / shadow 行
 _SECRET_CONT = re.compile(r"\s*(?:%\^%#|%\$%\^|\$[0-9a-z]{1,3}\$)")                             # 折行后的密文续行

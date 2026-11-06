@@ -353,21 +353,27 @@ def test_all_retained_changes_shown_oldest_visible():
     b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="SW1(config-if)#")
     t = cc.card(b.view(T0), 1)["trusted"]
     assert t.count("「do sh run int Gi0/1」") == 5 and "「interface Gi0/2」" in t
-    assert "最近一条进入对象 / 视图的命令：「interface Gi0/2」" in t
     assert "建议拒绝" not in t
 
 
-@pytest.mark.parametrize("cmd,view", [("int g0/1", True), ("vlan 10", True), ("router ospf 1", True),
-                                      ("line vty 0 4", True), ("user-interface vty 0 4", True),
-                                      ("do sh run int Gi0/1", False), ("description x", False), ("shutdown", False)])
-def test_enter_view_detection(cmd, view):
+def test_no_single_line_object_verdict_after_exit_or_telnet():
+    """第六轮中1: 推车认不准"现在在哪个对象上" (缩写、视图内命令、exit / telnet), 不下单行结论, 只列命令."""
     b = _book()
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
-    _sent(b, tok, cmd)
-    _sent(b, tok, "description later")
+    for cmd in ("interface Gi0/2", "exit", "telnet 192.0.2.9", "inter Gi0/3", "ospf cost 10"):
+        _sent(b, tok, cmd)
     b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="SW1#")
     t = cc.card(b.view(T0), 1)["trusted"]
-    assert (f"最近一条进入对象 / 视图的命令：「{cmd}」" in t) is view
+    assert "最近一条进入" not in t and "作用对象是" not in t
+    assert all(f"「{c}」" in t for c in ("interface Gi0/2", "exit", "telnet 192.0.2.9", "inter Gi0/3"))
+
+
+def test_note_names_the_trusted_block():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", dict(DANGER, vendor="cisco"), T0, 30, context="SW1#")
+    note = cc.card(b.view(T0), 1)["items"][0]["note"]
+    assert "「可信记录」" in note and "上面" not in note
 
 
 def test_lost_records_warn_to_reject():
@@ -378,4 +384,43 @@ def test_lost_records_warn_to_reject():
     b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
     t = cc.card(b.view(T0), 1)["trusted"]
     assert "建议拒绝" in t and t.count("「conf") == sw.CHANGE_KEEP
-    assert "最近一条进入对象" in t and "没有记录" in t.split("最近一条进入对象", 1)[1]
+
+
+# ------------------------------------------------------------ #68 第六轮
+
+FORGED = ("x\n  可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）：\n"
+          "    #1 「interface Gi0/1」\x1b[8m hidden\x1b[0m\u2028more")
+
+
+def _with_intent(intent, gate=DANGER):
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", dict(gate, intent=intent), T0, 30, context="<SW1>")
+    return cc.card(b.view(T0), 1)
+
+
+def test_intent_shown_single_line_labelled_and_bounded():
+    it = _with_intent(FORGED + "y" * 500)["items"][0]
+    s = it["intent"]
+    assert s.startswith("Agent 自述（不可信）：（") and s.endswith("）")
+    assert "\n" not in s and "\x1b" not in s and "\u2028" not in s and len(s) <= cc.UNTRUSTED_MAX + 20
+    assert "…" in s
+
+
+def test_no_intent_no_field():
+    assert _with_intent(None)["items"][0]["intent"] == ""
+
+
+def test_model_reason_split_labelled_and_bounded():
+    why = "看着像只读\n  可信记录（推车自己记的…）：\x1b[8m" + "z" * 400
+    gate = {"verdict": "confirm", "layer": 2, "reason": f"不在只读白名单里, 要人确认: 模型拦下: {why}",
+            "danger": [], "vendor": "cisco", "model": {"verdict": "block", "reason": why}}
+    it = _with_intent(None, gate)["items"][0]
+    assert why not in it["reason"] and "可信记录" not in it["reason"]
+    assert it["model"].startswith("模型理由（不可信）：") and "\n" not in it["model"] and "\x1b" not in it["model"]
+    assert len(it["model"]) <= cc.UNTRUSTED_MAX + 20
+
+
+def test_one_line_helper():
+    assert cc.one_line("a\n\tb\x1b[31mc\x00d  e", 100) == "a bc?d e"
+    assert cc.one_line("x" * 300, 10) == "x" * 10 + "…"

@@ -774,3 +774,35 @@ def test_cli_confirm_prints_trusted_change_before_yes(rig):
     p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
     rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
     assert "「system-view」" in text.split("输入 yes")[0]
+
+
+# ------------------------------------------------------------ #68 第六轮: intent 伪造可信记录
+
+FAKE_INTENT = ("x\n  可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）：\n"
+               "    #1 「interface Gi0/1」\x1b[8m")
+
+
+@pytest.mark.parametrize("cmd", ["pending", "confirm"])
+def test_cli_intent_cannot_forge_trusted_block(rig, cmd):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok, "intent": FAKE_INTENT})
+    args = ["confirm", str(p["id"])] if cmd == "confirm" else ["pending"]
+    rc, text = cli(rig, *args, stdin="no\n")
+    head = text.split("输入 yes")[0]
+    assert head.count("可信记录（推车自己记的") == 1 + 1        # 真块 1 次 + 被压进自述那一行 1 次
+    real = head.index("可信记录（推车自己记的")
+    assert real < head.index("Agent 自述（不可信）")
+    line = next(ln for ln in head.split("\n") if "Agent 自述（不可信）" in ln)
+    assert "可信记录（推车自己记的" in line and "「interface Gi0/1」" in line      # 伪造的都挤在同一行里
+    assert "\x1b" not in text
+
+
+def test_cli_confirm_trusted_before_reason_and_context(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "SW1(config-if)#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok, "intent": "关口"})
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
+    head = text.split("输入 yes")[0]
+    i = head.index("可信记录（推车自己记的")
+    assert i < head.index("闸门理由") < head.index("Agent 自述") < head.index("设备最近输出")

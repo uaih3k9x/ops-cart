@@ -1338,3 +1338,14 @@ def test_round5_plain_lines_not_masked(line):
 def test_prompt_with_secret_assignment_not_exempt():
     blob = "\n".join(sw.device_context("admin@db:/srv/token=Hunter2$")["lines"])
     assert "Hunter2" not in blob
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA"),
+    ("authorization: Bearer abc.def.ghi", "abc.def.ghi"),
+    ("usermod -p '$6$salt$hash' bob", "salt$hash"), ("useradd -p Hunter2 bob", "Hunter2"),
+    ("credentials=AKIAEXAMPLEKEY", "AKIAEXAMPLEKEY"), ("aws_credentials: S3cr3t", "S3cr3t"),
+])
+def test_round6_secret_forms_masked(line, secret):
+    blob = "\n".join(sw.device_context(line)["lines"])
+    assert secret not in blob, blob

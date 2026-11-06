@@ -428,7 +428,8 @@ $("#logout").onclick = async () => { await api("/api/logout", {}); location.relo
 // 网页只能往"停"的方向走; 确认发送和解除急停在推车车机上. 请求先排队, 推车执行后下一轮刷新就看得到
 function agentItem(it) {
   return `<div class="item"><div class="want">${esc(it.head)}</div><div class="dim">${esc(it.meta)}</div>
-    <div>${esc(it.reason)}</div>${it.danger ? `<div class="bad">${esc(it.danger)}</div>` : ""}
+    <div>${esc(it.reason)}</div>${it.model ? `<div class="dim">${esc(it.model)}</div>` : ""}
+    ${it.intent ? `<div class="dim">${esc(it.intent)}</div>` : ""}${it.danger ? `<div class="bad">${esc(it.danger)}</div>` : ""}
     ${it.note ? `<div class="bad">${esc(it.note)}</div>` : ""}
     ${it.context ? `<pre class="dim" style="white-space:pre-wrap;margin:4px 0">${esc(it.context)}</pre>` : ""}
     <button class="btn danger" data-reject="${it.id}">拒绝</button></div>`;

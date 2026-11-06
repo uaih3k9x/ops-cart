@@ -619,11 +619,6 @@ def local_human(env, pid, stat=read_stat, tty=False):
 CLI_CMDS = ("pending", "confirm", "reject", "estop", "resume", "requests")
 
 
-def _intent(item):
-    it = (item.get("gate") or {}).get("intent")
-    return f"\n      意图: {it}" if it else ""
-
-
 def _context(item):
     ctx = item.get("context") or {}
     lines = ctx.get("lines") or []
@@ -650,10 +645,12 @@ def _print_view(v, out):
     for s in v["slots"]:
         if any(p["slot"] == s["slot"] for p in v["pending"]):
             print(f"  槽位 {s['slot']} " + cc.card(v, s["slot"])["trusted"].replace("\n", "\n    "), file=out)
-    for p in v["pending"]:
+    for p in v["pending"]:              # 可信记录已在上面; 下面是 Agent / 模型 / 设备给的, 都压成一行或加 "| "
         warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
+        shown = next(x for x in cc.card(v, p["slot"])["items"] if x["id"] == p["id"])
+        extra = "".join(f"\n      {x}" for x in (shown["reason"], shown["model"], shown["intent"]) if x)
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"
-              f"\n      {p.get('reason')}{_intent(p)}{_context(p)}", file=out)
+              f"{extra}{_context(p)}", file=out)
     for h in v["history"][-5:]:
         print(f"  最近 #{h['id']} 槽位 {h['slot']} {h['cmd']!r} -> {h['status']}"
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)
@@ -722,16 +719,18 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         print(f"没有挂起的 #{a.id}", file=out)
         return 1
     warn = f"\n  !!! 高危词: {', '.join(item['danger'])}" if item.get("danger") else ""
-    shown = next(x for x in cc.card(store.view(), item["slot"])["items"] if x["id"] == a.id)
+    card = cc.card(store.view(), item["slot"])
+    shown = next(x for x in card["items"] if x["id"] == a.id)
     ctx = shown.get("context")
     if ctx:                             # 设备输出每行前加 "| ": 设备打出来的字不能伪装成推车自己的提示 (#65 第四轮)
         head_line, _, body = ctx.partition("\n")
         ctx = head_line + "\n" + _device_lines(body)
-    for extra in (shown.get("note"), cc.card(store.view(), item["slot"])["trusted"], ctx):
+    # 顺序 (#65 第六轮): 推车自己的 (可信记录、提示、闸门理由) 在前, Agent / 模型 / 设备给的 (都不可信) 在后
+    for extra in (card["trusted"], shown.get("note"), shown["reason"], shown["model"], shown["intent"], ctx):
         if extra:
             warn += "\n  " + extra.replace("\n", "\n    ")
     print(f"槽位 {item['slot']} ({item.get('name') or '名字未知'}) 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
-          f"\n  {item.get('reason')}{_intent(item).replace('      ', '  ')}{warn}\n确认发送? 输入 yes: ", end="", file=out)
+          f"{warn}\n确认发送? 输入 yes: ", end="", file=out)
     out.flush()
     if stdin.readline().strip() != "yes":
         print("没输 yes, 不发 (还挂着)", file=out)

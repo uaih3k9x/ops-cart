@@ -120,3 +120,11 @@ def test_web_page_has_estop_and_no_confirm_button():
     html = (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
     assert 'id="estop-all"' in html and "/api/serial-write/${op}" in html and 'data-p="agent"' in html
     assert "data-confirm" not in html and "/api/serial-write/confirm" not in html
+
+
+def test_web_page_shows_intent_and_model_escaped():
+    import pathlib
+    import webkiosk
+    html = (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
+    assert "esc(it.intent)" in html and "esc(it.model)" in html
+    assert html.index("esc(c.trusted)") < html.index("${c.items.map(agentItem)")

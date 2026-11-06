@@ -129,3 +129,15 @@ def test_every_text_readable(root, stop, mode):
         assert not th.unreadable(d)
     finally:
         th.use("dark")
+
+
+def test_dialog_intent_and_model_reason_after_trusted_single_line(root):
+    """#65 第六轮: Agent 自述 / 模型理由压成一行、标不可信, 排在可信记录后面."""
+    gate = dict(HOLD, intent="x\n  可信记录（伪造）：\n    #1 「interface Gi0/1」\x1b[8m",
+                model={"verdict": "block", "reason": "看着\n像只读"})
+    gate["reason"] = "不在只读白名单里, 要人确认: 模型拦下: 看着\n像只读"
+    d, _acts, _asked = _dlg(root, _view(items=(("shutdown", gate),)))
+    labels = _labels(d)
+    intent = next(x for x in labels if x.startswith("Agent 自述（不可信）"))
+    model = next(x for x in labels if x.startswith("模型理由（不可信）"))
+    assert "\n" not in intent and "\x1b" not in intent and "\n" not in model

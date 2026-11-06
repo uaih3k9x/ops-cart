@@ -93,6 +93,31 @@ def summary(states):
 
 # ------------------------------------------------------------ 确认框
 
+UNTRUSTED_MAX = 200         # Agent 自述 / 模型理由显示多少字
+
+
+def one_line(text, limit=UNTRUSTED_MAX):
+    """不可信文字 -> 一行: 删 ANSI 转义, 所有空白 (含换行、U+2028) 压成一个空格, 控制 / 格式字符换成 ?, 截短.
+    防它在审批界面上伪造出推车自己的块 (#65 第六轮)."""
+    s = sw._show(" ".join(sw._ANSI.sub("", str(text or "")).split())).strip()
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _intent(item):
+    it = (item.get("gate") or {}).get("intent")
+    return f"Agent 自述（不可信）：（{one_line(it)}）" if it else ""
+
+
+def _reasons(item):
+    """闸门理由 -> (推车自己的部分, 模型理由行). 第 2 层模型的理由单独标不可信、压成一行."""
+    reason = str(item.get("reason") or "-")
+    m = ((item.get("gate") or {}).get("model") or {}).get("reason")
+    if isinstance(m, str) and m.strip():
+        own = reason.replace(m, "").rstrip(" :：") if m in reason else reason
+        return own, f"模型理由（不可信）：{one_line(m)}"
+    return reason, ""
+
+
 def _want(item):
     if item.get("kind") == "key":
         return f"Agent 想按：{KEY_LABEL.get(item['cmd'], item['cmd'])}"
@@ -113,7 +138,7 @@ def _note(item):
     gate = item.get("gate") or {}
     if gate.get("vendor") == "huawei" and gate.get("vendor_registered") is True:
         return ""
-    return "注意：这类设备的提示符不带对象名，提示符不能证明作用对象；先看上面的可信记录再确认"
+    return "注意：这类设备的提示符不带对象名，提示符不能证明作用对象；先看「可信记录」一块再确认"
 
 
 TRUST_CMD_MAX = 60          # 可信记录里每条命令显示多少字
@@ -135,16 +160,14 @@ def _entry(e):
     return f"  #{e['id']} 「{cmd}」{by}{mark}"
 
 
-# 进入对象 / 子视图的命令 (各厂商合集, 小写比首词; int 是 interface 的常用缩写). 只用来单独标出"最近进的是哪个对象".
-ENTER_VIEW = re.compile(r"(?i)^\s*(?:interface|int|vlan|router|line|vrf|policy-map|class-map|route-map|controller"
-                        r"|user-interface|aaa|bgp|ospf|ospfv3|isis|rip|acl|port-group|ip\s+vpn-instance|cd)\b")
 LOST_WARN = ("  ！！更早的可能改变视图 / 对象的记录已被挤掉，无法确认作用对象 —— 建议拒绝，"
              "让 Agent 重新进入目标视图后再提交")
 
 
 def _trusted(slot_view):
     """推车自己记的本槽位实际发出的命令 (#65): 可信, 和设备输出分开显示; 没有记录也明说.
-    留着的可能改视图的命令全显示 (最多 CHANGE_KEEP 条), 另单独标出最近一条进入对象 / 视图的命令 (第五轮)."""
+    留着的可能改视图的命令全显示 (最多 CHANGE_KEEP 条). 不替人下"现在在哪个对象上"的结论: 缩写、视图内命令、
+    exit / telnet 推车认不准 (第六轮删掉了那一行)."""
     tr = slot_view.get("trusted") or {}
     changes, recent = tr.get("changes") or [], tr.get("recent") or []
     head = "可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）："
@@ -154,8 +177,6 @@ def _trusted(slot_view):
     rows = [head]
     if tr.get("lost"):
         rows += [lost, LOST_WARN]
-    view = next((e for e in reversed(changes) if e.get("kind") == "line" and ENTER_VIEW.match(str(e.get("cmd", "")))), None)
-    rows.append("  最近一条进入对象 / 视图的命令：" + (_entry(view).strip().split(" ", 1)[1] if view else "没有记录"))
     rows += [_entry(e) for e in changes] if changes else \
         ([] if tr.get("lost") else ["  （无可能改变视图 / 对象的命令记录）"])
     if tr.get("after"):
@@ -183,7 +204,8 @@ def card(view, n):
     for p in items:
         out.append({"id": p["id"], "head": _want(p),
                     "meta": f"#{p['id']} · 来自 {p['who']} · {p.get('age_s', 0)} 秒前",
-                    "reason": f"闸门理由：{p.get('reason') or '-'}",
+                    "reason": f"闸门理由：{one_line(_reasons(p)[0], 300)}", "model": _reasons(p)[1],
+                    "intent": _intent(p),
                     "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else "",
                     "context": _context(p), "note": _note(p)})
     return {"title": f"操作头 {n}" + (f" · {name}" if name else ""), "status": status,
