@@ -243,3 +243,134 @@ def test_label_status_and_print_take_printer_lock():
     tools["label_printer_status"].fn({})
     tools["label_print"].fn({"kind": "text", "labels": [{"big": "A", "small": "B"}]})
     assert log == [("status", True), ("status", True), ("write", True)]
+
+
+# ------------------------------------------------------------ 第二轮审查: 接线层 + 设备锁白名单 (#49)
+#
+# 只读档允许的写 (白名单, 文档第十六节同列): mcp-audit.log (审计, 本测试不接); 设备互斥锁 printer.lock / snap.lock
+# (flock + snap.lock 里记上次抓帧时刻); /run/ops-cart 下的临时 PNG (抓完即删); 往打印机写 ESC !? (这里用假件).
+# 除此之外: 不碰 Store.run / LeaseStore._tx / PXE Store.run, 不写事件, 不改任何状态文件.
+
+ALLOWED_LOCKS = {"printer.lock", "snap.lock"}
+
+
+def _wire_real_tools(d, monkeypatch, events, forbidden):
+    """把 cm.real_tools 用到的真机读数换成 tmp 下的真 Store 和假设备; 写路径一律打桩记账并抛异常."""
+    import cart_ocr
+    import cart_snap
+    import dash_core
+    import kvm_broker
+    import kvm_core
+    clock = lambda: T0                                              # noqa: E731
+    sp = os.path.join(d, "serial-write.json")
+    RS, RP, RL = ms.Store, mcp_pxe.Store, mcp_kvm.LeaseStore
+    monkeypatch.setattr(ms, "Store", lambda: RS(path=sp, log_dir=d, clock=clock, event=lambda *a: events.append(a),
+                                                on_estop_all=lambda by: events.append(("estop_all", by))))
+    monkeypatch.setattr(mcp_pxe, "Store", lambda: RP(path=os.path.join(d, "pxe-req.json"),
+                                                     log_path=os.path.join(d, "pxe-req.log"), clock=clock,
+                                                     event=lambda *a: events.append(a),
+                                                     stopped=lambda: mcp_pxe.serial_stopped(sp)))
+    monkeypatch.setattr(mcp_kvm, "LeaseStore", lambda: RL(path=os.path.join(d, "kvm-lease.json"), clock=clock,
+                                                          stopped=lambda: False, log_path=os.path.join(d, "kvm.log"),
+                                                          event=lambda *a: events.append(a)))
+
+    def spy(name):
+        def f(*a, **k):
+            forbidden.append(name)
+            raise RuntimeError(f"只读档不该走 {name}")
+        return f
+    monkeypatch.setattr(RS, "run", spy("serial Store.run"))
+    monkeypatch.setattr(RP, "run", spy("pxe Store.run"))
+    monkeypatch.setattr(RL, "_tx", spy("LeaseStore._tx"))
+    monkeypatch.setattr(kvm_broker, "BrokerCh", spy("BrokerCh (open 设备)"))
+
+    slots = [{"dev": f"/dev/con-{n}", "present": True, "baud": "9600", "count": 0} for n in range(1, 5)]
+    monkeypatch.setattr(cm, "real_slots", lambda: slots)
+    monkeypatch.setattr(ms, "real_slots", lambda: slots)
+    monkeypatch.setattr(cm, "conbroker_tail", lambda dev, n: "<SW1>")
+    monkeypatch.setattr(cm, "read_pxe", lambda: {"mode": "rescue"})
+    monkeypatch.setattr(dash_core, "read", lambda: {"ts": T0})
+    monkeypatch.setattr(kvm_core, "ports", lambda: {"SN1": "/dev/kvm-x"})
+    monkeypatch.setenv("OPS_KVM_SOCK", os.path.join(d, "no-broker.sock"))
+    monkeypatch.setattr(mcp_label, "real_status", lambda: 0)
+    monkeypatch.setattr(mcp_label, "PRINTER_LOCK", os.path.join(d, "printer.lock"))
+    monkeypatch.setattr(cart_snap, "SNAP_LOCK", os.path.join(d, "snap.lock"))
+    monkeypatch.setattr(cart_snap, "RUN_DIR", d)
+    monkeypatch.setattr(cart_snap, "running_mpv_device", lambda: None)
+    monkeypatch.setattr(cart_snap, "default_device", lambda: "/dev/video0")
+
+    def fake_ffmpeg(dev, out):
+        with open(out, "wb") as f:
+            f.write(b"\x89PNG")
+        return True, ""
+    monkeypatch.setattr(cart_snap, "via_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(cart_ocr, "ocr_best", lambda path, lang: ([], "fake"))
+
+
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+def test_real_tools_readonly_end_to_end(tmp_path, monkeypatch, scenario):
+    d = str(tmp_path)
+    SCENARIOS[scenario](d)
+    events, forbidden, locked = [], [], []
+    _wire_real_tools(d, monkeypatch, events, forbidden)
+    before = _snapshot(d)
+    real_flock = fcntl.flock
+
+    def flock(fd, op):
+        if op & (fcntl.LOCK_EX | fcntl.LOCK_SH):
+            locked.append(os.fstat(fd).st_ino)
+        return real_flock(fd, op)
+    monkeypatch.setattr(fcntl, "flock", flock)
+
+    server = cm.make_server("readonly", None)
+    assert set(server.tools) == {
+        "list_threads", "read_output", "screenshot", "cart_status", "pxe_status", "pending_list", "pxe_clients",
+        "pxe_requests", "kvm_status", "screen_ocr", "label_preview", "label_printer_status", "label_abbrev_propose"}
+
+    def call(name, args=None):
+        return server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": args or ARGS.get(name, {})}})["result"]
+
+    results = {name: call(name) for name in sorted(server.tools)}
+    again = call("screenshot")                                      # 只读档冷却 (比动手档长): 紧接着再截就拒
+    again_ocr = call("screen_ocr")                                  # OCR 也走同一条限速
+    assert forbidden == [], forbidden
+    assert events == []
+    for name in ("list_threads", "pending_list", "kvm_status", "pxe_requests", "label_printer_status"):
+        assert results[name]["isError"] is False, (name, results[name])
+    assert json.loads(results["kvm_status"]["content"][0]["text"])["broker"] is False
+    assert again["isError"] is True and "刚抓过" in again["content"][0]["text"]
+    assert again_ocr["isError"] is True and "刚抓过" in again_ocr["content"][0]["text"]
+    after = _snapshot(d)
+    inodes = {os.stat(p).st_ino: os.path.basename(p) for p in after}
+    assert {inodes.get(i, "?") for i in locked} == ALLOWED_LOCKS      # 只拿这两把设备锁, 别的锁一把都不拿
+    changed = {os.path.basename(p) for p in set(after) | set(before) if after.get(p) != before.get(p)}
+    assert changed <= ALLOWED_LOCKS, changed                        # 临时 PNG 抓完就删, 不留
+    assert not [p for p in after if p.endswith(".png")]
+
+
+def test_readonly_pxe_requests_shows_expiry_in_history(tmp_path):
+    d = str(tmp_path)
+    _pxe_expired(d)
+    st = mcp_pxe.Store(path=os.path.join(d, "pxe-req.json"), log_path=os.path.join(d, "l"), clock=lambda: T0,
+                       event=None, stopped=lambda: False)
+    before = _snapshot(d)
+    view = st.public_view()
+    assert view["pending"] == [] and [h["status"] for h in view["history"]] == ["expired"]
+    assert _snapshot(d) == before
+
+
+# ------------------------------------------------------------ 标签机锁打不开: 不拒打, 退回进程内锁并记一条
+
+def test_printer_lock_unopenable_falls_back(tmp_path):
+    notes = []
+    with mcp_label.printer_lock(str(tmp_path / "no" / "such" / "printer.lock"), note=notes.append):
+        pass
+    assert notes and "printer.lock" in notes[0]
+    log = []
+    bad = str(tmp_path / "missing" / "printer.lock")
+    tools = {t.name: t for t in mcp_label.build_label_tools(
+        write=lambda data: log.append("write"), status=lambda: 0, abbrev=lambda: ({}, "x"),
+        xlock=lambda: mcp_label.printer_lock(bad, note=notes.append))}
+    tools["label_print"].fn({"kind": "text", "labels": [{"big": "A", "small": "B"}]})
+    assert log == ["write"]

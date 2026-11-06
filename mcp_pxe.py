@@ -71,11 +71,13 @@ class Store:
                 self._log(book.events)
 
     def public_view(self):
-        """只读档用 (#49): 不加锁不写盘不写日志, 过期 / 急停只在视图里算. secret=False: 绝不带确认码和摘要.
-        读不了 / 读不懂 = 没有申请."""
+        """只读档用 (#49): 不加锁不写盘不写日志; 在内存里的 Book 上 tick 一次 (过期 / 急停作废进 history,
+        事件丢掉不落盘). secret=False: 绝不带确认码和摘要. 读不了 / 读不懂 = 没有申请."""
         now = self.clock()
         try:
-            return pr.Book.from_text(_read(self.path), now).view(now, stopped=self.stopped(), secret=False)
+            b, stopped = pr.Book.from_text(_read(self.path), now), self.stopped()
+            b.tick(now, stopped)
+            return b.view(now, stopped=stopped, secret=False)
         except Exception:               # noqa: BLE001
             return {"pending": [], "history": []}
 

@@ -189,7 +189,27 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
      `command=` 会忽略客户端要跑的命令；`restrict` 关掉端口转发、X11 / agent 转发和 pty。
   3. **这个账号没有密码**（`passwd -l agent-ro`），不能用密码登录，也不能 `su`。
   4. **不进设备组**（`dialout` `video` `lp`，也不进 `wheel`），也不进 serial.conf 里那个 user 的组。
-  - **为什么要同时配**：只配 sudoers 的话，钥匙还能拿普通 shell、开端口转发，去连本机的键鼠代理 socket、conbroker、动手档 HTTP 口；只配 `command=` 的话，哪天这把钥匙或 `command=` 配错了，sudo 也不会再兜底。不进设备组是最后一道：就算拿到 shell，也碰不到串口、采集卡和打印机。
+  5. **sshd 服务端兜底**：`authorized_keys` 里的选项靠这个文件本身没被改过，账号自己能写的话它就能把 `command=` 删掉。所以还要：
+     - `authorized_keys` 归 root 所有（`root:root 0644`，目录也一样），或者干脆放在 `/etc/ssh/authorized_keys/%u`；
+     - 在 `sshd_config` 末尾加上：
+
+```
+Match User agent-ro
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+    ForceCommand sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly
+    DisableForwarding yes
+    PermitTTY no
+    PermitTunnel no
+    PasswordAuthentication no
+```
+
+     `ForceCommand` 由 sshd 强制执行，不看 `authorized_keys`。`DisableForwarding` 一次关掉端口转发、X11 和 agent 转发。
+     账号要有**真的登录 shell**（如 `/bin/bash`）：sshd 是用登录 shell 去跑 `ForceCommand` 的，设成 `nologin` 的话服务根本起不来。别的口子已经由上面这几条堵住。
+  - **为什么要同时配**：
+    - 只配 sudoers：钥匙还能拿普通 shell、开端口转发，去连本机的键鼠代理 socket、conbroker、动手档 HTTP 口。
+    - 只配 `command=`：哪天这把钥匙或 `command=` 配错了，sudo 也不会再兜底。
+    - sshd 的 `Match`：哪怕 `authorized_keys` 被改了，它也照样生效。
+    - 不进设备组是最后一道：就算拿到 shell，也碰不到串口、采集卡和打印机。
 - **审计**：`mcp-audit.log` 每行多一个 `profile`。HTTP 认证失败那行也带。
 - **协议**：只读档 `serverInfo.name` 是 `ops-cart-readonly`，说明文字里不提租约和写工具；动手档还是 `ops-cart`。
 - **Agent 接法示例**（地址、令牌、名字都是示例值）：
@@ -197,7 +217,8 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 ```
 # 只读档, 走 ssh (推荐先只接这个; 要跑什么由 authorized_keys 的 command= 决定, 客户端不用写)
 claude mcp add cart-ro -- ssh agent-ro@192.0.2.10
-# 只读档, 走 HTTP (推车上: sudo python3 /opt/pxe/cart_mcp.py http --profile readonly)
+# 只读档, 走 HTTP (推车上: sudo systemctl enable --now cart-mcp-ro.service,
+#   单元里就是 cart_mcp.py http --profile readonly; 临时手跑: sudo python3 /opt/pxe/cart_mcp.py http --profile readonly)
 claude mcp add --transport http cart-ro http://192.0.2.10:8766/mcp --header "Authorization: Bearer <只读令牌>"
 # 动手档 (人盯着的会话才接)
 claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
@@ -205,11 +226,27 @@ claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profil
 
   其他 MCP 客户端照同样的命令行 / URL 配，两个服务用不同的服务名（如 `cart-ro` / `cart`），可以分别启用。
 - **只读档不碰状态文件**（审查后补）：只读档的 `list_threads`（写入者）、`pending_list`、`kvm_status`、`pxe_requests` 走 `mcp_serial.peek` / `mcp_kvm.peek` / `mcp_pxe.Store.public_view`。这几个入口不加锁、不写盘、不写日志，过期和读不懂只在视图里算掉。动手档的工具读状态时照旧加锁落盘，比如过期租约要作废、状态读不懂要全部急停并落盘。所以只读调用不会因为状态文件坏了就触发全部急停，也不会作废别人在等的命令或 PXE 申请。`public_view` 固定 `secret=False`，确认码和清单摘要不会出现在 Agent 的回包里。`tests/test_mcp_readonly_invariant.py` 用真的 Store 在临时目录里覆盖几种情况：状态文件坏了、租约过期、PXE 申请过期、空目录。逐个调用只读档的每个工具，断言没拿锁、没写事件、文件内容和 mtime 都不变。
+- **只读档会写什么（白名单，有意的例外）**：只读档不改任何状态文件、不写执行绪日志和 `events.log`，但下面这些会写：
+  1. **审计** `/var/log/ops-cart/mcp-audit.log`：每次调用一行，带 `profile=readonly`。查"只读 Agent 都看了什么"要靠它，所以这是有意的。
+  2. **设备互斥锁** `/run/ops-cart/printer.lock`、`/run/ops-cart/snap.lock`：只用 flock，`snap.lock` 里还记着上次抓帧的时刻。
+  3. **临时截图** `/run/ops-cart/cart-snap-*.png`：私有文件，抓完马上删。
+  4. **往打印机写 `ESC !?`**：`label_printer_status` 读状态要先写这个查询，不出纸。
+  5. **打印机锁打不开时**（`/run/ops-cart` 不在之类），在 `events.log` 记一条 `[label]`。
+
+  不变量测试 `tests/test_mcp_readonly_invariant.py` 分两层：
+  - 直接调 `cm.real_tools("readonly")`：把真 Store 指到临时目录，把 `Store.run` / `LeaseStore._tx` / PXE `Store.run` / `BrokerCh` 打桩成"一调就记账并报错"，逐个调只读档的每个工具。断言这些一次都没走到；锁只拿了 `printer.lock` 和 `snap.lock`；目录里只有这两个文件变了，临时 PNG 没留下。
+  - 用变异确认这些测试真能抓到接线错误：把接线改回动手档的入口、去掉打印机锁、`kvm_status` 改回 `open` 设备、截图 / OCR 不传只读限速，这些改法测试都会红。
 - **共享设备**：
-  - `label_printer_status` 和 `label_print` 用进程间锁 `/run/ops-cart/printer.lock`（flock，等 10 秒拿不到就报忙），两档各起一个进程也不会抢 `ESC !?` 的回字节；进程内原来的锁还在。
-  - 截图和 OCR 走 ffmpeg 那一路时用 `/run/ops-cart/snap.lock`：同时只有一个 ffmpeg，上次抓完 3 秒内不再开卡，免得只读 Agent 连着截图把采集卡一直占着。
-  - 走 mpv 那一路的截图命令带 `no-osd`，预览画面上不闪提示字。
-  - `kvm_status` 探测键鼠代理时只发 `status` 控制操作，不 `open` 设备。
+  - **标签机**：`label_printer_status` 和 `label_print` 用进程间锁 `/run/ops-cart/printer.lock`（flock，等 10 秒拿不到就报忙），两档各起一个进程也不会抢 `ESC !?` 的回字节；进程内原来的锁还在。
+    - 锁文件打不开时**不拒打**：退回只用进程内锁，并在 `events.log` 记一条（打印行为和以前一样）。
+    - 人手工 `cat > /dev/usb/lp0` 不经过这把锁。Agent 正在打印或查状态时手工打，可能遇到 `EBUSY` 或者内容交错，所以别同时进行。
+  - **截图 / OCR** 用 `/run/ops-cart/snap.lock`，两档规则不一样：
+    - 动手档只在走 ffmpeg 时排队：等锁，上次抓完 3 秒内就等冷却过去，最多等 25 秒，不直接拒。
+    - 只读档不管走 mpv 还是 ffmpeg、是截图还是 OCR，都要过这把锁：两次之间至少 10 秒，有人在抓或者还在冷却就直接拒（回"刚抓过，N 秒后再试"），免得只读 Agent 把采集卡和 CPU 一直占着，挤掉人盯着的会话。
+    - 冷却时刻两档共用，所以只读档会让着动手档。
+  - **mpv 截图**先发命名参数形式，带 `"_flags": ["no-osd"]`，预览画面上不闪提示字。mpv 明确回错误时（老版本不认命名参数），退回旧的数组形式再试一次。取舍：老 mpv 上截图照样能用，代价是预览上可能闪一下提示字。超时、连不上不重试。
+  - **`kvm_status`** 探测键鼠代理时只发 `status` 控制操作，不 `open` 设备。
+- **只读 `pxe_requests`**：在内存里的那份状态上算一次过期和急停作废（事件丢掉、不落盘），所以过期或作废的申请会出现在 `history` 里，和动手档看到的一致。
 - **`destructiveHint`**：只读工具一律 `false`。动手工具按实际标：
   - `true`：`send_command` `send_key` `kvm_key` `kvm_type` `pxe_request` `pxe_retire`。
   - `false`：`estop`（只停、不动设备；标成破坏性的话，客户端会先问人，急停不能等）、`label_print`（最坏废一张）、各个租约工具（只是记账）。

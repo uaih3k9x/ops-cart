@@ -496,8 +496,8 @@ def broker_up(_port):
     return broker_probe()
 
 
-def real_ocr(dev, lang):
-    path, why, used = cart_snap.grab(dev)
+def real_ocr(dev, lang, readonly=False):
+    path, why, used = cart_snap.grab(dev, readonly=readonly)     # 只读档限速更紧 (#49)
     if path is None:
         raise mc.ToolError(why)
     try:
@@ -513,5 +513,6 @@ def real_ocr(dev, lang):
 
 
 def real_tools(store=None, readonly=False):
-    return build_tools(store or LeaseStore(), ports=kvm_core.ports, opener=real_opener, ocr=real_ocr,
+    ocr = (lambda dev, lang: real_ocr(dev, lang, readonly=True)) if readonly else real_ocr
+    return build_tools(store or LeaseStore(), ports=kvm_core.ports, opener=real_opener, ocr=ocr,
                        wol=wol_core.send, broker_up=broker_up, readonly=readonly)

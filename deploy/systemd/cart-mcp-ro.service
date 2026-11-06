@@ -1,0 +1,23 @@
+[Unit]
+Description=ops-cart MCP 只读档 (#49: 只注册只看的工具, 键鼠/写串口/WOL/PXE 申请/打印都不在; 只绑本机和 tailnet 地址, 要只读令牌)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# 不依赖 kiosk.service / cart-dash / cart-mcp: 那边挂了工具各自报错, 服务照样在
+
+[Service]
+# root: 截图要采集卡和 mpv 的 socket (root), 读串口输出要 sudo -u <serial.conf 的 user> 跑 conbroker tail.
+# 只读状态文件 (不加锁不写盘); 会写的只有审计 mcp-audit.log、设备锁 printer.lock / snap.lock、抓完即删的临时截图.
+# 令牌在 /etc/ops-cart/mcp.json 的 readonly 段 (port 默认 8766, tokens); 没有 readonly 段 = 谁都进不来, 不借动手档令牌.
+# 和动手档 cart-mcp.service 可以同时开, 两个进程两个端口. 默认不开机自启.
+ExecStart=/usr/bin/python3 /opt/pxe/cart_mcp.py http --profile readonly
+WorkingDirectory=/opt/pxe
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

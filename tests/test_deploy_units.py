@@ -140,3 +140,14 @@ def test_pxe_firewall_zone_in_repo_opens_what_pxe_needs():
     xml = (UNITS.parent / "firewalld" / "pxe.xml").read_text()
     for port, proto in ((67, "udp"), (68, "udp"), (69, "udp"), (4011, "udp"), (80, "tcp"), (8000, "tcp")):
         assert f'port="{port}" protocol="{proto}"' in xml
+
+
+def test_cart_mcp_readonly_unit():
+    """#49: 只读档 HTTP 单独一个单元, 加固同 cart-mcp, 默认不开 (验收表里按需, 见 test_accept_core)."""
+    u = unit("cart-mcp-ro.service")
+    body = "\n".join(l for l in u.splitlines() if not l.lstrip().startswith("#"))
+    assert "ExecStart=/usr/bin/python3 /opt/pxe/cart_mcp.py http --profile readonly" in body
+    for k in ("UMask=0077", "PrivateTmp=yes", "Restart=on-failure", "ProtectKernelTunables=yes",
+              "WantedBy=multi-user.target"):
+        assert k in body, k
+    assert "--bind" not in body and "kiosk.service" not in body

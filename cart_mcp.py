@@ -175,8 +175,8 @@ def conbroker_tail(dev, n):
     return r.stdout.rstrip("\n")
 
 
-def real_snap(dev):
-    path, why, used = cart_snap.grab(dev)
+def real_snap(dev, readonly=False):
+    path, why, used = cart_snap.grab(dev, readonly=readonly)     # 只读档限速更紧 (#49)
     if path is None:
         raise mc.ToolError(why)
     try:
@@ -209,7 +209,8 @@ def real_tools(profile=mc.DEFAULT_PROFILE):
     """按档位挑好的工具; 档位不认识抛 ValueError."""
     ro = mc.check_profile(profile) == mc.READONLY       # 只读档: 各模块只给只读工具, 读状态走 peek (不加锁不写盘)
     store = mcp_serial.Store()
-    tools = (build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap, state=dash_core.read, pxe=read_pxe,
+    snap = (lambda dev: real_snap(dev, readonly=True)) if ro else real_snap
+    tools = (build_tools(slots=real_slots, tail=conbroker_tail, snap=snap, state=dash_core.read, pxe=read_pxe,
                          writer=lambda: mcp_serial.writers(store, readonly=ro))
              + mcp_serial.real_tools(conbroker_tail, store, readonly=ro)    # 写串口 (#21)
              + mcp_pxe.real_tools(readonly=ro)          # PXE 解锁申请 (#24): 只挂起, 人在车机上确认

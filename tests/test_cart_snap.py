@@ -55,12 +55,32 @@ def _fake_mpv(reply_error="success", write=True, extra_lines=()):
         for ln in extra_lines:
             b.sendall(ln.encode() + b"\n")
         if write:
-            with open(req["command"]["filename"], "wb") as f:
+            cmd = req["command"]
+            with open(cmd["filename"] if isinstance(cmd, dict) else cmd[1], "wb") as f:
                 f.write(b"PNG")
         b.sendall(json.dumps({"request_id": req["request_id"] + 1, "error": "success"}).encode() + b"\n")
         b.sendall(json.dumps({"request_id": req["request_id"], "error": reply_error}).encode() + b"\n")
     threading.Thread(target=serve, daemon=True).start()
     return a
+
+
+def _fake_mpv_named_unsupported():
+    """旧 mpv: 命名参数形式回 invalid parameter, 数组形式照常. 每次 connect 一条新连接."""
+    def connect():
+        a, b = socket.socketpair()
+
+        def serve():
+            req = json.loads(b.makefile().readline())
+            cmd = req["command"]
+            if isinstance(cmd, dict):
+                b.sendall(json.dumps({"request_id": req["request_id"], "error": "invalid parameter"}).encode() + b"\n")
+                return
+            with open(cmd[1], "wb") as f:
+                f.write(b"PNG")
+            b.sendall(json.dumps({"request_id": req["request_id"], "error": "success"}).encode() + b"\n")
+        threading.Thread(target=serve, daemon=True).start()
+        return a
+    return connect
 
 
 def test_via_mpv_waits_for_matching_reply(tmp_path):
@@ -225,12 +245,58 @@ def test_ffmpeg_slot_mutex_and_cooldown(tmp_path):
         pass
 
 
-def test_grab_reports_busy_instead_of_running_ffmpeg(tmp_path, monkeypatch):
+def test_grab_readonly_refuses_during_cooldown(tmp_path, monkeypatch):
     ran = []
     monkeypatch.setattr(cs, "running_mpv_device", lambda: None)
     monkeypatch.setattr(cs, "via_ffmpeg", lambda dev, out: ran.append(dev) or (True, ""))
     monkeypatch.setattr(cs, "SNAP_LOCK", str(tmp_path / "snap.lock"))
     out = str(tmp_path / "a.png")
-    assert cs.grab("/dev/video0", out)[0] == out
-    path, why, _ = cs.grab("/dev/video0", out)
+    assert cs.grab("/dev/video0", out, readonly=True)[0] == out
+    path, why, _ = cs.grab("/dev/video0", out, readonly=True)
     assert path is None and "刚抓过" in why and len(ran) == 1
+
+
+def test_readonly_cooldown_longer_than_act():
+    assert cs.READONLY_COOLDOWN_S > cs.FFMPEG_COOLDOWN_S
+
+
+def test_grab_readonly_limits_mpv_route_too(tmp_path, monkeypatch):
+    shots = []
+    monkeypatch.setattr(cs, "running_mpv_device", lambda: "/dev/video0")
+    monkeypatch.setattr(cs.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(cs, "via_mpv", lambda out: shots.append(out) or True)
+    monkeypatch.setattr(cs, "SNAP_LOCK", str(tmp_path / "snap.lock"))
+    out = str(tmp_path / "a.png")
+    assert cs.grab(None, out, readonly=True)[0] == out
+    assert cs.grab(None, out, readonly=True)[0] is None and len(shots) == 1
+    assert cs.grab(None, out)[0] == out                                # 动手档走 mpv 不限 (不占采集卡)
+
+
+def test_act_waits_for_lock_instead_of_refusing(tmp_path):
+    import fcntl
+    import os
+    import threading
+    p = str(tmp_path / "snap.lock")
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    threading.Timer(0.3, lambda: os.close(fd)).start()              # 别的进程 0.3 秒后抓完
+    with cs.ffmpeg_slot(p, cooldown=0, wait_s=5):
+        pass
+
+
+def test_act_waits_out_cooldown(tmp_path):
+    t, slept = [1000.0], []
+    p = str(tmp_path / "snap.lock")
+    with cs.ffmpeg_slot(p, cooldown=3, clock=lambda: t[0]):
+        pass
+    t[0] += 1
+    with cs.ffmpeg_slot(p, cooldown=3, clock=lambda: t[0], wait_s=10, sleep=slept.append):
+        pass
+    assert slept and abs(sum(slept) - 2) < 0.01
+
+
+def test_via_mpv_falls_back_to_legacy_command(tmp_path):
+    out = tmp_path / "s.png"
+    conn = _fake_mpv_named_unsupported()
+    assert cs.via_mpv(str(out), timeout=2, connect=conn) is True
+    assert out.read_bytes() == b"PNG"

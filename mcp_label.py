@@ -20,6 +20,7 @@ import threading
 import time
 
 import cart_label as cl
+import cartlog
 import mcp_core as mc
 import tspl_preview as tp
 
@@ -353,13 +354,24 @@ def real_abbrev(paths=ABBREV_PATHS):
     raise mc.ToolError(f"没有缩写对照表 (找过 {', '.join(paths)})")
 
 
+def _lock_note(msg):
+    try:
+        cartlog.event("label", msg)
+    except Exception:                   # noqa: BLE001  记不下也不能挡打印
+        pass
+
+
 @contextlib.contextmanager
-def printer_lock(path=PRINTER_LOCK, wait_s=PRINTER_LOCK_WAIT_S, sleep=time.sleep):
-    """进程间打印机锁 (flock). 等 wait_s 秒还拿不到就报忙, 不无限等."""
+def printer_lock(path=None, wait_s=PRINTER_LOCK_WAIT_S, sleep=time.sleep, note=_lock_note):
+    """进程间打印机锁 (flock). 等 wait_s 秒还拿不到就报忙, 不无限等.
+    锁文件打不开 (/run/ops-cart 不在之类): 不拒打, 退回只有进程内锁 (调用方已拿着), 记一条事件."""
+    path = path or PRINTER_LOCK
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as e:
-        raise mc.ToolError(f"打印机锁 {path} 打不开: {e}") from None
+        note(f"打印机锁 {path} 打不开 ({e}), 只用进程内锁; 两个 MCP 进程同时用打印机可能抢状态字节")
+        yield
+        return
     try:
         deadline = time.monotonic() + wait_s
         while True:
