@@ -91,7 +91,7 @@
 ## 九、P2 落地记录（#21）
 
 - 代码：`serial_write_core.py`（纯逻辑：行校验、高危词、闸门第 1 层、写租约 / 挂起 / 在途 / 急停的 `Book`、日志行）+ `mcp_serial.py`（状态文件 flock、执行绪日志、conbroker send 封装、MCP 工具、车机命令行）。`cart_mcp` 只加注册行和子命令转发。
-- 工具：`lease_acquire` / `lease_renew` / `lease_release`、`send_command`（一行可打印 ASCII，不许控制字符 / 换行 / 全角 / 零宽，不许 `-` 开头）、`send_key`（`enter` / `space` 直发，`ctrl_c` 挂起等人）、`pending_list`（只读，不含令牌）、`estop`（单条或全部；Agent 能自停，**没有 resume 工具**）。
+- 工具：`lease_acquire` / `lease_renew` / `lease_release`、`send_command`（一行可打印 ASCII，不许控制字符 / 换行 / 全角 / 零宽，不许 `-` 开头）、`send_key`（`enter` / `space` 一般直发，但设备停在确认类提示上或看不到最后一行时挂起等人，见下面 #73；`ctrl_c` 挂起等人）、`pending_list`（只读，不含令牌）、`estop`（单条或全部；Agent 能自停，**没有 resume 工具**）。
 - **写租约**：认令牌不认名字（两个 Agent 同一个 ssh 用户也分得开）；默认 60 秒，10–300 可选；`lease_renew` 续，过期不能续要重新申请；过期 / 释放 / 急停撤销时它挂着的命令一起作废；直发命令发完顺手续一个期限（Agent 等慢命令时自己续不了）。每槽位同时只有一条在途，上一条没回来不发下一条；发送进程死了，在途标记过"超时 + 90 秒"自动清掉并记 `status=unknown`。
 - **闸门第 1 层**：直发要同时满足——认得出厂商（规则文件登记了槽位，或最后一行是华为 `<名>` / `[名]`；思科 `名#` 和 Linux `bash-4.4#` 分不开，只能登记）、设备停在该厂商的提示符上（跳过 conbroker 自己的 `[时间 …]` 标记行；停在密码 / `[Y/N]` / 翻页 / 半截输出上都不算）、过 `survey_core.is_readonly`（规则文件只能给内置厂商加只读动词，如 `ping`）、不带高危词。高危词（save / reboot / reset / format / delete / write / copy / startup / shutdown …，含 VRP/IOS 式缩写 `sav` `wr` `del`）只增不减，永远要人确认。其余一律挂起。规则文件 `/etc/ops-cart/serial-gate.json`（样例 `examples/serial_gate.example.json`），坏了按内置默认。
 - **状态机**（每条命令一个条目，编号在一次开机内递增）：
@@ -171,3 +171,21 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 - **插话**：有人持键鼠租约时，其他 agent 的输入一律拒绝；没人持租约时命令行和配方照旧能用。配方运行中被别人拿走租约会停下。
 - **`recent_output`**：往前最多看 200 行，按时间判断：一小时内有设备输出才算最近，`last_output_age_s` 给出大约多少秒前。输出行本身没有时间，后面有标记行就按标记算，在日志尾巴上就按日志修改时间。仍然只是日志判断，要确认对端就拿租约 `send_key enter`；推车不会自动发。
 - **PXE 卡在 `NBP filesize`（被测机上的 EFI 程序，推车改不了）**：有的机器开机时没拿到地址、空等一轮后才拿到的话，问完启动文件大小就不再发 TFTP 请求，转而往服务器的 UDP 5526 发 549 字节的包（带 MAC 和一串标识），之后卡住或退回本地系统。2026-11-03 在一台联想上试了 6 次：开机时已在发地址 3 次都成功，抓包的那次没有这种包；开机时没地址 3 次都失败。这台机器的 EFI 分区里，`bootmgfw.efi` 被换过（原版改名 `bootmgfwold.efi`），旁边有 `HookDisk.efi`、`lenovoEDU.efi` 和一整套 UEFI 网络驱动（DHCP、UDP、TFTP、PXE）。所以很可能是：固件第一轮 PXE 失败后转去 Windows 启动项，这个 EFI 程序自己再拉起 PXE，拿到推车的地址后去找它的服务端。包内容没在这些文件里直接搜到，这条链还没完全证实。**办法：先让推车发地址，再开机；卡住了重启一次。**
+
+## 十七、按键闸门看设备状态（#73）
+
+- **问题**：以前 `send_key` 的回车 / 空格不看设备停在哪，直接放行。有人敲了 `reload` 或 `copy running-config startup-config` 后没回答就走开，设备停在 `Proceed with reload? [confirm]` 或 `Destination filename [startup-config]?` 上，Agent 发一个回车，就等于替人确认了。
+- **现在的规则**：`serial_write_core.classify_key(key, text)`，`text` 是发键前读到的设备最近几行输出，取最后一行有内容的（跳过 conbroker 的标记行）：
+  - 拿不到最后一行（tail 读失败、日志是空的、只有标记行）：按未知算，回车 / 空格都挂起，要人确认；
+  - 最后一行是确认类提示（`is_confirm_prompt`）：挂起，要人确认；
+  - 否则照旧放行（第 1 层）。`ctrl_c` 不变，永远要人确认。
+- **确认类提示**（只看最后一行，不分大小写）：
+  - `[confirm]`；
+  - `[Y/N]`、`[yes/no]`、`(y/n)`、`[Y/n]`、`([y]/n)`、`(yes/no/[fingerprint])` 这类是否选项；
+  - `Are you sure`；
+  - **以问号收尾**的行，比如 `Destination filename [x]?`、`Continue?`、`...?:`。正常的命令提示符不会以问号收尾。
+  - `--More--` / `---- More ----` 翻页不算，空格照常翻页；`Password:` / `Username:` 也不算。
+- **代价**：日志是空的时候，"拿租约 `send_key enter` 看有没有回显"也要人确认一次。往多问的方向错。
+- **survey_core**：它也有一份确认提示识别（PR #57 在改）。为了不冲突，这里先在 `serial_write_core` 里独立实现，合并后再统一成一份。
+- **配套改动（另一个仓库，未做）**：conbroker 的发前把关现在只认 `[y/n]`，要扩充到同一套确认类提示。conbroker 那一层要在真正写串口前再看一次最后一行：人 3 秒内敲过键时，Agent 的键会排队，排队期间设备状态可能变了。推车这边在挂起前看的那一眼挡不住这个时间差。
+

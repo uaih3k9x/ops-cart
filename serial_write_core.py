@@ -270,12 +270,34 @@ KEYS = {
 }
 
 
-def classify_key(key):
+# 确认类提示 (#73): 设备停在这些上面时, 回车 / 空格就是替人回答. 只看最后一行, 不分大小写.
+# 注: survey_core 也有一份确认提示识别 (PR #57 在改), 这里先独立实现, 合并后再统一成一份.
+_CONFIRM_PROMPT = re.compile(
+    r"\[confirm\]"                                     # 思科 Proceed with reload? [confirm]
+    r"|[\[(]\s*\[?y(?:es)?\]?\s*/\s*\[?n(?:o)?\]?\s*(?:/[^\])]*)?[\])]"   # [Y/N] [yes/no] (y/n) [Y/n] ([y]/n) (yes/no/[fingerprint])
+    r"|\bare\s+you\s+sure\b"                           # Are you sure ...
+    r"|\?\s*:?\s*$",                                    # 问号收尾: Destination filename [x]? / Continue? / ...?:
+    re.I)
+
+
+def is_confirm_prompt(line):
+    """这一行是不是在等人回答 (确认 / 是否 / 带默认值的问句). --More-- 翻页不算."""
+    return bool(_CONFIRM_PROMPT.search(line or ""))
+
+
+def classify_key(key, text=None):
+    """text = 设备最近的输出 (tail). 回车 / 空格: 拿不到最后一行 = 未知, 停在确认类提示上 = 替人回答, 都要人确认.
+    没给 text 按未知算 (宁可多问)."""
     k = KEYS.get(key)
     if k is None:
         raise Refused("bad", f"只给这几个键: {', '.join(KEYS)}")
     if k["confirm"]:
         return _gate("confirm", f"{k['label']} 是打断键, 要人确认")
+    ln = last_line(text)
+    if not ln:
+        return _gate("confirm", f"看不到设备最后一行 (读不到输出或日志是空的), 不知道 {k['label']} 会回答什么, 要人确认")
+    if is_confirm_prompt(ln):
+        return _gate("confirm", f"设备停在确认提示上 ({ln[-80:]}), {k['label']} 等于替人回答, 要人确认")
     return _gate("pass", f"固定特殊键 {k['label']} (第 1 层放行)")
 
 

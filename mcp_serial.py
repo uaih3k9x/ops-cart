@@ -341,11 +341,12 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
     def send_key(a):
         n, key = a["slot"], a["key"]
         s = _slot(n)
-        gate = sw.classify_key(key)
         try:
-            name = mc.thread_name(tail(s["dev"], TAIL_LINES))
+            text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
-            name = None
+            text = None                 # 看不到设备停在哪: 回车 / 空格按未知挂起 (#73)
+        gate = sw.classify_key(key, text)
+        name = mc.thread_name(text) if text is not None else None
         k = sw.KEYS[key]
         return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"])
 
@@ -382,7 +383,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
               "timeout_s": {"type": "integer", "minimum": 1, "maximum": SEND_TIMEOUT_MAX, "default": SEND_TIMEOUT,
                             "description": "等提示符的秒数"}},
              send_command, destructive=True),
-        Tool("send_key", "发一个固定特殊键: enter (回车) / space (翻页空格) 直接发; ctrl_c (打断) 要人确认. "
+        Tool("send_key", "发一个固定特殊键: enter (回车) / space (翻页空格) 一般直接发, 但设备停在确认类提示上 ([confirm]、[Y/N]、"
+             "(y/n)、Are you sure、以问号收尾的问句) 或看不到最后一行时挂起等人确认; ctrl_c (打断) 要人确认. "
              "需要别的按键 (BootROM 菜单、按任意键) 请人在推车屏幕上操作.",
              {"slot": SLOT, "key": {"type": "string", "enum": sorted(sw.KEYS), "required": True,
                                     "description": "哪个键"},

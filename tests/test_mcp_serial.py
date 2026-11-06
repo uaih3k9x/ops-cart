@@ -312,6 +312,31 @@ def test_keys(rig):
     assert [r["cmd"] for r in keys] == ["enter", "space", "ctrl_c"]
 
 
+@pytest.mark.parametrize("line", ["Proceed with reload? [confirm]", "Destination filename [startup-config]?",
+                                  "Warning: The current configuration will be written to the device. Continue? [Y/N]:"])
+def test_enter_on_confirm_prompt_is_held(rig, line):
+    """#73: 有人敲了 reload 没回答就走了, Agent 一个回车不能替他确认."""
+    tok = rig.lease(1)
+    rig.tail_text["/dev/con-1"] = f"<SW1>\n{line}"
+    for key in ("enter", "space"):
+        out = rig.ok("send_key", {"slot": 1, "key": key, "lease": tok})
+        assert out["status"] == "pending" and "确认提示" in out["reason"]
+    assert rig.sent == []
+
+
+def test_enter_held_when_tail_unreadable(rig):
+    tok = rig.lease(1)
+    rig.tail_text.pop("/dev/con-1")
+    assert rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})["status"] == "pending"
+    assert rig.sent == []
+
+
+def test_more_page_space_still_passes(rig):
+    tok = rig.lease(1)
+    rig.tail_text["/dev/con-1"] = "display current\nline\n  ---- More ----"
+    assert rig.ok("send_key", {"slot": 1, "key": "space", "lease": tok})["status"] == "sent"
+
+
 # ------------------------------------------------------------ 急停
 
 def test_agent_estop_one_slot(rig):

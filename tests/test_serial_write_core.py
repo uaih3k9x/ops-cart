@@ -314,12 +314,71 @@ def test_classify_vendor_model_off_by_rules():
 
 
 def test_classify_key():
-    assert sw.classify_key("enter")["verdict"] == "pass"
-    assert sw.classify_key("space")["verdict"] == "pass"
-    g = sw.classify_key("ctrl_c")
+    assert sw.classify_key("enter", "<SW1>")["verdict"] == "pass"
+    assert sw.classify_key("space", "<SW1>")["verdict"] == "pass"
+    g = sw.classify_key("ctrl_c", "<SW1>")
     assert g["verdict"] == "confirm" and "打断" in g["reason"]
     with pytest.raises(sw.Refused):
-        sw.classify_key("ctrl_z")
+        sw.classify_key("ctrl_z", "<SW1>")
+
+
+# #73: 回车 / 空格在确认类提示上等于替人回答, 一律要人确认
+CONFIRM_PROMPTS = [
+    "Proceed with reload? [confirm]",                                            # 思科 reload
+    "Destination filename [startup-config]?",                                    # 思科 copy run start
+    "Delete filename [vlan.dat]?",
+    "Delete flash:/vlan.dat? [confirm]",
+    "Erasing the nvram filesystem will remove all configuration files! Continue? [confirm]",
+    "Would you like to enter the initial configuration dialog? [yes/no]:",
+    "Warning: The current configuration will be written to the device. Continue? [Y/N]:",   # 华为 save
+    "System will reboot! Continue ? [y/n]:",                                     # 华为 reboot
+    "The current configuration will be written to the device. Are you sure? [Y/N]:",       # H3C
+    "Are you sure to continue?[Y/N]",
+    "Info: Are you sure",
+    "Do you want to continue? [Y/n]",                                            # Linux 包管理
+    "Proceed ([y]/n)?",
+    "Are you sure you want to continue connecting (yes/no/[fingerprint])?",      # ssh 首次连
+    "Remove this file? (y/n)",
+    "Do you want to save the current configuration?",                            # 以问号收尾的问句
+    "Save? [Y/N]",
+]
+NOT_CONFIRM = [
+    "<SW1>", "[~SW1]", "[*SW1-GigabitEthernet0/0/1]", "[yard-sw]", "R1#", "R1(config)#", "R1(config-if)#",
+    "ruijie(config-if-range)#", "ops@host:~$", "[root@host ~]#", "bash-4.4#",
+    "--More--", "  ---- More ----", " --More-- ", "Password:", "Username:", "login:",
+]
+
+
+@pytest.mark.parametrize("line", CONFIRM_PROMPTS)
+@pytest.mark.parametrize("key", ["enter", "space"])
+def test_key_on_confirm_prompt_needs_human(key, line):
+    text = f"display current\nsome output\n{line}"
+    assert sw.is_confirm_prompt(line), line
+    g = sw.classify_key(key, text)
+    assert g["verdict"] == "confirm" and g["layer"] == 3 and "确认提示" in g["reason"], line
+
+
+@pytest.mark.parametrize("line", NOT_CONFIRM)
+def test_key_on_normal_prompt_passes(line):
+    assert not sw.is_confirm_prompt(line), line
+    for key in ("enter", "space"):
+        assert sw.classify_key(key, f"output\n{line}")["verdict"] == "pass", (key, line)
+
+
+def test_key_skips_conbroker_marker_lines():
+    text = "Proceed with reload? [confirm]\n[2026-11-06 10:00:00 Claude 断开]\n"
+    assert sw.classify_key("enter", text)["verdict"] == "confirm"
+
+
+@pytest.mark.parametrize("text", [None, "", "\n\n", "[2026-11-06 10:00:00 Claude 接入]"])
+def test_key_without_last_line_is_unknown(text):
+    for key in ("enter", "space"):
+        g = sw.classify_key(key, text)
+        assert g["verdict"] == "confirm" and "看不到" in g["reason"], (key, text)
+
+
+def test_classify_key_text_is_required_positionally_safe():
+    assert sw.classify_key("enter")["verdict"] == "confirm"           # 没给设备输出 = 未知, 要人确认
 
 
 # ------------------------------------------------------------ 写租约
