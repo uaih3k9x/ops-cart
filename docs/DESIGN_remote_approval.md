@@ -11,10 +11,13 @@
 ## 〇、结论先说
 
 1. **不另起一套挂起状态。** 串口 `serial_write_core.Book`、键鼠 `mcp_kvm.LeaseStore`、PXE `pxe_req_core.Book` 仍然是各自挂起项的唯一事实来源。新增的 `approval_core` 负责三件事：把三处挂起项映射成统一视图；提供一个纯函数 `digest(item)`，原生入口在**自己的 flock 里**用它比对；记录"谁、在哪个通道、用什么因素、做了什么决定"。
-2. **人看到的东西必须来自手机，不能只来自电脑。** 维护者和 Agent 往往在同一台电脑上，被 Agent 驱动的浏览器可以让页面显示 A、实际提交 B。所以 L3 及以上用**带外码**：推车把服务端生成的摘要和一个**跟 digest 绑定的短码**，推到维护者手机上与审批专用应用的飞书单聊里。人在手机上看清楚内容以后，再把码填回网页。网页里改投到别的挂起项，这个码就对不上。见 3.3 和 4.2。
-3. **第二因素是 TOTP，但它只证明"有人在场"。** 种子只通过 `LoadCredential=` 交给 root 的审批单元 `cart-approve`；其他所有单元都用 `InaccessiblePaths` 把种子目录遮掉，测试会遍历 `deploy/systemd/*.service` 逐个断言。
+2. **人要在手机上看清楚，不能只看电脑。** 维护者和 Agent 往往在同一台电脑上，被 Agent 驱动的浏览器可以让页面显示 A、实际提交 B。所以网页批准都要用**带外码**：推车把服务端生成的摘要和一个跟（账号, id, digest, nonce）绑定的短码，推到维护者手机上，发在与审批专用应用的飞书单聊里。
+   带外码**能挡住**的情况：页面为 A 要码，却把码拿去交给 B。
+   带外码**挡不住**的情况：页面显示 A，后台直接为 B 发起 challenge。这时手机上收到的是 B 的摘要，只要人在手机上读一眼就会发现不对。所以推送会单独写一句"如果这不是你刚点的那一条，别填码，直接急停"。
+   这一步说到底靠的是人在手机上读那条推送。串口 L3 优先直接在飞书卡片上批，不经网页。见 3.3。
+3. **第二因素是 TOTP，但它只证明"有人在场"。** 种子只通过 `LoadCredential=` 交给取件单元 `cart-approve`。其他单元都用 `InaccessiblePaths` 遮掉两个位置：种子目录，以及 `/run/credentials`（`LoadCredential` 实际落盘的地方）。**注意，对 root 运行的单元来说，`InaccessiblePaths` 不算边界**：root 可以经 D-Bus 或 `systemd-run` 拉起一个不受限制的单元，再去读。所以在 #49 把 `cart-mcp` 降为非 root 之前，**种子隔离对 `cart-mcp` 不成立**。`approval-check` 会把这一点当作硬性检查项（4.7）。
 4. **残余风险如实写。** ops-web 在 `dialout` 组里，能直接写 CH9329 和 conbroker 的人用通道。网页会话最长 7 天，Agent 偷到 cookie 就能直接调 `/api/hid`、`/api/type`、`/api/serial/send`。WOL 加上 PXE 默认的救援菜单再加上键鼠直通，这条路**完全不经审批**（#70）。这些都不是本设计能挡住的，第三节和第六节逐条列出。
-5. **批准分两步执行。** 第一步是"取件校验"：秒级完成、从不阻塞，在取到请求的那一刻校验 TOTP 和带外码。第二步是"执行"：每条批准一个模板实例 `cart-approve-exec@<id>`，互不排队。急停每个通道各有自己的目录和单元，`lockdown`（远程关掉审批）也走急停这一路。
+5. **批准分两步执行。** 第一步是"取件校验"：秒级完成、从不阻塞，在取到请求的那一刻校验 TOTP 和带外码。第二步是"执行"：每条批准一个模板实例 `cart-approve-exec@<id>`，互不排队。L3 及以上在执行前先推送"即将执行"，留出撤回窗口；推送没送达就不执行。急停、撤回（`withdraw`）、`lockdown` 都走各通道自己的急停目录，不经过执行器；`exec@` 在原生锁里检查撤回和 lockdown 标记。
 6. **部署前提有程序检查。** `cart_mcp.py approval-check` 检查 PIN 已设、各单元的遮挡真的生效、root 的 `authorized_keys` 是空的、sudo 里没有 NOPASSWD、种子的权限位正确。任何一项不合格，就**拒绝打开远程审批**。
 7. **Claude 只转达。** 它只能看到挂起项的服务端摘要和编号，拿不到链接，拿不到码，也没有任何能批准的工具。所有界面上都写明："**任何人（包括 Claude）向你要验证码，都是攻击。**"
 
@@ -46,8 +49,8 @@
 |---|---|
 | `id` | `f"{kind}:{epoch}:{native_id}"`。`epoch` 是**状态文件新建时生成的随机 8 位十六进制**（三处 Book 都加一个 `doc["epoch"]`）。开机、读坏重置（串口 `from_text`、键鼠 `read_state`、PXE `from_text`）都会换一个新的 epoch，所以重号以后的旧 id 也对不上。这比用 boot_id 更好：boot_id 管不了同一次开机里状态文件读坏后重新编号的情况 |
 | `kind` / `tool` / `agent` | `serial` / `kvm` / `pxe`；条目自己的 kind 推出工具名；`agent` 是条目的 `who`（MCP 令牌名，只是名字） |
-| `target` | 槽位号、键鼠序列号或 MAC；提示符上认出的设备名放在 `target_label`，标为不可信 |
-| `action` | 串口：`cmd`。键鼠：从上次回车起的整段输入（`line` 加本次内容）。PXE：`purpose` 加清单 |
+| `target` | 槽位号、键鼠序列号或 MAC。键鼠在**挂起时**就解析出序列号写进条目（`_port` 的结果，不留 `serial=None`），批准时只发给这一块；`target` 为空的挂起项不许远程批准。提示符上认出的设备名放在 `target_label`，标为不可信 |
+| `action` | 串口：`cmd`。键鼠：挂起前的行前缀 `prefix`（挂起时 `st["line"]` 的快照，单独保存）加上本次内容，渲染时分开显示"已经敲在屏幕上的"和"批准后才会敲的"。PXE：`purpose` 加清单 |
 | `ctx` | 串口：挂起时该槽位的 `send_seq`（2.2）。键鼠：挂起时该键鼠的 `human_seq`（2.2） |
 | `evidence` | 串口：挂起时设备最近 20 行输出；键鼠：挂起时的截图。**只给人看，不进 digest**（截图每次都不一样，进了 digest 也没有意义） |
 | `danger` / `gate_reason` / `model_reason` / `intent` | `intent` 是 Agent 自述，没有核实过；`model_reason` 是模型意见 |
@@ -61,10 +64,13 @@ digest = sha256(canonical_json({"v": 1, id, kind, target, action, danger, create
 
 - **A1 就把 `send_seq` 和 `human_seq` 做出来**（只是加计数，不改变行为），这样 A1 和 A2 的 digest 是同一个公式，测试不会出现"A1 测了 A2 才有的字段"。
 - **串口 `send_seq` 无条件计数**：这个槽位上的任何发送都加 1，包括闸门放行的直发、同槽位其他挂起项被批准后发出（`PENDING_MAX = 5`，兄弟挂起项发出也要算）、人用通道的写入。人用通道的写入走 conbroker，Book 看不到，分两路处理：
-  - 网页的 `/api/serial/send`：该槽位有挂起项时，终端上方显示"有 N 条等审批，你现在键入会让它们作废"；第一次写入时往 `serial-req` 投一个 `human_touch` 请求，root 收到后给 `send_seq` 加 1。
+  - 网页的 `/api/serial/send`：该槽位有挂起项时，终端上方显示"有 N 条等审批，你现在键入会让它们作废"；每条挂起项**挂起之后**，人第一次写入时往 `serial-req` 投一个 `human_touch` 请求（网页按"槽位 + 当前最大挂起编号"记住已经投过，同一批挂起项不重复投），root 收到后给 `send_seq` 加 1。
   - 车机本机终端和其他 conbroker 客户端：conbroker 在另一个仓库，要请它在人用写入时更新一个公开的计数文件（**待核**）。在那之前，审批摘要里写明"人用通道的写入可能没有计入"。
   - #65 如果采用"有挂起项时禁止直发"，`send_seq` 仍然保留，用来覆盖兄弟挂起项和人用通道的情况。
-- **键鼠 `human_seq`**：`kvm_broker` 每次接受一个人用通道的有效输入（也就是更新 `Arbiter.last_human` 的地方），就把 `{序列号: {seq, last}}` 写进 `/run/ops-cart/kvm-human.json`（0644，不含内容）。挂起时记下 `human_seq`，批准时发现变了，就作废这一条（`dropped: 人动过键鼠`）。Agent 那一侧在挂起期间本来就发不出键（`LeaseStore.gate` 发现有挂起项就拒）。
+- **键鼠 `human_seq`**：`kvm_broker` 每次接受一个人用通道的有效输入（也就是更新 `Arbiter.last_human` 的地方），就把 `{序列号: {seq, last, ts}}` 写进 `/run/ops-kvm/kvm-human.json`（0644，不含内容）。`kvm-broker.service` 是 `ProtectSystem=strict`，现在只能写 `/var/log/ops-cart`，所以要么给它加 `RuntimeDirectory=ops-kvm`，要么加 `ReadWritePaths=`，写进 A1 的计划。挂起时记下 `human_seq`，批准时发现变了，就作废这一条（`dropped: 人动过键鼠`）。
+  - **文件读不到、读不懂，或者 `ts` 比代理的心跳旧 10 秒以上，一律按"人动过"处理**，作废这一条。
+  - **代理不在时，键鼠的远程批准直接拒绝**：代理没跑的话，webkiosk 会直开设备（`kvm_broker.open_ch` 失败后的退路），人用输入就不计数了。
+  - Agent 那一侧在挂起期间本来就发不出键（`LeaseStore.gate` 发现有挂起项就拒）。
 - **比对在原生锁里做**：`Book.confirm(iid, by, now, expect=None)`、`LeaseStore.take(iid, by, expect=None)`、PXE 的 `take` 和 `remote_confirm` 都新增一个 `expect` 参数。执行器把请求里的 digest 传进去，原生入口在**自己的 flock 里**用 `approval_core.digest` 重算，再比对 `ctx`。这样从比对到标记在途之间，没有可以插进来的空隙。车机上的确认传 `expect=None`：车机界面本来就直接读原生状态。
 - **PXE 的 digest 能推算出来**：`remote_confirm` 绝对不能把"知道 digest"当成任何凭据。它只认执行器传进来的"TOTP 和带外码都已经校验过"的结果。原有的 `human_confirm` 也不变，靠的是屏幕上的码。
 
@@ -95,21 +101,33 @@ digest: 3f9a1c0e5b7d2a46
 ### 2.4 状态机
 
 ```
-pending ─批准(取件校验通过: 通道 + 因素 + 带外码 + 没过期)─► authorized ─(exec@id 在原生锁里: digest + ctx 一致)─► executing ─► done
-   │                                                          └─(超过 AUTH_TTL_S=120 没开始执行 / 原生锁里比对失败)─► dropped
-   ├─拒绝─► rejected      ├─到期─► expired      ├─急停 / 租约没了 / ctx 变了─► dropped
+pending ─批准(取件校验通过)─► authorized ─┬─(L3+: "即将执行"推送送达 → 撤回窗口 W 秒内没人撤)─┐
+   │                                      └─(L2: 直接)──────────────────────────────────────┤
+   │                                                                                          ▼
+   │                         exec@id 在原生锁里: digest + ctx 一致 + 没撤回 + 没 lockdown ─► executing ─► done
+   │                                    └─ 任一不满足 / 超过 AUTH_TTL_S 没开始 / 推送没送达 ─► dropped
+   ├─拒绝─► rejected     ├─到期─► expired     ├─急停 / 租约没了 / ctx 变了 / lockdown─► dropped
+   ├─撤回(authorized 期间, 任一已认证通道, 不要 TOTP)─► withdrawn
    └─被另一个通道先处理─► 按原生状态显示, 附上"由 <账号> 经 <通道>"
 ```
+
+- **撤回窗口**：`exec@` 在窗口期间**不碰原生锁**，只是等着；窗口结束后才调 `confirm(expect)`，并在原生锁里检查撤回标记和 lockdown 标记（两个都是持久文件，见 2.5）。"即将执行"推送如果没送达（飞书接口报错或超时），就直接中止，记 `dropped: 回执未送达`，宁可不执行。
+- **lockdown**：写一个持久标记 `/var/lib/ops-cart/approval-lockdown`，同时把所有 `authorized` 状态的条目作废。`exec@` 在原生锁里也查这个标记，所以 lockdown 之前已经批准、还没开始发的，一个字节都不会发。已经交给 conbroker 的那一条收不回来，这跟急停一样，靠急停去拦。
 
 决定记录放在 **`/var/lib/ops-cart/approvals.json`**（root 0600，flock，原子写）。里面有每个账号的 TOTP `last_step`、输错计数和冷却时间，已经用过的 nonce（保留 24 小时），以及每条挂起项的决定。放在 `/var/lib` 而不是 `/run`，是为了重启以后防重放和冷却记录还在。挂起项本身在 `/run`，重启就没了，跟现在一样。
 
 ### 2.5 执行、并发、急停
 
-- **取件**：`cart-approve.path` 盯着 `/run/ops-cart/approve-req/<通道>/`，拉起 `cart-approve.service`（oneshot）。它只做校验和登记：解析请求，校验 TOTP 和带外码（**校验时刻就是取件时刻**，取件从不阻塞，所以只比用户提交晚几秒），通过就记 `authorized`，然后 `systemctl start --no-block cart-approve-exec@<id>`。请求文件照旧只认 60 秒以内的。TOTP 按取件时刻容许 ±1 步。
-- **执行**：`cart-approve-exec@.service` 每条批准一个实例。它调原生入口，并传入 `expect`。同一个槽位的串口天然串行（`Book` 的在途检查），不同槽位可以并行。取件不会因为某一条发送卡住而排队。
-- **幂等**：nonce 只能用一次（重启后也是）。同一条挂起项上重复同一个决定，返回 `already`；先后两个相反的决定，后到的返回 `conflict`。车机确认和远程批准撞上时，先拿到原生锁的那个生效。
-- **急停和 lockdown 都不经过审批执行器**：每个通道一个急停目录，由各自的单元处理（网页：`serial-req` → `cart-serial-req`；飞书：`estop-req/feishu/` → `cart-estop-feishu`），解析都用 `confirm_core.parse_request`，在原有的 `estop`、`reject`、`kvm_reject` 之外，再加 `kvm_stop` 和 `lockdown`。
-- **键鼠的"本路急停"要新做**：`mcp_serial.Store._flag` 写 `serial-estop.json` 的 `kvm` 字段，现在只在全部急停时为真。新增一个 `kvm_stop` 操作：收回键鼠租约、丢掉挂起项，并单独把 `kvm` 置真（不停串口）。解除时也单独解除。`kvm_broker` 不用改，它本来就读这个字段。
+- **取件**：`cart-approve.path` 盯着 `/run/ops-cart/approve-req/<通道>/`，拉起 `cart-approve.service`（oneshot）。它只做校验和登记：解析请求，校验 TOTP 和带外码（**校验时刻就是取件时刻**，取件从不阻塞），通过就记 `authorized`，然后 `systemctl start --no-block cart-approve-exec@<id>`。请求文件照旧只认 60 秒以内的。TOTP 按取件时刻容许 ±1 步。**只有取件单元有 `LoadCredential`**。
+- **执行**：`cart-approve-exec@.service` 每条批准一个实例，**不带 `LoadCredential`**（因素在取件时已经校验完）。它调原生入口，并传入 `expect`。
+- **同一个槽位一次只能批一条**：`Book.confirm` 遇到在途会抛 `Refused("inflight")`；第一条发出去以后 `send_seq` 加 1，同槽位的第二条就必然作废。界面上写明："同一路一次批一条；这条发出后，同一路其余挂起项会作废，要 Agent 重新提交。"
+- **结果回传**：root 写 `/run/ops-cart/approve-res/web.json` 和 `/run/ops-cart/approve-res/feishu.json`（0640，属组分别是 ops-web 和飞书服务的组；只有 root 写，两个服务都只读）。内容是按 nonce 索引的结果，以及每个账号当前的 challenge 状态（不含码）。网页和飞书服务据此显示"已提交 / 已批准 / 被拒（原因）"。
+- **幂等**：nonce 只能用一次（重启后也是）。同一条挂起项上重复同一个决定，返回 `already`；先后两个相反的决定，后到的返回 `conflict`。**撤回豁免 `conflict`**：撤回本来就是"先批准、后反悔"。车机确认和远程批准撞上时，先拿到原生锁的那个生效。
+- **急停和 lockdown 都不经过审批执行器**：每个通道一个急停目录，由各自的单元处理（网页：`serial-req` → `cart-serial-req`；飞书：`estop-req/feishu/` → `cart-estop-feishu`），解析都用 `confirm_core.parse_request`，在原有的 `estop`、`reject`、`kvm_reject` 之外，再加 `kvm_stop`、`withdraw`（带 id，停的方向）和 `lockdown`。
+- **键鼠的"本路急停"要新做，而且要有自己的持久状态**：`mcp_serial.Store._flag` 每次存状态都会**重新算**一遍 `serial-estop.json` 的 `kvm` 字段（`everything or (bool(stopped) and serial_all_stopped(path))`）。没有串口槽位急停时，这个字段会被算成 False，单独设置的值会被冲掉。所以：
+  - `kvm_stop` 写自己的状态 `/run/ops-cart/kvm-stop.json`（root 0600：谁、何时、来源），同时收回键鼠租约、丢掉挂起项。
+  - `_flag` 合并时改成 `kvm = 原有算法 or kvm_stop 生效中`：**只能把它置真，不能把它清掉**。
+  - 解除 `kvm_stop` 只能删 `kvm-stop.json`，然后重算一遍。`kvm_broker` 不用改。
 - **急停里的拒绝不带 digest，明确豁免**：`serial-req` 和飞书急停目录里的 `reject`、`kvm_reject` 照旧只带 id。拒绝是"停"的方向，id 投错了，最多是多拒掉一条。审批目录里的 `reject` 要带 digest，因为它和批准共用同一套记录。
 
 ## 三、风险分级
@@ -120,9 +138,9 @@ pending ─批准(取件校验通过: 通道 + 因素 + 带外码 + 没过期)�
 |---|---|---|---|---|
 | L0 | 只读，或者"停"的方向 | 不用审批 | 不用审批 | 不用审批 |
 | L1 | 不碰被测设备的配置 | 直通 | 直通 | 直通 |
-| L2 | 改设备状态，但一般能撤回 | 点"确认" | 点卡片 | 审批会话（4.2）加 TOTP |
+| L2 | 改设备状态，但一般能撤回 | 点"确认" | 点卡片并填 **TOTP** | 审批会话（4.2）加 TOTP；A3 以后再加**带外码**（A2 阶段网页 L2 没有带外码，列为残余风险 T12） |
 | L3 | 可能中断业务、丢配置 | 点"确认"，再问一次 | 串口：点卡片并填 TOTP。**键鼠：只能拒绝**，批准要去网页看实时画面 | TOTP 加**带外码**；键鼠还要看实时画面 |
-| L4 | 不可逆，或者进入一个能任意写盘的环境 | 照抄屏幕确认码 | 只能拒绝 | TOTP 加带外码，再**复述目标**；带外推送里附 30 秒撤回窗口 |
+| L4 | 不可逆，或者进入一个能任意写盘的环境 | 照抄屏幕确认码 | 只能拒绝 | TOTP 加带外码，再**复述目标**；30 秒撤回窗口 |
 
 - 同一个账号 30 秒内只能批一条 L3 或 L4。
 - **飞书只用单聊**：审批卡片只发到审批专用应用和白名单账号的**单聊**里，不发到群里。群里的其他机器人可以发长得一模一样的仿冒卡片，单聊里只有这个应用能发。
@@ -159,19 +177,20 @@ pending ─批准(取件校验通过: 通道 + 因素 + 带外码 + 没过期)�
 | 方案 | 证明什么 | 绑定到具体挂起项吗 | 定位 |
 |---|---|---|---|
 | TOTP（RFC 6238） | 这 30 秒里，手机在人手上 | 不绑定 | L2 起都要 |
-| **带外码** | 人在**手机上**看到了服务端生成的摘要 | **绑定**：`code = HMAC(oob_key, id ‖ digest ‖ nonce)` 取 6 位，`oob_key` 只给 `cart-approve` | L3、L4 网页批准都要 |
+| **带外码** | 人在**手机上**看到了服务端生成的摘要 | **绑定**：`code = HMAC(oob_key, account ‖ id ‖ digest ‖ nonce)` 取 6 位，`oob_key` 只给 `cart-approve` | A3 以后，网页上的所有批准都要 |
 | WebAuthn / 通行密钥 | 人在**这台设备**上按了，挑战里带着 digest | 绑定 | 列为 L3 和 L4 的长期方案（要先给网页上 HTTPS） |
-| 30 秒撤回窗口 | 执行前人还有一次机会喊停 | — | L4 额外加；L3 可选（待拍板第 17 条） |
+| 撤回窗口 | 执行前人还有一次机会喊停（推送没送达就不执行） | — | L3 15 秒，L4 30 秒（待拍板第 17 条） |
 | 车机屏幕码 | 人在现场 | 绑定 | 只用于现场 |
 
-带外码的流程（网页批准 L3、L4）：
+带外码的流程（网页批准）：
 
 1. 人在网页上点"批准"，网页投一个 `op=challenge` 请求。
-2. `cart-approve` 生成 nonce，算出码，把**服务端摘要和码**经飞书单聊推到这个账号的手机上，并写明"不要把这个码告诉任何人，包括 Claude"。
-3. 人在手机上核对摘要，跟网页上显示的是同一件事，再把码和 TOTP 一起填回网页。
-4. 取件时重算 HMAC。网页如果被改成提交另一条挂起项（换了 id 或 digest），码就对不上。
+2. `cart-approve` 在 root 一侧登记这个 challenge：账号、id、digest、nonce、时限 120 秒、剩余尝试 3 次。**同一个账号同时只保留一个有效的 challenge**：新的发起时作废旧的，并在新推送里注明"之前那条已作废"。每个账号每分钟最多发起 3 个。
+3. `cart-approve` **自己**调飞书发消息接口，把服务端摘要和码推到这个账号的单聊里（用它自己的 `LoadCredential` 拿到 app_secret，见 4.3），并写明两句话："不要把这个码告诉任何人，包括 Claude。""**如果这不是你刚点的那一条，别填码，直接点急停。**"
+4. 人在手机上读完摘要，再把码和 TOTP 一起填回网页。
+5. 取件时，`approve` 只认跟登记的 challenge **完全匹配**（账号、id、digest、nonce 都一样）、没有过期、还有剩余次数的请求，然后重算 HMAC 校验码。
 
-**飞书服务能看到带外码**（是它发出去的），所以"飞书服务被拿下，同时浏览器也被 Agent 驱动"这种组合挡不住，算残余风险（T3）。L4 再加 30 秒撤回窗口：执行前推送"即将执行：<摘要>，30 秒内可撤回"。
+剩下的风险：飞书服务本身看不到码（它不负责发码），但飞书云端能看到。L3 和 L4 有撤回窗口（2.4）：执行前推送"即将执行：<摘要>，W 秒内可撤回"，推送没送达就中止。
 
 TOTP 的约束：标准库实现（`hmac`、`hashlib.sha1`，30 秒一步），种子按人分开；±1 步；`last_step` 按账号记、只增不减，**重启后也还在**（存在 `/var/lib`）；同一个码跨通道也只能用一次；时钟回拨后，步数小于等于 `last_step` 的码一律拒，并记日志；输错按 `PinGate` 的方式指数退避，封顶 1 小时，按账号算、跨通道共享；冷却期间车机确认照常能用。
 
@@ -179,7 +198,11 @@ TOTP 的约束：标准库实现（`hmac`、`hashlib.sha1`，30 秒一步），�
 
 ### 4.1 共同规则
 
-- **种子和带外密钥**：放在 `/etc/ops-cart/approve-secrets/`（root 0700）。**只通过 `LoadCredential=` 交给 `cart-approve.service` 和 `cart-approve-exec@.service`**；deploy/systemd 下的**其他每一个单元**（包括 `cart-mcp`、`kiosk`、`pxe-server`、`pxe-http-boot`、`pxe-http-repo`、`cart-dash`、`cart-notify`、`cart-dream`、`webkiosk`、飞书服务、急停单元）都加 `InaccessiblePaths=-/etc/ops-cart/approve-secrets`。测试遍历 `deploy/systemd/*.service` 逐个断言。没有单元约束的交互式 root shell 照样能读到，所以 `approval-check` 还要检查 root 的 ssh 和 sudo（4.7）。
+- **种子和带外密钥**：放在 `/etc/ops-cart/approve-secrets/`（root 0700）。**只通过 `LoadCredential=` 交给 `cart-approve.service`**（`exec@` 不带）。
+- **飞书 app_secret**：放在 `/etc/ops-cart/feishu-approve-secret/`，只通过 `LoadCredential=` 交给飞书回调服务和 `cart-approve`（后者要用它发带外码）。
+- **遮挡**：deploy/systemd 下的**其他每一个单元**（`cart-mcp`、`kiosk`、`pxe-server`、`pxe-http-boot`、`pxe-http-repo`、`cart-dash`、`cart-notify`、`cart-dream`、`cart-serial-req`、`kvm-broker`、`webkiosk`、急停单元、`cart-approve-exec@`）都加三条：`InaccessiblePaths=-/etc/ops-cart/approve-secrets -/etc/ops-cart/feishu-approve-secret -/run/credentials`。飞书服务本身只遮种子目录。测试遍历 `deploy/systemd/*.service` 逐个断言。
+- **决定记录**：`/var/lib/ops-cart/approvals.json` 和 `approval-lockdown` 对除了 `cart-approve*` 以外的单元也用 `InaccessiblePaths` 遮掉（ops-web 有 `CAP_DAC_READ_SEARCH`）。网页需要的状态从 `approve-res` 读。
+- **root 单元的边界**：对 root 运行的单元，这几条遮挡只能防误读，防不住有意为之（它可以经 `/run/systemd/private` 或 `/run/dbus/system_bus_socket` 拉起不受限制的单元）。所以 `approval-check` 对每个 root 单元的要求是：要么它已经不是 root，要么它同时遮掉 `/run/systemd/private` 和 `/run/dbus/system_bus_socket`，并且 `RestrictAddressFamilies` 不含 `AF_UNIX`，或者只允许它确实需要的 socket。都做不到的，`approval-check` 判为"种子隔离不成立"，并如实降级提示（第 20 条拍板）。**`cart-mcp` 在 #49 完成之前属于"不成立"**：它要用 `sudo -u` 跑 conbroker，也要 mpv 的 socket，限制不了 `AF_UNIX`。
 - **请求目录**：`/run/ops-cart/approve-req/web/`（ops-web 0700）和 `/run/ops-cart/approve-req/feishu/`（飞书服务用户 0700）。`webkiosk.service` 要加 `ReadWritePaths=-/run/ops-cart/approve-req/web`，因为它是 `ProtectSystem=strict`，写进 A2 的计划。root 按所在目录认通道。请求格式（`approval_core.parse_request`，字段多一个或少一个都不认）：
   ```json
   {"op": "challenge|approve|reject|elevate", "id": "serial:1a2b3c4d:17", "digest": "3f9a1c0e5b7d2a46",
@@ -193,16 +216,20 @@ TOTP 的约束：标准库实现（`hmac`、`hashlib.sha1`，30 秒一步），�
 
 ### 4.2 网页
 
-- **审批会话单独签发**：审批页不认普通的网页登录会话，要另外输一次 TOTP，换来一个 15 分钟、不滑动、绑定（会话, 账号）的审批会话，由 root 登记。**每次批准**还要再输 TOTP，L3 及以上再加带外码。没有提权窗口。
-- **前提**：网页登录和审批都不在跑 Agent 的机器上做。用另一台设备，或者用 Agent 那个系统账号读不到的浏览器配置（Agent 和浏览器是同一个系统用户时，"另开一个浏览器配置"不算隔离）。推车验证不了这一条，`approval-check` 只能给出提示，列为残余风险 T13。
+- **审批会话单独签发**：审批页不认普通的网页登录会话，要另外输一次 TOTP，换来一个 15 分钟、不滑动、绑定（会话, 账号）的审批会话，由 root 登记。**每次批准**还要再输 TOTP，A3 以后还要加带外码。没有提权窗口。
+- 因为 `last_step` 只增不减，签发会话用掉一个码以后，同一个 30 秒步里不能马上批第一条，要等下一个码。为了省掉这次等待，倾向**把签发和第一次批准合并**：在审批页上第一次批准时，一个码同时完成签发和批准（待拍板第 10 条）。
+- **前提**：网页登录和审批都不在跑 Agent 的机器上做。用另一台设备，或者用 Agent 那个系统账号读不到的浏览器配置（Agent 和浏览器是同一个系统用户时，"另开一个浏览器配置"不算隔离）。这一条**部分可检**：取件时，把网页请求的来源 IP 和 tailscale 设备，跟 `cart-mcp` 最近 24 小时见过的 Agent 来源做比对，同 IP 或同设备就拒绝（`ev=same_host`，待拍板第 8 条）。这样能挡住"在跑 Agent 的那台机器上直接审批"的情况，挡不住"Agent 经别的机器中转"。所以仍然列为残余风险 T13。
 - 防 CSRF：同源检查、`SameSite=Strict`、一次性的表单 nonce。防点击劫持：`X-Frame-Options: DENY` 和 `frame-ancestors 'none'`，作为纵深防御。
 
 ### 4.3 飞书
 
 - **专用应用、只用单聊**：不和任何其他机器人或桥接共用凭据（长连接是集群模式，回调会随机分给任一客户端）。卡片和带外码只发给白名单账号的单聊。
 - 长连接，官方 SDK 装在独立的 venv 里；回调用新版 `card.action.trigger`，签名和字段**实现前对照当前官方文档核对**（待核）。
+- **应用权限只申请"以机器人身份发消息"和卡片回调**，不申请读消息、读通讯录之类的权限。这样即使 app_secret 泄露，也读不出单聊里发过的带外码（具体权限项实现前核对官方文档，待核）。
+- **带外码由 `cart-approve` 直接发**，不经过飞书回调服务。回调服务只负责接收按钮点击和 TOTP 输入框，看不到码。
 - **服务沙箱**：独立用户；不进 `dialout`、`video` 组；`IPAddressDeny=any`，只放行飞书出口；用 `InaccessiblePaths` 遮掉种子目录和 `/run/ops-cart` 下的状态文件，只留自己的请求目录和急停目录可写。
 - 只在手机上批；桌面版和网页版飞书不登录审批账号（T12）。
+- 飞书上 L2 和串口 L3 都要填 TOTP。
 - 键鼠 L3、全部 L4 的卡片上**只有拒绝和急停**（键鼠要看实时画面，飞书上给不了）。串口 L3 卡片有 TOTP 输入框，并附设备最近输出（标不可信）。
 - 卡片常驻"急停"按钮：串口是本路和全部；键鼠是 `kvm_stop` 和全部；外加"关掉远程审批"（`lockdown`）。这些都投到飞书的急停目录。
 
@@ -220,23 +247,35 @@ dsh 作为 MCP 客户端调用推车工具时不经过它自己的审批（#49�
 
 ### 4.7 部署前提和 `approval-check`
 
-`cart_mcp.py approval-check` 每次开启远程审批时运行，执行器每小时也跑一次。**有任何一项不合格就拒绝开启**；已经开着的，自动 `lockdown` 并推送通知。
+`cart_mcp.py approval-check` 在每次开启远程审批时运行。**有任何一项不合格就拒绝开启**；已经开着的，自动 `lockdown` 并推送通知。
 
-| 检查项 | 怎么查 |
-|---|---|
-| 推车设了 PIN | `web_core.pin_state` 返回 `set` |
-| 遮挡真的生效 | 对每个已装的单元查 `systemctl show -p InaccessiblePaths <单元>`，必须包含种子目录（`cart-approve*` 除外） |
-| root 没有 ssh 密钥 | `/root/.ssh/authorized_keys` 不存在或为空 |
-| sudo 没有 NOPASSWD | 解析 `sudo -l -U <每个普通用户>` 的输出 |
-| 种子权限 | 目录 0700、文件 0600，属主 root |
-| 提示项（不拒绝） | 决策模型是否打开（第 16 条）；#70 的默认救援是否还在；"网页登录不在跑 Agent 的机器上"无法验证 |
+`approval-check` 由 `cart-approval-check.timer` 每小时跑一次（不放在执行器里）。
 
-文字层面的前提：跑 Agent 的机器上不配 `ssh cart sudo …` 的 MCP 接法；PIN、种子、飞书凭据不放在 Agent 的机器上；审批飞书账号只在手机上登录。
+| 检查项 | 怎么查 | 不合格时 |
+|---|---|---|
+| 推车设了 PIN | `web_core.pin_state` 返回 `set` | 拒绝开启 |
+| 遮挡在**运行中的进程**上真的生效 | 对每个在跑的单元取 `MainPID`，用 `nsenter -t <pid> -m` 进到它的挂载空间里，实际 `stat` 一下种子目录、`/run/credentials`、`approvals.json`，必须是不可访问。光看 `systemctl show` 只能说明配置写了，不能说明进程用上了。另外比对 `ExecMainStartTimestamp` 和单元文件的修改时间，并检查 `NeedDaemonReload`：改了配置但没重启的，算不合格 | 拒绝开启 |
+| root 单元的边界 | 见 4.1：不是 root，或者遮掉了 systemd 和 D-Bus 的 socket 并限制了 `AF_UNIX` | 判为"种子隔离不成立"，按第 20 条拍板结果处理（拒绝开启，或者降级：只开 L2） |
+| 飞书凭据 | `feishu-approve-secret` 的权限位；只有飞书服务和 `cart-approve` 有 `LoadCredential` | 拒绝开启 |
+| 种子权限 | 目录 0700、文件 0600，属主 root | 拒绝开启 |
+| **root 登录面** | ① Tailscale SSH：`tailscale debug prefs` 里 `RunSSH` 为真，**直接不合格**；② sshd：用 `sshd -T` 取 `permitrootlogin`（必须是 `no`）、`authorizedkeysfile`（逐个文件检查 root 有没有密钥）、`authorizedkeyscommand`（设了就不合格）、`passwordauthentication`；③ 能 sudo 的普通用户：`getent group wheel` 加 `sudo -l -U`，有 NOPASSWD 就不合格；④ 等同 root 的组（`docker`、`disk`、`lxd`、`libvirt`）里有没有成员；⑤ `cart-revtunnel` 把本机 22 端口反向映射出去（`-R localhost:<端口>:localhost:22`），跳板机那头的人就能到推车的 sshd，所以要求 ②③ 也成立 | ① 到 ④ 拒绝开启；⑤ 提示 |
+| 提示项（不拒绝） | 决策模型是否打开（第 16 条）；#70 的默认救援是否还在；`same_host` 比对是否开着 | 提示 |
+
+**范围**：`approval-check` 只检查本仓库 `deploy/systemd` 里的单元，以及上面列出的登录面。推车上别的软件装的单元和 root 进程不在检查范围内，列为残余风险（T17）。
+
+**从 `ssh cart sudo …` 接法迁移**：
+
+1. 在推车上给每个 Agent 生成一个 Bearer 令牌，写进 `/etc/ops-cart/mcp.json`（`examples/mcp.example.json` 有样例）。
+2. 启用 `cart-mcp.service`（http 模式，只绑本机和 tailnet 地址）。
+3. Agent 那边改成 `claude mcp add --transport http cart http://<推车>:8765/ -H "Authorization: Bearer <令牌>"`。
+4. 删掉 Agent 机器上能 sudo 的 ssh 密钥，然后在推车上跑一遍 `approval-check`，确认 root 登录面这一项通过。
+
+文字层面的前提：PIN、种子、飞书凭据都不放在 Agent 的机器上；审批飞书账号只在手机上登录。
 
 ### 4.8 审计
 
 - `/var/log/ops-cart/approval.log`（JSONL；`*.log` 已有的 logrotate 规则管）。每行包括：`t`、`ev`、`id`、`digest`、`kind`、`tier`、`channel`（kiosk / web / feishu / cli）、`account`、`by`（web 是 `ip/会话标签`，feishu 是 open_id，kiosk 是 `human:kiosk@local`）、`factor`（`totp:ok`、`oob:ok`、`none`）、`summary`（就是 `render` 的标题和动作行；secret 只显示长度）、`result`。
-- `ev` 有这些：`notify`、`challenge`、`approve`、`authorized`、`executed`、`reject`、`expire`、`drop`、`lost_race`、`conflict`、`replay`、`forbidden`、`totp_bad`、`totp_lock`、`oob_bad`、`clock_back`、`lockdown`、`check_fail`。
+- `ev` 有这些：`notify`、`challenge`、`approve`、`authorized`、`executed`、`reject`、`expire`、`drop`、`lost_race`、`conflict`、`replay`、`forbidden`、`totp_bad`、`totp_lock`、`oob_bad`、`clock_back`、`lockdown`、`check_fail`、`withdraw`、`receipt_fail`、`same_host`、`challenge_superseded`。
 - 车机确认也要写一行（通道 `kiosk`，因素 `none`），这样审计是完整的。原生日志（`serial-slot<N>.log`、`kvm-thread.log`、`pxe-req.log`）照旧记各自的 `confirm` 和 `send`。
 - `events.log` 只记一行 `[approval]` 摘要，不写命令原文。
 - 日志里永远不出现：TOTP 码、带外码、种子、cookie、卡片 token、nonce 原文（只记前 4 位）。
@@ -246,14 +285,14 @@ dsh 作为 MCP 客户端调用推车工具时不经过它自己的审批（#49�
 | 阶段 | 内容 | 前置 |
 |---|---|---|
 | A0 | 本设计稿 | — |
-| A1 统一视图（只读） | `approval_core`（`collect`、`TIER`、`render`、`digest` v1）；三处 Book 加 `epoch`；串口 `send_seq`；`kvm_broker` 写 `kvm-human.json`；`approvals` 命令行；网页只读页；`approval_list` | #64、#65 |
-| A2 执行器 + TOTP + 网页 | `totp_core`；`totp-enroll`；种子目录、`LoadCredential`、所有单元的 `InaccessiblePaths`；`approval-check`；`cart-approve` 和 `cart-approve-exec@`；原生入口的 `expect` 参数；`remote_confirm`；`/var/lib/ops-cart/approvals.json`；审批会话；webkiosk 的 `ReadWritePaths`；`human_touch` 请求；防点击劫持头 | A1 |
-| A3 飞书 | 专用应用和单聊；带外码；卡片；飞书急停目录；`kvm_stop`；`lockdown`；撤回窗口 | A2 |
+| A1 统一视图（只读） | `approval_core`（`collect`、`TIER`、`render`、`digest` v1）；三处 Book 加 `epoch`（**升级步骤**：旧版状态文件里没有 `epoch`，按"读不懂"处理会全部急停。所以缺 `epoch` 时就地补一个新的，不算读坏；只在 JSON 坏了的时候才走原有的全部急停）；串口 `send_seq`；键鼠挂起时写定 `serial` 和 `prefix`；`kvm_broker` 写 `/run/ops-kvm/kvm-human.json`（加 `RuntimeDirectory`）；`approvals` 命令行；网页只读页；`approval_list` | #64、#65 |
+| A2 执行器 + TOTP + 网页 | `totp_core`；`totp-enroll`；种子目录、`LoadCredential`、所有单元的 `InaccessiblePaths`；`approval-check`；`cart-approve` 和 `cart-approve-exec@`；原生入口的 `expect` 参数；`remote_confirm`；`/var/lib/ops-cart/approvals.json`；审批会话（签发和第一次批准合并）；`approve-res` 结果文件；`same_host` 比对；webkiosk 的 `ReadWritePaths`；`human_touch` 请求（挂起之后第一次写入）；防点击劫持头；`cart-approval-check.timer`；`withdraw`、`lockdown` 持久标记 | A1 |
+| A3 飞书 | 专用应用（只申请发消息权限）和单聊；带外码（`cart-approve` 直接发，challenge 在 root 一侧登记）；卡片；飞书急停目录；`kvm_stop`（独立的持久状态）；"即将执行"推送和撤回窗口 | A2 |
 | A4 | 防疲劳、remote resume、`kind=acp` | 按拍板结果 |
 | A5 | 收尾更新文档 | — |
 | 长期 | `cart-mcp` 降为非 root（#49）；HTTPS 加 WebAuthn；#70 | — |
 
-**A2 的网页 L3 批准必须等 A3 的带外码上线才能开**。A2 阶段网页只开放 L2，L3 和 L4 仍然只能在车机上确认。
+**A2 的网页 L3 批准必须等 A3 的带外码上线才能开**。A2 阶段网页只开放 L2（没有带外码，残余风险见 T12），L3 和 L4 仍然只能在车机上确认。A3 以后，网页上的所有批准都要带外码。
 
 测试清单（先写红灯）：
 
@@ -262,7 +301,10 @@ dsh 作为 MCP 客户端调用推车工具时不经过它自己的审批（#49�
 - `digest` v1 公式固定；加一条"公式回归"用例，A2 以后不许改。
 - `send_seq`：直发、兄弟挂起项发出、`human_touch` 都会加 1。
 - `kvm-human.json`：人用输入会让 `seq` 加 1，Agent 的输入不会。
-- `render`：Tab 显示为 `⇥`；固定有"要码就是攻击"那一行。
+- `render`：Tab 显示为 `⇥`；固定有"要码就是攻击"那一行；键鼠分开显示 `prefix`（已经敲在屏幕上的）和本次内容。
+- `epoch` 升级：没有 `epoch` 的旧状态文件就地补上，**不触发**全部急停；JSON 坏了照旧全部急停。
+- 键鼠：挂起项里写定了 `serial`；`target` 为空的不出现在可远程批准的列表里。
+- `kvm-human.json`：文件不在、读不懂、过时，都被 `collect` 当成"人动过"。
 - `TIER`：`pxe_request` 四种用途都是 L4；模型放行单列；键鼠挂起默认 L3。
 - 不变量：MCP 工具里没有审批写路径；`approval_list` 不返回链接，也不返回码。
 
@@ -284,16 +326,25 @@ dsh 作为 MCP 客户端调用推车工具时不经过它自己的审批（#49�
 - 重启以后（重新加载 `/var/lib` 的文件），`last_step`、冷却、nonce 都还在，旧码和旧 nonce 都被拒。
 - 审批会话：15 分钟到期；不滑动；换了账号无效；普通登录会话进不了审批页。
 - 网页 L3、L4 在 A2 阶段被拒（带外码还没上线）。
+- 遍历单元文件：除了 `cart-approve.service`，每个单元都遮掉种子目录、飞书凭据目录和 `/run/credentials`；`exec@` 没有 `LoadCredential`；`approvals.json` 也被遮掉。
+- `approval-check`：用假的 `nsenter` / `stat` 结果模拟"配置写了、进程没生效"，以及 `NeedDaemonReload=yes`、`ExecMainStartTimestamp` 早于单元文件，都判不合格；root 单元没遮 D-Bus 和 systemd 的 socket，判"种子隔离不成立"；登录面逐项检查（`RunSSH`、`permitrootlogin`、`authorizedkeyscommand`、NOPASSWD、docker/disk/lxd 组成员）。
+- `same_host`：网页请求的来源跟 `cart-mcp` 见过的 Agent 来源相同就拒。
+- `lockdown`：`authorized` 之后、执行之前打开 lockdown，一个字节都不发；lockdown 标记重启后还在。
+- 撤回：`authorized` 期间撤回，`exec@` 在原生锁里看到撤回标记，不执行；撤回不算 `conflict`。
+- `approve-res`：只有 root 写；ops-web 能读到结果，读不到别的账号的 challenge 细节以外的东西（里面本来就不含码）。
+- 同一个槽位两条都批了：第二条要么收到 `Refused("inflight")`，要么因为 `send_seq` 变了被作废，只发一条。
+- 签发审批会话和第一次批准合并时，只用掉一个码，紧接着的下一条要等下一个码。
 
 **A3**
 - 回调：白名单之外的账号、`app_id` 或 `tenant_key` 不对、事件重复，都按预期处理；卡片在被别的通道处理、过期、作废以后，没有能点的按钮。
-- 带外码：换 id、换 digest、换 nonce 都会对不上；同一个码只能用一次；码只发到单聊。
+- 带外码：换账号、换 id、换 digest、换 nonce 都会对不上；同一个码只能用一次；码只发到单聊；同一个账号同时只有一个有效的 challenge，新的作废旧的；超过频率限制被拒；推送里有"不是你点的就别填码"那一句；推送由 `cart-approve` 发，飞书回调服务的代码路径里看不到码。
 - 卡片：键鼠 L3 和全部 L4 的卡片上没有批准按钮；有急停、`kvm_stop` 和 `lockdown`。
-- `kvm_stop`：只停键鼠，串口不受影响；`kvm_broker` 读到 `kvm` 为真时不发键；解除后要重新申请租约。
+- `kvm_stop`：只停键鼠，串口不受影响；`kvm_broker` 读到 `kvm` 为真时不发键；**`kvm_stop` 以后再做串口的 `lease_acquire`、急停解除等任何会让 `_flag` 重算的操作，`kvm` 仍然为真**；解除后要重新申请租约。
+- "即将执行"推送失败（模拟飞书接口报错）时，`exec@` 中止，一个字节都不发。
 - `lockdown` 和急停走急停目录，在执行器阻塞时照常生效；开回来只认 `local_human`。
 - 撤回窗口内撤回，就不执行。
 
-**待实机验证**：path 单元能不能被拉起；飞书长连接断线重连，卡片在手机上的显示；车机有没有 NTP；飞书回调字段和签名（对照官方文档）；用 `systemd-run -p User=ops-web -p AmbientCapabilities=CAP_DAC_READ_SEARCH -p InaccessiblePaths=… cat <种子>` 读种子，应该失败；webkiosk 加了新的 `ReadWritePaths` 以后原有功能正常；`kvm-human.json` 在车机键鼠和网页键鼠两条路上都会计数；conbroker 人用写入的计数（另一个仓库，待核）。
+**待实机验证**：path 单元能不能被拉起；飞书长连接断线重连，卡片在手机上的显示；车机有没有 NTP；飞书回调字段和签名（对照官方文档）；以 webkiosk 的同等权限（`systemd-run -p User=ops-web -p AmbientCapabilities=CAP_DAC_READ_SEARCH` 加上它的 `InaccessiblePaths`）去读种子目录和 `/run/credentials/cart-approve.service/`，都应该失败；`approval-check` 的 `nsenter` 实测在车上能跑通；`kvm-broker` 加了 `RuntimeDirectory` 以后能写 `/run/ops-kvm/`；webkiosk 加了新的 `ReadWritePaths` 以后原有功能正常；`kvm-human.json` 在车机键鼠和网页键鼠两条路上都会计数；conbroker 人用写入的计数（另一个仓库，待核）。
 
 ## 六、威胁模型
 
@@ -301,42 +352,45 @@ dsh 作为 MCP 客户端调用推车工具时不经过它自己的审批（#49�
 |---|---|---|
 | T0 | Agent 和人同在 tailnet 上，没设 PIN 时直接登录网页 | 要求设 PIN；`approval-check` 检查；执行器拒绝 |
 | T1 | 手机丢了 | 手机锁屏、验证器 App 加锁；`lockdown`；`approval-revoke` |
-| T2 | 飞书账号被盗 | 只用单聊；L3 及以上要 TOTP；键鼠 L3 和 L4 在飞书上批不了 |
-| T3 | ops-web 或飞书服务被拿下 | ops-web 在 `dialout` 组，能绕过审批（残余风险，待拍板第 15 条）；改投 TOTP 码会被带外码挡住；飞书服务被拿下，同时浏览器被 Agent 驱动，这种组合挡不住（残余风险），L4 的根本办法是 WebAuthn |
+| T2 | 飞书账号被盗 | 只用单聊；L2 起就要 TOTP；键鼠 L3 和 L4 在飞书上批不了 |
+| T3 | ops-web 或飞书服务被拿下 | ops-web 在 `dialout` 组，能绕过审批（残余风险，待拍板第 15 条）；改投 TOTP 码会被带外码挡住；飞书回调服务看不到带外码（码由 `cart-approve` 直接发）；它被拿下以后能伪造点击，但每一级都要 TOTP；L4 的根本办法是 WebAuthn |
 | T4 | 提示词注入，生成诱导性摘要 | 摘要由服务端生成；L3 及以上人在手机上看摘要 |
 | T5 | 拆开发送、改掉现场 | `send_seq`、`human_seq`，在原生锁里比对；#64、#65、#69 |
 | T6 | 批准疲劳 | 没有"全部批准"；L2 也要 TOTP；同一账号 30 秒只能批一条 L3 或 L4；L4 复述目标、有撤回窗口；同类请求计数，超了自动升级；每日汇总 |
 | T7 | 重放 | `epoch`、digest、nonce 和 `last_step` 都落盘；带外码绑定 nonce |
 | T8 | 检查和使用之间被换了 | 在原生锁里比对 digest 和 ctx |
-| T9 | AI 审批 AI | 代码不变量加 `approval-check`；`cart-mcp` 降为非 root 是长期方案 |
+| T9 | AI 审批 AI | 代码不变量加 `approval-check`（含 root 登录面检查）；`cart-mcp` 是 root，在 #49 之前，对它来说种子隔离不成立，只靠"Agent 拿不到 root" |
 | T10 | 时钟漂移、回拨 | 窗口固定 ±1 步；`last_step` 只增不减，回拨时宁可暂时用不了；车机要有 NTP |
 | T11 | Agent 故意输错 TOTP，把人锁在外面 | 退避封顶 1 小时；车机确认不受影响；急停和拒绝不需要 TOTP；每次进入冷却都推通知 |
-| T12 | Agent 驱动维护者已经登录的浏览器或飞书客户端 | 没有提权窗口；飞书只在手机上批（推车验证不了，残余风险）；L3 及以上的码在手机上 |
+| T12 | Agent 驱动维护者已经登录的浏览器或飞书客户端 | 没有提权窗口；飞书只在手机上批（推车验证不了，残余风险）。A2 阶段网页 L2 可以"显示 A、提交 B"（没有带外码），属于残余风险，A3 以后网页的所有批准都加带外码。带外码挡不住"直接为 B 发起 challenge"，靠人在手机上读推送 |
 | **T13** | Agent 偷维护者浏览器里的 cookie（会话最长 7 天），直接调人用接口 | 不在 Agent 的机器上登录网页（前提，推车验证不了）；审批会话单独签发、15 分钟；人用接口本身的风险见待拍板第 15 条 |
 | **T14** | 仿冒：仿冒的审批页、群里的仿冒卡片、在 Claude 转达通道里向人要码 | 卡片只发单聊；审批链接不由 Agent 提供；所有界面都写"要码就是攻击"；带外码只在手机上出现，填回的位置只有推车网页 |
 | **T15** | WOL、默认救援、键鼠直通这条不经审批的路 | 3.2 如实列出；#70、#69；`approval-check` 提示 |
 | **T16** | 决策模型放行改配置的命令（模型审批 Agent） | 单列，默认关；开远程审批时警告（第 16 条） |
+| **T17** | 不在本仓库里的 root 单元或进程（其他软件装的） | `approval-check` 查不到，列为残余风险；保持推车上软件的最小化 |
+| **T18** | 撤回窗口期间人没看手机 | 窗口只是多一次机会，不能当成审批本身；推送没送达就不执行 |
 
 ## 七、需要维护者拍板
 
 | # | 问题 | 我的倾向 |
 |---|---|---|
 | 1 | 第二因素 | TOTP；L3 和 L4 加带外码；长期上 WebAuthn |
-| 2 | 飞书能批到哪一级 | 串口 L2、L3（L3 加 TOTP）；键鼠 L3 和全部 L4 只能拒绝 |
+| 2 | 飞书能批到哪一级 | 串口 L2、L3（都要 TOTP）；键鼠 L3 和全部 L4 只能拒绝 |
 | 3 | 网页登录加 TOTP | 要（挡得住 curl 自己登录，挡不住 T13） |
 | 4 | 远程解除急停 | 远程按 L3 |
 | 5 | 卡片上显示原文 | 显示（只在单聊里） |
 | 6 | 飞书接入方式 | 长连接，专用应用 |
 | 7 | `label_print` 批量的 `confirmed` | 维持现状 |
-| 8 | 审计带 tailscale 身份 | 不带 |
+| 8 | tailscale 身份 | 审计里不带；但**取件时做 `same_host` 比对**：网页请求的来源 IP 或 tailscale 设备，跟 `cart-mcp` 见过的 Agent 来源相同就拒。这能部分检出"在跑 Agent 的机器上审批"（要读 tailscaled 的 LocalAPI，由 root 的取件单元做，不给 ops-web） |
 | 9 | 各级期限 | L2 15 分钟 / L3 10 分钟 / L4 10 分钟；`AUTH_TTL_S` 120 秒 |
-| 10 | 审批会话时长 | 15 分钟，不滑动 |
+| 10 | 审批会话 | 15 分钟，不滑动；`last_step` 只增不减，签发会话会用掉一个码，倾向**把签发和第一次批准合并**，免得签发以后还要等下一个 30 秒 |
 | 11 | 有争议的分级 | `pxe_request` 全部 L4；不带高危词的串口配置命令 L2；键鼠 L2 白名单只放 `alt+f4` |
 | 12 | 种子每人一个还是全车一个 | 每人一个 |
 | 13 | ACP 接入 | 包装层转成挂起项，A4 以后做 |
 | 14 | #65 的修法 | 有挂起项时禁止直发，`send_seq` 照做 |
 | 15 | 网页人用通道的风险（ops-web 在 `dialout`；cookie 能直接打键） | 另开 issue：人用键鼠和串口走需要认证的代理，网页进程不进 `dialout` |
 | 16 | 决策模型和远程审批同时打开 | 允许，但 `approval-check` 警告；或者开远程审批时强制关掉第 2 层 |
-| 17 | 撤回窗口 | L4 必须，30 秒；L3 不加 |
+| 17 | 撤回窗口 | L3 15 秒，L4 30 秒；推送没送达就不执行 |
 | 18 | #70 默认救援菜单 | 不自动进救援、不带 sshd（在 #70 里定） |
-| 19 | 带外码的投递通道 | 飞书单聊；飞书不可用时，网页 L3 和 L4 拒绝（fail-closed），回到车机确认 |
+| 19 | 带外码的投递通道 | 飞书单聊，由 `cart-approve` 直接发；飞书不可用时，网页的批准一律拒绝（fail-closed），回到车机确认 |
+| 20 | root 单元的种子隔离不成立时 | 倾向：`approval-check` 判不合格，远程审批**只开 L2**（L3、L4 只能车机确认），直到 #49 完成；另一个选项是完全不开远程审批 |
