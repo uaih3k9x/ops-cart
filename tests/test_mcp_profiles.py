@@ -411,3 +411,63 @@ def test_doc_match_block_max_sessions():
     block = doc[doc.index("Match User agent-ro"):]
     assert "MaxSessions 1" in block[:block.index("```")]
     assert "stdio 只读档不受" in doc
+
+
+# ------------------------------------------------------------ #60 终审: 认证失败审计合并, 慢连接超时
+
+def _serve_clocked(profile, cfg, audit, clock):
+    tools = [mc.Tool("look", "d", {}, lambda a: [mc.text_content("ok")], kind=mc.READONLY)]
+    srv = cm.make_http_server("127.0.0.1", 0, mc.Server(tools, audit=audit, profile=profile),
+                              conf=lambda: cfg, audit=audit, clock=clock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _raw(port, headers):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("POST", "/mcp", body=b"{}", headers=headers)
+    st = c.getresponse().status
+    c.close()
+    return st
+
+
+@pytest.mark.parametrize("profile", ["readonly", "act"])
+def test_http_deny_audit_merged_per_code(profile):
+    """1000 个错令牌、1000 个错 Host: 审计每种拒绝每秒最多 1 行, 下一行带上没逐条记的次数 (两档都一样)."""
+    cfg = {"tokens": {"me": ACT_TOK}, "readonly": {"tokens": {"bot": RO_TOK}}, "hosts": []}
+    a, clk = ListAudit(), _Mono()
+    srv = _serve_clocked(profile, cfg, a, clk)
+    port = srv.server_address[1]
+    try:
+        for _ in range(1000):
+            assert _raw(port, {"Authorization": "Bearer wrong"}) == 401
+        for _ in range(1000):
+            assert _raw(port, {"Authorization": f"Bearer {ACT_TOK}", "Host": "evil.example"}) == 403
+        assert len(a.lines) <= 2
+        assert {ln["error"].split()[0] for ln in a.lines} == {"401", "403"}
+        clk.t += 1.5
+        assert _raw(port, {"Authorization": "Bearer wrong"}) == 401
+        assert len(a.lines) == 3 and "另有 999 次" in a.lines[-1]["error"] and a.lines[-1]["profile"] == profile
+    finally:
+        srv.shutdown()
+
+
+def test_http_idle_connection_is_dropped(monkeypatch):
+    import socket
+    import time
+    monkeypatch.setattr(cm, "HTTP_TIMEOUT_S", 0.5)
+    cfg = {"tokens": {"me": ACT_TOK}, "hosts": []}
+    srv = _serve_clocked("act", cfg, None, _Mono())
+    try:
+        s = socket.create_connection(("127.0.0.1", srv.server_address[1]))
+        s.settimeout(3)
+        t0 = time.monotonic()
+        assert s.recv(100) == b""                                    # 什么都不发: 服务端到时间就断
+        assert time.monotonic() - t0 < 2.5
+        s.close()
+    finally:
+        srv.shutdown()
+
+
+def test_http_timeout_default():
+    assert cm.HTTP_TIMEOUT_S == 30

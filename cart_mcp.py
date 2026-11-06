@@ -254,11 +254,17 @@ def serve_stdio(server, who, stdin, stdout):
 
 # ------------------------------------------------------------ HTTP (Streamable HTTP, 只回 application/json)
 
-def make_http_server(addr, port, server, conf=conf_read, audit=None):
-    """一个监听地址一个 server. 每个请求: 来源/Host/Origin/令牌 (mc.http_check) -> 读体 -> server.handle_text."""
+HTTP_TIMEOUT_S = 30         # 一个连接这么久没动静就断 (慢连接不永久占线程)
+
+
+def make_http_server(addr, port, server, conf=conf_read, audit=None, clock=time.monotonic):
+    """一个监听地址一个 server. 每个请求: 来源/Host/Origin/令牌 (mc.http_check) -> 读体 -> server.handle_text.
+    认证失败 (401/403) 的审计按 (档位, 状态码) 合并: 每秒最多一行, 带上中间没逐条记的次数 (#60)."""
+    merge = mc.AuditMerge(clock)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ops-cart-mcp"
+        timeout = HTTP_TIMEOUT_S
 
         def _reply(self, code, body=b"", ctype="application/json", extra=()):
             self.send_response(code)
@@ -272,9 +278,11 @@ def make_http_server(addr, port, server, conf=conf_read, audit=None):
                 self.wfile.write(body)
 
         def _deny(self, code, why, extra=()):
-            if audit is not None:
-                audit.write(mc.audit_line(f"-@{self.client_address[0]}", None, None, False, error=f"{code} {why}",
-                                          profile=server.profile))
+            log, quiet = merge.note((server.profile, code))
+            if audit is not None and log:
+                more = f" (之前另有 {quiet} 次同类拒绝, 没逐条记)" if quiet else ""
+                audit.write(mc.audit_line(f"-@{self.client_address[0]}", None, None, False,
+                                          error=f"{code} {why}{more}", profile=server.profile))
             self._reply(code, json.dumps({"error": why}, ensure_ascii=False).encode(), extra=extra)
 
         def _gate(self):

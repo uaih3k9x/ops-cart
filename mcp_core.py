@@ -347,6 +347,24 @@ def take_ro_slot(d=None, n=None):
     raise SlotBusy(f"只读档已经有 {n} 个进程在跑 (stdio 会话或 cart-mcp-ro), 同时最多 {n} 个; 先关掉一个再连")
 
 
+class AuditMerge:
+    """同一类审计 (key) 每 every 秒最多记一条; note(key) -> 这次记不记、上次之后有几次没逐条记.
+    限速调用和 HTTP 认证失败都用它: 刷请求不能把审计写满磁盘、借轮转冲掉真实记录 (#60)."""
+
+    def __init__(self, clock, every=RO_AUDIT_EVERY_S):
+        self.clock, self.every, self.lock, self.last, self.quiet = clock, every, threading.Lock(), {}, {}
+
+    def note(self, key):
+        with self.lock:
+            now = self.clock()
+            last = self.last.get(key)
+            if last is not None and now - last < self.every:
+                self.quiet[key] = self.quiet.get(key, 0) + 1
+                return False, 0
+            self.last[key] = now
+            return True, self.quiet.pop(key, 0)
+
+
 class _Bucket:
     """令牌桶; clock 单调时钟. 线程安全 (HTTP 多线程共用一个 Server)."""
 
@@ -379,7 +397,7 @@ class Server:
         self.audit, self.version, self.clock, self.profile = audit, version, clock, profile
         # 只读档 (#60): 不收批量, tools/call 整体令牌桶; 动手档照旧 (那边有租约 / 闸门 / 人确认)
         self.bucket = _Bucket(RO_RATE, RO_BURST, clock) if profile == READONLY else None
-        self._rl_lock, self._rl_logged, self._rl_quiet = threading.Lock(), None, 0
+        self._merge = AuditMerge(clock)
 
     def handle_text(self, text, who="-"):
         """一段 JSON 文本 -> 回包文本 (单行); 全是通知时返回 None."""
@@ -427,12 +445,9 @@ class Server:
 
     def _limited(self, who, name):
         """被限速的调用: RO_AUDIT_EVERY_S 内只记一条, 下一条带上中间没逐条记的次数."""
-        with self._rl_lock:
-            now = self.clock()
-            if self._rl_logged is not None and now - self._rl_logged < RO_AUDIT_EVERY_S:
-                self._rl_quiet += 1
-                return
-            quiet, self._rl_quiet, self._rl_logged = self._rl_quiet, 0, now
+        log, quiet = self._merge.note("limited")
+        if not log:
+            return
         more = f" (之前另有 {quiet} 次被限速, 没逐条记)" if quiet else ""
         self._log(who, name, {}, False, error=f"调用太频繁, 已限速{more}")
 
