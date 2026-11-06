@@ -410,3 +410,45 @@ def test_shared_status_vectors():
 
 def test_vectors_declare_v2():
     assert json.loads(VECTORS.read_text(encoding="utf-8"))["protocol"].startswith("ops-cart BLE input v2")
+
+
+# ------------------------------------------------------------ 第二轮审查 (#61)
+
+def test_cont_frame_extends_partial_life():
+    """CONT 到了要续命: 删掉 p.last = now 这条要红."""
+    rx = bc.Receiver()
+    frames = bc.encode(11, b"y" * 50, 23)
+    rx.feed(DEV, frames[0], T0, True)
+    rx.feed(DEV, frames[1], T0 + bc.PARTIAL_TTL_S - 1, True)
+    assert rx.expire(T0 + bc.PARTIAL_TTL_S + 1) == []
+
+
+@pytest.mark.parametrize("ch", ["\U0001fae0", "\U0001fae8", "\U0001fa75", "͸", "\U000e0080"])
+def test_unassigned_but_not_noncharacter_allowed(ch):
+    """中2: 推车 Python 3.9 只认 Unicode 13, 新 emoji 在它眼里是 Cn; Cn 不整类拒, 只拒非字符."""
+    assert bc.check_text(f"a{ch}".encode()) == f"a{ch}"
+
+
+@pytest.mark.parametrize("cp", [0xFDD0, 0xFDEF, 0xFFFE, 0xFFFF, 0x1FFFE, 0x1FFFF, 0x10FFFF])
+def test_noncharacters_rejected(cp):
+    with pytest.raises(bc.Bad):
+        bc.check_text(f"a{chr(cp)}".encode())
+
+
+def test_clean_text_keeps_newlines_drops_bad():
+    assert bc.clean_text("a​b c\n\td‍e\x00") == "abc\n\td‍e"
+
+
+def test_dedup_export_restore():
+    rx = bc.Receiver()
+    _feed_all(rx, bc.encode(9, b"x", 23))
+    rows = rx.export()
+    rx2 = bc.Receiver()
+    rx2.restore(rows, T0 + 5)
+    assert [e.kind for e in _feed_all(rx2, bc.encode(9, b"x", 23), now=T0 + 6)] == ["dup"]
+    rx3 = bc.Receiver()
+    rx3.restore(rows, T0 + bc.DEDUP_TTL_S + 1)                         # 过期的不要
+    assert _texts(_feed_all(rx3, bc.encode(9, b"x", 23), now=T0 + bc.DEDUP_TTL_S + 1)) == ["x"]
+    rx4 = bc.Receiver()
+    rx4.restore([["a"], "junk", [DEV, 1, 2, 3, T0 + 999]], T0)        # 坏行、未来时间都丢
+    assert rx4.export() == []

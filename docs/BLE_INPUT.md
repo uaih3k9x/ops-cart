@@ -38,7 +38,8 @@
 `Bonded` 属性时还要 `Bonded`。不受信的设备写进来回 `unpaired`，不留半包。
 
 D-Bus 方法（`WriteValue` / `StartNotify` / `StopNotify`）只认 `org.bluez` 当前属主调用，别的调用者抛
-`org.bluez.Error.NotPermitted`。启动时读适配器 `Pairable`，开着就关掉并记事件（关不掉记 WARN）。
+`org.bluez.Error.NotPermitted`。启动时和之后每 10 秒读适配器 `Pairable`，开着（又不在配对窗口里）就关掉并记事件
+（关不掉记 WARN）。BlueZ 默认 `Pairable` 就是开的，所以第一次启动一定会记一次。
 `org.bluez` 属主变了（bluetoothd 重启）进程退出，交给 systemd 重拉；单元 `BindsTo=bluetooth.service`。
 
 ## 分包
@@ -76,12 +77,18 @@ D-Bus 方法（`WriteValue` / `StartNotify` / `StopNotify`）只认 `org.bluez` 
 - 收齐后算 CRC32，不对：`crc`
 - 正文必须是 UTF-8（`utf8`）；检查在**重组之后**做（看不见的字符被切到两帧也拦得住），以下一律 `ctrl`：
   控制字符 Cc（换行、制表除外，含 ESC 序列）、格式字符 Cf（只放行 U+200D ZWJ，含双向覆盖符、零宽空格、BOM、软连字符）、
-  标签字符 U+E0000–E007F 整段、行 / 段分隔符 Zl / Zp（含 U+2028 / U+2029）、未分配 Cn、私用区 Co、代理 Cs、
-  看不见的韩文填充字（U+115F、U+1160、U+3164、U+FFA0）
+  标签字符 U+E0000–E007F 整段、行 / 段分隔符 Zl / Zp（含 U+2028 / U+2029）、非字符（U+FDD0–FDEF 和每个平面末尾的
+  xxFFFE / xxFFFF）、私用区 Co、代理 Cs、看不见的韩文填充字（U+115F、U+1160、U+3164、U+FFA0）。
+  **未分配 Cn 不整类拒**：推车 Rocky 9 的 Python 3.9 只认 Unicode 13，手机上的新 emoji（Unicode 14/15，如 U+1FAE0）
+  在它眼里是 Cn；两端都只拒非字符
 - 半包 10 秒没新分片：`timeout`；每台设备同时最多 2 个半包，再来新的就丢最老的那个：`busy`
 - 同一序号重新发 START：按新的来（手机重发）
 - 已投递的（来源设备，序号，总长，CRC）10 分钟内再来：回 `ack` 加 `dup`，不重复投递；同序号不同内容当新消息；
-  去重表按来源设备分开，每台最多记 64 条
+  去重表按来源设备分开，每台最多记 64 条；每次投递后落盘到 `/run/ops-cart/ble-input/dedup.json`（0600，单元
+  `RuntimeDirectoryPreserve`），服务重启不丢；时间用 monotonic（Linux 上跨进程同一个钟），推车重启机器时 `/run`
+  和 monotonic 一起清零，那时手机还没回执的消息可能重复投递一次
+- 半包和去重的时效都用 monotonic，改系统时间不影响
+- `WriteValue` 带非 0 `offset`（长写）：抛 `org.bluez.Error.InvalidOffset`
 - 队列满：`full`，手机可以稍后用同一序号重发
 
 ## 通知（TX）
@@ -92,15 +99,23 @@ D-Bus 方法（`WriteValue` / `StartNotify` / `StopNotify`）只认 `org.bluez` 
 {"t":"ack","id":5,"crc":3735928559}
 {"t":"ack","id":5,"crc":3735928559,"dup":true}
 {"t":"err","id":5,"crc":3735928559,"code":"crc"}   id / crc 读不出来时是 null
-{"t":"reply","text":"大肥鱼回复的摘要"}              正文最多 512 字节，超了在字符边界截断加 …
+{"t":"reply","text":"大肥鱼回复的摘要"}              正文最多 512 字节，超了在字符边界截断加 …；
+                                                    发之前按正文过滤的规矩把不合格字符删掉（换行留着）
 ```
 
 **回执归属**：`crc` 是被确认消息 START 里声明的 CRC32。通知是广播，同时连着两台手机时都会收到；手机只认
-`(id, crc)` 和自己发件箱对得上的回执。`crc` 为 null 的错误（例如 `nostart`、`frame`）手机只能按序号猜：最多安排一次重发
-（推车会去重），不从发件箱删。
+`(id, crc)` 和自己发件箱对得上的回执。`crc` 为 null 的错误手机只能按序号猜：错误码属于可重发的（`full`/`busy`/`timeout`/`nostart`/`crc`）时
+最多安排一次重发（推车会去重）；其他（例如 `frame`）忽略；都不从发件箱删。
+
+**有陌生设备连着时不发回执**：回执带 `crc`，短文本（例如 PIN）可以从 CRC 暴力反推。所以和 `reply` 一样，
+只有连着的设备全是受信设备时才发 `ack` / `err`；否则照常投递，只是不回执（审计记 `receipt-withheld`）。
+例外是 `unpaired`：它回的是陌生设备自己写的帧，照发。手机发完 20 秒没收到回执会同序号重发一次，陌生设备走了以后
+推车回 `ack dup`。读不到设备列表也当有陌生人。
 
 BlueZ 的通知发给所有订阅者，分不了设备：**只有连着的设备全是受信设备时**才发 `reply`，否则丢弃并写审计。
 回执和错误只有序号、CRC 和错误码，照常发。
+
+手机显示回复时每一行都加 `大肥鱼` 前缀，回复里写一行"✓ 已送达"也冒充不了回执。
 
 **推车重启**：推车的通知序号从随机起点重来；手机每次订阅 TX 成功（CCCD 写成功）都新建回执重组和去重状态，
 不会把新推车的回执当成旧的重复丢掉。
@@ -137,9 +152,10 @@ BlueZ 的通知发给所有订阅者，分不了设备：**只有连着的设备
 
 ## 配对（车机上确认）
 
-推车平时**不可配对**。配一台新手机：
+推车平时**不可配对**（`ble_input` 每 10 秒检查，开着就关）。配一台新手机先开 3 分钟配对窗口：
 
 ```
+sudo touch /run/ops-cart/ble-input/pairing   # 只有 root 能写这个目录; 3 分钟内 ble_input 不去关 Pairable
 sudo bluetoothctl
 [bluetooth]# agent DisplayYesNo
 [bluetooth]# default-agent
@@ -147,7 +163,8 @@ sudo bluetoothctl
 [bluetooth]# discoverable on          # 广播本身由 ble_input 发，这条只为首次配对
 ```
 
-手机 App 连上推车后第一次写入会触发配对；手机和车机终端上显示同一个六位数，两边都确认（数字比较，防中间人）。
+手机 App 连上推车后发起配对；手机和车机终端上显示同一个六位数，两边都确认（数字比较，防中间人）。
+**手机上没出现六位数（只问"是否配对"）就拒绝**：那是没有中间人保护的配对，可能连的不是推车。
 然后在车机上：
 
 ```
@@ -158,7 +175,7 @@ sudo bluetoothctl
 
 没 `trust` 的设备即使配了对也不收。撤销：`remove <手机地址>`。
 
-配完对**核对一遍**：
+窗口过了 `ble_input` 会自己把 `Pairable` 关掉。配完对**核对一遍**：
 
 ```
 [bluetooth]# devices Paired
@@ -171,7 +188,9 @@ sudo bluetoothctl
 ## 单元
 
 `cart-ble-input.service`：root（BlueZ 的 D-Bus 策略只让 root 注册 GATT 服务），没有能力、没有网络（只用 D-Bus 的
-Unix 套接字）、文件系统只读，只能写自己的运行目录和 `/var/log/ops-cart`。重启单元不清队列。默认不开：
+Unix 套接字）、文件系统只读，只能写自己的运行目录和 `/var/log/ops-cart`。重启单元不清队列和去重表。
+`BindsTo=bluetooth.service` + `WantedBy=bluetooth.service`：bluetoothd 停了跟着停、起来了跟着起；
+自己退出（例如 `org.bluez` 换了属主）由 `Restart=always` 5 秒后重拉。默认不开：
 
 ```
 sudo systemctl enable --now cart-ble-input.service
@@ -197,7 +216,8 @@ sudo systemctl enable --now cart-ble-input.service
 
 `capped-mtu517`：MTU 517 时首帧正好 512 字节。
 
-`text_rejects` / `text_accepts`：正文（UTF-8 十六进制）应该被拒（`ctrl`）/ 放行。
+`text_rejects` / `text_accepts`：正文（UTF-8 十六进制）应该被拒（`ctrl`）/ 放行。放行里有 Unicode 14/15 的 emoji
+和一个未分配码位，两端不管认识哪版 Unicode 都要放行。
 
 `status`：事件 → 回执 JSON 的确切字节（手机解析用）。
 
@@ -209,7 +229,8 @@ sudo systemctl enable --now cart-ble-input.service
 | 去重键 | （来源，序号） | （来源，序号，总长，CRC），每台设备单独 64 条 |
 | 回执 | `id` | `id` + `crc`（错误也带，读不出是 null） |
 | 通知分包 | 跟最后一次写的 MTU | 固定 23 |
-| 正文过滤 | Cc、双向覆盖符 | Cc、Cf（放行 ZWJ）、标签字符、Zl/Zp、Cn、Co、Cs、填充字 |
+| 正文过滤 | Cc、双向覆盖符 | Cc、Cf（放行 ZWJ）、标签字符、Zl/Zp、非字符、Co、Cs、填充字（Cn 不整类拒） |
+| 回执 | 照发 | 有陌生设备连着时不发（`unpaired` 除外） |
 | 投递 JSON | 5 个字段 | 加 `multiline` |
 | GATT 标志 | `encrypt-authenticated-*` | `secure-*`（目标 LE Secure Connections，待实机验证） |
 

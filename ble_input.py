@@ -17,6 +17,7 @@ Pairable 关掉; bluetoothd 换了属主 (重启) 就退出, 交给 systemd 重�
 """
 
 import argparse
+import json
 import os
 import random
 import re
@@ -35,6 +36,10 @@ REPLY_READ_MAX = 64 * 1024
 LOCAL_NAME = "ops-cart"
 TX_MTU = 23                 # 通知是广播, 分不了设备: 一律按最小 MTU 切, 哪台手机都收得下
 BLUEZ = "org.bluez"
+DEDUP = f"{BASE}/dedup.json"   # /run 下, 单元 RuntimeDirectoryPreserve: 服务重启不丢, 重启机器才丢 (monotonic 也跟着重来)
+PAIRING = f"{BASE}/pairing"    # root touch 它之后 PAIR_WINDOW_S 内允许 Pairable 开着
+PAIR_WINDOW_S = 180
+PAIRABLE_CHECK_S = 10
 
 _DEV_PATH = re.compile(r"/dev_([0-9A-Fa-f]{2}(?:_[0-9A-Fa-f]{2}){5})$")
 
@@ -96,11 +101,20 @@ def take_reply(path):
 # ------------------------------------------------------------ D-Bus 拿来的东西串起来
 
 class Handler:
-    """认设备 -> 重组 -> 投递 -> 回执 -> 审计. notify(帧) 把一帧发出去; log(正文) 写审计."""
+    """认设备 -> 重组 -> 投递 -> 回执 -> 审计. notify(帧) 把一帧发出去; log(正文) 写审计;
+    devices() 列出适配器上的设备 (BlueZ Device1 属性), 用来判断通知能不能发; dedup_path 是去重表落盘处."""
 
-    def __init__(self, sink, notify, log):
+    def __init__(self, sink, notify, log, devices=None, dedup_path=None, clock=time.monotonic):
         self.sink, self.notify, self.log = sink, notify, log
+        self.devices = devices or (lambda: [])
+        self.dedup_path, self.clock = dedup_path, clock
         self.rx, self.tx = bc.Receiver(), bc.Sender(random.getrandbits(16))
+        if dedup_path:
+            try:
+                with open(dedup_path, encoding="utf-8") as f:
+                    self.rx.restore(json.load(f), clock())
+            except (OSError, ValueError):
+                pass
 
     def _send(self, payload):
         try:
@@ -110,7 +124,23 @@ class Handler:
         for f in frames:
             self.notify(f)
 
+    def _all_trusted(self):
+        """通知是广播: 连着的设备全受信才发回执 (带 crc, 短文本可被反推) 和回复."""
+        try:
+            return bc.may_broadcast(self.devices())
+        except Exception:                   # noqa: BLE001 — 读不到设备列表就当有陌生人
+            return False
+
+    def _save_dedup(self):
+        if not self.dedup_path:
+            return
+        try:
+            atomicfile.write_json(self.dedup_path, self.rx.export(), mode=0o600)
+        except OSError:
+            pass
+
     def _handle(self, evs):
+        open_air = None
         for ev in evs:
             result = None
             if ev.kind == "text":
@@ -119,17 +149,29 @@ class Handler:
                 else:
                     self.rx.forget(ev)
                     ev = bc.Event("err", ev.src, ev.msg_id, size=ev.size, code="full", crc=ev.crc)
+                self._save_dedup()
+            if ev.code != "unpaired":       # unpaired 回的是陌生设备自己的帧, 照发, 它才知道要配对
+                if open_air is None:
+                    open_air = self._all_trusted()
+                if not open_air:
+                    result = (result or ev.kind) + ",receipt-withheld"
+                    self.log(bc.audit(ev, result=result))
+                    continue
             self.log(bc.audit(ev, result=result))
             self._send(bc.status_for(ev))
 
     def on_write(self, src, props, frame, now=None):
-        now = time.time() if now is None else now
+        now = self.clock() if now is None else now
         self._handle(self.rx.feed(src, frame, now, bc.device_trusted(props)))
 
     def tick(self, now=None):
-        self._handle(self.rx.expire(time.time() if now is None else now))
+        self._handle(self.rx.expire(self.clock() if now is None else now))
 
-    def send_reply(self, text, devices):
+    def send_reply(self, text):
+        try:
+            devices = self.devices()
+        except Exception:                   # noqa: BLE001
+            devices = []
         if not bc.may_broadcast(devices):
             self.log(cartlog.fields(kind="reply", result="dropped", reason="untrusted-connected",
                                     len=len(text.encode("utf-8"))))
@@ -140,8 +182,20 @@ class Handler:
 
 # ------------------------------------------------------------ 适配器 / bluetoothd 看门
 
-def ensure_not_pairable(get, set_, log):
-    """推车平时不可配对 (L5): 启动时 Pairable 开着就关掉并记事件; 关不掉记 WARN. 返回 ok / turned-off / warn."""
+def pairing_open(path, now=None):
+    """配对窗口: root 在运行目录 touch 了 pairing, 且没过 PAIR_WINDOW_S."""
+    now = time.time() if now is None else now
+    try:
+        return 0 <= now - os.stat(path).st_mtime <= PAIR_WINDOW_S
+    except OSError:
+        return False
+
+
+def ensure_not_pairable(get, set_, log, window=False):
+    """推车平时不可配对: 启动时和之后每 PAIRABLE_CHECK_S 秒查一次, Pairable 开着 (又不在配对窗口里) 就关掉并记事件;
+    关不掉记 WARN. 返回 ok / window / turned-off / warn."""
+    if window:
+        return "window"
     try:
         if not get("Pairable"):
             return "ok"
@@ -225,6 +279,8 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
             from_bluez(sender)
             if self.uuid != bc.RX_UUID:
                 raise dbus.exceptions.DBusException("只有 RX 能写", name="org.bluez.Error.NotSupported")
+            if int(options.get("offset", 0) or 0) != 0:
+                raise dbus.exceptions.DBusException("不支持偏移写", name="org.bluez.Error.InvalidOffset")
             path = options.get("device")
             handler_box[0].on_write(dev_addr(path), device_props(path) if path else None, bytes(value))
 
@@ -302,15 +358,18 @@ def main(argv=None):
     bus = dbus.SystemBus()
     box = [None]
     app, adv, tx, all_devices = _build(dbus, service, GLib, bus, a.adapter, box)
-    box[0] = Handler(DirSink(a.inbox), notify=tx.push, log=lambda s: cartlog.event("ble-input", s))
+    box[0] = Handler(DirSink(a.inbox), notify=tx.push, log=lambda s: cartlog.event("ble-input", s),
+                     devices=all_devices, dedup_path=DEDUP)
     os.makedirs(a.reply, mode=0o700, exist_ok=True)
     os.chmod(a.reply, 0o700)
     ad = bus.get_object(BLUEZ, f"/org/bluez/{a.adapter}")
     loop = GLib.MainLoop()
     adapter_props = dbus.Interface(ad, "org.freedesktop.DBus.Properties")
-    ensure_not_pairable(lambda k: adapter_props.Get("org.bluez.Adapter1", k),
-                        lambda k, v: adapter_props.Set("org.bluez.Adapter1", k, dbus.Boolean(v)),
-                        lambda s: cartlog.event("ble-input", s))
+    def check_pairable():
+        ensure_not_pairable(lambda k: adapter_props.Get("org.bluez.Adapter1", k),
+                            lambda k, v: adapter_props.Set("org.bluez.Adapter1", k, dbus.Boolean(v)),
+                            lambda s: cartlog.event("ble-input", s), window=pairing_open(PAIRING))
+    check_pairable()
 
     def bluez_gone():
         print("ble_input: org.bluez 属主变了 (bluetoothd 重启?), 退出交给 systemd 重拉", file=sys.stderr)
@@ -326,15 +385,17 @@ def main(argv=None):
     dbus.Interface(ad, "org.bluez.LEAdvertisingManager1").RegisterAdvertisement(
         adv, {}, reply_handler=ok("广播"), error_handler=fail("注册广播"))
 
+    n = [0]
+
     def tick():
         h = box[0]
         h.tick()
         text = take_reply(a.reply)
         if text:
-            try:
-                h.send_reply(text, all_devices())
-            except dbus.DBusException as e:
-                print(f"ble_input: 读设备列表失败, 回复丢弃: {e}", file=sys.stderr)
+            h.send_reply(text)
+        n[0] += 1
+        if n[0] % PAIRABLE_CHECK_S == 0:
+            check_pairable()
         return True
 
     GLib.timeout_add_seconds(1, tick)

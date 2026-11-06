@@ -10,7 +10,8 @@
   同序号不同内容当新消息. 去重表按来源设备分开计数.
 - 回执 / 错误带被确认消息的 (序号, CRC), 每台手机只认自己的.
 - 正文只能是可见文字加换行 / 制表: 控制字符、格式字符 (Cf, 只放行 ZWJ)、标签字符、行 / 段分隔符、
-  未分配码位、私用区、看不见的填充字一律拒 (ctrl). 检查在重组之后做.
+  非字符 (U+FDD0..FDEF、每个平面末尾两个)、私用区、看不见的填充字一律拒 (ctrl). 检查在重组之后做.
+  未分配 (Cn) 不整类拒: 推车的 Python 认的 Unicode 版本可能比手机老, 新 emoji 在它眼里就是 Cn.
 - 文字只进输入框: 换行不得触发提交; 送往 HID 或串口必须再走现有危险操作确认 (见 docs/BLE_INPUT.md).
 - 审计 (audit) 只写来源设备、序号、长度、结果, 不写正文.
 """
@@ -23,7 +24,7 @@ import zlib
 import cartlog
 
 SERVICE_UUID = "c7fa50cf-d4f6-4e23-a71d-7b725c250660"
-RX_UUID = "d0b9f7e0-8914-4d78-9501-69062f225d38"        # 手机写 (write / write without response)
+RX_UUID = "d0b9f7e0-8914-4d78-9501-69062f225d38"        # 手机写 (secure-write, 带回应的写)
 TX_UUID = "a1e1ae6b-abf5-4e3d-9e69-19bafa051e86"        # 推车 notify: 回执 / 错误 / 回复摘要
 
 T_START, T_CONT = 0x01, 0x02
@@ -40,7 +41,7 @@ REPLY_MAX = 512             # 回复摘要最多多少字节正文
 
 ALLOWED_CTRL = "\n\t"
 ZWJ = "\u200d"               # emoji 组合要用, Cf 里只放行它
-BAD_CATEGORIES = {"Cc", "Cf", "Cs", "Cn", "Co", "Zl", "Zp"}
+BAD_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Zl", "Zp"}       # 不含 Cn, 见模块说明
 TAGS = range(0xE0000, 0xE0080)                     # 标签字符 (有的是 Cf, 有的未分配), 整段拒
 INVISIBLE = {0x115F, 0x1160, 0x3164, 0xFFA0}        # 韩文填充字: 字母类但看不见
 
@@ -114,6 +115,19 @@ def peek_crc(frame):
     return int.from_bytes(frame[5:9], "big") if len(frame) >= START_HDR and frame[0] == T_START else None
 
 
+def _bad_char(ch):
+    if ch in ALLOWED_CTRL or ch == ZWJ:
+        return False
+    cp = ord(ch)
+    return (unicodedata.category(ch) in BAD_CATEGORIES or cp in TAGS or cp in INVISIBLE
+            or 0xFDD0 <= cp <= 0xFDEF or (cp & 0xFFFE) == 0xFFFE)
+
+
+def clean_text(text):
+    """推车自己发出去的正文 (大肥鱼回复) 用: 同一套规矩, 不合格的字符直接去掉, 换行 / 制表留着."""
+    return "".join(ch for ch in text if not _bad_char(ch))
+
+
 def check_text(data):
     """字节 -> 文字. 只收可见文字加换行 / 制表 (ZWJ 也放行)."""
     try:
@@ -123,11 +137,8 @@ def check_text(data):
     if not text:
         raise Bad("empty")
     for ch in text:
-        if ch in ALLOWED_CTRL or ch == ZWJ:
-            continue
-        cp = ord(ch)
-        if unicodedata.category(ch) in BAD_CATEGORIES or cp in TAGS or cp in INVISIBLE:
-            raise Bad("ctrl", f"含控制 / 格式 / 看不见的字符 U+{cp:04X}")
+        if _bad_char(ch):
+            raise Bad("ctrl", f"含控制 / 格式 / 看不见的字符 U+{ord(ch):04X}")
     return text
 
 
@@ -247,6 +258,26 @@ class Receiver:
             seen.popitem(last=False)
         return out + [Event("text", src, mid, text=text, size=len(data), crc=p.crc)]
 
+    def export(self):
+        """去重表 -> 可写 JSON 的行 [来源, 序号, 总长, crc, 时间]. 时间是调用方给的 (monotonic)."""
+        return [[src, k[0], k[1], k[2], t] for src, seen in self.done.items() for k, t in seen.items()]
+
+    def restore(self, rows, now):
+        """export 的反面; 坏行、过期的、比 now 还新的 (时钟不对) 都丢掉."""
+        for r in rows if isinstance(rows, list) else ():
+            try:
+                src, mid, total, crc, t = r
+                key = (int(mid), int(total), int(crc))
+                t = float(t)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(src, str) or not 0 <= now - t <= DEDUP_TTL_S:
+                continue
+            seen = self.done.setdefault(src, collections.OrderedDict())
+            seen[key] = t
+            while len(seen) > DEDUP_KEEP:
+                seen.popitem(last=False)
+
     def forget(self, ev):
         """投递失败 (例如队列满) 时调用: 手机重发同一条要能再收."""
         self.done.get(ev.src, {}).pop((ev.msg_id, ev.size, ev.crc), None)
@@ -281,6 +312,7 @@ def err(msg_id, code, crc=None):
 
 def reply(text):
     """大肥鱼回复的摘要: 超过 REPLY_MAX 字节在字符边界截断, 加省略号."""
+    text = clean_text(text)
     raw = text.encode("utf-8")
     if len(raw) > REPLY_MAX:
         cut = REPLY_MAX - len("…".encode())

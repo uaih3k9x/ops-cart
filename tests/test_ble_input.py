@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import stat
+import time
 
 import pytest
 
@@ -12,6 +13,8 @@ import ble_input as bi
 import ble_input_core as bc
 
 DEV = "02:00:00:00:00:01"
+CONN_OK = {"Bonded": True, "Paired": True, "Trusted": True, "Connected": True}
+OK_DEVS = lambda: [CONN_OK]                                          # noqa: E731
 UNIT = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "cart-ble-input.service"
 
 
@@ -74,7 +77,7 @@ def test_handler_flow_with_fake_parts(tmp_path):
     """外壳里把 D-Bus 拿到的东西串起来那段: 认设备 -> 重组 -> 投递 -> 回执 -> 审计."""
     sent, logged = [], []
     sink = bi.DirSink(str(tmp_path / "in"), max_files=8)
-    h = bi.Handler(sink, notify=sent.append, log=logged.append)
+    h = bi.Handler(sink, notify=sent.append, log=logged.append, devices=OK_DEVS)
     trusted = {"Bonded": True, "Paired": True, "Trusted": True}
     for f in bc.encode(3, "隔空打字".encode(), 23):
         h.on_write(DEV, trusted, f, now=10.0)
@@ -93,7 +96,7 @@ def test_handler_flow_with_fake_parts(tmp_path):
 
 def test_handler_full_sink_reports_full(tmp_path):
     sent = []
-    h = bi.Handler(bi.DirSink(str(tmp_path / "in"), max_files=0), notify=sent.append, log=lambda s: None)
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in"), max_files=0), notify=sent.append, log=lambda s: None, devices=OK_DEVS)
     for f in bc.encode(3, b"x", 23):
         h.on_write(DEV, {"Bonded": True, "Paired": True, "Trusted": True}, f, now=1.0)
     rx = bc.Receiver()
@@ -107,7 +110,7 @@ def test_unit_draft_hardened_not_enabled_by_tests():
     assert "After=bluetooth.service" in body
     for k in ("NoNewPrivileges=yes", "ProtectSystem=strict", "RuntimeDirectory=ops-cart/ble-input ",
               "RuntimeDirectoryMode=0700", "ReadWritePaths=/var/log/ops-cart",
-              "UMask=0077", "Restart=on-failure", "RestrictAddressFamilies=AF_UNIX"):
+              "UMask=0077", "RestrictAddressFamilies=AF_UNIX"):
         assert k in body, k
     assert "kiosk.service" not in body
 
@@ -143,7 +146,7 @@ def _acks(sent, now=1.0):
 def test_handler_notifies_with_fixed_small_frames_and_untrusted_cannot_change_anything(tmp_path):
     """P3 / L1: 通知是广播, 发给所有订阅者; 一律按 MTU 23 切, 不受某台设备 (尤其不受信的) 报的 MTU 影响."""
     sent = []
-    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None)
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None, devices=OK_DEVS)
     h.on_write("02:00:00:00:00:09", None, b"\x01\x00\x00", now=1.0)
     for f in bc.encode(3, "隔空打字".encode(), 517):
         h.on_write(DEV, TRUSTED, f, now=1.0)
@@ -154,7 +157,7 @@ def test_handler_notifies_with_fixed_small_frames_and_untrusted_cannot_change_an
 def test_handler_full_keeps_crc_and_forgets(tmp_path):
     sent = []
     sink = bi.DirSink(str(tmp_path / "in"), max_files=0)
-    h = bi.Handler(sink, notify=sent.append, log=lambda s: None)
+    h = bi.Handler(sink, notify=sent.append, log=lambda s: None, devices=OK_DEVS)
     (f,) = bc.encode(3, b"x", 23)
     h.on_write(DEV, TRUSTED, f, now=1.0)
     assert _acks(sent) == [{"t": "err", "id": 3, "crc": bc.crc32(b"x"), "code": "full"}]
@@ -355,3 +358,131 @@ def test_bluez_owner_watch_quits_on_change():
 def test_unit_binds_to_bluetooth():
     body = "\n".join(l for l in UNIT.read_text().splitlines() if not l.lstrip().startswith("#"))
     assert "BindsTo=bluetooth.service" in body
+
+
+# ------------------------------------------------------------ 第二轮审查 (#61)
+
+STRANGER = {"Paired": False, "Connected": True}
+
+
+def test_send_reply_checks_connected_devices():
+    """3: send_reply 的受信闸门要接上: 有陌生设备连着就不发回复正文."""
+    sent, logged = [], []
+    devs = [[CONN_OK, STRANGER]]
+    h = bi.Handler(None, notify=sent.append, log=logged.append, devices=lambda: devs[0])
+    assert h.send_reply("机密回复") is False and sent == []
+    assert "dropped" in logged[-1]
+    devs[0] = [CONN_OK]
+    assert h.send_reply("好的") is True and sent
+
+
+def test_receipts_withheld_while_stranger_connected(tmp_path):
+    """6: 回执带 crc, 短文本可被反推; 有不受信设备连着时不发回执 (unpaired 除外, 那是陌生设备自己的帧)."""
+    sent, logged = [], []
+    devs = [[CONN_OK, STRANGER]]
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=logged.append, devices=lambda: devs[0])
+    for f in bc.encode(3, b"1234", 23):
+        h.on_write(DEV, TRUSTED, f, now=1.0)
+    assert sent == [] and len(list((tmp_path / "in").iterdir())) == 1  # 照样投递, 只是不回执
+    assert "withheld" in logged[-1]
+    h.on_write("02:00:00:00:00:09", None, bc.encode(4, b"x", 23)[0], now=1.0)
+    assert [d["code"] for d in _acks(sent)] == ["unpaired"]
+    sent.clear()
+    devs[0] = [CONN_OK]
+    for f in bc.encode(3, b"1234", 23):                               # 陌生设备走了, 手机重发拿到 dup 回执
+        h.on_write(DEV, TRUSTED, f, now=2.0)
+    assert _acks(sent) == [{"t": "ack", "id": 3, "crc": bc.crc32(b"1234"), "dup": True}]
+
+
+def test_receipts_withheld_when_device_list_fails(tmp_path):
+    sent = []
+
+    def boom():
+        raise RuntimeError("dbus")
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None, devices=boom)
+    for f in bc.encode(3, b"x", 23):
+        h.on_write(DEV, TRUSTED, f, now=1.0)
+    assert sent == []
+
+
+def test_reply_text_cleaned_of_invisible_chars():
+    """5: 回复正文也过一遍: 零宽 / U+2028 / 控制字符去掉, 换行留着."""
+    sent = []
+    h = bi.Handler(None, notify=sent.append, log=lambda s: None, devices=OK_DEVS)
+    h.send_reply("好​的 \u001b[2J\n✓ 已送达")
+    (d,) = _acks(sent)
+    assert d == {"t": "reply", "text": "好的[2J\n✓ 已送达"}
+
+
+def test_handler_uses_monotonic_clock(monkeypatch, tmp_path):
+    """7: 半包和去重时效用 monotonic, 墙上时间被调也不乱."""
+    sent = []
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None, devices=OK_DEVS)
+    assert h.clock is time.monotonic
+    clock = [100.0]
+    h.clock = lambda: clock[0]
+    frames = bc.encode(5, b"y" * 50, 23)
+    h.on_write(DEV, TRUSTED, frames[0])
+    clock[0] += bc.PARTIAL_TTL_S + 1
+    h.tick()
+    assert [d["code"] for d in _acks(sent)] == ["timeout"]
+
+
+def test_dedup_survives_restart_via_run_file(tmp_path):
+    """8: 去重表落盘到 /run (单元 RuntimeDirectoryPreserve), 服务重启后手机重发不重复投递."""
+    path = tmp_path / "dedup.json"
+    inbox = tmp_path / "in"
+    frames = bc.encode(7, "只投一次".encode(), 23)
+    h = bi.Handler(bi.DirSink(str(inbox)), notify=lambda f: None, log=lambda s: None, devices=OK_DEVS,
+                   dedup_path=str(path))
+    for f in frames:
+        h.on_write(DEV, TRUSTED, f, now=50.0)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    sent = []
+    h2 = bi.Handler(bi.DirSink(str(inbox)), notify=sent.append, log=lambda s: None, devices=OK_DEVS,
+                    dedup_path=str(path), clock=lambda: 55.0)       # monotonic 跨进程同一个钟
+    for f in frames:
+        h2.on_write(DEV, TRUSTED, f, now=60.0)
+    assert len(list(inbox.iterdir())) == 1
+    assert _acks(sent)[0].get("dup") is True
+    path.write_text("{坏的")                                          # 坏文件不影响启动
+    bi.Handler(None, notify=None, log=lambda s: None, dedup_path=str(path))
+
+
+def test_write_value_nonzero_offset_refused():
+    """4: 我们不支持长写 / 偏移写."""
+    path = "/org/bluez/hci0/dev_02_00_00_00_00_01"
+    rec, _app, rx, _tx, _objs = _built({path: TRUSTED})
+    with pytest.raises(_FakeDBusException) as ei:
+        rx.WriteValue([1], {"device": path, "offset": 3}, sender=":1.7")
+    assert ei.value.name == "org.bluez.Error.InvalidOffset" and rec.calls == []
+    rx.WriteValue([1], {"device": path, "offset": 0}, sender=":1.7")
+    assert len(rec.calls) == 1
+
+
+def test_pairable_allowed_inside_pairing_window(tmp_path):
+    """9: tick 里也查 Pairable; 只有 root 在运行目录 touch 了 pairing 且没过窗口时才放着."""
+    marker = tmp_path / "pairing"
+    assert bi.pairing_open(str(marker), now=1000.0) is False
+    marker.write_text("")
+    os.utime(marker, (1000.0, 1000.0))
+    assert bi.pairing_open(str(marker), now=1000.0 + bi.PAIR_WINDOW_S - 1) is True
+    assert bi.pairing_open(str(marker), now=1000.0 + bi.PAIR_WINDOW_S + 1) is False
+    state, logged = {"Pairable": True}, []
+    assert bi.ensure_not_pairable(state.get, state.__setitem__, logged.append, window=True) == "window"
+    assert state["Pairable"] is True and logged == []
+    assert bi.ensure_not_pairable(state.get, state.__setitem__, logged.append, window=False) == "turned-off"
+
+
+def test_unit_restarts_always_and_follows_bluetooth():
+    """10: bluetoothd 停了跟着停, 起来了跟着起 (WantedBy=bluetooth.service); 自己退出也重拉."""
+    u = UNIT.read_text()
+    body = "\n".join(l for l in u.splitlines() if not l.lstrip().startswith("#"))
+    assert "Restart=always" in body and "Restart=on-failure" not in body
+    assert "WantedBy=bluetooth.service" in body
+
+
+def test_core_comment_matches_flags():
+    src = (pathlib.Path(__file__).resolve().parent.parent / "ble_input_core.py").read_text(encoding="utf-8")
+    line = next(l for l in src.splitlines() if l.startswith("RX_UUID"))
+    assert "secure-write" in line and "without response" not in line
