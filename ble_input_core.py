@@ -6,8 +6,12 @@
 - 蓝牙通道只是"打字": 收到的是文字数据, 不是命令. 这里只重组、校验、去重, 交给投递目标 (Sink), 不执行任何东西.
 - 只认已配对、已在车机上 trust、没被 block 的设备 (device_trusted); 不认的设备写进来直接回 unpaired, 不留半包.
 - 一条消息最多 MAX_LEN 字节 UTF-8; 半包 PARTIAL_TTL_S 没新分片就丢; 每台设备同时最多 MAX_PARTIAL 个半包.
-- 已投递过的 (来源, 序号) 在 DEDUP_TTL_S 内再来只回 ack dup, 不重复投递 (断线重连后手机会重发).
-- 正文只能是可见文字加换行 / 制表: 控制字符、ESC 序列、双向文字覆盖符一律拒 (ctrl).
+- 已投递过的 (来源, 序号, 总长, CRC) 在 DEDUP_TTL_S 内再来只回 ack dup, 不重复投递 (断线重连后手机会重发);
+  同序号不同内容当新消息. 去重表按来源设备分开计数.
+- 回执 / 错误带被确认消息的 (序号, CRC), 每台手机只认自己的.
+- 正文只能是可见文字加换行 / 制表: 控制字符、格式字符 (Cf, 只放行 ZWJ)、标签字符、行 / 段分隔符、
+  未分配码位、私用区、看不见的填充字一律拒 (ctrl). 检查在重组之后做.
+- 文字只进输入框: 换行不得触发提交; 送往 HID 或串口必须再走现有危险操作确认 (见 docs/BLE_INPUT.md).
 - 审计 (audit) 只写来源设备、序号、长度、结果, 不写正文.
 """
 
@@ -26,6 +30,7 @@ T_START, T_CONT = 0x01, 0x02
 START_HDR = 9               # 类型 1 + 序号 2 + 总长 2 + CRC32 4
 CONT_HDR = 5                # 类型 1 + 序号 2 + 偏移 2
 ATT_OVERHEAD = 3            # 一次 ATT 写 / 通知能带 MTU-3 字节
+ATT_MAX_ATTR = 512          # ATT 属性值最多 512 字节: 单帧 = min(MTU-3, 512)
 MAX_LEN = 4096
 PARTIAL_TTL_S = 10
 MAX_PARTIAL = 2
@@ -34,7 +39,10 @@ DEDUP_TTL_S = 600
 REPLY_MAX = 512             # 回复摘要最多多少字节正文
 
 ALLOWED_CTRL = "\n\t"
-BIDI = set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A))
+ZWJ = "\u200d"               # emoji 组合要用, Cf 里只放行它
+BAD_CATEGORIES = {"Cc", "Cf", "Cs", "Cn", "Co", "Zl", "Zp"}
+TAGS = range(0xE0000, 0xE0080)                     # 标签字符 (有的是 Cf, 有的未分配), 整段拒
+INVISIBLE = {0x115F, 0x1160, 0x3164, 0xFFA0}        # 韩文填充字: 字母类但看不见
 
 
 class Bad(Exception):
@@ -48,11 +56,11 @@ class Bad(Exception):
 class Event:
     """重组的结果. kind: text (投递 text) / dup (已投递过) / err (code 说明)."""
 
-    __slots__ = ("kind", "src", "msg_id", "text", "size", "code")
+    __slots__ = ("kind", "src", "msg_id", "text", "size", "code", "crc")
 
-    def __init__(self, kind, src, msg_id, text=None, size=None, code=None):
+    def __init__(self, kind, src, msg_id, text=None, size=None, code=None, crc=None):
         self.kind, self.src, self.msg_id = kind, src, msg_id
-        self.text, self.size, self.code = text, size, code
+        self.text, self.size, self.code, self.crc = text, size, code, crc
 
     def __repr__(self):
         return f"Event({self.kind}, {self.src}, {self.msg_id}, size={self.size}, code={self.code})"
@@ -65,12 +73,12 @@ def crc32(data):
 
 
 def encode(msg_id, payload, mtu):
-    """一条消息 -> 帧列表 (每帧不超过 mtu-3 字节). 首帧带总长和 CRC32, 后续帧带偏移."""
+    """一条消息 -> 帧列表 (每帧不超过 min(mtu-3, 512) 字节). 首帧带总长和 CRC32, 后续帧带偏移."""
     if not 0 <= msg_id <= 0xFFFF:
         raise ValueError("序号是 16 位")
     if not 0 < len(payload) <= MAX_LEN:
         raise ValueError(f"消息长度要在 1..{MAX_LEN} 字节")
-    room = mtu - ATT_OVERHEAD
+    room = min(mtu - ATT_OVERHEAD, ATT_MAX_ATTR)
     if room - START_HDR < 1:
         raise ValueError(f"MTU {mtu} 太小")
     mid = msg_id.to_bytes(2, "big")
@@ -101,8 +109,13 @@ def peek_id(frame):
     return int.from_bytes(frame[1:3], "big") if len(frame) >= 3 and frame[0] in (T_START, T_CONT) else None
 
 
+def peek_crc(frame):
+    """START 帧里声明的 CRC (回错误时带上, 手机据此认领); 读不出是 None."""
+    return int.from_bytes(frame[5:9], "big") if len(frame) >= START_HDR and frame[0] == T_START else None
+
+
 def check_text(data):
-    """字节 -> 文字. 只收可见文字加换行 / 制表."""
+    """字节 -> 文字. 只收可见文字加换行 / 制表 (ZWJ 也放行)."""
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -110,10 +123,11 @@ def check_text(data):
     if not text:
         raise Bad("empty")
     for ch in text:
-        if ch in ALLOWED_CTRL:
+        if ch in ALLOWED_CTRL or ch == ZWJ:
             continue
-        if unicodedata.category(ch) == "Cc" or ord(ch) in BIDI:
-            raise Bad("ctrl", f"含控制字符 U+{ord(ch):04X}")
+        cp = ord(ch)
+        if unicodedata.category(ch) in BAD_CATEGORIES or cp in TAGS or cp in INVISIBLE:
+            raise Bad("ctrl", f"含控制 / 格式 / 看不见的字符 U+{cp:04X}")
     return text
 
 
@@ -165,44 +179,49 @@ class Receiver:
 
     def __init__(self):
         self.partial = {}                       # (src, id) -> _Partial, 按到达顺序
-        self.done = collections.OrderedDict()   # (src, id) -> 投递时间
+        self.done = {}                          # src -> OrderedDict((id, 总长, crc) -> 投递时间)
 
     def expire(self, now):
         out = []
         for key in [k for k, p in self.partial.items() if now - p.last > PARTIAL_TTL_S]:
-            del self.partial[key]
-            out.append(Event("err", key[0], key[1], code="timeout"))
-        for key in [k for k, t in self.done.items() if now - t > DEDUP_TTL_S]:
-            del self.done[key]
+            p = self.partial.pop(key)
+            out.append(Event("err", key[0], key[1], code="timeout", crc=p.crc))
+        for src, seen in list(self.done.items()):
+            for key in [k for k, t in seen.items() if now - t > DEDUP_TTL_S]:
+                del seen[key]
+            if not seen:
+                del self.done[src]
         return out
+
+    def _delivered(self, src, mid):
+        return any(k[0] == mid for k in self.done.get(src, ()))
 
     def feed(self, src, frame, now, trusted):
         out = self.expire(now)
         frame = bytes(frame)
         if not trusted:
-            return out + [Event("err", src, peek_id(frame), code="unpaired")]
+            return out + [Event("err", src, peek_id(frame), code="unpaired", crc=peek_crc(frame))]
         try:
             kind, mid, a, crc, chunk = decode_frame(frame)
         except Bad as e:
             return out + [Event("err", src, peek_id(frame), code=e.code)]
         key = (src, mid)
         if kind == "start":
-            if key in self.done:
-                return out + [Event("dup", src, mid)]
+            if (mid, a, crc) in self.done.get(src, ()):
+                return out + [Event("dup", src, mid, crc=crc)]
             self.partial.pop(key, None)         # 同一序号重新开头 = 手机重发, 按新的来
             if not 0 < a <= MAX_LEN or len(chunk) > a:
-                return out + [Event("err", src, mid, code="len")]
+                return out + [Event("err", src, mid, code="len", crc=crc)]
             mine = [k for k in self.partial if k[0] == src]
             while len(mine) >= MAX_PARTIAL:
                 old = mine.pop(0)
-                del self.partial[old]
-                out.append(Event("err", src, old[1], code="busy"))
+                out.append(Event("err", src, old[1], code="busy", crc=self.partial.pop(old).crc))
             p = self.partial[key] = _Partial(a, crc, now)
             off = 0
         else:
             p = self.partial.get(key)
             if p is None:
-                if key in self.done:
+                if self._delivered(src, mid):
                     return out                  # 已投递消息的迟到分片, 安静丢掉
                 return out + [Event("err", src, mid, code="nostart")]
             off = a
@@ -210,26 +229,27 @@ class Receiver:
             p.add(off, chunk)
         except Bad as e:
             del self.partial[key]
-            return out + [Event("err", src, mid, code=e.code)]
+            return out + [Event("err", src, mid, code=e.code, crc=p.crc)]
         p.last = now
         if p.have < p.total:
             return out
         del self.partial[key]
         data = p.data()
         if crc32(data) != p.crc:
-            return out + [Event("err", src, mid, code="crc")]
+            return out + [Event("err", src, mid, code="crc", crc=p.crc)]
         try:
             text = check_text(data)
         except Bad as e:
-            return out + [Event("err", src, mid, code=e.code)]
-        self.done[key] = now
-        while len(self.done) > DEDUP_KEEP:
-            self.done.popitem(last=False)
-        return out + [Event("text", src, mid, text=text, size=len(data))]
+            return out + [Event("err", src, mid, code=e.code, crc=p.crc)]
+        seen = self.done.setdefault(src, collections.OrderedDict())
+        seen[(mid, p.total, p.crc)] = now
+        while len(seen) > DEDUP_KEEP:
+            seen.popitem(last=False)
+        return out + [Event("text", src, mid, text=text, size=len(data), crc=p.crc)]
 
-    def forget(self, src, msg_id):
+    def forget(self, ev):
         """投递失败 (例如队列满) 时调用: 手机重发同一条要能再收."""
-        self.done.pop((src, msg_id), None)
+        self.done.get(ev.src, {}).pop((ev.msg_id, ev.size, ev.crc), None)
 
 
 class Sender:
@@ -249,12 +269,14 @@ def _j(obj):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def ack(msg_id, dup=False):
-    return _j({"t": "ack", "id": msg_id, "dup": True} if dup else {"t": "ack", "id": msg_id})
+def ack(msg_id, crc, dup=False):
+    """回执带被确认消息的 (序号, CRC): 通知是广播, 手机只认和自己发件箱对得上的."""
+    return _j({"t": "ack", "id": msg_id, "crc": crc, "dup": True} if dup else {"t": "ack", "id": msg_id, "crc": crc})
 
 
-def err(msg_id, code):
-    return _j({"t": "err", "id": msg_id, "code": code})
+def err(msg_id, code, crc=None):
+    """crc 读不出来 (例如没有 START) 时是 null; 手机对 null 的只按序号试着重发, 不删发件箱."""
+    return _j({"t": "err", "id": msg_id, "crc": crc, "code": code})
 
 
 def reply(text):
@@ -268,10 +290,10 @@ def reply(text):
 
 def status_for(ev):
     if ev.kind == "text":
-        return ack(ev.msg_id)
+        return ack(ev.msg_id, ev.crc)
     if ev.kind == "dup":
-        return ack(ev.msg_id, dup=True)
-    return err(ev.msg_id, ev.code)
+        return ack(ev.msg_id, ev.crc, dup=True)
+    return err(ev.msg_id, ev.code, ev.crc)
 
 
 def audit(ev, result=None):

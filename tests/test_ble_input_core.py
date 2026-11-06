@@ -225,10 +225,11 @@ def test_may_broadcast_only_when_all_connected_trusted():
 # ------------------------------------------------------------ 回执 / 回复
 
 def test_status_payloads():
-    assert json.loads(bc.ack(5)) == {"t": "ack", "id": 5}
-    assert json.loads(bc.ack(5, dup=True)) == {"t": "ack", "id": 5, "dup": True}
-    assert json.loads(bc.err(5, "crc")) == {"t": "err", "id": 5, "code": "crc"}
-    assert json.loads(bc.err(None, "frame")) == {"t": "err", "id": None, "code": "frame"}
+    # 回执带被确认消息的 (序号, CRC), 每台手机只认自己的 (P3)
+    assert json.loads(bc.ack(5, 0xDEADBEEF)) == {"t": "ack", "id": 5, "crc": 0xDEADBEEF}
+    assert json.loads(bc.ack(5, 7, dup=True)) == {"t": "ack", "id": 5, "crc": 7, "dup": True}
+    assert json.loads(bc.err(5, "crc", 9)) == {"t": "err", "id": 5, "crc": 9, "code": "crc"}
+    assert json.loads(bc.err(None, "frame")) == {"t": "err", "id": None, "crc": None, "code": "frame"}
 
 
 def test_reply_truncated_on_char_boundary():
@@ -240,9 +241,11 @@ def test_reply_truncated_on_char_boundary():
 
 
 def test_event_to_status():
-    assert json.loads(bc.status_for(bc.Event("text", DEV, 3, text="x", size=1))) == {"t": "ack", "id": 3}
-    assert json.loads(bc.status_for(bc.Event("dup", DEV, 3))) == {"t": "ack", "id": 3, "dup": True}
-    assert json.loads(bc.status_for(bc.Event("err", DEV, 3, code="crc")))["code"] == "crc"
+    assert json.loads(bc.status_for(bc.Event("text", DEV, 3, text="x", size=1, crc=11))) == \
+        {"t": "ack", "id": 3, "crc": 11}
+    assert json.loads(bc.status_for(bc.Event("dup", DEV, 3, crc=11))) == {"t": "ack", "id": 3, "crc": 11, "dup": True}
+    d = json.loads(bc.status_for(bc.Event("err", DEV, 3, code="crc", crc=11)))
+    assert d["code"] == "crc" and d["crc"] == 11
 
 
 def test_tx_roundtrip_through_receiver():
@@ -289,3 +292,121 @@ def test_shared_vectors_match():
         rx = bc.Receiver()
         evs = _feed_all(rx, [bytes.fromhex(h) for h in v["frames_hex"]])
         assert [(e.kind, e.code) for e in evs][-1] == ("err", v["code"]), v["name"]
+
+
+# ------------------------------------------------------------ 审查意见 (#61 / #63)
+
+def test_frame_never_exceeds_att_attribute_max():
+    """P1: ATT 属性值最多 512 字节; MTU 517 时 mtu-3=514 会超, 单帧要按 min(mtu-3, 512) 切."""
+    frames = bc.encode(1, b"x" * bc.MAX_LEN, 517)
+    assert max(len(f) for f in frames) == bc.ATT_MAX_ATTR == 512
+    rx = bc.Receiver()
+    assert _texts(_feed_all(rx, frames)) == ["x" * bc.MAX_LEN]
+
+
+def test_same_id_different_content_is_new_message():
+    """P2 / M1: 去重键是 (来源, 序号, 总长, CRC). 手机重装后序号撞上, 内容不同要当新消息."""
+    rx = bc.Receiver()
+    assert _texts(_feed_all(rx, bc.encode(0, b"first", 185))) == ["first"]
+    assert _texts(_feed_all(rx, bc.encode(0, b"DIFFERENT", 185), now=T0 + 5)) == ["DIFFERENT"]
+    again = _feed_all(rx, bc.encode(0, b"first", 185), now=T0 + 6)
+    assert [e.kind for e in again] == ["dup"]
+
+
+def test_late_cont_of_delivered_message_silent_with_new_key():
+    rx = bc.Receiver()
+    frames = bc.encode(3, b"a" * 40, 23)
+    _feed_all(rx, frames)
+    assert rx.feed(DEV, frames[1], T0 + 1, True) == []
+
+
+def test_dedup_table_per_device():
+    """P5 / L4: 另一台设备刷 64 条不能把这台的去重记录挤掉."""
+    rx = bc.Receiver()
+    one = bc.encode(9, b"x", 23)
+    _feed_all(rx, one)
+    for i in range(bc.DEDUP_KEEP + 5):
+        _feed_all(rx, bc.encode(i, b"y", 23), src="02:00:00:00:00:02")
+    assert [e.kind for e in _feed_all(rx, one, now=T0 + 2)] == ["dup"]
+    for i in range(bc.DEDUP_KEEP + 1):                                 # 同一台自己刷才会挤掉最老的
+        _feed_all(rx, bc.encode(100 + i, b"z", 23))
+    assert _texts(_feed_all(rx, one, now=T0 + 3)) == ["x"]
+
+
+def test_events_carry_crc_for_receipts():
+    rx = bc.Receiver()
+    data = "回执".encode()
+    (ev,) = _feed_all(rx, bc.encode(4, data, 23))
+    assert ev.crc == bc.crc32(data)
+    (dup,) = _feed_all(rx, bc.encode(4, data, 23))
+    assert dup.kind == "dup" and dup.crc == bc.crc32(data)
+    (u,) = rx.feed(DEV, bc.encode(5, data, 23)[0], T0, False)          # 未配对也带上 START 里的 CRC
+    assert (u.code, u.msg_id, u.crc) == ("unpaired", 5, bc.crc32(data))
+    (n,) = rx.feed(DEV, bytes([2, 0, 6, 0, 1]) + b"x", T0, True)
+    assert (n.code, n.crc) == ("nostart", None)
+    rx.feed(DEV, bc.encode(7, b"y" * 50, 23)[0], T0, True)
+    (t,) = rx.expire(T0 + bc.PARTIAL_TTL_S + 1)
+    assert (t.code, t.crc) == ("timeout", bc.crc32(b"y" * 50))
+
+
+def test_forget_takes_event_and_allows_resend():
+    rx = bc.Receiver()
+    frames = bc.encode(8, b"q", 23)
+    (ev,) = _feed_all(rx, frames)
+    rx.forget(ev)
+    assert _texts(_feed_all(rx, frames)) == ["q"]
+
+
+@pytest.mark.parametrize("ch", [
+    "​",           # 零宽空格 Cf
+    "‎",           # LRM Cf
+    "؜",           # 阿拉伯字母标记 Cf
+    "﻿",           # BOM Cf
+    "­",           # 软连字符 Cf
+    " ", " ",  # Zl / Zp
+    "\U000e0069", "\U000e0001", "\U000e007f",  # 标签字符
+    "￿", "\U0010fffe",  # Cn
+    "", "\U000f0000",  # Co
+    "ㅤ", "ﾠ",  # 看不见的韩文填充字
+])
+def test_invisible_and_format_chars_rejected(ch):
+    """M2: 看不见的格式字符可以藏指令, 一律 ctrl; 只放行 ZWJ (emoji 组合要用)."""
+    with pytest.raises(bc.Bad) as ei:
+        bc.check_text(f"a{ch}b".encode())
+    assert ei.value.code == "ctrl"
+
+
+@pytest.mark.parametrize("ok", ["👨‍👩‍👧", "❤️", "第一行\n\t第二行", "é", "한국어"])
+def test_visible_text_still_ok(ok):
+    assert bc.check_text(ok.encode()) == ok
+
+
+def test_filter_runs_after_reassembly_split_inside_tag():
+    """过滤在重组后: 标签字符的 4 个字节被切到两帧也拦得住."""
+    data = ("x" * 10 + "\U000e0069").encode()
+    frames = bc.encode(1, data, 23)
+    assert len(frames) == 2
+    evs = _feed_all(bc.Receiver(), frames)
+    assert [(e.kind, e.code) for e in evs] == [("err", "ctrl")]
+
+
+def test_shared_text_rejects_vectors():
+    doc = json.loads(VECTORS.read_text(encoding="utf-8"))
+    assert len(doc["text_rejects"]) >= 8
+    for v in doc["text_rejects"]:
+        with pytest.raises(bc.Bad) as ei:
+            bc.check_text(bytes.fromhex(v["utf8_hex"]))
+        assert ei.value.code == v["code"], v["name"]
+    for v in doc["text_accepts"]:
+        assert bc.check_text(bytes.fromhex(v["utf8_hex"])).encode() == bytes.fromhex(v["utf8_hex"]), v["name"]
+
+
+def test_shared_status_vectors():
+    doc = json.loads(VECTORS.read_text(encoding="utf-8"))
+    for v in doc["status"]:
+        ev = bc.Event(v["kind"], DEV, v["id"], code=v.get("code"), crc=v.get("crc"), size=1, text="x")
+        assert bc.status_for(ev).decode() == v["json"], v["name"]
+
+
+def test_vectors_declare_v2():
+    assert json.loads(VECTORS.read_text(encoding="utf-8"))["protocol"].startswith("ops-cart BLE input v2")
