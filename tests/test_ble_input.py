@@ -13,7 +13,7 @@ import ble_input as bi
 import ble_input_core as bc
 
 DEV = "02:00:00:00:00:01"
-CONN_OK = {"Bonded": True, "Paired": True, "Trusted": True, "Connected": True}
+CONN_OK = {"Address": DEV, "Bonded": True, "Paired": True, "Trusted": True, "Connected": True}
 OK_DEVS = lambda: [CONN_OK]                                          # noqa: E731
 UNIT = pathlib.Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "cart-ble-input.service"
 
@@ -313,12 +313,15 @@ def test_write_on_tx_not_supported():
     assert ei.value.name == "org.bluez.Error.NotSupported"
 
 
-def test_notify_only_after_start_notify():
+def test_push_does_not_depend_on_notifying_state():
+    """BlueZ 的 StartNotify / StopNotify 计数不可靠 (已绑定设备断开不减), 外壳不靠它判断有无订阅者;
+    能不能发由 Handler 的闸门决定, push 只管交给 BlueZ."""
     _rec, _app, _rx, tx, _objs = _built()
     tx.push(b"\x01")
     tx.StartNotify(sender=":1.7")
+    tx.StopNotify(sender=":1.7")
     tx.push(b"\x02")
-    assert [a[1]["Value"] for a in tx._emitted] == [[2]]
+    assert [a[1]["Value"] for a in tx._emitted] == [[1], [2]]
 
 
 # ------------------------------------------------------------ L5 / L6
@@ -373,6 +376,7 @@ def test_send_reply_checks_connected_devices():
     assert h.send_reply("机密回复") is False and sent == []
     assert "dropped" in logged[-1]
     devs[0] = [CONN_OK]
+    h.saw_secure_write(DEV)
     assert h.send_reply("好的") is True and sent
 
 
@@ -409,6 +413,7 @@ def test_reply_text_cleaned_of_invisible_chars():
     """5: 回复正文也过一遍: 零宽 / U+2028 / 控制字符去掉, 换行留着."""
     sent = []
     h = bi.Handler(None, notify=sent.append, log=lambda s: None, devices=OK_DEVS)
+    h.saw_secure_write(DEV)
     h.send_reply("好​的 \u001b[2J\n✓ 已送达")
     (d,) = _acks(sent)
     assert d == {"t": "reply", "text": "好的[2J\n✓ 已送达"}
@@ -486,3 +491,54 @@ def test_core_comment_matches_flags():
     src = (pathlib.Path(__file__).resolve().parent.parent / "ble_input_core.py").read_text(encoding="utf-8")
     line = next(l for l in src.splitlines() if l.startswith("RX_UUID"))
     assert "secure-write" in line and "without response" not in line
+
+
+# ------------------------------------------------------------ 只发给本次连接里刚 secure-write 过的设备
+
+OTHER = "02:00:00:00:00:02"
+OTHER_OK = dict(CONN_OK, Address=OTHER)
+
+
+def test_receipts_need_every_connected_device_to_have_written_recently(tmp_path):
+    """冒充已 trust 手机地址的未加密连接, 可能靠 BlueZ 恢复的 CCC 收到通知; 它写不了 secure-write.
+    所以连着的每台设备都要本次连接内最近 FRESH_S 秒里 secure-write 成功过, 才发回执 / 回复."""
+    sent, logged = [], []
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=logged.append,
+                   devices=lambda: [CONN_OK, OTHER_OK])
+    for f in bc.encode(3, b"1234", 23):
+        h.on_write(DEV, TRUSTED, f, now=1.0)
+    assert sent == [] and "withheld" in logged[-1]                     # OTHER 连着但没写过
+    h.on_write(OTHER, TRUSTED, bc.encode(9, b"z", 23)[0], now=2.0)
+    assert [d["id"] for d in _acks(sent)] == [9]                       # 两台都写过了
+
+
+def test_untrusted_write_does_not_count_as_fresh(tmp_path):
+    sent = []
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None,
+                   devices=lambda: [CONN_OK])
+    h.on_write(DEV, {"Paired": False}, bc.encode(4, b"x", 23)[0], now=1.0)   # unpaired 照发
+    sent.clear()
+    assert h.send_reply("机密", now=1.0) is False and sent == []
+
+
+def test_reply_freshness_expires_and_disconnect_clears(tmp_path):
+    sent = []
+    devs = [[CONN_OK]]
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None,
+                   devices=lambda: devs[0])
+    for f in bc.encode(3, b"x", 23):
+        h.on_write(DEV, TRUSTED, f, now=100.0)
+    assert h.send_reply("好", now=100.0 + bi.FRESH_S - 1) is True
+    assert h.send_reply("好", now=100.0 + bi.FRESH_S + 1) is False     # 太久没写
+    h.saw_secure_write(DEV, now=500.0)
+    devs[0] = [dict(CONN_OK, Connected=False)]
+    h.send_reply("好", now=501.0)                                       # 断了: 记录清掉
+    devs[0] = [CONN_OK]                                                 # 同地址又连上 (可能是冒充的), 还没写
+    assert h.send_reply("好", now=502.0) is False
+
+
+def test_device_without_address_blocks(tmp_path):
+    h = bi.Handler(None, notify=lambda f: None, log=lambda s: None,
+                   devices=lambda: [{k: v for k, v in CONN_OK.items() if k != "Address"}])
+    h.saw_secure_write(DEV, now=1.0)
+    assert h.send_reply("好", now=1.0) is False

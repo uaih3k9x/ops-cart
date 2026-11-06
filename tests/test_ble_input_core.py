@@ -213,13 +213,19 @@ def test_device_trusted(props, ok):
     assert bc.device_trusted(props) is ok
 
 
-def test_may_broadcast_only_when_all_connected_trusted():
-    good = {"Bonded": True, "Paired": True, "Trusted": True, "Connected": True}
-    stranger = {"Paired": False, "Connected": True}
-    offline = {"Paired": False, "Connected": False}
-    assert bc.may_broadcast([good, offline]) is True
-    assert bc.may_broadcast([good, stranger]) is False
-    assert bc.may_broadcast([]) is False
+def test_may_notify_needs_trusted_and_fresh_secure_write():
+    good = {"Address": DEV, "Bonded": True, "Paired": True, "Trusted": True, "Connected": True}
+    stranger = {"Address": "02:00:00:00:00:02", "Paired": False, "Connected": True}
+    offline = {"Address": "02:00:00:00:00:03", "Paired": False, "Connected": False}
+    recent = {DEV: 100.0}
+    assert bc.may_notify([good, offline], recent, 100.0, 300) is True
+    assert bc.may_notify([good, stranger], recent, 100.0, 300) is False
+    assert bc.may_notify([good], {}, 100.0, 300) is False              # 受信但没写过
+    assert bc.may_notify([good], recent, 401.0, 300) is False          # 写得太久了
+    mixed = dict(good, Address="02:00:00:00:00:ab")
+    assert bc.may_notify([mixed], {"02:00:00:00:00:AB": 100.0}, 100.0, 300) is True   # 属性里小写也认
+    assert bc.may_notify([], recent, 100.0, 300) is False
+    assert bc.may_notify([dict(good, Trusted=False)], recent, 100.0, 300) is False   # 写过之后被撤了 trust
 
 
 # ------------------------------------------------------------ 回执 / 回复

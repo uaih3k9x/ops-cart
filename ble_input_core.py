@@ -154,10 +154,17 @@ def device_trusted(props):
     return props.get("Bonded", True) is True
 
 
-def may_broadcast(devices):
-    """notify 发给所有订阅者, 分不了设备: 只在连着的设备全是受信设备时才发回复正文."""
+def may_notify(devices, recent, now, fresh):
+    """回执 / 回复能不能发 (通知是广播): 连着的每台设备都受信, 而且本次连接内最近 fresh 秒里 secure-write 成功过
+    (recent: 大写地址 -> 时间). 冒充已 trust 地址的未加密连接可能靠 BlueZ 恢复的 CCC 收到通知, 但它写不了 secure-write."""
     on = [d for d in devices if d.get("Connected") is True]
-    return bool(on) and all(device_trusted(d) for d in on)
+    if not on:
+        return False
+    for d in on:
+        t = recent.get(str(d.get("Address") or "").upper())
+        if not device_trusted(d) or t is None or not 0 <= now - t <= fresh:
+            return False
+    return True
 
 
 # ------------------------------------------------------------ 重组
