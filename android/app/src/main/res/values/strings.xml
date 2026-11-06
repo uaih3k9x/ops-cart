@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">推车打字</string>
+    <string name="hint">在这里输入（手机输入法、语音都行）</string>
+    <string name="send">发送</string>
+    <string name="voice">语音</string>
+    <string name="stop">断开</string>
+    <string name="channel">推车蓝牙连接</string>
+</resources>

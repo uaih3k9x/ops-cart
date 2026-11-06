@@ -13,7 +13,7 @@
 | `ble_input.py` | 薄外壳：BlueZ D-Bus 上的 GATT 服务和 LE 广播；投递目标；回复取件 |
 | `deploy/systemd/cart-ble-input.service` | 单元草稿，默认不开 |
 | `docs/ble_input_vectors.json` | Python 和安卓两边共用的测试向量 |
-| `android/` | 手机 App（另一个 PR） |
+| `android/` | 手机 App（Kotlin），见 `android/README.md` |
 
 依赖：`bluez`、`python3-dbus`、`python3-gobject`（缺了 `ble_input.py` 退出码 2，说明要装什么）。
 
