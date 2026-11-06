@@ -347,22 +347,37 @@ def take_ro_slot(d=None, n=None):
     raise SlotBusy(f"只读档已经有 {n} 个进程在跑 (stdio 会话或 cart-mcp-ro), 同时最多 {n} 个; 先关掉一个再连")
 
 
+AUDIT_SRC_CAP = 1000    # 合并审计里"来自几个不同来源"最多数到多少 (只记个数, 集合有上限)
+
+
 class AuditMerge:
-    """同一类审计 (key) 每 every 秒最多记一条; note(key) -> 这次记不记、上次之后有几次没逐条记.
+    """同一类审计 (key) 每 every 秒最多记一条. note(key, src) -> (这次记不记, 上次之后有几次没逐条记, 那几次来自几个
+    不同来源); flush(emit) 把还没落盘的尾巴计数交给 emit(key, 次数, 来源数) 写出 (进程退出 / 定时).
     限速调用和 HTTP 认证失败都用它: 刷请求不能把审计写满磁盘、借轮转冲掉真实记录 (#60)."""
 
     def __init__(self, clock, every=RO_AUDIT_EVERY_S):
-        self.clock, self.every, self.lock, self.last, self.quiet = clock, every, threading.Lock(), {}, {}
+        self.clock, self.every, self.lock = clock, every, threading.Lock()
+        self.last, self.quiet, self.srcs = {}, {}, {}
 
-    def note(self, key):
+    def note(self, key, src=None):
         with self.lock:
             now = self.clock()
             last = self.last.get(key)
             if last is not None and now - last < self.every:
                 self.quiet[key] = self.quiet.get(key, 0) + 1
-                return False, 0
+                seen = self.srcs.setdefault(key, set())
+                if src is not None and len(seen) < AUDIT_SRC_CAP:
+                    seen.add(src)
+                return False, 0, 0
             self.last[key] = now
-            return True, self.quiet.pop(key, 0)
+            return True, self.quiet.pop(key, 0), len(self.srcs.pop(key, ()))
+
+    def flush(self, emit):
+        with self.lock:
+            pend = [(k, q, len(self.srcs.pop(k, ()))) for k, q in self.quiet.items() if q]
+            self.quiet.clear()
+        for k, q, n in pend:
+            emit(k, q, n)
 
 
 class _Bucket:
@@ -445,11 +460,16 @@ class Server:
 
     def _limited(self, who, name):
         """被限速的调用: RO_AUDIT_EVERY_S 内只记一条, 下一条带上中间没逐条记的次数."""
-        log, quiet = self._merge.note("limited")
+        log, quiet, srcs = self._merge.note("limited", who)
         if not log:
             return
-        more = f" (之前另有 {quiet} 次被限速, 没逐条记)" if quiet else ""
+        more = f" (之前另有 {quiet} 次被限速, 来自 {srcs} 个不同来源, 没逐条记)" if quiet else ""
         self._log(who, name, {}, False, error=f"调用太频繁, 已限速{more}")
+
+    def flush_audit(self):
+        """把合并后还没落盘的限速计数写出 (进程退出时 atexit 调)."""
+        self._merge.flush(lambda key, q, n: self._log(
+            "-", None, {}, False, error=f"调用太频繁, 已限速 (另有 {q} 次被限速, 来自 {n} 个不同来源, 没逐条记)"))
 
     def _log(self, who, tool, args, ok, error=None, ms=None):
         if self.audit is not None:

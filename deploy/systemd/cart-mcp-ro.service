@@ -23,6 +23,8 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 UMask=0077
+# 每个 HTTP 连接一个线程: 封顶, 慢连接刷不出无限线程 (#60)
+TasksMax=64
 Restart=on-failure
 RestartSec=5
 

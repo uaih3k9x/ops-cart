@@ -471,3 +471,118 @@ def test_http_idle_connection_is_dropped(monkeypatch):
 
 def test_http_timeout_default():
     assert cm.HTTP_TIMEOUT_S == 30
+
+
+# ------------------------------------------------------------ #60 最后一轮: 慢滴、尾巴计数、403 按原因
+
+def test_http_dribbling_headers_cut_at_deadline(monkeypatch):
+    """每 0.2 秒一个字节 (比单次超时短): 读请求头整体超过时限也断开."""
+    import socket
+    import time
+    monkeypatch.setattr(cm, "HTTP_TIMEOUT_S", 5)
+    monkeypatch.setattr(cm, "HTTP_HEADER_DEADLINE_S", 0.8)
+    srv = _serve_clocked("act", {"tokens": {"me": ACT_TOK}, "hosts": []}, None, _Mono())
+    try:
+        s = socket.create_connection(("127.0.0.1", srv.server_address[1]))
+        s.sendall(b"POST /mcp HTTP/1.0\r\nX-A: ")
+        t0, alive = time.monotonic(), True
+        while time.monotonic() - t0 < 4:
+            try:
+                s.sendall(b"a")
+                s.settimeout(0.2)
+                if s.recv(10) == b"":
+                    alive = False
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                alive = False
+                break
+        assert not alive and time.monotonic() - t0 < 2.5
+        s.close()
+    finally:
+        srv.shutdown()
+
+
+def test_http_normal_request_unaffected_by_deadline(monkeypatch):
+    monkeypatch.setattr(cm, "HTTP_HEADER_DEADLINE_S", 0.5)
+    cfg = {"tokens": {"me": ACT_TOK}, "hosts": []}
+    srv = _serve_clocked("act", cfg, None, _Mono())
+    try:
+        import time
+        st, data = _post(srv.server_address[1], ACT_TOK, {"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        assert st == 200
+        time.sleep(0.8)                                             # 计时器已经取消, 不会事后乱断
+        st, _ = _post(srv.server_address[1], ACT_TOK, {"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        assert st == 200
+    finally:
+        srv.shutdown()
+
+
+def test_limited_tail_flushed():
+    clk, audit = _Mono(), _Audit()
+    s, _ = _ro_server(clock=clk, audit=audit)
+    for i in range(mc.RO_BURST):
+        s.handle(_call_req(i))
+    audit.lines.clear()
+    for i in range(50):
+        s.handle(_call_req(i))                                      # 50 次被限, 只记第 1 次
+    assert len(audit.lines) == 1
+    s.flush_audit()
+    assert len(audit.lines) == 2 and "49" in audit.lines[-1]["error"]
+    s.flush_audit()
+    assert len(audit.lines) == 2                                     # 刷过就清零, 不重复记
+
+
+def test_http_deny_tail_flushed_with_distinct_sources():
+    cfg = {"tokens": {"me": ACT_TOK}, "hosts": []}
+    a, clk = ListAudit(), _Mono()
+    srv = _serve_clocked("act", cfg, a, clk)
+    try:
+        for _ in range(50):
+            assert _raw(srv.server_address[1], {"Authorization": "Bearer wrong"}) == 401
+        assert len(a.lines) == 1
+        srv.flush_audit()
+        assert len(a.lines) == 2 and "49" in a.lines[-1]["error"] and "1 个不同来源" in a.lines[-1]["error"]
+        assert "127.0.0.1" not in a.lines[-1]["error"]               # 只记来源个数, 不列 IP
+    finally:
+        srv.shutdown()
+
+
+def test_audit_merge_counts_distinct_sources_capped():
+    m = mc.AuditMerge(lambda: 0.0)
+    assert m.note("k", "198.51.100.1") == (True, 0, 0)
+    for i in range(5000):
+        m.note("k", f"198.51.100.{i % 7}")
+    got = []
+    m.flush(lambda key, quiet, srcs: got.append((key, quiet, srcs)))
+    assert got == [("k", 5000, 7)]
+    for i in range(mc.AUDIT_SRC_CAP + 50):
+        m.note("k", f"src{i}")
+    got.clear()
+    m.flush(lambda key, quiet, srcs: got.append(srcs))
+    assert got == [mc.AUDIT_SRC_CAP]
+
+
+def test_http_403_split_by_reason():
+    """403 按原因分开合并: 刷 Host 不在白名单的, 不会把 Origin 不同源的那条也压掉."""
+    cfg = {"tokens": {"me": ACT_TOK}, "hosts": []}
+    a, clk = ListAudit(), _Mono()
+    srv = _serve_clocked("act", cfg, a, clk)
+    port = srv.server_address[1]
+    try:
+        for _ in range(20):
+            assert _raw(port, {"Authorization": f"Bearer {ACT_TOK}", "Host": "evil.example"}) == 403
+        assert _raw(port, {"Authorization": f"Bearer {ACT_TOK}", "Origin": "http://evil.example"}) == 403
+        errs = [ln["error"] for ln in a.lines]
+        assert len(errs) == 2 and "白名单" in errs[0] and "跨站" in errs[1]
+    finally:
+        srv.shutdown()
+
+
+def test_main_registers_audit_flush(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cm.atexit, "register", lambda f: seen.append(f))
+    monkeypatch.setattr(cm, "serve_stdio", lambda *a: None)
+    cm.main(["stdio", "--profile", "readonly", "--audit", "/dev/null"])
+    assert seen and all(callable(f) for f in seen)

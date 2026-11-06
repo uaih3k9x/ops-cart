@@ -25,8 +25,10 @@ PXE 解锁申请 (#24, mcp_pxe): pxe_request 只挂起, 人在车机上照抄确
 """
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -254,7 +256,8 @@ def serve_stdio(server, who, stdin, stdout):
 
 # ------------------------------------------------------------ HTTP (Streamable HTTP, 只回 application/json)
 
-HTTP_TIMEOUT_S = 30         # 一个连接这么久没动静就断 (慢连接不永久占线程)
+HTTP_TIMEOUT_S = 30         # 单次读写这么久没动静就断
+HTTP_HEADER_DEADLINE_S = 10  # 读完请求头和请求体的整体时限: 每 <30 秒滴一个字节的慢连接也占不久 (#60)
 
 
 def make_http_server(addr, port, server, conf=conf_read, audit=None, clock=time.monotonic):
@@ -265,8 +268,30 @@ def make_http_server(addr, port, server, conf=conf_read, audit=None, clock=time.
     class Handler(BaseHTTPRequestHandler):
         server_version = "ops-cart-mcp"
         timeout = HTTP_TIMEOUT_S
+        _deadline = None
+
+        def handle_one_request(self):
+            t = threading.Timer(HTTP_HEADER_DEADLINE_S, self._cut)
+            t.daemon = True
+            self._deadline = t
+            t.start()
+            try:
+                super().handle_one_request()
+            finally:
+                t.cancel()
+
+        def _cut(self):
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        def _read_done(self):
+            if self._deadline is not None:
+                self._deadline.cancel()         # 请求读完了: 工具跑多久不归这个时限管
 
         def _reply(self, code, body=b"", ctype="application/json", extra=()):
+            self._read_done()
             self.send_response(code)
             for k, v in extra:
                 self.send_header(k, v)
@@ -278,9 +303,9 @@ def make_http_server(addr, port, server, conf=conf_read, audit=None, clock=time.
                 self.wfile.write(body)
 
         def _deny(self, code, why, extra=()):
-            log, quiet = merge.note((server.profile, code))
+            log, quiet, srcs = merge.note((server.profile, code, why), self.client_address[0])  # 403 按原因分开
             if audit is not None and log:
-                more = f" (之前另有 {quiet} 次同类拒绝, 没逐条记)" if quiet else ""
+                more = f" (之前另有 {quiet} 次同类拒绝, 来自 {srcs} 个不同来源, 没逐条记)" if quiet else ""
                 audit.write(mc.audit_line(f"-@{self.client_address[0]}", None, None, False,
                                           error=f"{code} {why}{more}", profile=server.profile))
             self._reply(code, json.dumps({"error": why}, ensure_ascii=False).encode(), extra=extra)
@@ -308,7 +333,9 @@ def make_http_server(addr, port, server, conf=conf_read, audit=None, clock=time.
             if n < 0 or n > MAX_BODY:
                 self.close_connection = True
                 return self._reply(413, b'{"error": "body too large"}')
-            out = server.handle_text(self.rfile.read(n).decode("utf-8", "replace"), who)
+            text = self.rfile.read(n).decode("utf-8", "replace")
+            self._read_done()
+            out = server.handle_text(text, who)
             if out is None:
                 return self._reply(202)
             self._reply(200, out.encode())
@@ -324,9 +351,24 @@ def make_http_server(addr, port, server, conf=conf_read, audit=None, clock=time.
 
     class Srv(ThreadingHTTPServer):
         daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            e = sys.exc_info()[1]
+            if isinstance(e, OSError):          # 慢连接被时限掐断之类: 一行就够, 别把整段 traceback 刷进 journald
+                print(f"cart_mcp: 连接 {client_address[0]} 断开: {type(e).__name__}", file=sys.stderr, flush=True)
+                return
+            super().handle_error(request, client_address)
         address_family = socket.AF_INET6 if ":" in addr else socket.AF_INET
 
-    return Srv((addr, port), Handler)
+    srv = Srv((addr, port), Handler)
+
+    def flush_audit():
+        if audit is not None:
+            merge.flush(lambda key, q, n: audit.write(mc.audit_line(
+                "-", None, None, False, error=f"{key[1]} {key[2]} (另有 {q} 次同类拒绝, 来自 {n} 个不同来源, 没逐条记)",
+                profile=key[0])))
+    srv.flush_audit = flush_audit
+    return srv
 
 
 def _ip_json():
@@ -349,8 +391,11 @@ def serve_http(server, port, audit, conf=conf_read):
                 print(f"cart_mcp: 绑不上 {addr}:{port}: {e}", file=sys.stderr, flush=True)
                 continue
             live[addr] = srv
+            atexit.register(srv.flush_audit)    # 合并审计的尾巴计数: 退出时写出, 平时每轮补绑时也写一次
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             print(f"cart_mcp: 监听 {addr}:{port}/mcp", file=sys.stderr, flush=True)
+        for srv in live.values():
+            srv.flush_audit()
         time.sleep(REBIND_S)
 
 
@@ -375,6 +420,12 @@ def main(argv=None):
             return 3
     audit = mc.Audit(a.audit)
     server = make_server(a.profile, audit)
+    atexit.register(server.flush_audit)         # 合并审计的尾巴计数退出时写出 (#60)
+    for sig in (signal.SIGTERM, signal.SIGHUP):     # systemd 停服务 / ssh 断开: 走正常退出, atexit 才会跑
+        try:
+            signal.signal(sig, lambda *_a: sys.exit(0))
+        except (ValueError, OSError):
+            pass
     if a.mode == "stdio":
         for s in (sys.stdin, sys.stdout):
             if hasattr(s, "reconfigure"):

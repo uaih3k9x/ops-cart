@@ -155,3 +155,9 @@ def test_cart_mcp_readonly_unit():
         assert k in body, k
     assert "NoNewPrivileges" not in body                       # 读串口要 sudo -u 跑 conbroker tail (setuid), 不能加
     assert "--bind" not in body and "kiosk.service" not in body
+
+
+def test_mcp_http_units_cap_tasks():
+    """#60: 慢连接一个占一个线程, 单元把线程数封顶."""
+    for name in ("cart-mcp.service", "cart-mcp-ro.service"):
+        assert "TasksMax=64" in unit(name), name
