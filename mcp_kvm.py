@@ -17,6 +17,7 @@ import fcntl
 import hmac
 import json
 import os
+import re
 import secrets
 import subprocess
 import time
@@ -45,16 +46,60 @@ OCR_MIN_MEAN = 60.0             # 平均低于这个: 明说读不出, 叫 Agent
 OCR_HINT = "OCR 读不出 (没信号、纯图形画面都这样; 退回 Tesseract 时彩色桌面也读不出), 用 screenshot 看图"
 # 串口闸门的词表之外, 操作系统上常见的清盘 / 引导命令 (子串匹配: mkfs.ext4、Format-Volume 都算)
 DANGER_SUB = ("diskpart", "bcdedit", "mkfs", "wipefs", "fdisk", "sgdisk", "parted", "shred", "dd if=", "cipher /w",
-              "format-volume", "clear-disk", "remove-item", "reg delete")
+              "format-volume", "clear-disk", "remove-item", "reg delete", "initialize-disk", "remove-partition")
 # 高危组合键: 按下的键里包含其中一组就算 (多带 shift 等也算). SysRq 在 HID 上就是 alt+printscreen (+字母, Linux 魔术键).
 DANGER_KEYS = {frozenset(k) for k in (("ctrl", "alt", "delete"), ("ctrl", "alt", "del"), ("alt", "f4"),
                                       ("alt", "printscreen"))}
 
 
+# #69: 按"模式"查 (对 _norm 之后的整行): 小写、去掉引号 / 反引号 / ^ / 反斜杠、空白并成一个空格.
+# 变量拼接、编码、别名、脚本文件拦不住, 这是减速带. 往多拦的方向错, 只读的看盘命令 (ls / lsblk / blkid / cat /dev/sda) 不拦.
+_B = r"(?:^|[\s;&|(])"                         # 命令名前: 行首或分隔符 (sudo xxx 也算)
+_DEV = r"/dev/(?:sd|hd|vd|xvd|nvme|mmcblk|md|dm-|mapper/|disk/|loop|sg|sr)"
+_SYS = r"/(?:\*|etc|usr|bin|sbin|boot|lib|lib64|var|root|home|opt|dev|sys|proc|srv)?/?(?:\s|$)"
+DANGER_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
+    # Windows
+    ("rd /s", _B + r"(?:rd|rmdir)\s.*/s\b"),
+    ("del /s /q", _B + r"(?:del|erase)\s.*/[sq]\b"),
+    ("cipher /w", _B + r"cipher\s.*/w"),
+    ("diskpart clean", r"^clean(?: all)?$"),
+    ("diskpart convert", r"^convert (?:gpt|mbr|dynamic|basic)\b"),
+    ("Remove-Item -Recurse", _B + r"ri\s.*-r"),
+    ("takeown /r", _B + r"takeown\s.*/r\b"),
+    ("icacls /t", _B + r"icacls\s(?=.*/t\b)(?=.*/(?:reset|grant|deny|remove|setowner|inheritance|setintegritylevel))"),
+    # Linux: 把输出写到块设备
+    ("写块设备 >", r">\|?\s*" + _DEV),
+    ("tee 写块设备", r"\btee\b(?:\s+-\S+)*\s+" + _DEV),
+    ("of= 块设备", r"\bof=\s*" + _DEV),
+    ("拷到块设备", _B + r"(?:cp|mv|install|rsync)\s.*\s" + _DEV + r"\S*$"),
+    # Linux: 递归改系统目录的权限 / 属主, 截断 / 覆盖关键文件
+    ("chmod/chown -R 系统目录", _B + r"(?:chmod|chown|chgrp|setfacl)\s(?=(?:.*\s)?-(?:[a-z]*r[a-z]*|-recursive)\b).*\s" + _SYS),
+    ("truncate", _B + r"truncate\b"),
+    ("覆盖 /etc /boot", r"(?:^|[^>])>\|?\s*/(?:etc|boot)/"),
+    ("sysrq-trigger", r">\s*/proc/sysrq-trigger"),
+    ("find -delete", _B + r"find\s.*\s-delete\b"),
+    # Linux: 抹盘 / 分区 / 卷 / 固件启动项
+    ("抹盘 / 分区 / 卷", _B + r"(?:blkdiscard|gdisk|sfdisk|mke2fs|mkswap|mkntfs|mkdosfs|lvremove|vgremove|pvremove|lvreduce"
+                       r"|sg_format)\b"),
+    ("nvme format/sanitize", _B + r"nvme\s+(?:sanitize|format)\b"),
+    ("hdparm security-erase", r"--security-erase"),
+    ("zpool/zfs destroy", _B + r"(?:zpool\s+(?:destroy|labelclear)|zfs\s+destroy)\b"),
+    ("mdadm --zero-superblock", _B + r"mdadm\s.*--zero-superblock"),
+    ("cryptsetup luksFormat/erase", _B + r"cryptsetup\s.*\b(?:luksformat|erase|reencrypt)\b"),
+    ("efibootmgr 改启动项", _B + r"efibootmgr\s(?:.*\s)?-(?:b|o|n|c|a|-delete-bootnum|-bootorder|-bootnext|-create|-active)\b"),
+))
+_STRIP = re.compile(r"[\"'`^\\]")
+
+
+def _norm(text):
+    return re.sub(r"\s+", " ", _STRIP.sub("", (text or "").lower())).strip()
+
+
 def danger_of(text):
-    """这行里的高危词. 往多拦的方向错: 比如普通文字里带 write 也挂起."""
-    low = (text or "").lower()
-    return sw.danger_words(text) + [w for w in DANGER_SUB if w in low]
+    """这行里的高危词 / 高危模式. 往多拦的方向错: 比如普通文字里带 write 也挂起."""
+    low, norm = (text or "").lower(), _norm(text)
+    out = sw.danger_words(text) + [w for w in DANGER_SUB if w in low or w in norm]
+    return out + [label for label, rx in DANGER_PATTERNS if rx.search(norm) and label not in out]
 
 
 def danger_keys(keys):
@@ -105,13 +150,19 @@ def advance(line, blind, text, secret=False):
     第一行跟缓冲拼起来查. secret 的内容照样查, 但新 line 里只留 SECRET_MARK."""
     segs = text.split("\n")
     blocked = bool(blind) and bool(segs[0]) or (blind == UNKNOWN and len(segs) > 1)
-    hits = _hits([line + segs[0]] + segs[1:])
-    tail = segs[-1] if len(segs) > 1 else line + segs[0]
+    logical = (line + text).replace("\\\n", " ").split("\n")     # 行尾反斜杠续行 (#69): 拼起来再查一遍
+    hits = _hits([line + segs[0]] + segs[1:] + logical)
+    tail = logical[-1] if len(segs) > 1 else line + segs[0]
     if secret:
         tail = (SECRET_MARK if segs[-1] else "") if len(segs) > 1 else (line + SECRET_MARK if segs[0] else line)
     new_blind = (PARTIAL if secret and segs[-1] else "") if len(segs) > 1 else \
         (PARTIAL if secret and segs[0] else blind)
     return hits, blocked, tail[-TEXT_MAX:], new_blind
+
+
+def after_enter(line, blind):
+    """回车后的缓冲: 一般清空; 行尾是续行反斜杠时 shell 还在等下一行, 留着跟下一行拼."""
+    return line[:-1] + " " if line.endswith("\\") and not blind else ""
 
 
 def press(line, blind, keys):
@@ -122,7 +173,7 @@ def press(line, blind, keys):
     if eff[0] == "char":
         return advance(line, blind, eff[1])
     if eff[0] == "enter":
-        return [], blind == UNKNOWN, "", ""
+        return [], blind == UNKNOWN, after_enter(line, blind), ""
     if eff[0] == "backspace":
         return ([], False, line[:-1], blind) if line and not blind else ([], False, "", UNKNOWN)
     if eff[0] == "recall":
@@ -225,7 +276,7 @@ class LeaseStore:
                 hits, blocked, after, after_blind = advance(line, blind, text, secret)
                 if enter:
                     blocked = blocked or after_blind == UNKNOWN
-                    after, after_blind = "", ""
+                    after, after_blind = after_enter(after, after_blind), ""
                 full = line + ("" if secret else text)
             if hits and kind == "key" and danger_keys(keys):
                 why = "高危组合键, 要人确认"
