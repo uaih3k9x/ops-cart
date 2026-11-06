@@ -477,6 +477,7 @@ class LinkCore(private val port: Port, private val store: Store, private val ui:
         m.sent = true
         val t = ++m.ackToken
         if (m.ackResends >= ACK_RESENDS) return
+        if (m.lastCode == "unpaired" && m.retrying) return    // 已排了 unpaired 重发 (它先于最后一帧回调到了)
         later(ACK_WAIT_MS) {
             if (m.ackToken != t || m !in outbox) return@later
             m.ackResends++

@@ -818,4 +818,23 @@ class LinkCoreTest {
         assertEquals(1, f.saved.size)                         // 留在发件箱, 重连或过期再说
         assertEquals(f.lines.toString(), 1, f.lines.count { it.startsWith("✗ 推车还没 trust") })
     }
+
+    @Test
+    fun unpairedBeforeLastFrameSkipsAckWait() {
+        // 第五轮: unpaired 先于最后一帧的写回调到: 已经排了 unpaired 重发, 不再另排等回执重发
+        val f = bondedFake()
+        val core = LinkCore(f, f, f)
+        core.start()
+        val c = bringUp(core, f, mtu = 23)
+        core.send("多帧消息".repeat(5))
+        core.onWritten(c, true)                              // 第一帧写完, 推车已经回了 unpaired
+        FakeCart().notify("""{"t":"err","id":100,"crc":null,"code":"unpaired"}""").forEach { core.onNotify(c, it) }
+        drainWrites(core, c)                                 // 剩下的帧写完 -> awaitAck
+        f.advance(LinkCore.ACK_WAIT_MS + 1)
+        drainWrites(core, c)
+        assertEquals(1, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+        f.advance(LinkCore.UNPAIRED_RETRY_MS)
+        drainWrites(core, c)
+        assertEquals(2, c.writes.count { it[0].toInt() == FrameCodec.T_START })
+    }
 }
