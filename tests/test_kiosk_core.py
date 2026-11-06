@@ -1122,13 +1122,13 @@ def test_disarm_scrubs_install_menus_anywhere_in_tree(tmp_path):
     (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text(auto)
     (tmp_path / "grub.cfg-C000020A").write_text(auto)              # 按 IP (十六进制) 命名的菜单
     (tmp_path / "grub.cfg").write_text(auto)
-    (tmp_path / "grub.cfg.bak-20261021").write_text(auto)          # 手工备份: GRUB 不会自己去取, 留着
+    (tmp_path / "grub.cfg.bak-20261021").write_text(auto)          # 带装机项的手工备份: 也删 (#55 审查)
     kc.pxe_disarm(root=tmp_path, path=tmp_path / "pxe-mode.json")
     menus = {str(p.relative_to(tmp_path)): p.read_text() for p in tmp_path.rglob("grub.cfg*")
              if not p.name.startswith("grub.cfg.")}
     assert not any("inst.ks" in t for t in menus.values()), menus
     assert set(menus) == {"grub.cfg"}
-    assert (tmp_path / "grub.cfg.bak-20261021").exists()
+    assert not (tmp_path / "grub.cfg.bak-20261021").exists()
 
 
 # ------------------------------------------------------------ PinGate 退避 + 线程安全 (1.06.00)
@@ -1386,12 +1386,12 @@ def test_disarm_scrubs_winpe_menus_anywhere_in_tree(tmp_path):
     winpe = "set default=0\nmenuentry 'WinPE' {\n    chainloader (http,192.0.2.1)/win/ipxe.efi\n}\n"
     (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text(winpe)             # 手写进共享位置的 WinPE 菜单
     (tmp_path / "grub.cfg-C000020A").write_text(winpe)
-    (tmp_path / "grub.cfg.bak-20261030").write_text(winpe)                 # 手工备份: 不动
+    (tmp_path / "grub.cfg.bak-20261030").write_text(winpe)                 # 带装机项的手工备份: 也删 (#55 审查)
     kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
     menus = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("grub.cfg*")
              if not p.name.startswith("grub.cfg.")}
     assert menus == {"grub.cfg"}
-    assert (tmp_path / "grub.cfg.bak-20261030").exists()
+    assert not (tmp_path / "grub.cfg.bak-20261030").exists()   # #55 审查: 带装机项的备份也清
     assert (tmp_path / "boot.ipxe").exists() and (tmp_path / "win" / "boot.wim").exists()
 
 

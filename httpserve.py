@@ -14,7 +14,8 @@
 - pxelinux.cfg/ 下任何东西 (#55, 含 default、子目录、别名) 一律 404: pxelinux.0 只走 TFTP, TFTP 发的是生成的
 - grub.cfg* 超过 pxeserver.MENU_MAX 的当装机菜单 (不再只看前 64KB 却发整个文件)
 - 不列目录 (一律 404)
-- *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希) 永远 404
+- *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希)、*.tmp (atomicfile 临时文件)、grub.cfg.* 永远 404
+- 文件名判断都先过 pxeserver.norm_name (Windows 部署 NTFS 大小写不敏感: KS.CFG、Grub.cfg-01-… 是同一个文件)
 
 这是防"误装"的核对, 不是访问控制: MAC 头 (和 TFTP 的文件名一样) 是客户端自己报的, LAN1 上能抓到
 DHCP 的机器可以冒充. 真正的边界是物理的 —— LAN1 只接一台被测机、守卫发现别的 DHCP 就停服、
@@ -30,8 +31,8 @@ import socket
 import sys
 import time
 
-from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac,
-                       pxe_mode, pxelinux_cfg_gate, unlock_only_menu)
+from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, norm_name,
+                       private_name, pxe_mode, pxelinux_cfg_gate, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -46,7 +47,9 @@ def parse_args(argv):
 
 
 def is_ks(base):
-    return base.startswith("ks") and base.endswith(".cfg")
+    """归一后 ks 开头、带 .cfg 的都走 ks 门禁 (ks.cfg、ks-x.cfg、KS.CFG、ks.cfg.tmp…); ksh-*.rpm 这类仓库包不算."""
+    n = norm_name(base)
+    return n.startswith("ks") and ".cfg" in n
 
 
 def request_macs(headers):
@@ -68,8 +71,8 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
 
     def send_head(self):
         path = self.translate_path(self.path)
-        base = os.path.basename(path)
-        if ".bak" in base:
+        base = norm_name(os.path.basename(path))
+        if private_name(base) or base.startswith("grub.cfg."):
             self.send_error(404, "File not found")
             return None
         if pxelinux_cfg_gate(os.path.abspath(self.directory), path) is not None:

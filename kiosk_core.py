@@ -7,6 +7,8 @@
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -1117,8 +1119,34 @@ def _arm_clone(mac, now, root, path, seconds, purpose, confirm, conf_path, batch
                (f"; 不放行 {', '.join(skipped)}" if skipped else ""))
 
 
+@contextlib.contextmanager
+def _pxe_lock(path, required):
+    """arm / disarm 共用的跨进程锁 (#55 审查): <状态文件>.lock 上 flock, 约定同 mcp_pxe / mcp_serial.
+    车机 UI 的 pxe_arm 和 MCP 进程的 pxe_disarm 不会交错成"菜单删了、状态还是 install".
+    required=False (上锁) 时锁文件打不开就不加锁照做, 记事件: 上锁不能被锁挡住."""
+    try:
+        fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        if required:
+            raise
+        _pxe_event(f"拿不到装机模式锁 {path}.lock ({e.strerror or e}), 不加锁照样上锁")
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, purpose="rocky",
             confirm=None, conf_path=None, batch_path=None, env_path=None):
+    """持 _pxe_lock 做 _pxe_arm; 锁拿不到就抛 OSError, 什么都不写."""
+    with _pxe_lock(path, required=True):
+        return _pxe_arm(mac, now, root, path, seconds, purpose, confirm, conf_path, batch_path, env_path)
+
+
+def _pxe_arm(mac, now, root, path, seconds, purpose, confirm, conf_path, batch_path, env_path):
     """只给 mac 写解锁菜单. purpose 不认识、winpe 但 win/ 不齐都抛 ValueError (车机原样显示),
     什么都不写: 不齐时不退化成 rocky 菜单 (iPXE 一失败网卡就废了, 只能整机重启).
     克隆用途见 _arm_clone: clone-restore 不看 mac, 按清单来; confirm 是车机确认时 clone_plan 的 digest."""
@@ -1158,8 +1186,9 @@ def _rm(path, root, removed, failed):
 
 def _scrub_tftp(root):
     """-> (删掉的, 删不掉的). 每一步都兜住, 不抛.
-    - GRUB 会自己去取的菜单 (grub.cfg-*、子目录里的 grub.cfg) 带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu)
-      的删; 根下 grub.cfg-01-* 不看内容直接删. grub.cfg.bak-* 这类手工备份 GRUB 不会去取, 不动.
+    - 名字都先过 pxeserver.norm_name (大小写不敏感的文件系统).
+    - grub.cfg-*、子目录里的 grub.cfg、grub.cfg.* (备份; TFTP/HTTP 已不发, 这里再清一道) 带 inst.ks=、WinPE 项或
+      克隆项 (pxeserver.unlock_only_menu) 或超过 MENU_MAX 的删; 根下 grub.cfg-01-* 不看内容直接删. 无害的备份留着.
     - pxelinux.cfg (任何一级, #55): 推车只生成根下 pxelinux.cfg/default (普通文件), 别的不看内容一律删,
       含子目录、FIFO 等非常规文件、符号链接 (只删链接); pxelinux.cfg 本身不是目录 (文件 / 链接) 也删."""
     removed, failed = [], []
@@ -1177,7 +1206,7 @@ def _scrub_tftp(root):
 
     for d, dirs, files in os.walk(root):          # 不跟随符号链接目录
         for name in list(dirs):
-            if name.lower() == "pxelinux.cfg":
+            if pxeserver.norm_name(name) == "pxelinux.cfg":
                 dirs.remove(name)
                 full = os.path.join(d, name)
                 if os.path.islink(full):
@@ -1185,13 +1214,14 @@ def _scrub_tftp(root):
                 else:
                     scrub_pxelinux(full)
         for name in files:
-            full = os.path.join(d, name)
-            if name.lower() == "pxelinux.cfg":
+            full, n = os.path.join(d, name), pxeserver.norm_name(name)
+            if n == "pxelinux.cfg":
                 _rm(full, root, removed, failed)
                 continue
-            if not (name == "grub.cfg" or name.startswith("grub.cfg-")) or full == os.path.join(root, "grub.cfg"):
+            grubish = n == "grub.cfg" or n.startswith("grub.cfg-") or n.startswith("grub.cfg.")
+            if not grubish or (d == root and name == "grub.cfg"):
                 continue
-            if not (name.startswith("grub.cfg-01-") and d == root):
+            if not (d == root and n.startswith("grub.cfg-01-")):
                 try:
                     with open(full, "rb") as f:
                         head = f.read(pxeserver.MENU_MAX + 1)
@@ -1204,30 +1234,38 @@ def _scrub_tftp(root):
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
-    """上锁: 删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
+    """上锁: 删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全. 持 _pxe_lock (拿不到也照做).
     顺序 (#55 审查): 先删状态文件 (TFTP/HTTP 门禁立刻全锁) -> 清 tftp 树 (_scrub_tftp, 删不掉只记事件)
-    -> 写 grub.cfg -> 写 pxelinux.cfg/default (单独兜住; TFTP 发的本来就是生成的, 写不进去只记事件).
+    -> 写 grub.cfg -> 写 pxelinux.cfg/default. 每步都兜住, 一步失败不跳过后面的; 上锁事件一定写;
+    最后抛第一个错误 (pxelinux.cfg/default 除外: TFTP 发的本来就是生成的, 写不进去只记事件).
     clonezilla/ 和 win/ 不删. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
     再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
-    state_err = None
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        state_err = e
-    removed, failed = _scrub_tftp(root)
-    _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
-    _pxe_event("装机模式上锁, 只剩救援菜单" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else "") +
-               (f"; 删不掉 {', '.join(sorted(failed))}" if failed else ""))
-    try:
-        _write_atomic(os.path.join(root, "pxelinux.cfg", "default"), pxelinux_cfg_rescue())
-    except OSError as e:
-        _pxe_event(f"pxelinux.cfg/default 写失败 (TFTP 照样发生成的救援菜单): {e}")
-    if state_err:
-        _pxe_event(f"上锁时删不掉状态文件 {path}: {state_err}")
-        raise state_err
+    with _pxe_lock(path, required=False):
+        errors, notes = [], []
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            errors.append(e)
+            notes.append(f"删不掉状态文件 {path}: {e}")
+        removed, failed = _scrub_tftp(root)
+        try:
+            _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
+        except Exception as e:      # noqa: BLE001 -- 记下来, 后面照做, 最后再抛
+            errors.append(e)
+            notes.append(f"grub.cfg 写失败: {e}")
+        _pxe_event("装机模式上锁" + ("" if errors else ", 只剩救援菜单") +
+                   (f"; 删掉 {', '.join(sorted(removed))}" if removed else "") +
+                   (f"; 删不掉 {', '.join(sorted(failed))}" if failed else "") +
+                   "".join(f"; {n}" for n in notes))
+        try:
+            _write_atomic(os.path.join(root, "pxelinux.cfg", "default"), pxelinux_cfg_rescue())
+        except Exception as e:      # noqa: BLE001
+            _pxe_event(f"pxelinux.cfg/default 写失败 (TFTP 照样发生成的救援菜单): {e}")
+    if errors:
+        raise errors[0]
 
 
 def pxe_retire(macs, root=TFTP_ROOT):

@@ -888,12 +888,26 @@ def unlock_only_menu(text):
 MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 当装机菜单对待 (不读一半就放行)
 
 
+def norm_name(name):
+    """门禁比较用的文件名: 截掉 ":" 之后 (NTFS 备用数据流 ks.cfg::$DATA), 去尾部点和空格, 转小写.
+    Windows 部署 (NTFS 大小写不敏感、自动去尾点) 上 KS.CFG / Grub.cfg-01-… / ks.cfg. 都是同一个文件."""
+    return name.split(":", 1)[0].rstrip(". ").lower()
+
+
+def private_name(name):
+    """两个服务都不发的: *.bak* (ks_write 轮换的备份, 有旧密码哈希) 和 *.tmp (atomicfile 写到一半的临时文件)."""
+    n = norm_name(name)
+    return ".bak" in n or n.endswith(".tmp")
+
+
 def pxelinux_cfg_gate(root, path):
     """pxelinux 门禁 (#55, 白名单): "default" = 根下 pxelinux.cfg/default (发 pxelinux_menu 生成的, 不读盘);
     "deny" = 请求路径或解开符号链接后的真实路径里任何一级叫 pxelinux.cfg (子目录、bios/pxelinux.cfg、别名);
-    None = 跟 pxelinux.cfg 无关. 比较不分大小写、去掉尾部点和空格 (Windows 部署的文件系统会这么归一)."""
+    None = 跟 pxelinux.cfg 无关. 每一级先过 norm_name (Windows 部署的文件系统会这么归一).
+    不防硬链接 (os.link 出来的别名, 真实路径不含 pxelinux.cfg): 无害, 因为 pxelinux 只会自己去取 pxelinux.cfg/ 下的名字,
+    别的文件只有菜单点名才会被取, 而菜单是生成的 (没有 INCLUDE/CONFIG, IMPLICIT 0). 前提同 TftpServer: tftp 根只有 root 能写."""
     def parts(p, r):
-        return [c.rstrip(". ") for c in os.path.relpath(p, r).replace(os.sep, "/").lower().split("/")]
+        return [norm_name(c) for c in os.path.relpath(p, r).replace(os.sep, "/").split("/")]
     rel = parts(path, root)
     if rel == ["pxelinux.cfg", "default"]:
         return "default"
@@ -1054,7 +1068,9 @@ class TftpServer:
         没过期、文件名就是那台 MAC 时才照发, 否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走).
         超过 MENU_MAX 的 grub.cfg* 也按装机菜单对待.
         pxelinux (#55, 白名单, pxelinux_cfg_gate): pxelinux.cfg/default 不读盘, 发 pxelinux_menu 生成的;
-        pxelinux.cfg 下别的 (任意深度、别名) 一律找不到, pxelinux 会落到 default."""
+        pxelinux.cfg 下别的 (任意深度、别名) 一律找不到, pxelinux 会落到 default.
+        文件名判断都先过 norm_name (大小写不敏感的文件系统). grub.cfg.* (GRUB 不会去取的备份) 和 private_name 一律找不到.
+        前提: tftp 根只有 root 能写 (不用 O_NOFOLLOW 防"检查后换成链接"; 能在根下放链接的人本来就能改菜单)."""
         path = tftp_safe_name(self.root, name)
         cfg = pxelinux_cfg_gate(self.root, path)
         if cfg == "default":
@@ -1062,10 +1078,12 @@ class TftpServer:
             return io.BytesIO(data), len(data), f"TFTP RRQ {name} (推车生成)"
         if cfg == "deny":
             raise FileNotFoundError(f"{name} 不发 (pxelinux 只出推车生成的 default)")
+        base = norm_name(os.path.basename(path))
+        if private_name(base) or base.startswith("grub.cfg."):
+            raise FileNotFoundError(f"{name} 不发 (备份 / 临时文件)")
         f = open(path, "rb")
         size = os.fstat(f.fileno()).st_size
-        base = os.path.basename(path)
-        if not base.startswith("grub.cfg") or base.startswith("grub.cfg."):
+        if not base.startswith("grub.cfg"):
             return f, size, f"TFTP RRQ {name}"
         with f:
             data = f.read()
