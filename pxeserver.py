@@ -760,17 +760,37 @@ IPXE_SCRIPT = "boot.ipxe"
 WINPE_TITLE = "WinPE (GRUB -> iPXE -> wimboot)"
 
 
+# Memtest86+ (#55): 官方 x86_64 文件既是 EFI 程序又是 Linux bzImage, 一个文件 UEFI / BIOS 两边都用.
+# 放 tftp 根目录下 memtest/, 由 memtest_core.py 按固定版本下载校验后写入 (二进制不进仓库).
+# 不动硬盘, 所以挂在人人可取的救援菜单最后一项; EFI 文件没有签名, 开着安全启动会被 shim/GRUB 拒绝.
+MEMTEST_EFI = "memtest/memtest64.efi"
+MEMTEST_TITLE = "Memtest86+ memory test (HTTP; turn Secure Boot OFF first)"
+
+
 def grub_menu(ip, install=False):
     """GRUB 菜单: 救援 (默认, 不装系统) / 自动装机. 每项都给 HTTP (快) 和 TFTP (慢) 两条路.
+    救援菜单最后加 Memtest86+ (chainloader, 只走 HTTP); 装机菜单倒计时短, 不加.
     装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此核对是不是解锁的那台
     (防误装; MAC 头是客户端自报的, 不当访问控制)."""
     repo = f"http://{ip}:8000"
     if install:
         title, args, timeout = ("Rocky 9.8 auto install",
                                 f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg inst.ks.sendmac", 5)
+        extra = ""
     else:
         title, args, timeout = ("Rescue shell", _rescue_args(repo), 10)
-    return f"set default=0\nset timeout={timeout}\n\n" + _linux_entries(ip, title, args)
+        extra = f"\nmenuentry '{MEMTEST_TITLE}' {{\n    chainloader (http,{ip})/{MEMTEST_EFI}\n}}\n"
+    return f"set default=0\nset timeout={timeout}\n\n" + _linux_entries(ip, title, args) + extra
+
+
+def pxelinux_menu(ip):
+    """BIOS 机器的 pxelinux.cfg/default: 默认救援 (10 秒), 另一项 Memtest86+. 不用 menu.c32,
+    boot: 提示符下敲标签名. pxelinux.0 只会 TFTP, 路径相对 tftp 根. 没有任何自动装机项."""
+    return ("DEFAULT rescue\nPROMPT 1\nTIMEOUT 100\n"
+            "SAY Rescue shell in 10 s. Type memtest and Enter for Memtest86+.\n\n"
+            "LABEL rescue\n    KERNEL vmlinuz\n"
+            f"    APPEND initrd=initrd.img ip=dhcp {_rescue_args(f'http://{ip}:8000')}\n\n"
+            f"LABEL memtest\n    LINUX {MEMTEST_EFI}\n")
 
 
 def _rescue_args(repo):

@@ -83,6 +83,7 @@
 | [`notify_core.py`](notify_core.py) | 关键事件推到手机(UPS、守卫、校园网认证、服务挂了、非正常重启):只读状态文件、只在变化时推、防抖冷却;渠道 ntfy、飞书群自定义机器人或推车专用飞书应用(只开发消息权限),默认不外发 |
 | [`recipe_core.py`](recipe_core.py) · [`recipe.py`](recipe.py) | 屏幕自动化配方:截图 + OCR + CH9329,第一个配方 `boot-pxe` 自动进启动菜单选网络启动;配方里不许出现保存类按键 |
 | [`clone_core.py`](clone_core.py) | 整盘克隆(Clonezilla over PXE):解锁用途 clone-save / clone-restore、启动参数生成、目标盘按型号/序列号显式匹配(绝不默认 sda)、批量清单确认;见 [`docs/CLONE.md`](docs/CLONE.md) |
+| [`memtest_core.py`](memtest_core.py) | PXE 菜单里的 Memtest86+:固定官方版本,下载后 zip 和解出文件各校验 sha256,不符就中止;见 [`docs/MEMTEST.md`](docs/MEMTEST.md) |
 | [`srv_data_core.py`](srv_data_core.py) · [`samba_core.py`](samba_core.py) | 数据盘和装机库(#11):数据盘按 UUID 挂 `/srv/data`(XFS、nofail,没装盘照常开机)、ISO 只读挂载单元(单元名按 systemd-escape 转义)、目录布局;Samba 配置生成(只绑 LAN1、hosts allow 装机网段、装机共享账号登录、克隆共享照 `clone.json`)、firewalld 规则。部署 `scripts/setup-srv-data.sh` / `scripts/setup-samba.sh`,见 [`docs/DATA_DISK.md`](docs/DATA_DISK.md) |
 | [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
 | [`sun_core.py`](sun_core.py) | 按日出日落判断深色 / 浅色(#31,NOAA 算法、不联网):档位 auto / dark / light,auto 下日出日落后留缓冲(默认 20 分钟)不来回跳,没配经纬度或配置读不懂按深色;配置 `/etc/ops-cart/theme.json`(样例 [`examples/theme.example.json`](examples/theme.example.json),坐标是格林尼治天文台,推车位置在车上配);结果由 cart-dash 写进快照 `theme` |
@@ -101,7 +102,7 @@
 | [`fonts/`](fonts/) | 车机和副屏的界面字体 Unifont 16px 点阵(OTF + 授权原文),部署装到 `/usr/local/share/fonts/ops-cart/`;取不到车机退回 Noto,自检 `UI FONT` 一行变 WARN |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
 | [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查,`cart_accept.py` 推车只读验收(逐项 PASS / FAIL / SKIP / 人工,纯逻辑在 `accept_core.py`);`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
-| [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md)、[备用远程通道](docs/REMOTE_TUNNEL.md) |
+| [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[Memtest86+](docs/MEMTEST.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md)、[备用远程通道](docs/REMOTE_TUNNEL.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
 | [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |

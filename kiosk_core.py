@@ -1010,6 +1010,12 @@ def grub_cfg_rescue(env_path=None):
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
+def pxelinux_cfg_rescue(env_path=None):
+    """BIOS 机器的 pxelinux.cfg/default (#55): 救援 + Memtest86+, 模板在 pxeserver.pxelinux_menu."""
+    return ("# 推车生成: 默认只进救援 shell, 不装系统\n" +
+            pxeserver.pxelinux_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
+
+
 def grub_cfg_install(env_path=None):
     return ("# 推车生成: 装机模式, 只下发给解锁时选定的那台机器\n" +
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"], install=True))
@@ -1380,7 +1386,7 @@ def video_size(dev):
 # ---------------------------------------------------------------- 命令行 (部署脚本用)
 
 def main(argv=None):
-    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留救援菜单 (setup-cart.sh 调).
+    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留救援菜单, 另写 BIOS 的 pxelinux.cfg/default (setup-cart.sh 调).
     菜单只从这里 (pxeserver.grub_menu) 生成, 部署脚本不再自己写 grub.cfg."""
     ap = argparse.ArgumentParser(prog="kiosk_core.py")
     ap.add_argument("--write-rescue", action="store_true", help="写救援菜单并删掉所有自动装机菜单")
@@ -1391,7 +1397,8 @@ def main(argv=None):
         ap.print_usage(sys.stderr)
         return 2
     pxe_disarm(root=a.root, path=a.state)
-    print(f"救援菜单已写入 {os.path.join(a.root, 'grub.cfg')}")
+    _write_atomic(os.path.join(a.root, "pxelinux.cfg", "default"), pxelinux_cfg_rescue())
+    print(f"救援菜单已写入 {os.path.join(a.root, 'grub.cfg')} 和 pxelinux.cfg/default")
     return 0
 
 
