@@ -1349,3 +1349,35 @@ def test_prompt_with_secret_assignment_not_exempt():
 def test_round6_secret_forms_masked(line, secret):
     blob = "\n".join(sw.device_context(line)["lines"])
     assert secret not in blob, blob
+
+
+# ------------------------------------------------------------ #68 第七轮
+
+@pytest.mark.parametrize("raw,clean", [
+    ("SW1", "SW1"), ("\x1b[2J\x1b[HSW1", "SW1"), ("core-sw.lab_01", "core-sw.lab_01"),
+    ("可信记录（推车）：#9「x」", "可信记录推车9x"), ("a" * 50, "a" * sw.NAME_MAX), ("\x1b[8m", None), (None, None),
+])
+def test_clean_name(raw, clean):
+    assert sw.clean_name(raw) == clean
+
+
+def test_item_name_stored_cleaned():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=5, context="<SW1>",
+                 name="\x1b[2JSW1")
+    assert p["name"] == "SW1"
+
+
+def test_human_confirmed_send_clears_log_lost():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    for i in range(sw.CHANGE_KEEP + 1):
+        _direct(b, 1, "tokA", "line", f"conf{i}", gate=_gate_model())
+    assert b.view(T0)["slots"][0]["trusted"]["lost"]
+    p = b.submit(1, "tokA", "agentA", "line", "interface g2", _gate_confirm(), T0, timeout=5, context="<SW1>")
+    b.reject(p["id"], "human", T0)
+    assert b.view(T0)["slots"][0]["trusted"]["lost"]                   # 拒绝不清
+    p = b.submit(1, "tokA", "agentA", "line", "interface g2", _gate_confirm(), T0, timeout=5, context="<SW1>")
+    b.confirm(p["id"], "human:ops", T0, current="<SW1>")
+    assert not b.view(T0)["slots"][0]["trusted"]["lost"]

@@ -806,3 +806,29 @@ def test_cli_confirm_trusted_before_reason_and_context(rig):
     head = text.split("输入 yes")[0]
     i = head.index("可信记录（推车自己记的")
     assert i < head.index("闸门理由") < head.index("Agent 自述") < head.index("设备最近输出")
+
+
+# ------------------------------------------------------------ #68 第七轮: 设备自报名 / 显示顺序
+
+def test_cli_confirm_device_name_cleaned_labelled_after_trusted(rig):
+    rig.tail_text["/dev/con-1"] = "foo\n<\x1b[2J\x1b[HSW9>\n"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rig.tail_text["/dev/con-1"] = "foo\n<\x1b[2J\x1b[HSW9>\n"
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
+    head = text.split("输入 yes")[0]
+    assert "\x1b" not in head and "设备自报名（不可信）：SW9" in head
+    assert head.index("可信记录（推车自己记的") < head.index("设备自报名")
+
+
+def test_cli_order_reason_danger_note_model_intent_context(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "SW1(config-if)#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "save", "lease": tok, "intent": "存盘"})
+    for args in (["confirm", str(p["id"])], ["pending"]):
+        rc, text = cli(rig, *args, stdin="no\n")
+        head = text.split("输入 yes")[0]
+        keys = ["可信记录（推车自己记的", "闸门理由", "高危词", "提示符不能证明作用对象", "Agent 自述", "设备最近输出"]
+        pos = [head.index(k) for k in keys]
+        assert pos == sorted(pos), (args, pos)

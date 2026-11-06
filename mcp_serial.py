@@ -628,6 +628,14 @@ def _context(item):
     return f"\n      设备最近输出 (来自设备, 不可信, 仅供参考):{body}"
 
 
+def _untrusted_tail(shown, item):
+    """一条挂起项除可信记录、设备输出外要显示的几行, 三处显示面同一个顺序 (#65 第七轮):
+    闸门理由 -> 高危词 -> 提示 -> 模型理由 -> Agent 自述 -> 设备自报名."""
+    name = sw.clean_name(item.get("name"))
+    return (shown["reason"], shown["danger"], shown.get("note"), shown["model"], shown["intent"],
+            f"设备自报名（不可信）：{name}" if name else "")
+
+
 def _device_lines(text):
     """设备输出 -> 每行前加 "| " (命令行上和推车自己的话分开)."""
     return "\n".join("| " + ln for ln in (text or "").split("\n"))
@@ -645,11 +653,10 @@ def _print_view(v, out):
     for s in v["slots"]:
         if any(p["slot"] == s["slot"] for p in v["pending"]):
             print(f"  槽位 {s['slot']} " + cc.card(v, s["slot"])["trusted"].replace("\n", "\n    "), file=out)
-    for p in v["pending"]:              # 可信记录已在上面; 下面是 Agent / 模型 / 设备给的, 都压成一行或加 "| "
-        warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
+    for p in v["pending"]:              # 可信记录已在上面; 顺序同车机 / 网页: 理由 -> 高危词 -> 提示 -> 模型 -> 自述 -> 设备
         shown = next(x for x in cc.card(v, p["slot"])["items"] if x["id"] == p["id"])
-        extra = "".join(f"\n      {x}" for x in (shown["reason"], shown["model"], shown["intent"]) if x)
-        print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"
+        extra = "".join(f"\n      {x}" for x in _untrusted_tail(shown, p) if x)
+        print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前)"
               f"{extra}{_context(p)}", file=out)
     for h in v["history"][-5:]:
         print(f"  最近 #{h['id']} 槽位 {h['slot']} {h['cmd']!r} -> {h['status']}"
@@ -718,7 +725,7 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
     if item is None:
         print(f"没有挂起的 #{a.id}", file=out)
         return 1
-    warn = f"\n  !!! 高危词: {', '.join(item['danger'])}" if item.get("danger") else ""
+    warn = ""
     card = cc.card(store.view(), item["slot"])
     shown = next(x for x in card["items"] if x["id"] == a.id)
     ctx = shown.get("context")
@@ -726,10 +733,10 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         head_line, _, body = ctx.partition("\n")
         ctx = head_line + "\n" + _device_lines(body)
     # 顺序 (#65 第六轮): 推车自己的 (可信记录、提示、闸门理由) 在前, Agent / 模型 / 设备给的 (都不可信) 在后
-    for extra in (card["trusted"], shown.get("note"), shown["reason"], shown["model"], shown["intent"], ctx):
+    for extra in (card["trusted"], *_untrusted_tail(shown, item), ctx):
         if extra:
-            warn += "\n  " + extra.replace("\n", "\n    ")
-    print(f"槽位 {item['slot']} ({item.get('name') or '名字未知'}) 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
+            warn += "\n  " + ("!!! " if extra == shown["danger"] else "") + extra.replace("\n", "\n    ")
+    print(f"槽位 {item['slot']} 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
           f"{warn}\n确认发送? 输入 yes: ", end="", file=out)
     out.flush()
     if stdin.readline().strip() != "yes":

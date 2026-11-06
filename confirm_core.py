@@ -111,10 +111,12 @@ def _intent(item):
 def _reasons(item):
     """闸门理由 -> (推车自己的部分, 模型理由行). 第 2 层模型的理由单独标不可信、压成一行."""
     reason = str(item.get("reason") or "-")
-    m = ((item.get("gate") or {}).get("model") or {}).get("reason")
-    if isinstance(m, str) and m.strip():
-        own = reason.replace(m, "").rstrip(" :：") if m in reason else reason
-        return own, f"模型理由（不可信）：{one_line(m)}"
+    model = (item.get("gate") or {}).get("model") or {}
+    for key, label in (("reason", "模型理由（不可信）："), ("error", "模型出错（不可信）：")):
+        m = model.get(key)
+        if isinstance(m, str) and m.strip() and m not in ("off", "danger"):
+            own = reason[:-len(m)].rstrip(" :：,，") if reason.endswith(m) else reason   # 只切后缀, 不改推车自己的话
+            return own or "-", label + one_line(m)
     return reason, ""
 
 
@@ -208,7 +210,8 @@ def card(view, n):
                     "intent": _intent(p),
                     "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else "",
                     "context": _context(p), "note": _note(p)})
-    return {"title": f"操作头 {n}" + (f" · {name}" if name else ""), "status": status,
+    name = sw.clean_name(name)                       # 设备自报的, 显示前再洗一遍 (旧状态文件里的没洗过)
+    return {"title": f"操作头 {n}" + (f" · {name}（设备自报）" if name else ""), "status": status,
             "stopped": bool(s["estop"]), "items": out, "trusted": _trusted(s) if out else ""}
 
 

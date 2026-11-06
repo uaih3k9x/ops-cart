@@ -97,15 +97,15 @@ class ConfirmDialog(tk.Toplevel):
         self._meta[it["id"]].pack(fill="x")
         tk.Label(f, text=it["reason"], font=FONT, bg=CARD, fg=FG, anchor="w", justify="left",
                  wraplength=680).pack(fill="x")
-        for key in ("model", "intent"):                     # 模型理由 / Agent 自述 (#65 第六轮): 不可信, 灰字一行
-            if it.get(key):
-                tk.Label(f, text=it[key], font=FONT, bg=CARD, fg=DIM, anchor="w", justify="left",
-                         wraplength=680).pack(fill="x")
         if it["danger"]:
             tk.Label(f, text=it["danger"], font=FONT_BIG, bg=CARD, fg=th.BAD, anchor="w").pack(fill="x")
         if it.get("note"):
             tk.Label(f, text=it["note"], font=FONT, bg=CARD, fg=th.BAD, anchor="w", justify="left",
                      wraplength=680).pack(fill="x")
+        for key in ("model", "intent"):                     # 模型理由 / Agent 自述 (#65 第六 / 七轮: 排在提示后、设备输出前): 不可信, 灰字一行
+            if it.get(key):
+                tk.Label(f, text=it[key], font=FONT, bg=CARD, fg=DIM, anchor="w", justify="left",
+                         wraplength=680).pack(fill="x")
         if it.get("context"):                               # 设备最近输出 (#65): 不可信, 灰字等宽, 只作参考
             tk.Label(f, text=it["context"], font=th.font(14, mono=True), bg=CARD, fg=DIM, anchor="w",
                      justify="left", wraplength=680).pack(fill="x")

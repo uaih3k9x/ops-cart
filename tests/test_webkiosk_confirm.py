@@ -128,3 +128,13 @@ def test_web_page_shows_intent_and_model_escaped():
     html = (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
     assert "esc(it.intent)" in html and "esc(it.model)" in html
     assert html.index("esc(c.trusted)") < html.index("${c.items.map(agentItem)")
+
+
+def test_web_item_order_reason_danger_note_model_intent_context():
+    import pathlib
+    import webkiosk
+    html = (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
+    body = html[html.index("function agentItem"):html.index("function agentCard")]
+    keys = ["esc(it.reason)", "esc(it.danger)", "esc(it.note)", "esc(it.model)", "esc(it.intent)", "esc(it.context)"]
+    pos = [body.index(k) for k in keys]
+    assert pos == sorted(pos)

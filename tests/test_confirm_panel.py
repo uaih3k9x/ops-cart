@@ -141,3 +141,13 @@ def test_dialog_intent_and_model_reason_after_trusted_single_line(root):
     intent = next(x for x in labels if x.startswith("Agent 自述（不可信）"))
     model = next(x for x in labels if x.startswith("模型理由（不可信）"))
     assert "\n" not in intent and "\x1b" not in intent and "\n" not in model
+
+
+def test_dialog_item_order(root):
+    gate = dict(HOLD, vendor="cisco", danger=["save"], intent="存盘", model={"verdict": "block", "reason": "要人看"})
+    gate["reason"] = "不在只读白名单里, 要人确认: 模型拦下: 要人看"
+    d, _acts, _asked = _dlg(root, _view(items=(("save", gate),)))
+    labels = _labels(d)[::-1]          # _labels 是栈序, 反过来近似 pack 顺序
+    order = [next(i for i, x in enumerate(labels) if x.startswith(k))
+             for k in ("闸门理由", "高危词", "注意", "模型理由", "Agent 自述", "设备最近输出")]
+    assert order == sorted(order), labels

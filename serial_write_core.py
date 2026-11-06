@@ -302,6 +302,18 @@ def classify_key(key):
 
 # ------------------------------------------------------------ 日志行
 
+NAME_MAX = 32               # 设备自报的名字 (提示符里认出来的) 最多留几个字
+
+
+def clean_name(name):
+    """设备自报的名字 -> 只留字母数字 (含中文) 和 - _ . : @ ~, 删转义, 截到 NAME_MAX; 剩不下返回 None.
+    名字来自被测设备 (mcp_core.thread_name 认提示符), 显示前一律当不可信 (#65 第七轮)."""
+    if not isinstance(name, str):
+        return None
+    s = "".join(ch for ch in _ANSI.sub("", name) if ch.isalnum() or ch in "-_.:@~")[:NAME_MAX]
+    return s or None
+
+
 def stamp(wall):
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(wall))
 
@@ -656,6 +668,7 @@ class Book:
         it = {"id": self.doc["seq"], "slot": slot, "kind": kind, "cmd": cmd, "who": who, "lease": token,
               "t": stamp(now), "ts": now, "timeout": timeout, "gate": gate, "reason": gate.get("reason"),
               "danger": list(gate.get("danger") or ()), "status": status}
+        name = clean_name(name)
         if name:
             it["name"] = name
         self.doc["items"].append(it)
@@ -693,6 +706,8 @@ class Book:
         it.pop("context", None)
         self._log(it)
         s = self._s(it["slot"])
+        if it.get("by"):            # 人看过"更早的记录被挤掉"的提示仍确认发送: 视为人接管了现场, 清掉 (#65 第七轮)
+            s["log_lost"] = False
         s["sent"] = s.get("sent", 0) + 1                # 发送序号: 挂起项靠它知道"提交后有没有发过别的"
         s["inflight"] = {"id": it["id"], "cmd": it["cmd"], "since": now,
                                            "deadline": now + it["timeout"] + INFLIGHT_GRACE_S}
