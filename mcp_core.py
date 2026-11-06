@@ -3,7 +3,8 @@
 - 执行绪命名: 从串口输出的提示符认名字 (华为 <名> / [名]), 调用和日志永远带槽位号, 名字只是标签
 - 参数校验: 工具参数用一张小表声明, 同一张表导出 inputSchema; 不认识的参数、类型不对一律拒
 - 协议: JSON-RPC 2.0 (initialize / ping / tools/list / tools/call), 不依赖 mcp SDK; 传输在 cart_mcp
-- 审计: 每次 tools/call 一行 JSON (谁、哪个工具、参数、成没成、耗时), 落 /var/log/ops-cart/
+- 审计: 每次 tools/call 一行 JSON (谁、档位、哪个工具、参数、成没成、耗时), 落 /var/log/ops-cart/
+- 档位 (#49): 每个工具显式标 readonly / act; 只读档的 Server 根本不注册 act 工具, HTTP 两档令牌分开
 """
 
 import base64
@@ -195,10 +196,12 @@ def _clip(v):
     return s if len(s) <= AUDIT_CLIP else s[:AUDIT_CLIP] + "…"
 
 
-def audit_line(who, tool, args, ok, error=None, ms=None, now=None):
-    """'谁、哪个工具、参数、成没成' 一行 JSON (json.dumps 把换行转义掉, 不会断行)."""
+def audit_line(who, tool, args, ok, error=None, ms=None, now=None, profile=None):
+    """'谁、哪个档位、哪个工具、参数、成没成' 一行 JSON (json.dumps 把换行转义掉, 不会断行)."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() if now is None else now))
     d = {"ts": ts, "who": _clip(who), "tool": _clip(tool), "args": _clip(args), "ok": bool(ok)}
+    if profile is not None:
+        d["profile"] = profile
     if ms is not None:
         d["ms"] = int(ms)
     if error is not None:
@@ -230,6 +233,57 @@ INSTRUCTIONS = ("运维推车 (ops-cart) 的工具: 只读的看串口操作头 
                 "看推车状态和 PXE 装机模式. 写串口要先 lease_acquire 拿写租约并按时续期; 只读命令直接发, "
                 "其余挂起等人在推车上确认 (pending_list 看结果); 拿不准就 estop. 说到执行绪时永远带上槽位号, 名字只是标签. "
                 "PXE 解锁只能 pxe_request 申请, 人在推车上照抄确认码才生效.")
+READONLY_INSTRUCTIONS = ("运维推车 (ops-cart) 只读档: 只能看串口操作头 (槽位 1-4) 的输出、截图 / OCR 被测机器画面、"
+                         "看推车、键鼠、PXE 状态和挂起的申请. 这个服务里没有任何会动手的工具 (键鼠、写串口、网络唤醒、"
+                         "PXE 申请、打印都不在), 要动手得由人另接动手档. 说到执行绪时永远带上槽位号, 名字只是标签.")
+
+# ------------------------------------------------------------ 档位 (#49)
+
+READONLY, ACT = "readonly", "act"           # 工具的标注: 只看 / 会产生副作用
+KINDS = (READONLY, ACT)
+PROFILES = {READONLY: (READONLY,), ACT: (READONLY, ACT)}     # 档位 -> 注册哪些标注的工具; act 档 = 现在的全部工具
+DEFAULT_PROFILE = ACT       # 现有 `cart_mcp.py stdio` 接法依赖全部工具, 先不改 (待拍板)
+READONLY_PORT = 8766        # 只读档 HTTP 默认端口 (动手档沿用 mcp.json 顶层 port)
+SERVER_NAMES = {READONLY: "ops-cart-readonly", ACT: "ops-cart"}
+
+
+def check_profile(profile):
+    if profile not in PROFILES:
+        raise ValueError(f"不认识的档位 {profile!r}, 只有 {', '.join(PROFILES)}")
+    return profile
+
+
+def select_tools(tools, profile):
+    """按档位挑工具. 标注不认识的一律报错 (宁可起不来, 不猜它会不会动手)."""
+    allow = PROFILES[check_profile(profile)]
+    out = []
+    for t in tools:
+        if getattr(t, "kind", None) not in KINDS:
+            raise ValueError(f"工具 {getattr(t, 'name', t)!r} 没有标 readonly / act")
+        if t.kind in allow:
+            out.append(t)
+    return out
+
+
+def profile_tokens(cfg, profile):
+    """mcp.json -> 这一档认的令牌. 动手档 = 顶层 tokens (兼容现有配置), 只读档 = readonly.tokens;
+    只读档没配就是空 (不借动手令牌); 动手档不认和任何只读令牌同值的 (手抖填重了也拿不到动手权限)."""
+    check_profile(profile)
+    ro = cfg.get("readonly")
+    ro = ro.get("tokens") if isinstance(ro, dict) else None
+    ro = ro if isinstance(ro, dict) else {}
+    if profile == READONLY:
+        return dict(ro)
+    act = cfg.get("tokens")
+    bad = {v for v in ro.values() if isinstance(v, str)}
+    return {k: v for k, v in (act if isinstance(act, dict) else {}).items() if v not in bad}
+
+
+def profile_port(cfg, profile):
+    if check_profile(profile) == READONLY:
+        ro = cfg.get("readonly")
+        return int((ro if isinstance(ro, dict) else {}).get("port", READONLY_PORT))
+    return int(cfg.get("port", 8765))
 
 
 class ToolError(Exception):
@@ -237,12 +291,17 @@ class ToolError(Exception):
 
 
 class Tool:
-    def __init__(self, name, description, params, fn):
-        self.name, self.description, self.params, self.fn = name, description, params, fn
+    """kind 必填: READONLY (只看) / ACT (会产生副作用). 只读档靠它决定注册不注册, 所以不给默认值."""
+
+    def __init__(self, name, description, params, fn, *, kind):
+        if kind not in KINDS:
+            raise ValueError(f"工具 {name!r} 的标注要是 readonly / act, 给的是 {kind!r}")
+        self.name, self.description, self.params, self.fn, self.kind = name, description, params, fn, kind
 
     def spec(self):
         return {"name": self.name, "description": self.description, "inputSchema": input_schema(self.params),
-                "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}}
+                "annotations": {"readOnlyHint": self.kind == READONLY, "destructiveHint": False,
+                                "openWorldHint": False}}
 
 
 def _error(rid, code, msg):
@@ -254,11 +313,17 @@ def _result(rid, res):
 
 
 class Server:
-    """消息进, 回包出; 不管传输 (stdio / HTTP 在 cart_mcp). 多线程 HTTP 共用一个实例, 本身无状态."""
+    """消息进, 回包出; 不管传输 (stdio / HTTP 在 cart_mcp). 多线程 HTTP 共用一个实例, 本身无状态.
+    profile 决定收哪些工具: 给了档位不允许的工具直接报错, 不是注册了再拒."""
 
-    def __init__(self, tools, audit=None, version="", clock=time.monotonic):
-        self.tools = {t.name: t for t in tools}
-        self.audit, self.version, self.clock = audit, version, clock
+    def __init__(self, tools, audit=None, version="", clock=time.monotonic, profile=DEFAULT_PROFILE):
+        tools = list(tools)
+        picked = select_tools(tools, profile)
+        if len(picked) != len(tools):
+            extra = sorted(t.name for t in tools if t not in picked)
+            raise ValueError(f"{profile} 档不收这些工具: {', '.join(extra)}")
+        self.tools = {t.name: t for t in picked}
+        self.audit, self.version, self.clock, self.profile = audit, version, clock, profile
 
     def handle_text(self, text, who="-"):
         """一段 JSON 文本 -> 回包文本 (单行); 全是通知时返回 None."""
@@ -288,8 +353,8 @@ class Server:
             return _result(rid, {
                 "protocolVersion": want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "ops-cart", "version": self.version},
-                "instructions": INSTRUCTIONS})
+                "serverInfo": {"name": SERVER_NAMES[self.profile], "version": self.version},
+                "instructions": READONLY_INSTRUCTIONS if self.profile == READONLY else INSTRUCTIONS})
         if method == "ping":
             return _result(rid, {})
         if method == "tools/list":
@@ -300,7 +365,7 @@ class Server:
 
     def _log(self, who, tool, args, ok, error=None, ms=None):
         if self.audit is not None:
-            self.audit.write(audit_line(who, tool, args, ok, error=error, ms=ms))
+            self.audit.write(audit_line(who, tool, args, ok, error=error, ms=ms, profile=self.profile))
 
     def _call(self, rid, params, who):
         name, args = params.get("name"), params.get("arguments", {})

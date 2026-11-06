@@ -208,7 +208,7 @@ def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disa
     return [
         mcp_serial.Tool(
             "pxe_clients", "最近在 LAN1 上要地址的机器 (只读): MAC、厂商串、架构、多久前. pxe_request 要 MAC 时先看这个.",
-            {}, pxe_clients, read_only=True),
+            {}, pxe_clients, kind=mc.READONLY),
         mcp_serial.Tool(
             "pxe_request", "申请 PXE 解锁 (只挂起, 不解锁): purpose = rocky (自动装 Rocky, 清空整块硬盘) / winpe "
             "(进 WinPE) / clone-save (整盘抓镜像到推车, 给 mac) / clone-restore (按推车上的克隆清单整批覆盖, "
@@ -217,15 +217,15 @@ def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disa
             {"purpose": {"type": "string", "enum": list(pr.PURPOSES), "required": True, "description": "用途"},
              "mac": dict(MAC_PARAM, description="目标机器 MAC (rocky / winpe / clone-save)"),
              "batch": {"type": "boolean", "description": "clone-restore 时给 true: 按推车上的克隆清单"}},
-            pxe_request),
+            pxe_request, kind=mc.ACT),
         mcp_serial.Tool(
             "pxe_requests", "看 PXE 解锁申请: 在等人确认的 (剩几秒) 和最近的结果 (armed 已解锁 / rejected / "
             "refused 清单变了等 / expired / dropped 急停或撤销). 只读. 解锁之后的状态用 pxe_status.",
-            {}, pxe_requests, read_only=True),
+            {}, pxe_requests, kind=mc.READONLY),
         mcp_serial.Tool(
             "pxe_retire", "提前上锁 (只收紧, 直接执行): 不给 mac = 整个装机口上锁、撤掉所有在等的申请; "
             "给 mac = 撤掉涉及它的申请, 它正解锁着就删它的菜单 (只剩它一台就整个上锁).",
-            {"mac": dict(MAC_PARAM, description="只收这一台; 不给 = 全部")}, pxe_retire),
+            {"mac": dict(MAC_PARAM, description="只收这一台; 不给 = 全部")}, pxe_retire, kind=mc.ACT),
     ]
 
 

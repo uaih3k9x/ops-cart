@@ -1,0 +1,216 @@
+"""#49: 推车 MCP 按档位启动. 只读档根本不注册会动手的工具; HTTP 两档令牌分开; 审计带档位."""
+
+import http.client
+import json
+import threading
+
+import pytest
+
+import cart_mcp as cm
+import mcp_core as mc
+
+# 会产生副作用的工具 (键鼠、串口写、WOL、PXE 申请 / 上锁、打印、租约、急停). 新加动手工具也要进这张表.
+ACT_NAMES = {"lease_acquire", "lease_renew", "lease_release", "send_command", "send_key", "estop",
+             "pxe_request", "pxe_retire", "kvm_lease_acquire", "kvm_lease_renew", "kvm_lease_release",
+             "kvm_key", "kvm_type", "wol_send", "label_print"}
+READONLY_NAMES = {"list_threads", "read_output", "screenshot", "cart_status", "pxe_status", "pending_list",
+                  "pxe_clients", "pxe_requests", "kvm_status", "screen_ocr", "label_preview",
+                  "label_printer_status", "label_abbrev_propose"}
+
+
+def _listed(server):
+    return {t["name"] for t in server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]}
+
+
+class ListAudit:
+    def __init__(self):
+        self.lines = []
+
+    def write(self, line):
+        self.lines.append(json.loads(line))
+        return True
+
+
+# ------------------------------------------------------------ 标注
+
+def test_every_real_tool_is_explicitly_marked():
+    tools = cm.real_tools("act")
+    assert all(t.kind in mc.KINDS for t in tools)
+    assert {t.name for t in tools if t.kind == mc.ACT} == ACT_NAMES
+    assert {t.name for t in tools if t.kind == mc.READONLY} == READONLY_NAMES
+
+
+def test_tool_kind_is_required_and_checked():
+    with pytest.raises(TypeError):
+        mc.Tool("x", "d", {}, lambda a: [])                         # 没标注 = 起不来
+    with pytest.raises(ValueError):
+        mc.Tool("x", "d", {}, lambda a: [], kind="maybe")
+
+
+def test_read_only_hint_follows_kind():
+    specs = {t.name: t.spec() for t in cm.real_tools("act")}
+    for name, s in specs.items():
+        assert s["annotations"]["readOnlyHint"] is (name in READONLY_NAMES), name
+
+
+# ------------------------------------------------------------ 只读档注册表
+
+def test_readonly_registry_has_no_act_tool():
+    tools = cm.real_tools("readonly")
+    assert tools and all(t.kind == mc.READONLY for t in tools)
+    assert {t.name for t in tools} == READONLY_NAMES
+    server = cm.make_server("readonly", ListAudit())
+    assert set(server.tools) == READONLY_NAMES and not set(server.tools) & ACT_NAMES
+    assert _listed(server) == READONLY_NAMES
+
+
+def test_readonly_server_does_not_know_act_tools():
+    a = ListAudit()
+    server = cm.make_server("readonly", a)
+    for name in sorted(ACT_NAMES):
+        r = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": name, "arguments": {}}})
+        assert r["error"]["code"] == -32602 and "没有这个工具" in r["error"]["message"]
+    assert all(line["profile"] == "readonly" and line["ok"] is False for line in a.lines)
+
+
+def test_select_tools_refuses_unmarked_or_unknown_profile():
+    t = mc.Tool("x", "d", {}, lambda a: [], kind=mc.READONLY)
+    with pytest.raises(ValueError):
+        mc.select_tools([t], "rw")
+    t.kind = "weird"                                               # 事后被改坏也不放进来
+    with pytest.raises(ValueError):
+        mc.select_tools([t], "readonly")
+
+
+def test_act_profile_has_everything():
+    assert {t.name for t in cm.real_tools("act")} == READONLY_NAMES | ACT_NAMES
+    assert _listed(cm.make_server("act", ListAudit())) == READONLY_NAMES | ACT_NAMES
+
+
+# ------------------------------------------------------------ 档位参数
+
+def test_unknown_profile_fails_to_start(capsys):
+    with pytest.raises(SystemExit) as e:
+        cm.main(["stdio", "--profile", "rw", "--audit", "/dev/null"])
+    assert e.value.code != 0
+    with pytest.raises(ValueError):
+        cm.real_tools("rw")
+
+
+def test_default_profile_keeps_existing_setup():
+    # 现有 `cart_mcp.py stdio` 接法 (Claude Code、开机验收) 依赖全部工具: 默认档先不改, 见 PR 待拍板
+    assert mc.DEFAULT_PROFILE == "act"
+    assert {t.name for t in cm.real_tools()} == READONLY_NAMES | ACT_NAMES
+
+
+def test_main_passes_profile_to_stdio(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cm, "serve_stdio", lambda server, who, i, o: seen.update(server=server))
+    assert cm.main(["stdio", "--profile", "readonly", "--audit", "/dev/null"]) == 0
+    assert set(seen["server"].tools) == READONLY_NAMES and seen["server"].profile == "readonly"
+
+
+def test_main_http_readonly_uses_its_own_port(monkeypatch, tmp_path):
+    p = tmp_path / "mcp.json"
+    p.write_text(json.dumps({"port": 9100, "tokens": {}, "readonly": {"port": 9101, "tokens": {}}}))
+    seen = {}
+    monkeypatch.setattr(cm, "serve_http", lambda server, port, audit, conf: seen.update(port=port, server=server))
+    cm.main(["http", "--profile", "readonly", "--conf", str(p), "--audit", "/dev/null"])
+    assert seen["port"] == 9101 and seen["server"].profile == "readonly"
+    cm.main(["http", "--conf", str(p), "--audit", "/dev/null"])
+    assert seen["port"] == 9100 and seen["server"].profile == "act"
+
+
+def test_profile_port_defaults():
+    assert mc.profile_port({"port": 8765}, "act") == 8765
+    assert mc.profile_port({"port": 8765}, "readonly") == mc.READONLY_PORT
+    assert mc.profile_port({"readonly": {"port": 9001}}, "readonly") == 9001
+
+
+# ------------------------------------------------------------ 协议 / 审计带档位
+
+def test_initialize_names_profile():
+    t = [mc.Tool("x", "d", {}, lambda a: [], kind=mc.READONLY)]
+    ro = mc.Server(t, profile="readonly").handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    assert ro["result"]["serverInfo"]["name"] == "ops-cart-readonly"
+    assert "lease_acquire" not in ro["result"]["instructions"] and "只读" in ro["result"]["instructions"]
+    act = mc.Server(t, profile="act").handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    assert act["result"]["serverInfo"]["name"] == "ops-cart"
+
+
+def test_server_refuses_unknown_profile_and_foreign_tools():
+    with pytest.raises(ValueError):
+        mc.Server([], profile="rw")
+    with pytest.raises(ValueError):                                 # 只读档的 Server 不收动手工具, 绕开 select 也不行
+        mc.Server([mc.Tool("x", "d", {}, lambda a: [], kind=mc.ACT)], profile="readonly")
+
+
+def test_audit_line_has_profile():
+    d = json.loads(mc.audit_line("w", "t", {}, True, profile="readonly"))
+    assert d["profile"] == "readonly"
+    a = ListAudit()
+    s = mc.Server([mc.Tool("x", "d", {}, lambda a: [mc.text_content("ok")], kind=mc.READONLY)],
+                  audit=a, profile="readonly")
+    s.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x", "arguments": {}}})
+    assert a.lines[-1]["profile"] == "readonly" and a.lines[-1]["ok"] is True
+
+
+# ------------------------------------------------------------ HTTP 令牌按档位分开
+
+RO_TOK, ACT_TOK = "r" * 32, "a" * 32
+
+
+def test_profile_tokens():
+    cfg = {"tokens": {"me": ACT_TOK, "dup": RO_TOK}, "readonly": {"tokens": {"bot": RO_TOK}}}
+    assert mc.profile_tokens(cfg, "readonly") == {"bot": RO_TOK}
+    assert mc.profile_tokens(cfg, "act") == {"me": ACT_TOK}           # 和只读令牌同值的不认
+    assert mc.profile_tokens({"tokens": {"me": ACT_TOK}}, "readonly") == {}   # 没配只读段: 谁都进不来, 不借动手令牌
+    assert mc.profile_tokens({"readonly": "bad"}, "readonly") == {}
+    with pytest.raises(ValueError):
+        mc.profile_tokens(cfg, "rw")
+
+
+def _serve(profile, cfg, audit):
+    tools = [mc.Tool("look", "d", {}, lambda a: [mc.text_content("ok")], kind=mc.READONLY)]
+    if profile == "act":
+        tools.append(mc.Tool("poke", "d", {}, lambda a: [mc.text_content("poked")], kind=mc.ACT))
+    srv = cm.make_http_server("127.0.0.1", 0, mc.Server(tools, audit=audit, profile=profile),
+                              conf=lambda: cfg, audit=audit)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _post(port, token, body):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("POST", "/mcp", body=json.dumps(body).encode(),
+              headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    r = c.getresponse()
+    data = r.read()
+    c.close()
+    return r.status, data
+
+
+@pytest.mark.parametrize("dup", [False, True])
+def test_http_readonly_token_cannot_reach_act(dup):
+    cfg = {"tokens": {"me": ACT_TOK}, "readonly": {"tokens": {"bot": RO_TOK}}, "hosts": []}
+    if dup:
+        cfg["tokens"]["oops"] = RO_TOK                               # 手抖把只读令牌也填进动手档
+    a = ListAudit()
+    ro, act = _serve("readonly", cfg, a), _serve("act", cfg, a)
+    try:
+        call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "poke", "arguments": {}}}
+        st, _ = _post(act.server_address[1], RO_TOK, call)
+        assert st == 401
+        assert a.lines[-1]["profile"] == "act" and "401" in a.lines[-1]["error"]
+        st, data = _post(act.server_address[1], ACT_TOK, call)
+        assert st == 200 and json.loads(data)["result"]["isError"] is False
+        assert a.lines[-1]["who"] == "me@127.0.0.1" and a.lines[-1]["profile"] == "act"
+        assert _post(ro.server_address[1], ACT_TOK, call)[0] == 401     # 动手令牌也不当只读令牌用
+        st, data = _post(ro.server_address[1], RO_TOK, call)
+        assert st == 200 and "没有这个工具" in json.loads(data)["error"]["message"]
+        assert a.lines[-1]["profile"] == "readonly"
+    finally:
+        for s in (ro, act):
+            s.shutdown()
+            s.server_close()

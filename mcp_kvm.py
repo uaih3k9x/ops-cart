@@ -418,34 +418,34 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
     T = ms.Tool
     return [
         T("kvm_status", "键鼠状态 (只读): 在线的键鼠序列号、代理在不在、写入者、全部急停、挂起等确认的和最近结果.",
-          {}, kvm_status, read_only=True),
+          {}, kvm_status, kind=mc.READONLY),
         T("kvm_lease_acquire", "申请键鼠写租约 (同时一个写入者), 返回令牌. 全部急停时不给.",
           {"ttl_s": {"type": "integer", "minimum": TTL_MIN_S, "maximum": TTL_MAX_S, "default": TTL_S,
-                     "description": "期限秒"}}, kvm_lease_acquire),
-        T("kvm_lease_renew", "续键鼠写租约. 过期了要重新申请.", {"lease": LEASE}, kvm_lease_renew),
-        T("kvm_lease_release", "交还键鼠写租约.", {"lease": LEASE}, kvm_lease_release),
+                     "description": "期限秒"}}, kvm_lease_acquire, kind=mc.ACT),
+        T("kvm_lease_renew", "续键鼠写租约. 过期了要重新申请.", {"lease": LEASE}, kvm_lease_renew, kind=mc.ACT),
+        T("kvm_lease_release", "交还键鼠写租约.", {"lease": LEASE}, kvm_lease_release, kind=mc.ACT),
         T("kvm_key", "往被测机按键或组合键, 如 enter / esc / f12. 高危组合键 (ctrl+alt+delete 等) 挂起等人确认. "
           "人最近 3 秒动过键鼠会排队. 按之前先 screen_ocr 确认焦点对.",
           {"keys": {"type": "string", "required": True, "maxLength": 64, "pattern": r"[A-Za-z0-9_+-]+",
                     "description": "键名, 组合键用 + 连"}, "lease": LEASE, "serial": SERIAL},
-          kvm_key, destructive=True),
+          kvm_key, kind=mc.ACT, destructive=True),
         T("kvm_type", "往被测机打一段 ASCII (被测机输入法要在英文). 整行带高危词 (format、diskpart 等) 就挂起等人确认, "
           "可能误拦普通文字. 内容进审计日志, 密码给 secret=true. 敲之前先 screen_ocr 确认焦点对.",
           {"text": {"type": "string", "required": True, "maxLength": TEXT_MAX, "description": "要打的字"},
            "enter": {"type": "boolean", "description": "打完按回车"},
            "secret": {"type": "boolean", "description": "密码等: 内容不进审计和日志; 带高危词直接拒绝"},
            "lease": LEASE, "serial": SERIAL},
-          kvm_type, destructive=True, redact=redact_type),
+          kvm_type, kind=mc.ACT, destructive=True, redact=redact_type),
         T("screen_ocr", "读被测机屏幕上的字 (OCR, 带坐标), 比 screenshot 省得多, 看画面先用这个. readable=false 时再用 "
           "screenshot. engine 写明用的引擎; 可能有形近字错误, 命令和路径回车前要核对.",
           {"device": {"type": "string", "pattern": r"(/dev/)?video[0-9]{1,2}", "maxLength": 16,
                       "description": "采集设备, 默认正在预览的那块, 没预览就有信号的采集卡"},
            "lang": {"type": "string", "enum": ["eng", "eng+chi_sim"], "default": "eng",
                     "description": "只对退回 Tesseract 时有用; RapidOCR 中英都读"}},
-          screen_ocr, read_only=True),
+          screen_ocr, kind=mc.READONLY),
         T("wol_send", "往 LAN1 (装机口) 发网络唤醒魔术包. 不保证醒.",
           {"mac": {"type": "string", "required": True, "maxLength": 17,
-                   "pattern": r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}", "description": "目标 MAC"}}, wol_send),
+                   "pattern": r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}", "description": "目标 MAC"}}, wol_send, kind=mc.ACT),
     ]
 
 

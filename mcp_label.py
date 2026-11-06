@@ -154,9 +154,12 @@ def propose_abbrev(table, path, category, entries):
 class LabelTool(mc.Tool):
     """mc.Tool 默认标只读; 打印要标成会出纸. labels 的 items 结构补进 inputSchema."""
 
-    def __init__(self, name, description, params, fn, read_only=True):
-        super().__init__(name, description, params, fn)
-        self.read_only = read_only
+    def __init__(self, name, description, params, fn, *, kind):
+        super().__init__(name, description, params, fn, kind=kind)
+
+    @property
+    def read_only(self):
+        return self.kind == mc.READONLY
 
     def spec(self):
         s = super().spec()
@@ -272,7 +275,7 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
                   "出界和对折对称, 回检查结果 JSON + 前几张的 SVG (文本). abbrev=true 先按缩写对照表把中文/长名缩短, "
                   "回包里的 labels 就是要打的内容.",
                   {"kind": KIND, "labels": LABELS,
-                   "abbrev": {"type": "boolean", "default": False, "description": "先套缩写对照表"}}, preview),
+                   "abbrev": {"type": "boolean", "default": False, "description": "先套缩写对照表"}}, preview, kind=mc.READONLY),
         LabelTool("label_print",
                   "打标签 (TSC 标签机). 校验同 label_preview, 不过就拒; 打印机开盖/缺纸/缺碳带也拒. "
                   "默认只许 1 张, 回一个 proof; 批量 (>1 张) 必须带同版面单张打样回的 proof (10 分钟内, 一次性) "
@@ -281,16 +284,16 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
                    "proof": {"type": "string", "maxLength": 64, "description": "批量才要: 单张打样回的 proof"},
                    "confirmed": {"type": "string", "maxLength": 200,
                                  "description": "批量才要: 人看过样张后确认的原话, 记进审计"}},
-                  do_print, read_only=False),
+                  do_print, kind=mc.ACT),
         LabelTool("label_printer_status",
                   "读标签机状态字节 (ESC !?): ok / 开盖 / 卡纸 / 缺纸 / 缺碳带 / 暂停 / 打印中, 可能多项同时.",
-                  {}, printer_status),
+                  {}, printer_status, kind=mc.READONLY),
         LabelTool("label_abbrev_propose",
                   "提议往缩写对照表加/改条目 (原文 -> ASCII 缩写): 回校验问题和 diff. 只提议, 不写回; 写回要人做.",
                   {"category": {"type": "string", "pattern": r"[a-z][a-z0-9_]{0,31}", "required": True,
                                 "description": "类别, 如 vendor / device_type / role / port / medium / location"},
                    "entries": {"type": "object", "required": True, "description": "{原文: 缩写}, 1~20 条"}},
-                  abbrev_propose),
+                  abbrev_propose, kind=mc.READONLY),
     ]
 
 

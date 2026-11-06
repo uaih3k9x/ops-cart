@@ -171,3 +171,30 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 - **插话**：有人持键鼠租约时，其他 agent 的输入一律拒绝；没人持租约时命令行和配方照旧能用。配方运行中被别人拿走租约会停下。
 - **`recent_output`**：往前最多看 200 行，按时间判断：一小时内有设备输出才算最近，`last_output_age_s` 给出大约多少秒前。输出行本身没有时间，后面有标记行就按标记算，在日志尾巴上就按日志修改时间。仍然只是日志判断，要确认对端就拿租约 `send_key enter`；推车不会自动发。
 - **PXE 卡在 `NBP filesize`（被测机上的 EFI 程序，推车改不了）**：有的机器开机时没拿到地址、空等一轮后才拿到的话，问完启动文件大小就不再发 TFTP 请求，转而往服务器的 UDP 5526 发 549 字节的包（带 MAC 和一串标识），之后卡住或退回本地系统。2026-11-03 在一台联想上试了 6 次：开机时已在发地址 3 次都成功，抓包的那次没有这种包；开机时没地址 3 次都失败。这台机器的 EFI 分区里，`bootmgfw.efi` 被换过（原版改名 `bootmgfwold.efi`），旁边有 `HookDisk.efi`、`lenovoEDU.efi` 和一整套 UEFI 网络驱动（DHCP、UDP、TFTP、PXE）。所以很可能是：固件第一轮 PXE 失败后转去 Windows 启动项，这个 EFI 程序自己再拉起 PXE，拿到推车的地址后去找它的服务端。包内容没在这些文件里直接搜到，这条链还没完全证实。**办法：先让推车发地址，再开机；卡住了重启一次。**
+
+## 十六、只读档和动手档（#49）
+
+- **为什么在服务端分**：有的 Agent 底座作为 MCP 客户端调用工具时不走它自己的审批，它的"只读模式"也拦不住 MCP 工具。所以权限边界只能放在推车这头：只读档的进程里**根本没有**会动手的工具，不是注册了再拒绝。
+- **同一程序，按档位启动**：`cart_mcp.py stdio|http --profile readonly|act`。不认识的档位直接起不来。
+  - `readonly`：`list_threads` `read_output` `screenshot` `screen_ocr` `cart_status` `pxe_status` `pxe_clients` `pxe_requests` `pending_list` `kvm_status` `label_preview` `label_printer_status` `label_abbrev_propose`。
+  - `act`：上面这些 + 键鼠（`kvm_lease_*` `kvm_key` `kvm_type`）、写串口（`lease_*` `send_command` `send_key`）、`estop`、`wol_send`、`pxe_request` `pxe_retire`、`label_print`。闸门、挂起确认、急停全部照旧，一条没放宽；Agent 侧仍然没有任何"确认"工具。
+- **标注**：每个工具构造时必须给 `kind=mc.READONLY` 或 `kind=mc.ACT`，不给就构造失败（`TypeError`），给错值也失败。`mc.select_tools` 遇到标注不认识的工具直接报错；`mc.Server` 只收档位允许的工具，收到别的就报错，绕开 `select_tools` 也塞不进去。`readOnlyHint` 由标注推出来。`estop` 和 `pxe_retire` 只收紧，但它们会撤别人的租约、删菜单，按会动手算，不进只读档。
+- **默认档位**：现在是 `act`。现有接法（Claude Code 的 `cart_mcp.py stdio`、开机验收按工具表核对）依赖全部工具，改默认会把它们弄坏。新接法一律写明 `--profile`。默认改不改成 `readonly` 待拍板。
+- **HTTP**：两档各起一个进程。动手档用 `mcp.json` 顶层 `port` / `tokens`，和以前一样；只读档用 `readonly.port`（默认 8766）/ `readonly.tokens`。没有 `readonly` 段时只读档谁都进不来，不借用动手令牌。动手档不认和任何只读令牌同值的令牌：手抖把只读令牌也填进顶层，也拿不到动手权限。只读令牌拿到动手档是 401，反过来也是。
+- **stdio**：没有令牌，边界是 ssh 那一层。给只读 Agent 的 ssh 身份要锁死命令行，否则它能自己把 `--profile` 改成 `act`。比如 sudoers 只放这一条（用户名是示例）：
+  `agent-ro ALL=(root) NOPASSWD: /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly`
+  或者在 `authorized_keys` 里给这把钥匙配 `command="sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly",restrict`。
+- **审计**：`mcp-audit.log` 每行多一个 `profile`。HTTP 认证失败那行也带。
+- **协议**：只读档 `serverInfo.name` 是 `ops-cart-readonly`，说明文字里不提租约和写工具；动手档还是 `ops-cart`。
+- **Agent 接法示例**（地址、令牌、名字都是示例值）：
+
+```
+# 只读档, 走 ssh (推荐先只接这个)
+claude mcp add cart-ro -- ssh agent-ro@cart sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly
+# 只读档, 走 HTTP (推车上: python3 /opt/pxe/cart_mcp.py http --profile readonly)
+claude mcp add --transport http cart-ro http://192.0.2.10:8766/mcp --header "Authorization: Bearer <只读令牌>"
+# 动手档 (人盯着的会话才接)
+claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
+```
+
+  其他 MCP 客户端照同样的命令行 / URL 配，两个服务用不同的服务名（如 `cart-ro` / `cart`），可以分别启用。

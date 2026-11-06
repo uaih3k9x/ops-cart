@@ -233,9 +233,15 @@ class Server(mc.Server):
 
 
 class Tool(mc.Tool):
-    def __init__(self, name, description, params, fn, read_only=False, destructive=False, redact=None):
-        super().__init__(name, description, params, fn)
-        self.read_only, self.destructive, self.redact = read_only, destructive, redact
+    """kind 必填 (mc.READONLY / mc.ACT, #49): 只读档按它决定注册不注册."""
+
+    def __init__(self, name, description, params, fn, *, kind, destructive=False, redact=None):
+        super().__init__(name, description, params, fn, kind=kind)
+        self.destructive, self.redact = destructive, redact
+
+    @property
+    def read_only(self):
+        return self.kind == mc.READONLY
 
     def spec(self):
         d = super().spec()
@@ -364,11 +370,11 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              "租约有期限要续期, 过期自动释放, 挂着的命令一起作废. 急停中拿不到.",
              {"slot": SLOT, "ttl_s": {"type": "integer", "minimum": sw.LEASE_TTL_MIN_S,
                                       "maximum": sw.LEASE_TTL_MAX_S, "default": sw.LEASE_TTL_S,
-                                      "description": "期限秒数"}}, lease_acquire),
+                                      "description": "期限秒数"}}, lease_acquire, kind=mc.ACT),
         Tool("lease_renew", "续写租约 (从现在起再给一个期限). 过期了不能续, 要重新申请.",
-             {"slot": SLOT, "lease": LEASE}, lease_renew),
+             {"slot": SLOT, "lease": LEASE}, lease_renew, kind=mc.ACT),
         Tool("lease_release", "用完交还写租约; 自己还挂着等确认的命令一起作废.",
-             {"slot": SLOT, "lease": LEASE}, lease_release),
+             {"slot": SLOT, "lease": LEASE}, lease_release, kind=mc.ACT),
         Tool("send_command", "往某个槽位的串口发一行命令 (自动补回车, 只收一行可打印 ASCII, 不给原始字节). "
              "过闸门: 认得出厂商、设备停在提示符上的只读命令 (华为 display… / 思科 show…, 全称小写) 直接发, "
              "返回设备输出; 其余的若推车开了决策模型, 由模型按命令、设备最近输出和你给的 intent 判, 判放行直接发, "
@@ -381,21 +387,21 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                          "description": "这条命令要干什么、为什么 (一两句). 给决策模型和确认的人看, 进日志"},
               "timeout_s": {"type": "integer", "minimum": 1, "maximum": SEND_TIMEOUT_MAX, "default": SEND_TIMEOUT,
                             "description": "等提示符的秒数"}},
-             send_command, destructive=True),
+             send_command, kind=mc.ACT, destructive=True),
         Tool("send_key", "发一个固定特殊键: enter (回车) / space (翻页空格) 直接发; ctrl_c (打断) 要人确认. "
              "需要别的按键 (BootROM 菜单、按任意键) 请人在推车屏幕上操作.",
              {"slot": SLOT, "key": {"type": "string", "enum": sorted(sw.KEYS), "required": True,
                                     "description": "哪个键"},
-              "lease": LEASE}, send_key, destructive=True),
+              "lease": LEASE}, send_key, kind=mc.ACT, destructive=True),
         Tool("pending_list", "看各槽位的写入者 / 急停 / 在途, 挂起等人确认的命令, 和最近的结果 "
              "(人确认后发出的命令输出摘要在 history 里, 完整输出用 read_output). 只读.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "只看这个槽位, 不给 = 全部"}},
-             pending_list, read_only=True),
+             pending_list, kind=mc.READONLY),
         Tool("estop", "急停: 撤销写租约、丢弃挂起的命令, 之后谁都不能写这个槽位, 直到人在推车上解除. "
              "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位, 同时停键鼠、作废在等确认的 PXE 解锁申请. "
              "觉得自己要出错时就用它.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "槽位; 不给 = 全部"}},
-             estop),
+             estop, kind=mc.ACT),
     ]
 
 

@@ -68,7 +68,7 @@
 | [`kvm_broker.py`](kvm_broker.py) · [`kvm_broker_core.py`](kvm_broker_core.py) | 键鼠常驻代理(`kvm-broker.service`):统一持有 CH9329,车机 / 网页口 / 命令行 / 配方都经本地 socket `/run/ops-kvm/kvm.sock`(行式 JSON,0660 给 dialout)发键;人永远优先,人 3 秒内动过键鼠 agent 就暂停排队;急停只丢 agent 没发的、不插任何按键,解除要人;每次发键记来源到 `/var/log/ops-cart/kvm.log`。代理不在各客户端退回直开 + flock。纯逻辑(解析、拆步、仲裁、租约钩子、日志行)在 `_core` |
 | [`serial_panel.py`](serial_panel.py) · [`serial_core.py`](serial_core.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务。纯逻辑(读 `serial.conf`、conbroker 命令与输出解析、选口、终端字节)在 `serial_core`,不碰 Tk,无界面的服务都用它 |
 | [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
-| [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19 只读部分 + #20 标签;写串口见下一行 #21):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;列执行绪时带写租约持有者。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
+| [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19 只读部分 + #20 标签;写串口见下一行 #21):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;列执行绪时带写租约持有者。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`(带档位)。**档位(#49)**:`--profile readonly` 只注册只看的工具(键鼠、写串口、WOL、PXE 申请 / 上锁、打印、租约、急停根本不在),`--profile act`(默认)= 全部工具;HTTP 两档各起一个进程、令牌分开(只读档用 `mcp.json` 的 `readonly.port` / `readonly.tokens`)。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
 | [`mcp_serial.py`](mcp_serial.py) · [`serial_write_core.py`](serial_write_core.py) | 串口写路径(#21):MCP 工具 `lease_acquire/renew/release`、`send_command`(只收一行可打印 ASCII)、`send_key`(回车 / 翻页空格 / Ctrl+C)、`pending_list`、`estop`。每槽位同时一个写入者,租约默认 60 秒要续、过期作废;闸门第 1 层:认得出厂商(华为提示符自动认,思科 / 锐捷 / Linux 在 [`examples/serial_gate.example.json`](examples/serial_gate.example.json) 登记)、停在提示符上、过只读白名单才直发,带 save/reboot/reset/format/delete 等高危词的永远要人确认;第 2 层(#22,[`serial_gate_model.py`](serial_gate_model.py),规则文件 `model.enabled` 打开,默认关):其余命令交决策模型按命令 + 设备最近输出 + Agent 声明的 `intent` 判,放行直发,判拦 / 超时 / 报错 / 格式不对 / 预算超限一律挂起等人确认,理由进日志;Ctrl+C 要人确认。急停单条 / 全部:撤租约、丢挂起,不往设备发任何东西。状态 `/run/ops-cart/serial-write.json`(读不懂 = 全部急停),每槽位 JSONL 日志 `/var/log/ops-cart/serial-slot<N>.log`。车机上 `cart_mcp.py pending / confirm / reject / estop / resume`,确认和解除只认本机终端(不经 sshd / tailscaled) |
 | [`confirm_core.py`](confirm_core.py) · [`confirm_panel.py`](confirm_panel.py) | Agent 写串口确认 UI(#23):执行器条操作头急停红 / 待确认黄闪 / Agent 输入紫闪,点开确认框确认 / 拒绝 / 急停 / 解除(高危词再问一次),另有「Agent 全部急停」块;网页「Agent」页只能急停和拒绝(经 `/run/ops-cart/serial-req/` 投请求,root 的 `cart-serial-req.path` 执行),确认和解除只在车机;副屏操作头同色并写挂起数和急停。状态读不懂 = 全部急停 |
 | [`mcp_kvm.py`](mcp_kvm.py) | MCP 看和动被测机(#41):`screen_ocr` 读屏幕字、键鼠 `kvm_*`(写租约、只经代理、全部急停收回、高危内容挂起等车机确认)、`wol_send`(只发 LAN1) |
@@ -161,7 +161,9 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 # Agent 接入 (MCP) 按需: stdio 不用装单元, HTTP 先配令牌:
 #   sudo install -m 0600 examples/mcp.example.json /etc/ops-cart/mcp.json   (改掉 CHANGE-ME)
 #   sudo systemctl enable --now cart-mcp.service
-#   claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio
+#   claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
+#   只读档 (给不审批 MCP 调用的 Agent 底座; 边界在服务端, 见 docs/DESIGN_agent_mcp.md 第十六节):
+#   claude mcp add cart-ro -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile readonly
 # 标签工具 (#20) 要缩写对照表: sudo install -m 0644 examples/label_abbrev.json /etc/ops-cart/   (真实资产名的缩写只加在这份里)
 # 串口写闸门规则 (可选; 不放就是内置: 华为提示符自动认, 只放行 display / show, 决策模型不开;
 #   开第 2 层把 model.enabled 改 true, 模型走 serial.conf 那个 user 的 ~/.claude 线路, 同 cart-dream):

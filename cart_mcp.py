@@ -4,8 +4,12 @@
     sudo python3 /opt/pxe/cart_mcp.py stdio     # 本机 / ssh 上来的 Agent (ssh 本身就是认证)
     sudo python3 /opt/pxe/cart_mcp.py http      # tailnet: 只绑 127.0.0.1 和 tailnet 地址, 要 Bearer 令牌
 
+档位 (#49): --profile readonly 只注册只看的工具 (会动手的根本不在); --profile act (默认) = 全部工具.
+HTTP 两档各起一个进程: 动手档用 mcp.json 顶层 port/tokens, 只读档用 readonly.port (默认 8766) / readonly.tokens.
+
 Claude Code 接法 (地址、令牌换成自己的):
-    claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio
+    claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
+    claude mcp add cart-ro -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile readonly
     claude mcp add --transport http cart http://<推车 tailnet 地址>:8765/mcp --header "Authorization: Bearer <令牌>"
 
 工具: list_threads (槽位 1-4) / read_output (走 conbroker tail, 不直开串口) / screenshot (cart_snap) /
@@ -15,7 +19,7 @@ PXE 解锁申请 (#24, mcp_pxe): pxe_request 只挂起, 人在车机上照抄确
     sudo python3 /opt/pxe/cart_mcp.py pending | confirm <编号> | reject <编号> | estop [槽位] | resume <槽位|all>
 要 root: 截图要采集卡和 mpv 的 socket, 读串口输出要 sudo -u <serial.conf 的 user> 跑 conbroker.
 令牌和端口在 /etc/ops-cart/mcp.json (样例 examples/mcp.example.json), 每个请求重读, 加令牌不用重启.
-审计每次调用一行 JSON, 落 /var/log/ops-cart/mcp-audit.log.
+审计每次调用一行 JSON (带档位), 落 /var/log/ops-cart/mcp-audit.log.
 """
 
 import argparse
@@ -135,19 +139,19 @@ def build_tools(slots, tail, snap, state, pxe, now=time.time, writer=lambda: {})
         mc.Tool("list_threads", "列出串口操作头槽位 1-4 的执行绪: present = USB 转接头在 (串口探测不了对端, 不代表接了设备), "
                 "recent_output = 一小时内有没有设备输出 (只看日志, 不探测), last_output_age_s = 大约多少秒前; 有没有在跑的 conbroker 服务、波特率、"
                 "从提示符认出的设备名 (华为 <名>/[名]), 写入者 (写租约持有者). 名字只是标签, 以槽位号为准.",
-                {}, list_threads),
+                {}, list_threads, kind=mc.READONLY),
         mc.Tool("read_output", "读某个槽位串口最近 N 行输出 (经 conbroker tail 读它的日志, 不直接开串口). 只读.",
                 {"slot": SLOT_PARAM,
                  "lines": {"type": "integer", "minimum": 1, "maximum": 500, "default": READ_LINES,
-                           "description": "行数"}}, read_output),
+                           "description": "行数"}}, read_output, kind=mc.READONLY),
         mc.Tool("screenshot", "截被测机器当前画面 (HDMI 采集卡; 推车锁屏也拿得到), 返回 PNG. 很占上下文: 想读字先用 screen_ocr.",
                 {"device": {"type": "string", "pattern": r"(/dev/)?video[0-9]{1,2}", "maxLength": 16,
-                            "description": "采集设备, 默认正在预览的那块, 没预览就有信号的采集卡"}}, screenshot),
+                            "description": "采集设备, 默认正在预览的那块, 没预览就有信号的采集卡"}}, screenshot, kind=mc.READONLY),
         mc.Tool("cart_status", "推车状态快照 (cart-dash 写的 state.json): UPS、网络、LAN1/LAN2 的 LLDP 对端、"
-                "操作头、锁屏、自检、温度风扇; stale=true 表示采集停了.", {}, cart_status),
+                "操作头、锁屏、自检、温度风扇; stale=true 表示采集停了.", {}, cart_status, kind=mc.READONLY),
         mc.Tool("pxe_status", "PXE 装机口状态 (只读): 当前模式 (rescue/install/expired)、解锁的 MAC、到期时间、"
                 "剩余秒数、用途 (rocky/winpe/clone-save/clone-restore)、守卫状态. 解锁用 pxe_request 申请, 人在推车上确认.",
-                {}, pxe_status),
+                {}, pxe_status, kind=mc.READONLY),
     ]
 
 
@@ -199,14 +203,21 @@ def read_pxe(mode_path=kc.PXE_MODE, root=kc.TFTP_ROOT, guard_path=None, now=None
     return mc.pxe_view(mode, menu, kc.pxe_guard_read(guard_path), now)
 
 
-def real_tools():
+def real_tools(profile=mc.DEFAULT_PROFILE):
+    """按档位挑好的工具; 档位不认识抛 ValueError."""
+    mc.check_profile(profile)
     store = mcp_serial.Store()
-    return (build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap, state=dash_core.read, pxe=read_pxe,
-                        writer=lambda: mcp_serial.writers(store))
-            + mcp_serial.real_tools(conbroker_tail, store)      # 写串口 (#21)
-            + mcp_pxe.real_tools()                              # PXE 解锁申请 (#24): 只挂起, 人在车机上确认
-            + mcp_kvm.real_tools()                              # 键鼠 / OCR / WOL (#41)
-            + mcp_label.real_label_tools())                     # 标签 (#20)
+    tools = (build_tools(slots=real_slots, tail=conbroker_tail, snap=real_snap, state=dash_core.read, pxe=read_pxe,
+                         writer=lambda: mcp_serial.writers(store))
+             + mcp_serial.real_tools(conbroker_tail, store)     # 写串口 (#21)
+             + mcp_pxe.real_tools()                             # PXE 解锁申请 (#24): 只挂起, 人在车机上确认
+             + mcp_kvm.real_tools()                             # 键鼠 / OCR / WOL (#41)
+             + mcp_label.real_label_tools())                    # 标签 (#20)
+    return mc.select_tools(tools, profile)                      # 只读档: 动手工具不注册 (#49)
+
+
+def make_server(profile, audit):
+    return mcp_serial.Server(real_tools(profile), audit=audit, version=version(), profile=profile)   # 写工具要知道"谁"
 
 
 def version():
@@ -259,12 +270,14 @@ def make_http_server(addr, port, server, conf=conf_read, audit=None):
 
         def _deny(self, code, why, extra=()):
             if audit is not None:
-                audit.write(mc.audit_line(f"-@{self.client_address[0]}", None, None, False, error=f"{code} {why}"))
+                audit.write(mc.audit_line(f"-@{self.client_address[0]}", None, None, False, error=f"{code} {why}",
+                                          profile=server.profile))
             self._reply(code, json.dumps({"error": why}, ensure_ascii=False).encode(), extra=extra)
 
         def _gate(self):
             cfg = conf()
-            code, who = mc.http_check(self.client_address[0], self.headers, cfg.get("tokens"), cfg.get("hosts"))
+            code, who = mc.http_check(self.client_address[0], self.headers, mc.profile_tokens(cfg, server.profile),
+                                      cfg.get("hosts"))       # 令牌按档位分开 (#49)
             if code:
                 self._deny(code, who, extra=[("WWW-Authenticate", "Bearer")] if code == 401 else ())
                 return None
@@ -336,12 +349,14 @@ def main(argv=None):
         return mcp_serial.cli(argv)
     ap = argparse.ArgumentParser(description="ops-cart MCP 服务")
     ap.add_argument("mode", choices=["stdio", "http"])
+    ap.add_argument("--profile", choices=list(mc.PROFILES), default=mc.DEFAULT_PROFILE,
+                    help="readonly = 只注册只看的工具; act = 全部 (默认)")
     ap.add_argument("--port", type=int, help="HTTP 端口, 默认取 mcp.json 的 port (8765)")
     ap.add_argument("--conf", default=MCP_CONF, help="令牌/端口配置")
     ap.add_argument("--audit", default=mc.AUDIT_PATH, help="审计日志 (JSONL)")
     a = ap.parse_args(argv)
     audit = mc.Audit(a.audit)
-    server = mcp_serial.Server(real_tools(), audit=audit, version=version())    # 写工具要知道"谁"
+    server = make_server(a.profile, audit)
     if a.mode == "stdio":
         for s in (sys.stdin, sys.stdout):
             if hasattr(s, "reconfigure"):
@@ -349,7 +364,7 @@ def main(argv=None):
         serve_stdio(server, stdio_who(os.environ), sys.stdin, sys.stdout)
         return 0
     conf = lambda: conf_read(a.conf)        # noqa: E731
-    serve_http(server, a.port or int(conf()["port"]), audit, conf=conf)
+    serve_http(server, a.port or mc.profile_port(conf(), a.profile), audit, conf=conf)
     return 0
 
 
