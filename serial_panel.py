@@ -123,6 +123,7 @@ class SerialPanel(tk.Frame):
         self.chat_entry = tk.Entry(row, textvariable=self.chat_var, font=FONT, bg=BG2, fg=FG,
                                    insertbackground=FG, **th.SUNKEN, highlightthickness=2,
                                    highlightbackground=BG2, highlightcolor=th.PRIMARY)
+        self.chat_entry.no_ime = True       # 发往串口的命令, 不接中文输入 (中文输入的 NO_IME 约定)
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())
         _btn(row, "发送", self.chat_send, bg=th.PRIMARY).pack(side="left", padx=(6, 0))

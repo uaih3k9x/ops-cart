@@ -186,19 +186,104 @@ def _repo_py():
                 yield os.path.relpath(p, root), open(p, encoding="utf-8").read()
 
 
-def test_only_whitelisted_entries_get_ime():
+_MANIFESTS = {"scripts/accept_core.py"}       # 验收清单里列了模块名 "ime_tk"
+
+
+def ime_refs(src):
+    """-> (是否引用了 ime_tk, [(用途 或 None, 写法)], [违规写法]). 只认 `import ime_tk` + `ime_tk.attach(..., purpose="...")`;
+    别名、from-import、动态导入 (含字符串拼接) 一律算违规, 白名单内的文件也不行. 这是提醒, 不是安全边界."""
     import re
-    users, pairs = set(), set()
+    bad = []
+    if re.search(r"\bimport\s+ime_tk\s+as\b", src):
+        bad.append("import ime_tk as")
+    if re.search(r"\bfrom\s+ime_tk\s+import\b", src):
+        bad.append("from ime_tk import")
+    lits = re.findall(r"[\'\"]([^\'\"\n]*)[\'\"]", src)
+    head = any(x.startswith(("ime", "Ime")) or x in ("i", "im") for x in lits)
+    tail = any("_tk" in x or x in ("tk", "e_tk") or "ImeEntry" in x for x in lits)
+    if re.search(r"import_module|__import__|importlib|\bexec\(|\beval\(", src) and (head or tail):
+        bad.append("动态导入 ime*")
+    elif head and tail or any("ImeEntry" in x or "ime_tk" in x for x in lits):
+        bad.append("字符串拼出 ime_tk")
+    if re.search(r"\bImeEntry\b", src):
+        bad.append("直接用 ImeEntry")
+    used = bool(bad) or bool(re.search(r"\bime_tk\b", src))
+    calls = []
+    for m in re.finditer(r"\bime_tk\.(\w+)\(", src):
+        if m.group(1) != "attach":
+            bad.append(f"ime_tk.{m.group(1)}")
+            continue
+        pm = re.search(r"purpose=\"([\w.]+)\"", src[m.start():m.start() + 200])
+        calls.append(pm.group(1) if pm else None)
+    if re.search(r"(?<!ime_tk\.)\battach\(", src) and used:
+        bad.append("attach 不经 ime_tk.")
+    return used, calls, bad
+
+
+def test_only_whitelisted_entries_get_ime():
+    from collections import Counter
+    users, pairs = set(), Counter()
+    import re
     for rel, src in _repo_py():
-        if re.search(r"\bimport ime_tk\b|\bfrom ime_tk\b|\bime_tk\.|\bImeEntry\b|(?:import_module|__import__)\(\s*['\"]ime_", src):
+        if rel in _MANIFESTS:       # 只是列模块名 (验收清单), 不许真用
+            assert not re.search(r"\battach\(|^\s*(?:import|from)\s+ime_tk\b", src, re.M), rel
+            continue
+        used, calls, bad = ime_refs(src)
+        assert not bad, (rel, bad)
+        if used:
             users.add(rel)
-            for m in re.finditer(r"attach\(", src):
-                call = src[m.start():m.start() + 200]
-                pm = re.search(r"purpose=\"([\w.]+)\"", call)
-                assert pm, (rel, call)                       # attach 必须带字面的 purpose=
-                pairs.add((rel, pm.group(1)))
+            for purpose in calls:
+                assert purpose, rel                          # attach 必须带字面的 purpose=
+                pairs[(rel, purpose)] += 1
     assert users == {f for f, _p in ALLOWED}
-    assert pairs == ALLOWED
+    assert pairs == Counter(ALLOWED)                         # 每个 (文件, 用途) 恰好一次
+
+
+@pytest.mark.parametrize("src", [
+    "import ime_tk as k\nk.attach(e, purpose='x.y')\n",
+    "from ime_tk import attach as a\na(e, purpose=\"x.y\")\n",
+    "from ime_tk import ImeEntry\n",
+    "import importlib\nm = importlib.import_module('ime' + '_tk')\n",
+    "m = __import__(\"im\" \"e_tk\")\n",
+    "import importlib\nm = importlib.import_module(\"ime_\" + \"tk\")\n",
+    "name = 'ime' + '_tk'\n",
+    "x = getattr(mod, 'ImeEntry')  # 'ime'\n",
+    "import ime_tk\nime_tk.ImeEntry(e, 'x.y')\n",
+    "import ime_tk\nf = ime_tk.attach\nf(e, purpose=\"x.y\")\n",
+])
+def test_ime_refs_catches_indirect_forms(src):
+    used, calls, bad = ime_refs(src)
+    assert bad or (used and None in calls) or (used and not calls), src
+
+
+def test_ime_refs_same_purpose_twice_is_counted_twice():
+    src = 'import ime_tk\nime_tk.attach(a, purpose="wol.name")\nime_tk.attach(b, purpose="wol.name")\n'
+    used, calls, bad = ime_refs(src)
+    from collections import Counter
+    assert used and not bad and Counter(("wol_panel.py", p) for p in calls) != Counter(ALLOWED)
+
+
+def test_no_ime_marked_entry_refused():
+    kw = dict(opener=lambda: (FakeEngine(), ""), label=FakeLabel, spawn=lambda f: None)
+    assert it.attach(FakeEntry(), purpose="x.y", **kw) is not None
+    e = FakeEntry()
+    e.no_ime = True
+    assert it.attach(e, purpose="x.y", **kw) is None
+    with pytest.raises(ValueError):
+        it.ImeEntry(e, "x.y", **kw)
+
+
+# 已知"要人亲手敲"的输入框打 no_ime 标记 (运行时兜底): 文件 -> 至少几处
+NO_IME = {"kiosk.py": 3, "pxe_req_panel.py": 1, "serial_panel.py": 1, "netmode_panel.py": 1}
+
+
+def test_safety_entries_are_marked_no_ime():
+    import os
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name, n in NO_IME.items():
+        src = open(os.path.join(root, name), encoding="utf-8").read()
+        assert len(re.findall(r"\.no_ime = True", src)) >= n, name
 
 
 def test_attach_requires_purpose():

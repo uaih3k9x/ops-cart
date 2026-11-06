@@ -7,7 +7,8 @@
   - 中文且没在拼: 小写字母开始拼音, 其余键 (数字、标点、大写、回车、退格、Ctrl/Alt 组合) 原样放过.
   - 正在拼: 字母 / ' 继续拼, 退格删拼音, 空格上高亮的候选 (默认第一个), 1-9 选本页第几个,
     回车把敲的字母原样上屏 (上英文), Esc 取消, - = PageUp PageDown 翻页, 其余键吃掉 (不漏进输入框).
-引擎任何一步抛异常: 记下原因, 退回英文且不再用它 (status=unavailable), 不让输入框跟着坏; 运行中崩的
+引擎任何一步抛异常: 记下原因, 退回英文且不再用它 (status=unavailable), 不让输入框跟着坏; 正在拼时出错
+那个键照样吃掉 (回车把敲的字母上屏), 不漏进输入框; 运行中崩的
 (子进程退出 / 超时) 下次 Shift 可以重开, 最多 MAX_REOPEN 次; 打开就失败的 (没库 / 没词库) 不重开.
 引擎不认第一个字母 (方案没加载: 不进拼音也不上屏) 同样当坏了处理, 那个字母还给输入框, 不吞键.
 """
@@ -87,10 +88,18 @@ class Ime:
         if not self.zh or self.engine is None:
             return Result()
         try:
+            snap = self.engine.snapshot()
+        except Exception:
+            snap = _EMPTY
+        try:
             return self._press(keysym, char or "", state)
-        except Exception as e:                       # 引擎坏了: 退回英文, 这个键交还输入框
+        except Exception as e:                       # 引擎坏了: 退回英文
             self._drop(f"{type(e).__name__}: {e}")
-            return Result()
+            if not snap.preedit:                     # 没在拼: 这个键交还输入框
+                return Result()
+            if keysym in ("Return", "KP_Enter"):     # 在拼: 回车照样把字母上屏, 绝不漏给输入框 (会触发它的回车动作)
+                return Result(consume=True, commit=snap.raw or None)
+            return Result(consume=True)
 
     def _press(self, keysym, char, state):
         eng = self.engine

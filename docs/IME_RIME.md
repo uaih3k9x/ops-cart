@@ -18,7 +18,11 @@
 目前只接了**网络唤醒面板的"名字"输入框**做示范（`attach(e, purpose="wol.name")`）。只接普通文字输入框；确认码、
 PIN、密码、命令输入框一律不接（候选上屏等于替人打字，这几处要人亲手敲）：
 - `attach` 必须带用途名；`tests/test_ime_tk.py` 递归扫全仓，对 (文件, 用途) 做白名单，新接一处要改那里；
-- 运行时兜底：设了 `show=` 的输入框（密码框）`attach` 直接拒。
+- 运行时兜底：设了 `show=` 的输入框（密码框）、以及打了 `no_ime` 标记（`e.no_ime = True`）的输入框，`attach` 直接拒。
+  已标记：车机 PIN、PXE 解锁的 MAC 和确认码、PXE 申请确认码、串口命令框、网口模式的网络参数框。
+- 白名单测试是**提醒，不是安全边界**：它只认 `import ime_tk` + `ime_tk.attach(..., purpose="...")`，
+  别名、from-import、动态导入、字符串拼名字都判失败，每个 (文件, 用途) 只能出现一次；但静态扫描挡不住所有写法，
+  真正的兜底是上面的 `show=` / `no_ime`。
 
 ## 代码
 
@@ -34,10 +38,24 @@ PIN、密码、命令输入框一律不接（候选上屏等于替人打字，�
 
 librime 是 C++，在 kiosk（root）进程里崩了会带崩车机，还可能把 systemd 的重启次数用完。所以放子进程：
 
-- kiosk 是 root 时用 `systemd-run --pipe` 起，沙箱属性仿照 `cart-ocr.service`：`DynamicUser=yes`、`PrivateNetwork=yes`、
-  `CapabilityBoundingSet=`（空）、`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`MemoryMax=512M` 等；
-  用户目录用 `StateDirectory=ops-cart-ime`（`/var/lib/ops-cart-ime`，部署产物留着下次不用重编）。没有 `systemd-run` 就不起。
-- 非 root（开发机）直接用当前 python 起，只有崩溃隔离，没有降权断网。
+- kiosk 是 root 时用 `systemd-run --pipe` 起，沙箱属性对齐 `cart-ocr.service`（全表见 `ime_proc._SANDBOX`）：
+  `DynamicUser`、`PrivateNetwork`、能力集置空、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、
+  `ProtectKernelLogs`、`RestrictRealtime`、`ProtectProc=invisible`、`ProtectClock`、`ProtectHostname`、
+  `SystemCallFilter=@system-service`、`MemoryDenyWriteExecute`、`UMask=0077`、`MemoryMax=512M`、`MemorySwapMax=0`、
+  `TasksMax=32`、`CPUQuota=50%`；`InaccessiblePaths` 遮住 `/etc/ops-cart`、`/var/lib/ops-cart`、`/var/log/ops-cart`、
+  `/run/ops-cart`、`/root`、`/etc/shadow`、`/etc/gshadow`、`/opt/pxe/http`（ks 里有 root 哈希）、`/opt/pxe/kiosk.conf`。
+  解释器带 `-I`。用户目录用 `StateDirectory=ops-cart-ime`（`/var/lib/ops-cart-ime`，部署产物留着下次不用重编）。
+  没有 `systemd-run` 就不起。
+- `MemoryDenyWriteExecute`：`ime_rime` 只用 ctypes 调函数指针，不建 Python 回调（不需要可写可执行内存）；
+  但如果推车上的 librime-lua 链的是 **LuaJIT**，JIT 会被拒——实机起不来就去掉这一项（待实机验证）。
+- 生命周期：单元名固定为 `ops-cart-ime-<kiosk pid>-<序号>`。root 下 `Popen` 拿到的只是 `systemd-run` 客户端，
+  所以 `kill()` 还会在后台线程里 `systemctl kill --signal=KILL <单元>`（3 秒超时，不阻塞界面）。另有
+  `RuntimeMaxSec=900` 兜底；kiosk 在 `kiosk.service` 里跑时加 `BindsTo=kiosk.service`，车机停了 worker 一起停
+  （手工起的车机不加，免得起 worker 时把 `kiosk.service` 拉起来）。
+  到 15 分钟 worker 会被 systemd 停掉，界面判"不可用"回英文，按 Shift 可以重开（最多 2 次）。
+- 子进程的回复当不可信数据：去掉控制字符，上屏最多 64 字、每个候选最多 32 字、拼音串最多 64 字，
+  页码和高亮夹到范围内，一行回复最多 64KB；看不懂（含 `inf`、层层嵌套的 JSON）就杀掉、判不可用。
+- 非 root（开发机）直接用当前 python（`-I`）起，只有崩溃隔离，没有降权断网。
 
 ## 配置（环境变量，都可不设）
 

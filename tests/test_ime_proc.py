@@ -136,7 +136,7 @@ def test_worker_cmd_as_root_uses_systemd_run_sandbox(monkeypatch):
         assert want in props, want
     assert any(a.startswith("MemoryMax=") for a in props)
     assert "--setenv=OPS_CART_RIME_USER=/var/lib/ops-cart-ime" in cmd
-    assert cmd[-1].endswith("ime_worker.py")
+    assert cmd[-1].endswith("ime_worker.py") and cmd[-2] == "-I"
 
 
 def test_worker_cmd_root_without_systemd_run_refuses(monkeypatch):
@@ -150,7 +150,7 @@ def test_worker_cmd_root_without_systemd_run_refuses(monkeypatch):
 def test_worker_cmd_non_root_plain_python(monkeypatch):
     monkeypatch.setattr(ip.os, "geteuid", lambda: 1000)
     cmd = ip.worker_cmd()
-    assert cmd[0] == sys.executable and cmd[-1].endswith("ime_worker.py")
+    assert cmd[:2] == [sys.executable, "-I"] and cmd[-1].endswith("ime_worker.py")
 
 
 def test_main_process_never_loads_librime():
@@ -214,3 +214,143 @@ def test_real_worker_subprocess(tmp_path, monkeypatch):
         assert ime.press("space", " ", 0).commit
     finally:
         eng.close()
+
+
+# ------------------------------------------------------------ #72 第二轮: 单元名 / 杀单元 / 沙箱 / 清洗回复
+
+def _root_cmd(monkeypatch, cgroup="0::/system.slice/kiosk.service\n"):
+    monkeypatch.setattr(ip.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ip.shutil, "which", lambda n: "/usr/bin/" + n if n in ("systemd-run", "systemctl") else None)
+    monkeypatch.setattr(ip, "_own_cgroup", lambda: cgroup)
+    cmd = ip.worker_cmd()
+    return cmd, [cmd[i + 1] for i, a in enumerate(cmd) if a == "-p"]
+
+
+def test_worker_cmd_unique_unit_and_lifetime(monkeypatch):
+    cmd, props = _root_cmd(monkeypatch)
+    units = [a for a in cmd if a.startswith("--unit=")]
+    assert len(units) == 1 and units[0].startswith(f"--unit=ops-cart-ime-{os.getpid()}-")
+    assert units[0] != [a for a in ip.worker_cmd() if a.startswith("--unit=")][0]   # 每次一个新名字
+    assert "RuntimeMaxSec=900" in props
+    assert "BindsTo=kiosk.service" in props and "After=kiosk.service" in props
+
+
+def test_worker_cmd_no_bindsto_outside_kiosk_service(monkeypatch):
+    """不在 kiosk.service 里跑 (手工起的车机) 不加 BindsTo: 否则起 worker 会顺手把 kiosk.service 拉起来."""
+    _cmd, props = _root_cmd(monkeypatch, cgroup="0::/user.slice/session-1.scope\n")
+    assert not any(p.startswith("BindsTo=") for p in props)
+
+
+def test_worker_cmd_sandbox_matches_cart_ocr(monkeypatch):
+    _cmd, props = _root_cmd(monkeypatch)
+    for want in ("ProtectKernelLogs=yes", "RestrictRealtime=yes", "MemorySwapMax=0",
+                 "SystemCallFilter=@system-service", "ProtectProc=invisible", "ProtectClock=yes",
+                 "ProtectHostname=yes", "MemoryDenyWriteExecute=yes", "UMask=0077", "CPUQuota=50%"):
+        assert want in props, want
+    assert any(p.startswith("TasksMax=") for p in props)
+    hidden = next(p for p in props if p.startswith("InaccessiblePaths=")).split("=", 1)[1].split()
+    for d in ("-/etc/ops-cart", "-/var/lib/ops-cart", "-/var/log/ops-cart", "-/run/ops-cart", "-/root",
+              "-/etc/shadow", "-/opt/pxe/http"):
+        assert d in hidden, d
+
+
+class _Proc:
+    """假 Popen: 只看 kill 路径."""
+    def __init__(self, alive=True):
+        self.alive, self.killed, self.returncode = alive, False, None
+        self.stdin = self.stdout = io.BytesIO()
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def kill(self):
+        self.killed, self.alive = True, False
+
+    def wait(self, timeout=None):
+        return 0
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_kill_also_kills_unit_in_background(monkeypatch, alive):
+    """root 下 proc 只是 systemd-run 客户端; worker 在另一个单元里, 要 systemctl kill 它. 不阻塞界面线程."""
+    seen = []
+    monkeypatch.setattr(ip, "_kill_unit", lambda unit: seen.append(unit))
+    eng = ip.ProcEngine(_Proc(alive), unit="ops-cart-ime-1-1")
+    eng.kill()
+    eng.kill()
+    assert seen == ["ops-cart-ime-1-1"]                    # 客户端死没死都杀单元, 只杀一次
+
+
+def test_kill_unit_runs_systemctl_kill_with_timeout_in_thread(monkeypatch):
+    calls, threads = [], []
+    monkeypatch.setattr(ip.shutil, "which", lambda n: "/usr/bin/systemctl")
+    monkeypatch.setattr(ip.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)))
+    monkeypatch.setattr(ip, "_spawn", lambda f: threads.append(f))
+    ip._kill_unit("ops-cart-ime-1-1")
+    assert calls == []                                     # 不在调用线程里跑
+    threads[0]()
+    argv, kw = calls[0]
+    assert argv == ["/usr/bin/systemctl", "kill", "--signal=KILL", "ops-cart-ime-1-1"]
+    assert 0 < kw["timeout"] <= 5
+
+
+def test_open_engine_passes_unit_from_cmd(fake, monkeypatch):
+    seen = []
+    monkeypatch.setattr(ip, "_kill_unit", seen.append)
+    eng, _ = ip.open_engine(cmd=fake("ok")[:2] + ["--unit=ops-cart-ime-9-9"] + fake("ok")[2:])
+    assert eng is not None and eng.unit == "ops-cart-ime-9-9"
+    eng.close()
+    assert seen == ["ops-cart-ime-9-9"]
+
+
+def _engine_replying(resp):
+    """ProcEngine, call 直接回 resp (不起进程)."""
+    eng = ip.ProcEngine(_Proc())
+    eng.call = lambda req, timeout=None: resp
+    return eng
+
+
+def test_reply_is_sanitized():
+    long = "字" * 200
+    eng = _engine_replying({"ok": True, "handled": True, "commit": "你\x00好\x1b[31m\x7f" + long,
+                            "snap": ["ni\x07hao", "ni hao\n", ["候\x00选" + long] * 20, 10 ** 9, True, 99]})
+    eng.feed("n")
+    s = eng.snapshot()
+    c = eng.take_commit()
+    assert c.startswith("你好[31m") and len(c) == ip.COMMIT_MAX
+    assert all(len(x) <= ip.CAND_MAX and "\x00" not in x for x in s.candidates) and len(s.candidates) == 9
+    assert s.raw == "nihao" and s.preedit == "ni hao"
+    assert 0 <= s.highlighted < len(s.candidates) and 0 <= s.page_no <= ip.PAGE_MAX
+    assert ip.LINE_MAX == 64 * 1024
+
+
+def test_reply_highlight_clamped_when_no_candidates():
+    eng = _engine_replying({"ok": True, "handled": True, "commit": None, "snap": ["n", "n", [], -5, True, -3]})
+    eng.feed("n")
+    assert eng.snapshot().highlighted == 0 and eng.snapshot().page_no == 0
+
+
+@pytest.mark.parametrize("snap", [["n", "n", [], float("inf"), True, 0], ["n", "n", [], 0, True, float("nan")]])
+def test_reply_overflow_is_failure_not_crash(snap):
+    eng = _engine_replying({"ok": True, "handled": True, "commit": None, "snap": snap})
+    with pytest.raises(OSError):
+        eng.feed("n")
+    assert eng.proc.killed
+
+
+def test_call_deeply_nested_reply_is_failure(monkeypatch):
+    eng = ip.ProcEngine(_Proc())
+    monkeypatch.setattr(eng, "_readline", lambda t: b"[" * 100000 + b"]" * 100000)
+    eng.proc.stdin = io.BytesIO()
+    with pytest.raises(OSError):
+        eng.call({"op": "feed", "ch": "n"})
+    assert eng.proc.killed
+
+
+def test_open_engine_unexpected_exception_kills(monkeypatch, fake):
+    killed = []
+    real_kill = ip.ProcEngine.kill
+    monkeypatch.setattr(ip.ProcEngine, "call", lambda self, req, timeout=None: (_ for _ in ()).throw(RecursionError("deep")))
+    monkeypatch.setattr(ip.ProcEngine, "kill", lambda self: (killed.append(1), real_kill(self)))
+    eng, why = ip.open_engine(cmd=fake("ok"))
+    assert eng is None and "RecursionError" in why and killed

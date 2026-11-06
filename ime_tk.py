@@ -5,7 +5,8 @@
 失败返回 None, 输入框照旧. 默认英文, 单按 Shift 切中文; 第一次切中文才在后台起 librime 子进程 (ime_proc),
 打不开就一直英文并提示原因. 本进程不加载 librime.
 只接给普通文字输入框; 别接确认码 / PIN / 密码 / 命令输入框 (候选上屏是"替人打字", 那几处要人亲手敲):
-设了 show= 的 (密码框) 直接拒; 接入点在 tests/test_ime_tk.py 的 (文件, 用途) 白名单里登记.
+设了 show= 的 (密码框) 和标了 no_ime 的直接拒; 接入点在 tests/test_ime_tk.py 的 (文件, 用途) 白名单里登记
+(那个测试是提醒, 不是边界: 静态扫描挡不住所有写法, 运行时兜底靠 show= / no_ime).
 拼音期间吃掉的键不会冒泡到 bind_all, 所以每吃一个键补发虚拟事件 INPUT_EVENT, kiosk 拿它算"有人在操作".
 """
 
@@ -17,6 +18,7 @@ import theme as th
 
 _seq = [0]
 INPUT_EVENT = "<<OpsCartImeInput>>"
+NO_IME = "no_ime"           # 输入框上 `e.no_ime = True`: 要人亲手敲的框 (确认码 / PIN / 串口命令 / MAC / 网络参数), attach 见到就拒
 AUTO_SWITCH_S = 3.0         # 引擎在切中文那一下之后这么久内到、且中间没打字, 才自动切到中文
 
 
@@ -58,6 +60,8 @@ class ImeEntry:
             raise ValueError("要给用途名 purpose")
         if entry.cget("show"):
             raise ValueError("密码框不接中文输入")
+        if getattr(entry, NO_IME, False):
+            raise ValueError("这个输入框标了 no_ime (确认码 / PIN / 命令), 不接中文输入")
         if label is None:
             import tkinter as tk
             label = tk.Label

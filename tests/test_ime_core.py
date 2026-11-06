@@ -339,3 +339,50 @@ def test_open_failure_does_not_reopen():
     ime.set_unavailable("没有词库")
     ime.press("Shift_L", "", 0)
     assert not ime.release("Shift_L").need_engine
+
+
+# ------------------------------------------------------------ #72 第二轮: 拼音中引擎出错, 键不漏进输入框
+
+class FailMid(FakeEngine):
+    """拼了几个字母之后坏掉."""
+
+    def __init__(self, broken_op):
+        super().__init__()
+        self.broken_op = broken_op
+
+    def _boom(self, op):
+        if op == self.broken_op:
+            raise OSError("子进程退出了")
+
+    def feed(self, ch):
+        if self.raw:
+            self._boom("feed")
+        return super().feed(ch)
+
+    def clear(self):
+        self._boom("clear")
+        super().clear()
+
+    def backspace(self):
+        self._boom("backspace")
+        super().backspace()
+
+
+@pytest.mark.parametrize("key", ["Return", "KP_Enter"])
+def test_enter_while_composing_and_engine_fails_commits_raw(key):
+    ime = ic.Ime()
+    ime.set_engine(FailMid("clear"), zh=True)
+    for ch in "ni":
+        ime.press(ch, ch, 0)
+    r = ime.press(key, "\r", 0)
+    assert r.consume and r.commit == "ni"                  # 回车绝不漏给输入框 (会触发它的 <Return> 动作)
+    assert ime.status == "unavailable" and not ime.zh
+
+
+@pytest.mark.parametrize("op,key,char", [("feed", "h", "h"), ("backspace", "BackSpace", "\b")])
+def test_other_keys_while_composing_and_engine_fails_are_consumed(op, key, char):
+    ime = ic.Ime()
+    ime.set_engine(FailMid(op), zh=True)
+    ime.press("n", "n", 0)
+    r = ime.press(key, char, 0)
+    assert r.consume and r.commit is None and ime.status == "unavailable"
