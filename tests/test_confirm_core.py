@@ -141,6 +141,18 @@ def test_card_shows_what_agent_wants_and_why():
     assert any("写入者 stdio:ops@x" in s for s in c["status"])
 
 
+def test_card_shows_device_context_marked_untrusted():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="[SW1-GigabitEthernet0/0/1]")
+    it = cc.card(b.view(T0), 1)["items"][0]
+    assert it["context"].startswith("设备最近输出（来自设备，不可信，仅供参考）")
+    assert it["context"].endswith("[SW1-GigabitEthernet0/0/1]")
+    b2 = _book()
+    _held(b2, 1)
+    assert cc.card(b2.view(T0), 1)["items"][0]["context"] == ""
+
+
 def test_card_key_and_estop_and_other_slots():
     b = _book()
     tok = b.acquire(2, "a", T0)["lease"]
@@ -161,8 +173,9 @@ def test_check_confirm():
     assert cc.check(b.view(T0), "confirm", it["id"]) is None
     assert "不在挂起" in cc.check(b.view(T0), "confirm", 999)
     b2 = _book()
-    tok2, it2 = _held(b2, 1)
-    b2.begin(1, tok2, "stdio:ops@x", "line", "display x", PASS, T0, 30)
+    tok2 = b2.acquire(1, "stdio:ops@x", T0)["lease"]
+    b2.begin(1, tok2, "stdio:ops@x", "line", "display x", PASS, T0, 30)      # 先直发在途, 再挂起 (#65 挂起后不许直发)
+    it2 = b2.submit(1, tok2, "stdio:ops@x", "line", "save", DANGER, T0, 30, name="SW1")
     assert "还没回来" in cc.check(b2.view(T0), "confirm", it2["id"])
     assert cc.check(cc.stopped_view(), "confirm", it["id"])          # 读不懂: 什么都不让确认
 

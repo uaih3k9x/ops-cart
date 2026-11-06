@@ -10,6 +10,10 @@
   才直接发; 带高危词 (save / reboot / reset / format / delete ...) 的永远要人确认, 不送模型.
 - 闸门第 2 层 (#22): 认得出厂商、停在提示符上、不在白名单里、不带高危词的, 交调用方注入的 judge (决策模型,
   serial_gate_model) 判; 判放行才直发 (layer=2), 判拦 / 出错 / 超时 / 结果不对 / 没开一律挂起等人确认.
+- 挂起期间 (#65): 槽位有挂起项时, 这个槽位的任何直发 (第 1/2 层放行的命令和键) 都拒 (pending), 和键鼠一致 ——
+  否则人批准的"槽位 N · shutdown"会作用在 Agent 之后切过去的另一个接口上. 纵深: 挂起项记下提交时槽位的发送序号,
+  确认时序号变了 (提交后这个槽位又发过别的, 例如人先确认了同槽位另一条) 就作废 (stale), 让 Agent 重新提交.
+  挂起项带提交时设备最近几行输出 (来自设备、不可信, 限长, 口令类字段打码), 只在状态文件和审批界面, 不进执行绪日志.
 - 写租约: 每个槽位同一时间一个写入者, 认令牌不认名字; 有期限 (默认 60 秒), 要续期, 过期自动释放,
   它挂着的命令一起作废. 一条在途: 上一条没回来不发下一条.
 - 人优先: 人在车机 / 网页上敲键不经租约; 人 3 秒内敲过键 Agent 的输入由 conbroker 排队; 人随时急停、确认、拒绝.
@@ -22,6 +26,7 @@ import json
 import re
 import secrets
 import time
+import unicodedata
 
 import survey_core
 
@@ -35,11 +40,15 @@ PENDING_MAX_S = 900         # 挂起超过 15 分钟没人理就作废 (现场�
 INFLIGHT_GRACE_S = 90       # 在途标记超过 发送超时 + 这么久还没回来 = 发送进程死了
 HISTORY_MAX = 30            # 状态文件里留最近多少条结果给 pending_list 看 (完整的在执行绪日志里)
 ECHO_MAX = 1000             # 日志里设备回显摘要的长度
+CONTEXT_LINES = 8           # 挂起项带提交时设备最近几行输出 (#65), 给审批的人参考
+CONTEXT_LINE_MAX = 160
+CONTEXT_MAX = 1000
 STATE_VERSION = 1
 
 
 class Refused(Exception):
-    """不让做. code: bad (命令不合格) / estop / lease / busy / inflight / nope (没有这条或已经不在挂起)."""
+    """不让做. code: bad (命令不合格) / estop / lease / busy / inflight / nope (没有这条或已经不在挂起) /
+    pending (槽位有挂起项, 不许直发) / stale (挂起后槽位又发过别的, 这条作废)."""
 
     def __init__(self, code, msg):
         super().__init__(msg)
@@ -294,6 +303,31 @@ def echo_summary(text):
     return f"{s[:half]}\n…(省略 {len(s) - 2 * half} 字)…\n{s[-half:]}"
 
 
+_CTX_SECRET = re.compile(r"(?i)\b(password|passwd|secret|community|cipher|pre-shared-key|key-string|"
+                         r"authentication-key|psk)\b.*$")
+
+
+def _ctx_clean(ln):
+    """控制字符、ESC、零宽 / 双向覆盖这类格式字符 (Unicode 类别 C*) 换成 ?; 中文照留. 制表换空格."""
+    return "".join(" " if ch == "\t" else "?" if unicodedata.category(ch)[0] == "C" else ch for ch in ln)
+
+
+def device_context(text):
+    """挂起时设备最近几行输出 -> {src, untrusted, lines}; 没有 -> None. 来自被测设备, 只给人看, 不当指令:
+    掐尾 CONTEXT_LINES 行、每行 CONTEXT_LINE_MAX 字、总共 CONTEXT_MAX 字; 控制字符换成 ?; 口令类字段后面整行打码."""
+    lines = [ln for ln in (text or "").replace("\r", "").split("\n")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    out, total = [], 0
+    for ln in reversed(lines[-CONTEXT_LINES:]):
+        ln = _CTX_SECRET.sub(lambda m: m.group(1) + " ******", _ctx_clean(ln))[:CONTEXT_LINE_MAX]
+        if total + len(ln) > CONTEXT_MAX:
+            break
+        out.insert(0, ln)
+        total += len(ln)
+    return {"src": "device", "untrusted": True, "lines": out} if out else None
+
+
 def log_line(rec):
     """一条记录一行 JSON (换行在 JSON 里转义, 不会断行)."""
     return json.dumps(rec, ensure_ascii=False, default=str)
@@ -302,7 +336,7 @@ def log_line(rec):
 # ------------------------------------------------------------ 状态: 租约 / 挂起 / 在途 / 急停
 
 _PUBLIC = ("id", "slot", "kind", "cmd", "who", "t", "timeout", "gate", "reason", "danger", "status",
-           "by", "why", "echo", "name")
+           "by", "why", "echo", "name", "context")
 
 
 def _public(item):
@@ -310,7 +344,7 @@ def _public(item):
 
 
 def _slot_doc():
-    return {"lease": None, "estop": None, "inflight": None}
+    return {"lease": None, "estop": None, "inflight": None, "sent": 0}
 
 
 class Book:
@@ -484,9 +518,14 @@ class Book:
         self.doc["items"].append(it)
         return it
 
+    def _sent(self, slot):
+        return self._s(slot).get("sent", 0)
+
     def _start(self, it, now):
         it["status"] = "sending"
-        self._s(it["slot"])["inflight"] = {"id": it["id"], "cmd": it["cmd"], "since": now,
+        s = self._s(it["slot"])
+        s["sent"] = s.get("sent", 0) + 1                # 发送序号: 挂起项靠它知道"提交后有没有发过别的"
+        s["inflight"] = {"id": it["id"], "cmd": it["cmd"], "since": now,
                                            "deadline": now + it["timeout"] + INFLIGHT_GRACE_S}
 
     def _idle(self, slot):
@@ -500,16 +539,26 @@ class Book:
             raise ValueError("闸门没放行的只能 submit 挂起")
         self.writer(slot, token, now)
         self._idle(slot)
+        pend = self._pending(slot)
+        if pend:
+            ids = ", ".join(f"#{p['id']} {p['cmd']!r}" for p in pend)
+            raise Refused("pending", f"槽位 {slot} 有挂起等人确认的命令 ({ids}), 这期间不许直发任何命令或按键 "
+                                     "(会改变设备上下文, 让人批准的命令落到别的对象上). 先等人确认 / 拒绝, "
+                                     "或 lease_release 撤回")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "sending")
         self._start(it, now)
         return _public(it)
 
-    def submit(self, slot, token, who, kind, cmd, gate, now, timeout, name=None):
-        """挂起等人确认."""
+    def submit(self, slot, token, who, kind, cmd, gate, now, timeout, name=None, context=None):
+        """挂起等人确认. context = 提交时设备最近的输出 (原文, 这里掐短打码)."""
         self.writer(slot, token, now)
         if len(self._pending(slot)) >= PENDING_MAX:
             raise Refused("busy", f"槽位 {slot} 已经有 {PENDING_MAX} 条等人确认, 先等人处理")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "pending")
+        it["sent_mark"] = self._sent(slot)
+        ctx = device_context(context)
+        if ctx:
+            it["context"] = ctx
         self._ev("pending", slot, now, who=who, id=it["id"], kind=kind, cmd=cmd, gate=gate, name=name)
         return _public(it)
 
@@ -527,6 +576,10 @@ class Book:
             self._close(it, "dropped", now, why="提交它的 Agent 租约已失效")
             raise Refused("lease", "提交它的 Agent 租约已失效, 这条作废")
         self._idle(slot)
+        if it.get("sent_mark") != self._sent(slot):
+            why = "提交后这个槽位又发过别的命令, 设备上下文可能变了; 这条作废, 要 Agent 看过现场后重新提交"
+            self._close(it, "dropped", now, why=why)
+            raise Refused("stale", why)
         it["by"] = by
         self._start(it, now)
         self._ev("confirm", slot, now, src="human", who=by, id=it["id"], kind=it["kind"], cmd=it["cmd"],

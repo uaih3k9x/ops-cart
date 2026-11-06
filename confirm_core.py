@@ -98,6 +98,12 @@ def _want(item):
     return f"Agent 想执行：{item['cmd']}"
 
 
+def _context(item):
+    """挂起时设备最近输出 (#65): 来自被测设备, 不可信, 只给审批的人参考."""
+    lines = ((item.get("context") or {}).get("lines")) or []
+    return ("设备最近输出（来自设备，不可信，仅供参考）：\n" + "\n".join(lines)) if lines else ""
+
+
 def card(view, n):
     """槽位 n 的确认框 -> {title, status, stopped, items}. items 每条 {id, head, meta, reason, danger}."""
     s = next(x for x in view["slots"] if x["slot"] == n)
@@ -118,7 +124,8 @@ def card(view, n):
         out.append({"id": p["id"], "head": _want(p),
                     "meta": f"#{p['id']} · 来自 {p['who']} · {p.get('age_s', 0)} 秒前",
                     "reason": f"闸门理由：{p.get('reason') or '-'}",
-                    "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else ""})
+                    "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else "",
+                    "context": _context(p)})
     return {"title": f"操作头 {n}" + (f" · {name}" if name else ""), "status": status,
             "stopped": bool(s["estop"]), "items": out}
 

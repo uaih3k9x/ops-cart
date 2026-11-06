@@ -478,8 +478,8 @@ def test_confirm_refused_after_lease_expired():
 def test_confirm_needs_slot_idle():
     b = book()
     b.acquire(1, "agentA", T0, token="tokA")
-    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=30)
     b.begin(1, "tokA", "agentA", "line", "display version", _gate_pass(), T0, timeout=30)
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=30)
     with pytest.raises(sw.Refused) as e:
         b.confirm(p["id"], "human", T0 + 1)
     assert e.value.code == "inflight"
@@ -668,3 +668,113 @@ def test_events_have_timestamps_and_slot():
     b.acquire(2, "agentA", T0, token="tokA")
     e = b.events[0]
     assert e["slot"] == 2 and e["t"].startswith("20") and e["src"] == "agent"
+
+
+# ------------------------------------------------------------ 挂起期间不许直发 (#65)
+
+def test_direct_send_refused_while_slot_has_pending():
+    """挂起 shutdown 等人确认时, Agent 不能再经第 1/2 层直发 interface X 改设备上下文."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(["shutdown"]), T0, timeout=30)
+    for kind, cmd in (("line", "interface GigabitEthernet0/0/2"), ("line", "display version"), ("key", "enter")):
+        with pytest.raises(sw.Refused) as e:
+            b.begin(1, "tokA", "agentA", kind, cmd, _gate_pass(), T0 + 1, timeout=30)
+        assert e.value.code == "pending" and f"#{p['id']}" in str(e.value)
+    assert b.view(T0 + 1)["slots"][0]["inflight"] is None
+    assert [x["id"] for x in b.view(T0 + 1)["pending"]] == [p["id"]]      # 挂起项原样还在
+
+
+def test_direct_send_on_other_slot_unaffected():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    b.acquire(2, "agentA", T0, token="tokB")
+    b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30)
+    assert b.begin(2, "tokB", "agentA", "line", "display version", _gate_pass(), T0, timeout=30)["status"] == "sending"
+
+
+def test_direct_send_allowed_again_after_pending_resolved():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30)
+    b.reject(p["id"], "human", T0 + 1)
+    assert b.begin(1, "tokA", "agentA", "line", "display version", _gate_pass(), T0 + 2, timeout=30)["status"] == "sending"
+
+
+def test_confirm_voided_if_slot_sent_something_after_submit():
+    """纵深: 挂起之后槽位上又发过别的 (例如人先确认了同槽位另一条), 现场可能变了, 这条批准作废."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    a = b.submit(1, "tokA", "agentA", "line", "interface GigabitEthernet0/0/2", _gate_confirm(), T0, timeout=30)
+    s = b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(["shutdown"]), T0, timeout=30)
+    b.confirm(a["id"], "human", T0 + 1)
+    b.finish(a["id"], {"status": "sent", "echo": ""}, T0 + 2)
+    with pytest.raises(sw.Refused) as e:
+        b.confirm(s["id"], "human", T0 + 3)
+    assert e.value.code == "stale"
+    last = b.view(T0 + 3)["history"][-1]
+    assert last["id"] == s["id"] and last["status"] == "dropped" and "重新提交" in last["why"]
+
+
+def test_confirm_ok_when_nothing_sent_since_submit():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    b.begin(1, "tokA", "agentA", "line", "display version", _gate_pass(), T0, timeout=30)
+    b.finish(1, {"status": "sent", "echo": ""}, T0 + 1)
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0 + 2, timeout=30)
+    assert b.confirm(p["id"], "human", T0 + 3)["status"] == "sending"
+
+
+def test_old_state_item_without_send_mark_is_voided():
+    """升级前就挂着的条目没有发送序号: 按现场可能变了算, 不放行."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30)
+    doc = json.loads(b.dumps())
+    for it in doc["items"]:
+        it.pop("sent_mark", None)
+    b2 = sw.Book.from_text(json.dumps(doc), T0 + 1)
+    with pytest.raises(sw.Refused) as e:
+        b2.confirm(p["id"], "human", T0 + 2)
+    assert e.value.code == "stale"
+
+
+def test_pending_records_device_context_untrusted_and_bounded():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    text = "\n".join(f"line {i}" for i in range(50)) + "\n x" * 0 + "\n" + "Z" * 5000 + "\n\x1b[2J<SW1>\r\n"
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30, context=text)
+    ctx = b.view(T0)["pending"][0]["context"]
+    assert ctx["src"] == "device" and ctx["untrusted"] is True
+    assert len(ctx["lines"]) <= sw.CONTEXT_LINES and ctx["lines"][-1] == "?[2J<SW1>"
+    assert all(len(ln) <= sw.CONTEXT_LINE_MAX for ln in ctx["lines"])
+    assert sum(len(ln) for ln in ctx["lines"]) <= sw.CONTEXT_MAX
+    assert "context" not in json.dumps([e for e in b.events if e["ev"] == "pending"])   # 不进执行绪日志
+    assert p["context"] == ctx
+
+
+def test_pending_context_masks_secrets():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    text = (" local-user admin password irreversible-cipher $1a$Secr3t$\n snmp-agent community read cipher Pub1c\n"
+            " enable secret 5 $1$abc$\n username ops password 0 hunter2\n<SW1>")
+    b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30, context=text)
+    blob = json.dumps(b.view(T0)["pending"][0]["context"])
+    for s in ("Secr3t", "Pub1c", "$1$abc$", "hunter2"):
+        assert s not in blob, s
+    assert "<SW1>" in blob and "local-user admin password" in blob
+
+
+def test_pending_context_neutralises_format_chars():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30,
+             context="接口\u202edown\u200b\t<SW1>")
+    assert b.view(T0)["pending"][0]["context"]["lines"] == ["接口?down? <SW1>"]
+
+
+def test_pending_without_context_has_none():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(["save"]), T0, timeout=30)
+    assert b.view(T0)["pending"][0].get("context") is None

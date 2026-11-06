@@ -581,3 +581,30 @@ def test_flag_kvm_sticky_when_old_flag_unreadable(tmp_path):
         f.write("{bad")
     rig.store.run(lambda b, now: None)
     assert _flag(rig)["kvm"] is True
+
+
+# ------------------------------------------------------------ 挂起期间不许直发 (#65)
+
+def test_direct_send_refused_while_pending_then_shutdown_lands_where_approved(rig):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert p["status"] == "pending"
+    msg = rig.err("send_command", {"slot": 1, "command": "display interface brief", "lease": tok})
+    assert "挂起" in msg and f"#{p['id']}" in msg
+    assert "挂起" in rig.err("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert rig.sent == []                                             # 一个字节都没发
+    assert [r["why"] for r in rig.log(1) if r["ev"] == "refused"][-1] == "pending"
+    rc, text = cli(rig, "confirm", str(p["id"]))                      # 人那边照常
+    assert rc == 0, text
+    assert rig.sent == [("/dev/con-1", "shutdown", False)]
+
+
+def test_pending_carries_device_context_for_reviewer(rig):
+    rig.tail_text["/dev/con-1"] = "interface GigabitEthernet0/0/1\n[SW1-GigabitEthernet0/0/1]"
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    ctx = rig.ok("pending_list")["pending"][0]["context"]
+    assert ctx["untrusted"] is True and ctx["lines"][-1] == "[SW1-GigabitEthernet0/0/1]"
+    assert all("context" not in r for r in rig.log(1))                # 执行绪日志照旧不带
+    rc, text = cli(rig, "pending")
+    assert "设备最近输出" in text and "不可信" in text and "[SW1-GigabitEthernet0/0/1]" in text

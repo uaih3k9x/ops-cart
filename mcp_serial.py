@@ -277,10 +277,11 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         except OSError as e:
             raise mc.ToolError(f"写状态文件失败, 不发: {e}") from None
 
-    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw):
+    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw, context=None):
         me = who()
         if gate["verdict"] != "pass":
-            it = _run(lambda b, now: b.submit(n, lease, me, kind, cmd, gate, now, timeout, name), n, kind, cmd)
+            it = _run(lambda b, now: b.submit(n, lease, me, kind, cmd, gate, now, timeout, name, context=context),
+                      n, kind, cmd)
             return [mc.json_content({
                 "status": "pending", "id": it["id"], "slot": n, "cmd": cmd, "reason": gate["reason"],
                 "danger": gate["danger"],
@@ -336,18 +337,19 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
-                         cmd, False)
+                         cmd, False, context=text)
 
     def send_key(a):
         n, key = a["slot"], a["key"]
         s = _slot(n)
         gate = sw.classify_key(key)
         try:
-            name = mc.thread_name(tail(s["dev"], TAIL_LINES))
+            text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
-            name = None
+            text = ""
         k = sw.KEYS[key]
-        return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"])
+        return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, mc.thread_name(text), k["text"],
+                         k["raw"], context=text)
 
     def pending_list(a):
         return [mc.json_content(_run(lambda b, now: b.view(now, a.get("slot"))))]
@@ -373,7 +375,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              "过闸门: 认得出厂商、设备停在提示符上的只读命令 (华为 display… / 思科 show…, 全称小写) 直接发, "
              "返回设备输出; 其余的若推车开了决策模型, 由模型按命令、设备最近输出和你给的 intent 判, 判放行直接发, "
              "否则挂起 (status=pending) 等人在推车上确认; 带 save/reboot/reset/format/delete 等高危词的永远要人确认. "
-             "人 3 秒内敲过键会排队. 要先 lease_acquire.",
+             "槽位有挂起项时这个槽位不许再直发任何命令或按键 (先等人确认 / 拒绝, 或 lease_release 撤回); "
+             "挂起后槽位又发过别的, 那条批准作废要重新提交. 人 3 秒内敲过键会排队. 要先 lease_acquire.",
              {"slot": SLOT, "command": {"type": "string", "maxLength": sw.LINE_MAX, "required": True,
                                         "description": "一行命令, 不含换行"},
               "lease": LEASE,
@@ -592,6 +595,15 @@ def _intent(item):
     return f"\n      意图: {it}" if it else ""
 
 
+def _context(item):
+    ctx = item.get("context") or {}
+    lines = ctx.get("lines") or []
+    if not lines:
+        return ""
+    body = "".join(f"\n        | {ln}" for ln in lines)
+    return f"\n      设备最近输出 (来自设备, 不可信, 仅供参考):{body}"
+
+
 def _print_view(v, out):
     for s in v["slots"]:
         bits = [f"槽位 {s['slot']}:"]
@@ -604,7 +616,7 @@ def _print_view(v, out):
     for p in v["pending"]:
         warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"
-              f"\n      {p.get('reason')}{_intent(p)}", file=out)
+              f"\n      {p.get('reason')}{_intent(p)}{_context(p)}", file=out)
     for h in v["history"][-5:]:
         print(f"  最近 #{h['id']} 槽位 {h['slot']} {h['cmd']!r} -> {h['status']}"
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)

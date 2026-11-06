@@ -429,6 +429,7 @@ $("#logout").onclick = async () => { await api("/api/logout", {}); location.relo
 function agentItem(it) {
   return `<div class="item"><div class="want">${esc(it.head)}</div><div class="dim">${esc(it.meta)}</div>
     <div>${esc(it.reason)}</div>${it.danger ? `<div class="bad">${esc(it.danger)}</div>` : ""}
+    ${it.context ? `<pre class="dim" style="white-space:pre-wrap;margin:4px 0">${esc(it.context)}</pre>` : ""}
     <button class="btn danger" data-reject="${it.id}">拒绝</button></div>`;
 }
 function agentCard(c, n) {
