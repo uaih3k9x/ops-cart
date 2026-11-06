@@ -11,12 +11,15 @@ import dash_service as ds
 
 
 # 假时钟的起点: 钉在整分钟 (秒 = 0). 版面里的 "HH:MM" 变了会多推一帧, 起点要是取真时间, 碰上快到整分钟
-# 的那几秒, 测试中途分钟一跳就多推一帧, 偶发失败 (#62). 每次调用 time.time 才走 1 秒, 离下一分钟有 59 秒余量.
+# 的那几秒, 测试中途分钟一跳就多推一帧, 偶发失败 (#62). 假时钟每调用一次 time.time 走 1 秒:
+# pushes 和 theme 两条走不到下一分钟 (分别约 18 秒、8 秒); boot 那条约 126 秒会跨分钟, 但断言对多推的帧不敏感.
 T0 = time.mktime((2026, 10, 30, 14, 3, 0, 0, 0, -1))
 
 
 def _ctx(**over):
-    ctx = {"now": time.time, "net": lambda: "on",   # 快照 ts 用真时间, 不然 layout 判成过期
+    # now 绑的是调用 _ctx 那一刻的 time.time: 先 monkeypatch 再调 (如 pushes 测试) 拿到的就是假时钟,
+    # 不打桩的测试拿到真时间. 快照 ts 要和 layout 判过期用的是同一个钟, 不然判成过期.
+    ctx = {"now": time.time, "net": lambda: "on",
            "rows": lambda: [{"label": "LAN2", "state": "OK"}],
            "temps": lambda: [("CPU", 45)], "fans": lambda: [],
            "uptime": lambda: "1d", "lamps": lambda: {"con-1": 1},
@@ -185,7 +188,7 @@ def test_loop_marks_moving_counters_active(tmp_path, monkeypatch):
         n["pxe"] += 100                      # PXE 日志在长 = 有机器在取文件
         return {"pxe": n["pxe"]}
 
-    t = {"v": 1000.0}
+    t = {"v": T0}
 
     def fake_sleep(_s):
         n["round"] += 1
