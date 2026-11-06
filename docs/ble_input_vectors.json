@@ -1,6 +1,6 @@
 {
  "protocol": "ops-cart BLE input v2 (#52)",
- "note": "Python tests/test_ble_input_core.py 和 android 单元测试共用. v2: 单帧 min(MTU-3, 512); 去重键 (来源, 序号, 总长, CRC); 回执带 crc; 文字过滤加 Cf/Cn/Co/Zl/Zp/标签字符",
+ "note": "Python tests/test_ble_input_core.py 和 android 单元测试共用. v2: 单帧 min(MTU-3, 512); 去重键 (来源, 序号, 总长, CRC); 回执带 crc; 文字过滤加 Cf/Co/Zl/Zp/标签字符/非字符 (Cn 不整类拒, 两端 Unicode 版本可能不同)",
  "max_len": 4096,
  "vectors": [
   {
@@ -164,12 +164,12 @@
    "utf8_hex": "78f3a081bf"
   },
   {
-   "name": "noncharacter-cn",
+   "name": "noncharacter-ffff",
    "code": "ctrl",
    "utf8_hex": "efbfbf"
   },
   {
-   "name": "unassigned-cn",
+   "name": "noncharacter-plane16",
    "code": "ctrl",
    "utf8_hex": "61f48fbfbe62"
   },
@@ -197,6 +197,11 @@
    "name": "nul",
    "code": "ctrl",
    "utf8_hex": "726d00"
+  },
+  {
+   "name": "noncharacter-fdd0",
+   "code": "ctrl",
+   "utf8_hex": "61efb79062"
   }
  ],
  "text_accepts": [
@@ -219,6 +224,18 @@
   {
    "name": "hangul",
    "utf8_hex": "ed959ceab5adec96b4"
+  },
+  {
+   "name": "unicode14-emoji-melting-face",
+   "utf8_hex": "f09faba0"
+  },
+  {
+   "name": "unicode15-emoji-shaking-face",
+   "utf8_hex": "f09faba8"
+  },
+  {
+   "name": "unassigned-u0378",
+   "utf8_hex": "61cdb8"
   }
  ],
  "status": [
