@@ -50,6 +50,25 @@ def dev_addr(path):
     return m.group(1).replace("_", ":").upper() if m else None
 
 
+def addr_of(props, path):
+    """设备的稳定身份: Device1 的 Address 属性 (SMP 解析出身份地址后 BlueZ 改它但不改对象路径; bluetoothd 重启后
+    路径会换成身份地址, Address 不变). 读不到才退回对象路径里的地址. 记录、闸门、去重来源、审计都用它."""
+    a = (props or {}).get("Address")
+    return str(a).upper() if a else dev_addr(path)
+
+
+def device_changed(handler, iface, changed, path, lookup):
+    """org.bluez.Device1 的 PropertiesChanged: Connected 变 false 立刻删掉它的 secure-write 记录 (同地址冒充者
+    重连时不能沿用). lookup(path) -> Device1 属性 (读不到 None)."""
+    if iface != "org.bluez.Device1" or "Connected" not in changed or bool(changed["Connected"]):
+        return
+    try:
+        props = lookup(path)
+    except Exception:                       # noqa: BLE001
+        props = None
+    handler.disconnected(addr_of(props, path))
+
+
 # ------------------------------------------------------------ 投递目标 (可插拔: 任何有 put 的对象)
 
 class DirSink:
@@ -130,17 +149,27 @@ class Handler:
         if src:
             self.recent[str(src).upper()] = self.clock() if now is None else now
 
-    def _all_trusted(self, now):
-        """通知是广播: 连着的设备全受信、且本次连接内最近 FRESH_S 秒 secure-write 过, 才发回执 (带 crc,
-        短文本可被反推) 和回复. 断开的设备清掉记录, 同地址再连上要重新写过才算."""
+    def disconnected(self, addr):
+        if addr:
+            self.recent.pop(str(addr).upper(), None)
+
+    def _prune(self):
+        """断开的设备清掉记录 (主路是 Device1 断开信号, 这里兜底). 返回设备列表; 读不到就全清, 返回 None."""
         try:
             devs = self.devices()
         except Exception:                   # noqa: BLE001 — 读不到设备列表就当有陌生人
-            return False
+            self.recent.clear()
+            return None
         on = {str(d.get("Address") or "").upper() for d in devs if d.get("Connected") is True}
         for a in [a for a in self.recent if a not in on]:
             del self.recent[a]
-        return bc.may_notify(devs, self.recent, now, FRESH_S)
+        return devs
+
+    def _all_trusted(self, now):
+        """通知是广播: 连着的设备全受信、且本次连接内最近 FRESH_S 秒 secure-write 过, 才发回执 (带 crc,
+        短文本可被反推) 和回复. 断开的设备清掉记录, 同地址再连上要重新写过才算."""
+        devs = self._prune()
+        return devs is not None and bc.may_notify(devs, self.recent, now, FRESH_S)
 
     def _save_dedup(self):
         if not self.dedup_path:
@@ -180,6 +209,7 @@ class Handler:
 
     def tick(self, now=None):
         now = self.clock() if now is None else now
+        self._prune()                       # 每秒无条件剪一次, 不等闸门被调
         self._handle(self.rx.expire(now), now)
 
     def send_reply(self, text, now=None):
@@ -293,7 +323,8 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
             if int(options.get("offset", 0) or 0) != 0:
                 raise dbus.exceptions.DBusException("不支持偏移写", name="org.bluez.Error.InvalidOffset")
             path = options.get("device")
-            handler_box[0].on_write(dev_addr(path), device_props(path) if path else None, bytes(value))
+            props = device_props(path) if path else None
+            handler_box[0].on_write(addr_of(props, path), props, bytes(value))
 
         @service.method(CHRC, sender_keyword="sender")
         def StartNotify(self, sender=None):
@@ -331,6 +362,7 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
         def __init__(self):
             service.Object.__init__(self, bus, APP_PATH)
             self.svc, self.rx, self.tx = Svc(), rx, tx
+            self.device_props = device_props
 
         @service.method(OM, out_signature="a{oa{sa{sv}}}")
         def GetManagedObjects(self):
@@ -387,6 +419,10 @@ def main(argv=None):
         print("ble_input: org.bluez 属主变了 (bluetoothd 重启?), 退出交给 systemd 重拉", file=sys.stderr)
         loop.quit()
     bus.watch_name_owner(BLUEZ, OwnerWatch(bluez_gone))
+    bus.add_signal_receiver(
+        lambda iface, changed, invalidated, path=None: device_changed(box[0], iface, changed, path, app.device_props),
+        dbus_interface="org.freedesktop.DBus.Properties", signal_name="PropertiesChanged", bus_name=BLUEZ,
+        path_keyword="path")
 
     def fail(what):
         return lambda e: (print(f"ble_input: {what} 失败: {e}", file=sys.stderr), loop.quit())

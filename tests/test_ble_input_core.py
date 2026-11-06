@@ -226,6 +226,7 @@ def test_may_notify_needs_trusted_and_fresh_secure_write():
     assert bc.may_notify([mixed], {"02:00:00:00:00:AB": 100.0}, 100.0, 300) is True   # 属性里小写也认
     assert bc.may_notify([], recent, 100.0, 300) is False
     assert bc.may_notify([dict(good, Trusted=False)], recent, 100.0, 300) is False   # 写过之后被撤了 trust
+    assert bc.may_notify([good], {DEV: 101.0}, 100.0, 300) is False   # 记录时间比现在还新 (钟不对): 不算
 
 
 # ------------------------------------------------------------ 回执 / 回复

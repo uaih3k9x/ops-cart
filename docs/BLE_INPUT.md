@@ -113,7 +113,8 @@ D-Bus 方法（`WriteValue` / `StartNotify` / `StopNotify`）只认 `org.bluez` 
 
 1. 连着的每台设备都受信（Paired + Trusted，有 Bonded 时还要 Bonded）；
 2. 连着的每台设备在**本次连接内最近 300 秒**里有过一次受信的 secure-write（写能到推车就说明 BlueZ 认可了链路安全）。
-   设备一断开记录就清掉，同地址再连上要重新写过才算。
+   设备一断开记录就清掉：订阅 `org.bluez.Device1` 的 `PropertiesChanged`，`Connected` 变 false 立刻删；每秒 tick
+   再按设备列表无条件剪一次兜底（读不到设备列表就全清）。同地址再连上要重新写过才算。
 
 不满足就照常投递、只是不回执（审计记 `receipt-withheld`），回复丢弃并写审计。回执带 `crc`，短文本（例如 PIN）可以从
 CRC 暴力反推，这也是回执要过闸门的原因。读不到设备列表也当不满足。例外是 `unpaired`：它回的是陌生设备自己写的帧，照发。
@@ -191,7 +192,10 @@ sudo bluetoothctl
 
 只应有自己认识的手机；不认识的立刻 `remove <地址>`。`pairable off` 忘了关也没事，`ble_input` 下次启动会关掉并记事件。
 
-手机用随机私有地址时，配对后 BlueZ 按身份地址（IRK 解析后）记设备，审计里写的是这个地址。
+手机用随机私有地址时：SMP 交换身份信息（IRK）后，BlueZ 把 `Device1.Address` 改成身份地址，但**对象路径不变**
+（还是连上时随机地址那个 `dev_XX_...`）；bluetoothd 重启后才按身份地址建新路径。所以推车认设备一律用 `Address`
+属性（读不到才退回路径里的地址）：secure-write 记录、通知闸门、去重来源、审计里的 `dev=` 都是它。理由：`Address`
+在配对后和 bluetoothd 重启前后都不变，路径会变（用路径当去重来源，bluetoothd 重启后手机重发会重复投递）。
 
 ## 单元
 
