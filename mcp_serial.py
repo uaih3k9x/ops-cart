@@ -347,7 +347,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
             text = None                 # 看不到设备停在哪: 回车 / 空格按未知挂起 (#73)
         mtime = s.get("mtime")            # conbroker 日志的修改时间: 人敲键有回显, 几秒内动过 = 可能有人在用
         quiet = store.clock() - mtime if mtime else None
-        gate = sw.classify_key(key, text, quiet)
+        gate = sw.classify_key(key, text, quiet, vendor=(rules().get("slots") or {}).get(n))
         name = mc.thread_name(text) if text is not None else None
         k = sw.KEYS[key]
         return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"])
@@ -386,7 +386,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                             "description": "等提示符的秒数"}},
              send_command, destructive=True),
         Tool("send_key", "发一个固定特殊键: enter (回车) / space (翻页空格) 只有设备最后一行是命令提示符或 --More-- 翻页、且 5 秒内没动静时"
-             "才直接发; 停在确认提示 ([confirm]、[Y/N] 等)、半截输出、刚刷过日志、看不到时挂起等人确认 (要直发就等 5 秒再试); "
+             "才直接发 (--More-- 上的空格不用等 5 秒); 停在确认提示 ([confirm]、[Y/N] 等)、半截输出、刚刷过日志、看不到时挂起等人确认 "
+             "(要直发就等 5 秒再试); 同槽位前面还有挂起项时不收回车 / 空格; 人确认时推车会重看设备, 停在确认提示上就不发; "
              "ctrl_c (打断) 要人确认. "
              "需要别的按键 (BootROM 菜单、按任意键) 请人在推车屏幕上操作.",
              {"slot": SLOT, "key": {"type": "string", "enum": sorted(sw.KEYS), "required": True,
@@ -408,6 +409,21 @@ def real_slots():
     return lamps_core.slot_status(serial_core.data_dir(serial_core.serial_conf_read()))
 
 
+TAIL_TIMEOUT = 10
+
+
+def conbroker_tail(dev, n):
+    """conbroker tail <口> -n N (以 serial.conf 的 user 身份); 失败抛 ToolError. cart_mcp 和车机确认共用."""
+    try:
+        r = subprocess.run(serial_core._conbroker_cmd() + ["tail", dev, "-n", str(n)], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=TAIL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise mc.ToolError(f"conbroker tail 跑不起来: {e}") from None
+    if r.returncode != 0:
+        raise mc.ToolError(f"conbroker tail 失败: {serial_core.serve_error(r.returncode, r.stderr)}")
+    return r.stdout.rstrip("\n")
+
+
 def real_tools(tail, store=None):
     """cart_mcp 用: tail 用它的 conbroker_tail."""
     return build_tools(store or Store(), slots=real_slots, tail=tail, send=conbroker_send)
@@ -415,20 +431,43 @@ def real_tools(tail, store=None):
 
 # ------------------------------------------------------------ 人确认后发送 / 网页请求
 
-def send_confirmed(store, iid, by, slots, send):
-    """人确认 #iid -> 标在途 -> 经 conbroker 发 -> finish. -> (条目, status, 输出, 说明).
-    Book 不让 (急停 / 租约没了 / 在途 / 不在挂起) 抛 sw.Refused, 一个字节都不发. 会阻塞到发完, 车机放后台线程调."""
+def recheck_key(it, dev, tail, rules):
+    """挂起的回车 / 空格, 人确认时重看设备 (#74 第二轮): 停在确认提示 / 不在白名单 / 看不到 -> 不发的说明; 能发 -> None.
+    确认的人就在场, 不再看 5 秒窗口; 打断键 (ctrl_c) 不重看."""
+    if it["kind"] != "key" or it["cmd"] not in sw.KEY_ANSWERS:
+        return None
+    try:
+        text = tail(dev, TAIL_LINES)
+    except Exception:                   # noqa: BLE001  看不到 = 不知道会回答什么
+        text = None
+    vendor = (rules().get("slots") or {}).get(it["slot"])
+    g = sw.classify_key(it["cmd"], text, float("inf"), vendor=vendor)
+    if g["verdict"] == "pass":
+        return None
+    now_line = sw.last_line(text)
+    return (f"确认时重看设备, 没发: {g['reason']}; 设备现在最后一行: {now_line[-sw.LINE_SHOWN:] or '(看不到)'}. "
+            f"要发请让 Agent 重新挂起 (要回答确认提示请用 send_command 发 y / yes, 或在终端上自己敲)")
+
+
+def send_confirmed(store, iid, by, slots, send, tail=None, rules=sw.load_rules):
+    """人确认 #iid -> 标在途 -> (按键先重看设备) -> 经 conbroker 发 -> finish. -> (条目, status, 输出, 说明).
+    Book 不让 (急停 / 租约没了 / 在途 / 不在挂起) 抛 sw.Refused, 一个字节都不发. 会阻塞到发完, 车机放后台线程调.
+    tail(dev, n) 默认 conbroker_tail."""
     it = store.run(lambda b, now: b.confirm(iid, by, now))
+    held = None
     try:
         dev = slots()[it["slot"] - 1]["dev"]
         if it["kind"] == "key":
             text, raw = sw.KEYS[it["cmd"]]["text"], sw.KEYS[it["cmd"]]["raw"]
         else:
             text, raw = it["cmd"], False
+        held = recheck_key(it, dev, tail or conbroker_tail, rules)
     except Exception as e:              # noqa: BLE001  在途标记一定要收掉
         dev, err = None, f"{type(e).__name__}: {e}"
     t0 = time.monotonic()
-    if dev is None:
+    if held:
+        status, output, note = "refused", "", held
+    elif dev is None:
         status, output, note = "error", "", err
     else:
         try:
@@ -440,11 +479,11 @@ def send_confirmed(store, iid, by, slots, send):
     return it, status, output, note
 
 
-def human_action(store, op, arg, by, slots, send):
+def human_action(store, op, arg, by, slots, send, tail=None):
     """车机上人的按钮 (#23) -> 一句结果: confirm (arg = 编号, 会阻塞到发完) / reject (编号) / estop / resume
     (槽位, None = 全部). Book 不让抛 sw.Refused. 调用方保证是本机人 (车机进程), 放后台线程调."""
     if op == "confirm":
-        it, status, output, note = send_confirmed(store, arg, by, slots, send)
+        it, status, output, note = send_confirmed(store, arg, by, slots, send, tail=tail)
         tail = sw.echo_summary(output).strip().splitlines()[-1:] if output else []
         return f"#{it['id']} {it['cmd']} -> {status}" + (f" ({note})" if note else "") + \
             (f": {tail[0]}" if tail and not note else "")
@@ -615,7 +654,7 @@ def _print_view(v, out):
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)
 
 
-def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None):
+def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None, tail=None):
     store = store or Store()
     send = send or conbroker_send
     slots = slots or real_slots
@@ -685,7 +724,7 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         print("没输 yes, 不发 (还挂着)", file=out)
         return 1
     try:
-        it, status, output, note = send_confirmed(store, a.id, by, slots, send)
+        it, status, output, note = send_confirmed(store, a.id, by, slots, send, tail=tail)
     except sw.Refused as e:
         print(f"不行: {e}", file=out)
         return 1

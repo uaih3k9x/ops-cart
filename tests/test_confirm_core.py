@@ -239,4 +239,6 @@ def test_card_shows_device_last_line_for_held_key():
     tok = b.acquire(2, "a", T0)["lease"]
     b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", "Proceed with reload? [confirm]", 60), T0, 10)
     c = cc.card(b.view(T0), 2)
-    assert "Proceed with reload? [confirm]" in c["items"][0]["reason"] and "设备最后一行" in c["items"][0]["reason"]
+    reason = c["items"][0]["reason"]
+    assert "Proceed with reload? [confirm]" in reason
+    assert "挂起时（0 秒前）设备最后一行" in reason                        # 第二轮: 写明是挂起那一刻的, 不是现在的

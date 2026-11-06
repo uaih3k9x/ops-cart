@@ -321,6 +321,7 @@ def test_enter_on_confirm_prompt_is_held(rig, line):
     for key in ("enter", "space"):
         out = rig.ok("send_key", {"slot": 1, "key": key, "lease": tok})
         assert out["status"] == "pending" and "确认提示" in out["reason"]
+        rig.store.run(lambda b, now, i=out["id"]: b.reject(i, "human", now))   # 同槽位有挂起项时不收下一个 (#74 第二轮)
     assert rig.sent == []
 
 
@@ -337,8 +338,10 @@ def test_enter_held_while_log_is_fresh(rig):
     rig.slots[0]["mtime"] = T0 - 1
     out = rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})
     assert out["status"] == "pending" and "动静" in out["reason"]
+    rig.store.run(lambda b, now: b.reject(out["id"], "human", now))
     rig.slots[0]["mtime"] = None                                       # 取不到: 按可能有人在用
     assert rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})["status"] == "pending"
+    assert rig.call("send_key", {"slot": 1, "key": "space", "lease": tok})["isError"]   # 前面有挂起: 不收
     assert rig.sent == []
 
 
@@ -426,7 +429,7 @@ def test_read_stat_parses_comm_with_spaces(tmp_path):
 
 def cli(rig, *argv, stdin="yes\n", local=True):
     out = io.StringIO()
-    rc = ms.cli(list(argv), store=rig.store, send=rig.send, slots=lambda: rig.slots,
+    rc = ms.cli(list(argv), store=rig.store, send=rig.send, slots=lambda: rig.slots, tail=rig.tail,
                 local=lambda: (local, "测试" if local else "经 sshd 进来的"), stdin=io.StringIO(stdin), out=out,
                 env={"SUDO_USER": "ops"})
     return rc, out.getvalue()

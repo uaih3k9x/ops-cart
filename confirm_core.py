@@ -99,9 +99,9 @@ def _want(item):
 
 
 def _key_line(p):
-    """挂起的按键: 附上挂起时设备停在哪一行 (#74 审查), 人确认前看清回车会回答什么."""
+    """挂起的按键: 附上挂起时设备停在哪一行 (#74 审查). 那是挂起那一刻的, 不是现在的: 确认时推车会重看一次 (第二轮)."""
     line = (p.get("gate") or {}).get("line") if p.get("kind") == "key" else None
-    return f"\n设备最后一行：{line}" if line else ""
+    return f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{line}" if line else ""
 
 
 def card(view, n):

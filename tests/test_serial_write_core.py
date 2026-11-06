@@ -808,3 +808,107 @@ def test_events_have_timestamps_and_slot():
     b.acquire(2, "agentA", T0, token="tokA")
     e = b.events[0]
     assert e["slot"] == 2 and e["t"].startswith("20") and e["src"] == "agent"
+
+
+# ---- 审查 #74 第二轮: probe.py 全部写法、厂商专用提示符、回答词 / 引导提示、翻页空格、平方复杂度
+
+# (最后一行, 未登记厂商时回车的结论). 引导程序 / 回答词 / "yes or no" 都不算提示符.
+PROBE = [
+    ("U-Boot>", "confirm"), ("=>", "confirm"), ("boot>", "confirm"), ("grub>", "confirm"),
+    ("mysql>", "pass"), ("ftp>", "pass"), ("#", "pass"), ("$", "pass"),
+    ("[Y]", "confirm"), ("[N]", "confirm"), ("[yes]", "confirm"), ("[continue]", "confirm"),
+    ("Save(yes or no)>", "confirm"), ("Continue(yes or no)#", "confirm"), ("Ruijie(continue yes or no)#", "confirm"),
+    ("R(config)#", "pass"), ("[root@h ~]#", "pass"), ("root@h:~$", "pass"),
+    ("Proceed with reload? [confirm]", "confirm"), ("Router#Proceed? [confirm]", "confirm"),
+    ("Delete flash:x? [confirm]", "confirm"), ("--More-- (y/n)", "confirm"),
+    ("-- More --", "pass"), ("--More--", "pass"), ("---- More ----", "pass"), ("Overwrite? -- More --", "confirm"),
+    ("<HUAWEI>", "pass"), ("[~HUAWEI-GigabitEthernet0/0/1]", "pass"), ("[*HUAWEI]", "pass"),
+    ("Erase nvram: Continue>", "confirm"), ("Continue>", "confirm"), ("Proceed>", "confirm"), ("yes>", "confirm"),
+    ("y#", "confirm"), ("OK>", "confirm"), ("ok", "confirm"), ("Press any key>", "confirm"),
+    ("Delete>", "confirm"), ("Confirm>", "confirm"), ("[Delete]", "confirm"), ("[Y/N]", "confirm"),
+    ("[startup-config]", "pass"), ("user@h:[Y/N]$", "confirm"), ("[confirm-reload]", "pass"),
+    ("(y/n)#", "confirm"), ("Router(y/n)#", "confirm"), ("R(yes/no)#", "confirm"),
+    ("Router(config-if range)#", "pass"), ("Ruijie(Confirm continue y or n)#", "confirm"),
+    ("Ruijie(Are you sure)#", "confirm"), ("Ruijie(type yes to go)#", "confirm"),
+]
+
+
+@pytest.mark.parametrize("line,want", PROBE)
+def test_probe_lines(line, want):
+    assert sw.classify_key("enter", line, QUIET)["verdict"] == want, line
+
+
+@pytest.mark.parametrize("text,want", [
+    ("Proceed? [confirm]\rRouter#", "pass"), ("Router#\x1b(B", "pass"),
+    ("\x1b]0;root@h: ~\x07root@h:~# ", "pass"),                         # OSC 标题序列整个剥掉
+    (" --More-- \r          \rRouter#", "pass"),                         # \r 擦掉翻页再出提示符
+    ("Proceed? [confirm]\x1b[2K\x1b[1GRouter#", "confirm"),              # 光标擦行: 往多拦的方向错
+    ("Proceed? [confirm]\x1b[1000D\x1b[KRouter#", "confirm"),
+    ("Proceed? [confirm]\x1bcRouter#", "confirm"), ("Proceed [confirm]\x1b[1;1HRouter#", "confirm"),
+    (" --More-- " + "\b" * 10 + " " * 10 + "\b" * 10 + "Router#", "confirm"),
+])
+def test_probe_escape_sequences(text, want):
+    assert sw.classify_key("enter", text, QUIET)["verdict"] == want, repr(text)
+
+
+@pytest.mark.parametrize("line", ["[Y/N]", "[confirm]", "(y/n)", "[yes/no]:", "[Y]", "[continue]", "U-Boot>", "y#"])
+def test_at_any_prompt_rejects_answers(line):
+    assert sw.at_any_prompt(line) is False
+
+
+def test_registered_vendor_uses_only_its_prompt():
+    assert sw.at_any_prompt("<SW1>") and sw.at_any_prompt("<SW1>", "huawei")
+    assert not sw.at_any_prompt("<SW1>", "cisco")                         # 登记了思科, 华为式 <名> 不算
+    assert not sw.at_any_prompt("root@h:~$", "huawei")
+    assert sw.at_any_prompt("R1(config)#", "cisco") and sw.at_any_prompt("--More--", "cisco")
+    assert sw.classify_key("enter", "<SW1>", QUIET, vendor="cisco")["verdict"] == "confirm"
+    assert sw.classify_key("enter", "R1#", QUIET, vendor="cisco")["verdict"] == "pass"
+
+
+def test_pager_space_skips_quiet_window():
+    assert sw.classify_key("space", "out\n---- More ----", 0.5)["verdict"] == "pass"     # 翻页空格不会回答确认
+    assert sw.classify_key("enter", "out\n---- More ----", 0.5)["verdict"] == "confirm"  # 回车照旧等 5 秒
+    assert sw.classify_key("space", "<SW1>", 0.5)["verdict"] == "confirm"
+    assert sw.classify_key("space", "--More-- (y/n)", 0.5)["verdict"] == "confirm"
+
+
+@pytest.mark.parametrize("line", ["?" + " " * 32000 + "x", "[a]" + " " * 32000 + "x", "?" * 32000 + "x",
+                                  "x" + " " * 32000 + "?"])
+def test_long_line_is_fast(line):
+    import time
+    t = time.perf_counter()
+    sw.is_confirm_prompt(line)
+    sw.classify_key("enter", line, QUIET)
+    assert time.perf_counter() - t < 0.2
+
+
+def test_long_question_still_confirm():
+    assert sw.is_confirm_prompt("x" * 5000 + " continue ?") and sw.is_confirm_prompt("继续吗？：")
+
+
+# ---- 审查 #74 第二轮【中】: 同槽位有更早的挂起项时不收新的回车 / 空格 (chain.py)
+
+def _book_with_lease():
+    b = sw.Book.from_text(None, 1000.0)
+    return b, b.acquire(1, "agent", 1000.0, ttl=300)["lease"]
+
+
+def test_chain_enter_after_pending_reload_refused():
+    b, tok = _book_with_lease()
+    rules = {"slots": {1: "cisco"}, "danger": list(sw.DANGER)}
+    b.submit(1, tok, "agent", "line", "reload", sw.classify("reload", "cisco", True, rules), 1000.0, 30)
+    g = sw.classify_key("enter", "Router#", 1)
+    assert g["verdict"] == "confirm"
+    with pytest.raises(sw.Refused) as e:
+        b.submit(1, tok, "agent", "key", "enter", g, 1001.0, 5)
+    assert e.value.code == "busy" and "前面" in str(e.value)
+    for key in ("space",):
+        with pytest.raises(sw.Refused):
+            b.submit(1, tok, "agent", "key", key, sw.classify_key(key, "Router#", 1), 1001.0, 5)
+
+
+def test_ctrl_c_and_lines_still_queue_behind_pending():
+    b, tok = _book_with_lease()
+    b.submit(1, tok, "agent", "line", "reload", sw._gate("confirm", "x"), 1000.0, 30)
+    b.submit(1, tok, "agent", "key", "ctrl_c", sw.classify_key("ctrl_c"), 1001.0, 5)    # 打断键照旧能挂
+    assert len(b.view(1002.0)["pending"]) == 2

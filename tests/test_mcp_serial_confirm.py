@@ -220,3 +220,60 @@ def test_human_action_confirm_failure_reported(rig):
     rig.reply = ("refused", "[conbroker: 拒绝发送, 密码]", "[conbroker: 拒绝发送, 密码]")
     msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send)
     assert "refused" in msg and "密码" in msg
+
+
+# ------------------------------------------------------------ 审查 #74 第二轮: 确认挂起的回车 / 空格时重看设备
+
+def _held_enter(rig):
+    tok = rig.lease(1)
+    rig.tail_text["/dev/con-1"] = "Router#"
+    rig.slots[0]["mtime"] = rig.store.clock() - 1                       # 刚动过: 挂起
+    p = rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert p["status"] == "pending"
+    return p
+
+
+def test_confirm_held_enter_rechecks_and_refuses_on_confirm_prompt(rig):
+    """chain.py: 先挂 reload、再挂 enter; 人先批 reload, 设备停在 [confirm], 再批 enter 不能替人回答."""
+    p = _held_enter(rig)
+    rig.tail_text["/dev/con-1"] = "Router#reload\nProceed with reload? [confirm]"
+    it, status, _out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                               tail=rig.tail)
+    assert rig.sent == [] and status == "refused"
+    assert "Proceed with reload? [confirm]" in note and "重新" in note
+    assert rig.store.view()["slots"][0]["inflight"] is None
+    assert rig.ok("pending_list")["history"][-1]["status"] == "refused"
+
+
+@pytest.mark.parametrize("now_text", ["display x\n  Input: 12 packets", None])
+def test_confirm_held_enter_refuses_off_whitelist_or_unreadable(rig, now_text):
+    p = _held_enter(rig)
+    if now_text is None:
+        rig.tail_text.pop("/dev/con-1")
+    else:
+        rig.tail_text["/dev/con-1"] = now_text
+    _it, status, _out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                tail=rig.tail)
+    assert status == "refused" and rig.sent == [] and note
+
+
+def test_confirm_held_enter_sends_when_still_at_prompt(rig):
+    p = _held_enter(rig)                                                 # 人确认时就是人在场: 不再看 5 秒窗口
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail)
+    assert status == "sent" and rig.sent == [("/dev/con-1", "", False)]
+
+
+def test_human_action_confirm_held_enter_reports_current_line(rig):
+    p = _held_enter(rig)
+    rig.tail_text["/dev/con-1"] = "Proceed with reload? [confirm]"
+    msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail)
+    assert "refused" in msg and "[confirm]" in msg and rig.sent == []
+
+
+def test_cli_confirm_held_enter_rechecks(rig):
+    from test_mcp_serial import cli
+    p = _held_enter(rig)
+    rig.tail_text["/dev/con-1"] = "Proceed with reload? [confirm]"
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert rig.sent == [] and "[confirm]" in text
