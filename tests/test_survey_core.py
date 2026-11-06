@@ -169,12 +169,12 @@ def test_example_profiles_file_loads_and_passes():
 @pytest.mark.parametrize("text,name", [
     ("display version\nxx\n<SW-A>", "SW-A"),
     ("<SW-A>\n", "SW-A"),
-    ("[SW-A]", "SW-A"),
-    ("[~SW-A]", "SW-A"),
-    ("[*SW-A]", "SW-A"),
+    ("[SW-A]", None),                                   # #56 第四轮: 巡检只认 exec 模式 (华为 <名>)
+    ("[~SW-A]", None),
+    ("[*SW-A]", None),
     ("SW-A#", "SW-A"),
     ("SW-A>", "SW-A"),
-    ("SW-A(config)#", "SW-A"),
+    ("SW-A(config)#", None),
     ("show version\nfoo\nSW-B# ", "SW-B"),
     ("Username:", None),
     ("Password:", None),
@@ -826,7 +826,7 @@ def test_survey_tail_error_refuses(tmp_path):
     assert not r["ok"] and log == [] and "tail 失败" in r["summary"]
 
 
-@pytest.mark.parametrize("last", ["<SW-A>", "[SW-A]", "SW-A#", "SW-A>",
+@pytest.mark.parametrize("last", ["<SW-A>", "SW-A#", "SW-A>",
                                   "<SW-A>\n[2026-10-30 14:03:00 Claude 断开]"])
 def test_survey_runs_when_at_prompt(tmp_path, last):
     log = []
@@ -914,8 +914,8 @@ def test_not_device_prompts(text):
     assert sv.parse_device(text) is None and sv.at_prompt(text) is None
 
 
-@pytest.mark.parametrize("text,name", [("Router#", "Router"), ("Router(config)#", "Router"), ("<SW-A>", "SW-A"),
-                                       ("[SW-A-ui-console0]", "SW-A-ui-console0"), ("tcl-lab#", "tcl-lab")])
+@pytest.mark.parametrize("text,name", [("Router#", "Router"), ("Router>", "Router"), ("<SW-A>", "SW-A"),
+                                       ("tcl-lab#", "tcl-lab")])
 def test_still_device_prompts(text, name):
     assert sv.at_prompt(text) == name
 
@@ -947,3 +947,66 @@ def test_export_topo_force_does_not_follow_symlink(tmp_path):
     dangling.symlink_to(tmp_path / "nowhere.txt")
     assert sv.main(["--export-topo", r["path"], "-o", str(dangling)]) == 2        # 悬空链接也不跟
     assert not (tmp_path / "nowhere.txt").exists()
+
+
+# ------------------------------------------------------------ #56 第四轮审查
+
+@pytest.mark.parametrize("vendor,cmd", [
+    ("cisco", "show platform hardware qfp active statistics drop clear"), ("cisco", "show interfaces clear"),
+    ("huawei", "display interface clear"), ("ruijie", "show x clear"), ("h3c", "display x reset"),
+    # 主动发包 / 巨量输出 (小黑名单)
+    ("huawei", "display ntp-service trace"), ("h3c", "display ntp-service trace"), ("cisco", "show memory"),
+    ("cisco", "show memory statistics"), ("cisco", "show running-config all"),
+    ("cisco", "show platform software trace message fed switch active"), ("ruijie", "show memory"),
+])
+def test_round4_rejected(vendor, cmd):
+    assert not sv.is_readonly(cmd, vendor)
+
+
+@pytest.mark.parametrize("text", [
+    "[Y/N/C]", "[yes]", "[no]", "[OK]", "[ok]", "[cancel]", "[default]", "[Enter]", "[BootROM]", "[More]", "[Y]",
+    "[N]", "[n]", "[Yes/No]", "<BootLoad>", "<bootrom>", "[a/b]",
+    "rommon 1 >", "rommon>", "loader>", "switch(boot)#", "Router(boot)>", "grub>", "U-Boot>", "BootLoader>",
+    "bash-4.2#", "sh-4.4#", "busybox#", "ash#", "zsh#", "root#", "rbash-5.0#",
+    "SW(config)#", "SW(config-if)#", "[HUAWEI-ui-console0]", "[~HUAWEI]", "[H3C-probe]", "switch(standby)#",
+])
+def test_round4_not_exec_prompt(text):
+    assert sv.at_prompt(text) is None
+
+
+@pytest.mark.parametrize("out", [
+    "show x\n        ^\n% Invalid input detected at '^' marker.\n\nSW-A#",
+    "display x\n          ^\nError: Unrecognized command found at '^' position.\n<SW-A>",
+    "show x\n% Incomplete command.\nSW-A#", "show x\n% Ambiguous command:  \"show x\"\nSW-A#",
+    "display x\nError: Wrong parameter found at '^' position.\n<SW-A>", "show x\n% Unknown command.\nSW-A#",
+])
+def test_device_rejected_command_is_failure(tmp_path, out):
+    calls = []
+
+    def send(port, cmd, timeout):
+        calls.append(cmd)
+        return out if cmd not in sv._DEFAULT_PROFILES["cisco"]["paging"] else cmd + "\nSW-A#"
+    r = sv.run_survey("/dev/con-1", "cisco", send=send, tail=lambda p: "SW-A#", now=lambda: T0,
+                      survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
+    assert not r["ok"] and r["sections"][0]["status"] == "invalid" and "不认" in r["summary"]
+    assert all(s["status"] == "skipped" for s in r["sections"][1:])
+
+
+def test_survey_refuses_config_mode(tmp_path):
+    log = []
+    r = sv.run_survey("/dev/con-1", "cisco", send=fake_send(log), tail=lambda p: "SW-A(config)#", now=lambda: T0,
+                      survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
+    assert not r["ok"] and log == []
+
+
+def test_probe_skips_rejected_show_on_huawei():
+    """华为收到 show version 回 Error: Unrecognized command: 不算失败, 接着试 display."""
+    log = []
+
+    def send(port, cmd, timeout):
+        log.append(cmd)
+        if cmd == "show version":
+            return "show version\nError: Unrecognized command found at '^' position.\n<SW-A>"
+        return "display version\nHuawei Versatile Routing Platform Software\n<SW-A>"
+    assert sv.probe_vendor(send, "/dev/con-1") == ("huawei", "")
+    assert log == ["show version", "display version"]

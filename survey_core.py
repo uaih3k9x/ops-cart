@@ -53,7 +53,10 @@ _TOKEN = re.compile(r"[\x21-\x7e]+")          # 一个词: 可打印 ASCII, 不�
 _FORBIDDEN = set(";&<>`$#!?[]{}")                # 拼接/重定向/命令替换/注释/在线帮助/Tcl 替换, 出现就拒
 # 写文件的参数: 出现在任何位置都拒 (IOS-XE show logging ... to-file bootflash:x 这类); 加上任何带 ":" 的词
 # (flash: bootflash: disk0: usbflash0: nvram: cfa0: tftp:// scp: ...), 宁可多拦, 过滤词参数里也算
-_FILE_WORDS = {"to-file", "file", "filename", "tftp", "ftp", "sftp", "scp", "http", "https"}
+_FILE_WORDS = {"to-file", "file", "filename", "tftp", "ftp", "sftp", "scp", "http", "https",
+               "clear", "reset"}                 # 有的 show 末尾带 clear 会顺手清计数器 (show platform ... drop clear)
+# 主动发包 / 巨量输出的只读命令: 不放 (连续几个词出现就拒), 要看走人确认
+_DENY_PHRASES = (("ntp-service", "trace"), ("memory",), ("running-config", "all"), ("platform", "software", "trace"))
 _KEYWORD = re.compile(r"[a-z0-9][a-z0-9-]*")     # 内置动词后紧跟的关键词
 _QUOTES = set("\"'")
 MAX_LEN = 200
@@ -73,6 +76,10 @@ def is_readonly(cmd, vendor, extra_verbs=()):
         (show version [exec reload]). include 正则要字符类的, 走人确认.
       - 任何位置 (含过滤词参数) 都不许出现写文件参数: to-file / file / filename / tftp / ftp / sftp / scp /
         http / https, 以及任何带 ":" 的词 (文件系统或 URL 目标). IPv6 地址也因此不放, 走人确认.
+      - clear / reset 在任何位置都拒 (有的 show 末尾带 clear 会清计数器).
+      - 小黑名单 (连续出现就拒): ntp-service trace (主动发包)、memory、running-config all、
+        platform software trace (巨量输出, 会把串口占很久). 别的会触发 DNS 解析或输出很大的 show 照样可能放行,
+        见 docs/DESIGN_agent_mcp.md.
       - 规则文件加的动词 (extra_verbs, 如 ping) 后面的参数不受关键词字符集约束, 只受上面这些通用规则.
       - 引号 (" ') 只许出现在管道过滤词之后的参数里; 别处 (尤其关键词) 设备会去掉引号照样执行.
       - "|" 必须单独成词, 后面只许接过滤词 include/exclude/begin/section (要带参数)、count/no-more (不带);
@@ -101,6 +108,9 @@ def is_readonly(cmd, vendor, extra_verbs=()):
         return False
     if any(w in _FILE_WORDS or ":" in w for w in words):
         return False
+    for ph in _DENY_PHRASES:
+        if any(tuple(words[i:i + len(ph)]) == ph for i in range(1, len(words))):
+            return False
     if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2:
         return False
     kw = words[1]
@@ -210,14 +220,21 @@ def load_profiles(path=None):
 
 # ------------------------------------------------------------ 提示符 / 文件名
 
-_PROMPTS = [re.compile(r"<([^<>\s]+)>"),                    # 华为用户视图 <SW-A>
-            re.compile(r"\[[~*]?([^\[\]\s]+)\]"),           # 华为系统视图 [SW-A] / VRP8 [~SW-A] [*SW-A]
-            re.compile(r"([A-Za-z0-9][\w.-]*)(?:\([^()\s]*\))?[#>]")]   # 思科 SW-A# SW-A> SW-A(config)#
+# 巡检只认 exec 模式: 华为 / H3C 用户视图 <名>, 思科 / 锐捷 名# / 名> (不带括号; 系统视图 [名]、(config)# 都不算)
+_PROMPTS = [re.compile(r"<([^<>\s]+)>"),
+            re.compile(r"([A-Za-z0-9][\w.-]*)[#>]")]
 
 
 # 不算设备提示符的最后一行: 长得像华为 [名] 的确认 / 补齐提示, 思科 tclsh, Linux shell
-_CONFIRM = re.compile(r"\[(?:y/n|yes/no|confirm|startup-config|running-config)\]", re.I)
-_NOT_PROMPT = re.compile(r".*(?:\(tcl\)|-tcl)[#>]|[a-z]{0,4}sh-\d+(?:\.\d+)*[#$]", re.I)
+_CONFIRM = re.compile(r"\[(?:[a-z]{1,8}(?:/[a-z]{1,8})+|y|n|yes|no|ok|cancel|default|enter|more|bootrom|bootload|confirm"
+                      r"|startup-config|running-config)\]|<(?:bootload|bootrom)>", re.I)
+# 思科 tclsh、引导程序 (rommon / loader / switch(boot) / grub / u-boot / bootloader)、Linux shell
+_NOT_PROMPT = re.compile(r".*(?:\(tcl\)|-tcl|\(boot\))[#>]|rommon(?: \d+ ?)?>|loader>|grub>|u-boot>|bootloader>|=>"
+                         r"|switch:|root[#$]|(?:[a-z]{0,4}sh|busybox)(?:-\d+(?:\.\d+)*)?[#$]", re.I)
+# 设备不认这条命令 (输错 / 不支持 / 视图不对): 这一条算失败
+_INVALID = re.compile(r"^\s*(?:% ?(?:Invalid input|Incomplete command|Ambiguous command|Unknown command|"
+                      r"Unrecognized command)|Error: ?(?:Unrecognized command|Wrong parameter|Incomplete command|"
+                      r"Too many parameters|Ambiguous command))", re.I)
 _MARK = re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\n]*\]")     # conbroker 自己写进日志的标记行
 
 
@@ -277,7 +294,7 @@ def previous_archive(survey_dir, device, exclude=None):
 
 _STATUS = {"ok": "", "timeout": "超时, 没跑完", "refused": "conbroker 拒绝发送, 没跑",
            "error": "发送失败, 没跑完", "noprompt": "没回提示符, 没跑完", "changed": "提示符变了, 中止",
-           "skipped": "未执行"}
+           "skipped": "未执行", "invalid": "设备不认这条命令, 中止"}
 _SECTION = re.compile(r"===== \[(\d+)/(\d+)\] (.+?) =====(?: \((\w+): (.*)\))?")
 
 
@@ -406,7 +423,9 @@ def probe_vendor(send, port, timeout=DEFAULT_TIMEOUT):
         return seen["out"]
     for cmd in _PROBES:
         st, note, lines, _dev = _send_one(keep, port, cmd, timeout, None)
-        if st != "ok":
+        if st == "invalid":                 # 华为收到 show / 思科收到 display: 报错但回了提示符, 接着试
+            lines = []
+        elif st != "ok":
             return None, f"认厂商时 {cmd} {_STATUS[st]}: {note}"
         hits = _vendor_hits(lines)
         if len(hits) > 1:
@@ -421,8 +440,7 @@ def probe_vendor(send, port, timeout=DEFAULT_TIMEOUT):
 def _show_family(out):
     """最后一行是 名# / 名> (思科 / 锐捷式), 不是华为的 <名> / [名]."""
     lines = [ln.strip() for ln in (out or "").replace("\r", "").split("\n") if ln.strip()]
-    return bool(lines) and parse_device(lines[-1]) is not None and bool(_PROMPTS[2].fullmatch(lines[-1])) \
-        and not any(p.fullmatch(lines[-1]) for p in _PROMPTS[:2])
+    return bool(lines) and parse_device(lines[-1]) is not None and bool(_PROMPTS[1].fullmatch(lines[-1]))
 
 
 # ------------------------------------------------------------ 执行
@@ -458,7 +476,11 @@ def _send_one(send, port, cmd, timeout, device):
         return "noprompt", f"设备没回提示符, 最后一行: {last.strip()[:60]}", _split_output(out, cmd), device
     if device and name != device:
         return "changed", f"提示符从 {device} 变成了 {name}", _split_output(out, cmd), device
-    return "ok", "", _split_output(out, cmd), name
+    lines = _split_output(out, cmd)
+    bad = next((ln.strip() for ln in lines if _INVALID.match(ln)), None)
+    if bad:
+        return "invalid", f"设备不认: {bad[:80]}", lines, name
+    return "ok", "", lines, name
 
 
 def _compare(res, survey_dir, prof):

@@ -98,6 +98,12 @@ def danger_words(cmd, extra=()):
 
 RULES_PATH = "/etc/ops-cart/serial-gate.json"
 _VERB = re.compile(r"[a-z][a-z0-9-]{1,31}")
+# 规则文件永远加不进来的只读动词: 改配置 / 进交互 / 连别处 / 清东西的; 写成它们的前缀 (缩写) 也不行
+_VERB_DENY = ("terminal", "debugging", "undebug", "undo", "no", "clear", "test", "telnet", "ssh", "stelnet",
+              "system-view", "configure", "reload", "reboot", "copy", "write", "save", "delete", "format", "reset",
+              "erase", "shutdown", "startup", "boot", "install", "upgrade", "license", "patch", "rename", "move",
+              "mkdir", "rmdir", "tclsh", "enable", "disable", "request", "run", "bash", "start", "connect",
+              "ftp", "tftp", "sftp", "scp", "archive", "crypto", "set")
 # 第 2 层决策模型 (#22). 默认不开: 没配就和第 1 层之外全人确认一样
 MODEL_DEFAULT = {"enabled": False, "timeout_s": 30, "budget_usd": "0.2", "context_chars": 3000, "model": None}
 MODEL_TIMEOUT_MIN_S = 5
@@ -165,7 +171,8 @@ def load_rules(path=RULES_PATH):
     for v, spec in (doc.get("vendors") or {}).items() if isinstance(doc.get("vendors"), dict) else ():
         if v not in vendors or not isinstance(spec, dict):
             continue
-        verbs = [w for w in spec.get("extra_verbs") or () if isinstance(w, str) and _VERB.fullmatch(w)]
+        verbs = [w for w in spec.get("extra_verbs") or () if isinstance(w, str) and _VERB.fullmatch(w)
+                 and not any(d == w or d.startswith(w) for d in _VERB_DENY)]
         if v in survey_core._RULES:
             out["vendors"][v]["extra_verbs"] = sorted(set(verbs))
         if isinstance(spec.get("model"), bool):
