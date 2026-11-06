@@ -542,3 +542,74 @@ def test_device_without_address_blocks(tmp_path):
                    devices=lambda: [{k: v for k, v in CONN_OK.items() if k != "Address"}])
     h.saw_secure_write(DEV, now=1.0)
     assert h.send_reply("好", now=1.0) is False
+
+
+# ------------------------------------------------------------ 第三轮审查 (#61)
+
+def test_write_value_uses_address_property_not_path():
+    """中2: SMP 解析出身份地址后 BlueZ 改 Address 属性但不改对象路径; 记录 / 闸门 / 去重来源一律用 Address."""
+    path = "/org/bluez/hci0/dev_02_00_00_00_00_01"                    # 路径里还是连上时的随机地址
+    props = {"Address": "02:00:00:00:00:aa", "Paired": True, "Trusted": True}
+    rec, _app, rx, _tx, _objs = _built({path: props})
+    rx.WriteValue([1], {"device": path}, sender=":1.7")
+    assert rec.calls[0][0] == "02:00:00:00:00:AA"
+
+
+def test_path_and_address_differ_receipts_still_flow(tmp_path):
+    """受信手机路径和 Address 不一致时, 自己的回执不能被扣."""
+    sent = []
+    identity = "02:00:00:00:00:AA"
+    h = bi.Handler(bi.DirSink(str(tmp_path / "in")), notify=sent.append, log=lambda s: None,
+                   devices=lambda: [dict(CONN_OK, Address=identity)])
+    rec = []
+    path = "/org/bluez/hci0/dev_02_00_00_00_00_01"
+    _app, _adv, _tx, _all = bi._build(_FakeDbus, _FakeService, None,
+                                      _FakeBus({path: dict(TRUSTED, Address=identity)}), "hci0", [h])
+    rx = _app.rx
+    for f in bc.encode(3, b"hi", 23):
+        rx.WriteValue(list(f), {"device": path}, sender=":1.7")
+    assert _acks(sent) == [{"t": "ack", "id": 3, "crc": bc.crc32(b"hi")}]
+
+
+def test_disconnect_signal_clears_record_immediately():
+    """中1: 真手机写完断开, 同地址冒充者重连, 中间没有任何事件调闸门: 断开信号到了就得清掉记录."""
+    devs = [[CONN_OK]]
+    h = bi.Handler(None, notify=lambda f: None, log=lambda s: None, devices=lambda: devs[0])
+    h.saw_secure_write(DEV, now=10.0)
+    path = "/org/bluez/hci0/dev_02_00_00_00_00_01"
+    bi.device_changed(h, "org.bluez.Device1", {"Connected": _FakeDbus.Boolean(0)}, path,
+                      lambda p: {"Address": DEV})
+    assert DEV not in h.recent
+    assert h.send_reply("好", now=11.0) is False                       # 冒充者连上 (devices 里 Connected True)
+
+
+def test_disconnect_signal_ignores_other_changes():
+    h = bi.Handler(None, notify=lambda f: None, log=lambda s: None, devices=OK_DEVS)
+    h.saw_secure_write(DEV, now=10.0)
+    path = "/org/bluez/hci0/dev_02_00_00_00_00_01"
+    bi.device_changed(h, "org.bluez.Device1", {"RSSI": -40}, path, lambda p: {"Address": DEV})
+    bi.device_changed(h, "org.bluez.Adapter1", {"Connected": False}, path, lambda p: {"Address": DEV})
+    bi.device_changed(h, "org.bluez.Device1", {"Connected": True}, path, lambda p: {"Address": DEV})
+    assert DEV in h.recent
+    bi.device_changed(h, "org.bluez.Device1", {"Connected": False}, path, lambda p: None)   # 属性读不到: 按路径地址清
+    assert DEV not in h.recent
+
+
+def test_tick_prunes_without_gate_call():
+    """兜底: 每秒 tick 无条件剪一次, 断开期间没人调闸门也清掉."""
+    devs = [[CONN_OK]]
+    h = bi.Handler(None, notify=lambda f: None, log=lambda s: None, devices=lambda: devs[0])
+    h.saw_secure_write(DEV, now=10.0)
+    devs[0] = [dict(CONN_OK, Connected=False)]
+    h.tick(now=11.0)
+    devs[0] = [CONN_OK]
+    assert h.send_reply("好", now=12.0) is False
+
+
+def test_tick_prune_failure_clears_all():
+    def boom():
+        raise RuntimeError("dbus")
+    h = bi.Handler(None, notify=lambda f: None, log=lambda s: None, devices=boom)
+    h.saw_secure_write(DEV, now=10.0)
+    h.tick(now=11.0)
+    assert h.recent == {}
