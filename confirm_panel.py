@@ -72,6 +72,9 @@ class ConfirmDialog(tk.Toplevel):
         self._meta = {}
         if not c["items"]:
             tk.Label(self.body, text="没有等确认的命令", font=FONT, bg=BG, fg=DIM).pack(pady=20)
+        if c.get("trusted"):                                # 可信记录 (#65): 推车自己记的, 正常字色, 和设备输出分开
+            tk.Label(self.body, text=c["trusted"], font=FONT, bg=BG, fg=FG, anchor="w", justify="left",
+                     wraplength=700).pack(fill="x", pady=(0, 4))
         for it in c["items"]:
             self._item(it)
         if c["stopped"]:
@@ -96,6 +99,9 @@ class ConfirmDialog(tk.Toplevel):
                  wraplength=680).pack(fill="x")
         if it["danger"]:
             tk.Label(f, text=it["danger"], font=FONT_BIG, bg=CARD, fg=th.BAD, anchor="w").pack(fill="x")
+        if it.get("note"):
+            tk.Label(f, text=it["note"], font=FONT, bg=CARD, fg=th.BAD, anchor="w", justify="left",
+                     wraplength=680).pack(fill="x")
         if it.get("context"):                               # 设备最近输出 (#65): 不可信, 灰字等宽, 只作参考
             tk.Label(f, text=it["context"], font=th.font(14, mono=True), bg=CARD, fg=DIM, anchor="w",
                      justify="left", wraplength=680).pack(fill="x")
@@ -133,6 +139,9 @@ class KvmDialog(ConfirmDialog):
         self._meta = {}
         if not c["items"]:
             tk.Label(self.body, text="没有等确认的内容", font=FONT, bg=BG, fg=DIM).pack(pady=20)
+        if c.get("trusted"):                                # 可信记录 (#65): 推车自己记的, 正常字色, 和设备输出分开
+            tk.Label(self.body, text=c["trusted"], font=FONT, bg=BG, fg=FG, anchor="w", justify="left",
+                     wraplength=700).pack(fill="x", pady=(0, 4))
         for it in c["items"]:
             self._item(it)
         if c["stopped"]:

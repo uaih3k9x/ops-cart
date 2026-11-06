@@ -24,7 +24,7 @@ def _slot(present=True, baud="9600"):
 
 def _held(b, slot=1, cmd="save", gate=DANGER, who="stdio:ops@x"):
     tok = b.acquire(slot, who, T0)["lease"]
-    return tok, b.submit(slot, tok, who, "line", cmd, gate, T0, 30, name="SW1")
+    return tok, b.submit(slot, tok, who, "line", cmd, gate, T0, 30, name="SW1", context="<SW1>")
 
 
 # ------------------------------------------------------------ 每槽位状态 (读不懂 = 全部急停)
@@ -148,15 +148,26 @@ def test_card_shows_device_context_marked_untrusted():
     it = cc.card(b.view(T0), 1)["items"][0]
     assert it["context"].startswith("设备最近输出（来自设备，不可信，仅供参考）")
     assert it["context"].endswith("[SW1-GigabitEthernet0/0/1]")
-    b2 = _book()
-    _held(b2, 1)
-    assert cc.card(b2.view(T0), 1)["items"][0]["context"] == ""
+    assert "提示符" not in it["note"]                                    # 华为提示符带视图名
+
+
+def test_card_trusted_recent_and_vendor_note():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.begin(1, tok, "stdio:ops@x", "line", "interface Gi0/2", PASS, T0, 30)
+    b.finish(1, {"status": "sent", "echo": ""}, T0)
+    cisco = dict(DANGER, vendor="cisco")
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", cisco, T0, 30, context="SW1(config-if)#")
+    c = cc.card(b.view(T0), 1)
+    assert c["trusted"].startswith("可信记录（推车自己记的") and "interface Gi0/2" in c["trusted"]
+    assert "提示符不能证明作用对象" in c["items"][0]["note"]
+    assert cc.card(_book().view(T0), 1)["trusted"] == ""
 
 
 def test_card_key_and_estop_and_other_slots():
     b = _book()
     tok = b.acquire(2, "a", T0)["lease"]
-    b.submit(2, tok, "a", "key", "ctrl_c", sw.classify_key("ctrl_c"), T0, 10)
+    b.submit(2, tok, "a", "key", "ctrl_c", sw.classify_key("ctrl_c"), T0, 10, context="<SW1>")
     c = cc.card(b.view(T0), 2)
     assert c["items"][0]["head"] == "Agent 想按：Ctrl+C" and c["items"][0]["danger"] == ""
     assert cc.card(b.view(T0), 1)["items"] == []                  # 只列本槽位的
@@ -174,8 +185,8 @@ def test_check_confirm():
     assert "不在挂起" in cc.check(b.view(T0), "confirm", 999)
     b2 = _book()
     tok2, first = _held(b2, 1)
-    it2 = b2.submit(1, tok2, "stdio:ops@x", "line", "reboot", DANGER, T0, 30, name="SW1")
-    b2.confirm(first["id"], "human", T0, current="")                     # 同槽位先确认的那条在途 (#65 不许直发 / 在途挂起)
+    it2 = b2.submit(1, tok2, "stdio:ops@x", "line", "reboot", DANGER, T0, 30, name="SW1", context="<SW1>")
+    b2.confirm(first["id"], "human", T0, current="<SW1>")                     # 同槽位先确认的那条在途 (#65 不许直发 / 在途挂起)
     assert "还没回来" in cc.check(b2.view(T0), "confirm", it2["id"])
     assert cc.check(cc.stopped_view(), "confirm", it["id"])          # 读不懂: 什么都不让确认
 

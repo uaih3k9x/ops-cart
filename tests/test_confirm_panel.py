@@ -27,7 +27,7 @@ def _view(stop=False, items=(("save", DANGER), ("undo shutdown", HOLD))):
     b = sw.Book.from_text(None, T0)
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
     for cmd, gate in items:
-        b.submit(1, tok, "stdio:ops@x", "line", cmd, gate, T0, 30, name="SW1")
+        b.submit(1, tok, "stdio:ops@x", "line", cmd, gate, T0, 30, name="SW1", context="<SW1>")
     if stop:
         b.estop(1, "human:kiosk@local", "human", T0)
     return b.view(T0 + 2)

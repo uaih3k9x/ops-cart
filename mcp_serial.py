@@ -300,7 +300,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                 "danger": gate["danger"],
                 "hint": "已挂起, 一个字节都没发. 要人在推车上确认才发; 用 pending_list 看结果. "
                         "等的时候继续 lease_renew, 租约过期这条就作废."})]
-        it = _run(lambda b, now: b.begin(n, lease, me, kind, cmd, gate, now, timeout, name), n, kind, cmd)
+        it = _run(lambda b, now: b.begin(n, lease, me, kind, cmd, gate, now, timeout, name, mark=mark), n, kind, cmd)
         t0 = time.monotonic()
         try:
             status, out, note = send(dev, text, timeout, raw)
@@ -641,6 +641,11 @@ def _print_view(v, out):
             bits.append(f"在途 #{s['inflight']['id']} {s['inflight']['cmd']!r}")
         print(" ".join(bits), file=out)
     print("挂起等确认:" if v["pending"] else "挂起等确认: 无", file=out)
+    for s in v["slots"]:
+        if s.get("recent") and any(p["slot"] == s["slot"] for p in v["pending"]):
+            print(f"  槽位 {s['slot']} 可信记录 (推车自己记的最近实际发出的命令, 不含人直接敲的键): "
+                  + "; ".join(f"#{r['id']} {r['cmd']!r}" + (f" 人确认 {r['by']}" if r.get("by") else "")
+                              for r in s["recent"]), file=out)
     for p in v["pending"]:
         warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"

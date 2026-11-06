@@ -429,6 +429,7 @@ $("#logout").onclick = async () => { await api("/api/logout", {}); location.relo
 function agentItem(it) {
   return `<div class="item"><div class="want">${esc(it.head)}</div><div class="dim">${esc(it.meta)}</div>
     <div>${esc(it.reason)}</div>${it.danger ? `<div class="bad">${esc(it.danger)}</div>` : ""}
+    ${it.note ? `<div class="bad">${esc(it.note)}</div>` : ""}
     ${it.context ? `<pre class="dim" style="white-space:pre-wrap;margin:4px 0">${esc(it.context)}</pre>` : ""}
     <button class="btn danger" data-reject="${it.id}">拒绝</button></div>`;
 }
@@ -436,6 +437,7 @@ function agentCard(c, n) {
   const foot = c.stopped ? `<div class="bad">急停中 · 解除要在推车车机上点</div>`
                          : `<button class="btn estop" data-estop="${n}">急停本路</button>`;
   return `<div class="card"><h3>${esc(c.title)}</h3>${c.status.map((x) => `<div class="dim">${esc(x)}</div>`).join("")}
+    ${c.trusted ? `<pre style="white-space:pre-wrap;margin:4px 0">${esc(c.trusted)}</pre>` : ""}
     ${c.items.map(agentItem).join("")}<div style="margin-top:8px">${foot}</div></div>`;
 }
 function kvmCard(c) {  // 键鼠 (#43): 网页只能拒绝, 确认在车机上

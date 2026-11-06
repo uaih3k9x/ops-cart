@@ -191,10 +191,10 @@ def test_not_at_prompt_is_held(rig):
     rig.tail_text["/dev/con-1"] = "Username:"
     tok = rig.lease(1)
     assert rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})["status"] == "pending"
-    rig.tail_text.pop("/dev/con-1")                                   # 读不到输出: 一样挂起
+    rig.tail_text.pop("/dev/con-1")                                   # 读不到输出: 不挂起也不发 (#65 没法核对现场)
     rig.clock.t += 1
-    assert rig.ok("send_command", {"slot": 1, "command": "display clock", "lease": tok})["status"] == "pending"
-    assert rig.sent == []
+    assert "读不到" in rig.err("send_command", {"slot": 1, "command": "display clock", "lease": tok})
+    assert rig.sent == [] and len(rig.ok("pending_list")["pending"]) == 1
 
 
 @pytest.mark.parametrize("cmd", ["display version\rsave", "save\x08", "\x03", "display\tversion", "-h"])
@@ -643,7 +643,7 @@ def test_confirm_rereads_prompt_and_voids_if_changed(rig):
     p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
     rig.tail_text["/dev/con-1"] = GE2                                # 有人在网页口敲了 interface GE0/0/2
     rc, text = cli(rig, "confirm", str(p["id"]))
-    assert rc == 1 and "设备视图变了" in text
+    assert rc == 1 and "新输出" in text
     assert rig.sent == []
     assert rig.ok("pending_list")["history"][-1]["status"] == "dropped"
 
@@ -656,3 +656,52 @@ def test_confirm_with_unreadable_output_keeps_pending(rig):
     rc, text = cli(rig, "confirm", str(p["id"]))
     assert rc == 1 and "读不到" in text and rig.sent == []
     assert [x["id"] for x in rig.ok("pending_list")["pending"]] == [p["id"]]
+
+
+# ------------------------------------------------------------ #68 第二轮
+
+def test_send_command_while_inflight_refused_before_reading(rig):
+    tok = rig.lease(1)
+    rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface Gi0/2",
+                                         {"verdict": "pass", "layer": 1, "reason": "x", "danger": []}, now, 30))
+    rig.tails.clear()
+    assert "还没回来" in rig.err("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert rig.tails == [] and rig.sent == []                         # 连输出都没读
+
+
+def test_direct_send_refused_if_other_send_lands_while_judging(rig):
+    """第 2 层模型放行的直发也绑上下文: 读完输出后另一路发完了, 不发 (低6)."""
+    rig.model()
+    tok = rig.lease(1)
+    real_llm = rig.llm
+
+    def llm_then_other_sends(*a):
+        rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface Gi0/2",
+                                             {"verdict": "pass", "layer": 1, "reason": "x", "danger": []}, now, 30))
+        rig.store.run(lambda b, now: b.finish(b.doc["seq"], {"status": "sent", "echo": ""}, now))
+        return real_llm(*a)
+    rig.llm = llm_then_other_sends
+    msg = rig.err("send_command", {"slot": 1, "command": "system-view", "lease": tok})
+    assert "旧了" in msg and rig.sent == []
+
+
+def test_kiosk_default_path_rereads_with_conbroker_tail(rig, monkeypatch):
+    """车机 human_action 不传 tail: 默认走 conbroker_tail 重读, 变了照样作废."""
+    import confirm_core as cc
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    seen = []
+    monkeypatch.setattr(ms, "conbroker_tail", lambda dev, n: seen.append((dev, n)) or GE2)
+    with pytest.raises(sw.Refused) as e:
+        ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send)
+    assert e.value.code == "stale" and seen == [("/dev/con-1", ms.TAIL_LINES)] and rig.sent == []
+    _ = tok
+
+
+def test_cli_pending_shows_trusted_recent(rig):
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})
+    rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rc, text = cli(rig, "pending")
+    assert "可信记录" in text and "'display version'" in text

@@ -17,7 +17,7 @@ def _app(tmp_path, held=True):
     b = sw.Book.from_text(None, T0)
     if held:
         tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
-        b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, name="SW1")
+        b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, name="SW1", context="<SW1>")
     state = tmp_path / "serial-write.json"
     state.write_text(b.dumps())
     app.serial_peek = lambda: ms.peek(str(state), clock=lambda: T0 + 3)

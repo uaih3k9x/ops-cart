@@ -13,8 +13,10 @@
 - 挂起期间 (#65): 槽位有挂起项时, 这个槽位的任何直发 (第 1/2 层放行的命令和键) 都拒 (pending), 和键鼠一致 ——
   否则人批准的"槽位 N · shutdown"会作用在 Agent 之后切过去的另一个接口上. 纵深: 挂起项记下提交时槽位的发送序号,
   确认时序号变了 (提交后这个槽位又发过别的, 例如人先确认了同槽位另一条) 就作废 (stale), 让 Agent 重新提交.
-  在途时不收挂起; 序号在读设备输出之前取 (send_mark), 挂起时已变就不挂. 确认前重读设备最后一行, 和挂起时
-  不同就作废 —— 人用通道不计序号, 迟到的字节也会改视图, 都靠这一步兜住; 读不到就先不发.
+  在途时不收挂起也不给序号; 序号在读设备输出之前取 (send_mark), 挂起 / 直发时已变就不挂不发. 挂起时读不到
+  设备输出就不挂. 确认前重读同样行数的输出和挂起时整体比 (不打码的原文指纹), 有任何新输出就作废 —— 人用通道
+  不计序号、迟到的字节、思科这类提示符不带对象名, 都靠这一步兜住; 读不到就先不发. 审批界面另给"可信记录"
+  (推车自己记的本槽位最近实际发出的命令), 和不可信的设备输出分开.
   挂起项带提交时设备最近几行输出 (来自设备、不可信, 限长, 口令类字段打码), 只在状态文件和审批界面, 不进执行绪日志.
 - 写租约: 每个槽位同一时间一个写入者, 认令牌不认名字; 有期限 (默认 60 秒), 要续期, 过期自动释放,
   它挂着的命令一起作废. 一条在途: 上一条没回来不发下一条.
@@ -24,6 +26,7 @@
 - 状态文件读不懂 (坏了 / 版本不对) = 全部急停.
 """
 
+import hashlib
 import json
 import re
 import secrets
@@ -40,6 +43,8 @@ LEASE_TTL_MAX_S = 300
 PENDING_MAX = 5             # 一个槽位最多挂几条等人确认
 PENDING_MAX_S = 900         # 挂起超过 15 分钟没人理就作废 (现场早变了)
 INFLIGHT_GRACE_S = 90       # 在途标记超过 发送超时 + 这么久还没回来 = 发送进程死了
+RECENT_MAX = 5              # 审批界面"可信记录": 本槽位最近几条实际发出的命令
+SENT_STATES = ("sending", "sent", "timeout", "unknown")    # 已经交给 conbroker 的 (error / refused 没发出去)
 HISTORY_MAX = 30            # 状态文件里留最近多少条结果给 pending_list 看 (完整的在执行绪日志里)
 ECHO_MAX = 1000             # 日志里设备回显摘要的长度
 CONTEXT_LINES = 8           # 挂起项带提交时设备最近几行输出 (#65), 给审批的人参考
@@ -51,7 +56,7 @@ STATE_VERSION = 1
 class Refused(Exception):
     """不让做. code: bad (命令不合格) / estop / lease / busy / inflight / nope (没有这条或已经不在挂起) /
     pending (槽位有挂起项, 不许直发) / stale (挂起后槽位又发过别的或设备视图变了, 这条作废) /
-    prompt (确认时读不到设备输出, 先不发)."""
+    prompt (确认时读不到设备输出, 先不发) / context (挂起时读不到设备输出, 不挂)."""
 
     def __init__(self, code, msg):
         super().__init__(msg)
@@ -306,10 +311,15 @@ def echo_summary(text):
     return f"{s[:half]}\n…(省略 {len(s) - 2 * half} 字)…\n{s[-half:]}"
 
 
-# 口令类字段: 词前后不是字母数字 (下划线、连字符都算断开: admin_password / pre_shared_key / user-password=)
-_SECRET_WORDS = ("password", "passwd", "passphrase", "pwd", "secret", "psksecret", "community", "cipher", "psk",
-                 "key", "md5", "auth", "priv")
-_CTX_SECRET = re.compile(r"(?i)(?<![a-z0-9])(" + "|".join(_SECRET_WORDS) + r")(?![a-z0-9]).*$")
+# 口令类字段 (只管显示; 比对用没打码的原文). 短词前后都不能是字母数字 (下划线、连字符算断开: pre_shared_key);
+# 长词只要后边界, 前面可以接字母 (PGPASSWORD= / htpasswd / GITHUB_TOKEN= / psksecret). 打码从词后面开始.
+_SECRET_SHORT = re.compile(r"(?i)(?<![a-z0-9])(?P<k>key|md5|auth|priv|psk|community|cipher)(?![a-z0-9])")
+_SECRET_LONG = re.compile(r"(?i)(?P<k>passw(?:or)?d|passphrase|pwd|secret|token|bearer|api[-_]?key"
+                          r"|authentication-mode)(?![a-z0-9])")
+_SECRET_DASH = re.compile(r"(?<!\S)(?P<k>-p)(?=\S)|(?<!\S)(?P<u>(?:-u|--user)[\s=]+)(?=\S+:\S)")   # mysql -pX / curl -u a:b
+_SECRET_URL = re.compile(r"(?P<k>)[\w.%+-]+:[^\s@/]+@")                                        # https://user:pass@
+_SECRET_WHOLE = re.compile(r"(?i)chpasswd|^\s*[\w.-]+:\$[0-9a-z]{1,3}\$")                       # chpasswd / shadow 行
+_SECRET_CONT = re.compile(r"\s*(?:%\^%#|%\$%\^|\$[0-9a-z]{1,3}\$)")                             # 折行后的密文续行
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?")
 _PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY")
 _PEM_END = re.compile(r"(?i)-----END [A-Z0-9 ]*PRIVATE KEY")
@@ -323,30 +333,61 @@ def _show(ln):
     return "".join(" " if ch in " \t" else "?" if unicodedata.category(ch)[0] in "CZ" else ch for ch in ln)
 
 
+def _norm(ln):
+    """删 ANSI/CSI/OSC 转义 + NFKC 归一 (全角 -> 半角). 比对和认口令都从这里开始."""
+    return unicodedata.normalize("NFKC", _ANSI.sub("", ln))
+
+
 def _for_match(ln):
-    """拿来认口令的: NFKC 归一 (全角 -> 半角), 再删掉控制 / 格式字符 (零宽、软连字符拆不开 password)."""
-    return "".join(ch for ch in unicodedata.normalize("NFKC", ln) if unicodedata.category(ch)[0] != "C")
+    """认口令用: 归一后再删掉控制 / 格式字符 (零宽、软连字符拆不开 password)."""
+    return "".join(ch for ch in _norm(ln) if unicodedata.category(ch)[0] != "C")
+
+
+def _prompt_head(m):
+    """行首像提示符的一段 (各厂商提示符正则取最长), 显示时不打码 —— 主机名里带 auth/key/psk 不该把提示符抹平.
+    光秃秃的 $ / # 不算 (会吞掉 $6$ 这类密文开头)."""
+    best = 0
+    for rx in _PROMPT.values():
+        mm = rx.match(m)
+        if mm and mm.end() > best and len(mm.group(0)) >= 2 and any(c.isalnum() for c in mm.group(0)):
+            best = mm.end()
+    return best
 
 
 def _ctx_line(ln, in_key=False):
-    """一行设备输出 -> (给人看的一行, 是否在私钥块里). 先整体删 ANSI/CSI/OSC 转义, 再认口令 / 私钥 / 长 base64."""
-    ln = _ANSI.sub("", ln)
+    """一行设备输出 -> (给人看的一行, 是否在私钥块里)."""
     m = _for_match(ln)
     if _PEM_BEGIN.search(m):
         in_key = True
     elif in_key:
         return MASK, not _PEM_END.search(m)
-    if _B64.fullmatch(m):
-        return MASK, in_key
-    hit = _CTX_SECRET.search(m)
-    if hit:
-        return _show(m[:hit.start()]) + hit.group(1) + " " + MASK, in_key
-    return _show(ln), in_key
+    p = _prompt_head(m)
+    head, rest = m[:p], m[p:]
+    if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest):
+        return _show(head) + MASK, in_key
+    cut = None
+    for rx in (_SECRET_SHORT, _SECRET_LONG, _SECRET_DASH, _SECRET_URL):
+        for hit in rx.finditer(rest):
+            grp = "k" if hit.group("k") is not None else "u"
+            keep = hit.end(grp)
+            if cut is None or hit.start() < cut[0]:
+                cut = (hit.start(), keep)
+            break
+    if cut:
+        kept = rest[:cut[1]]
+        return _show(head + kept) + ("" if kept.endswith((" ", "=", "-p", "/")) or not kept else " ") + MASK, in_key
+    return _show(_ANSI.sub("", ln)), in_key
 
 
-def _prompt(text):
-    """设备停在哪: 最后一行 (同样清洗打码), 挂起时和确认时各取一次比对."""
-    return _ctx_line(last_line(text))[0][:CONTEXT_LINE_MAX]
+def _tail_hash(text):
+    """提交 / 确认时 tail 的整体指纹: 删转义 + NFKC 后的原文 (不打码), 去掉 \\r、行尾空白、conbroker 自己的标记行."""
+    lines = [_norm(ln).rstrip() for ln in (text or "").replace("\r", "").split("\n")]
+    lines = [ln for ln in lines if not _MARK.fullmatch(ln.strip())]
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def device_context(text):
@@ -581,8 +622,14 @@ class Book:
         if inf:
             raise Refused("inflight", f"槽位 {slot} 上一条 ({inf['cmd']!r}) 还没回来, 一次一条")
 
-    def begin(self, slot, token, who, kind, cmd, gate, now, timeout, name=None):
-        """闸门放行的直接发: 标在途 -> 调用方交给 conbroker -> finish."""
+    def _check_mark(self, slot, mark, what):
+        if mark is not None and mark != self._sent(slot):
+            raise Refused("stale", f"读设备输出之后槽位 {slot} 又发过别的命令, {what}用的上下文已经旧了; "
+                                   "重新看现场再来 (一个字节都没发)")
+
+    def begin(self, slot, token, who, kind, cmd, gate, now, timeout, name=None, mark=None):
+        """闸门放行的直接发: 标在途 -> 调用方交给 conbroker -> finish. mark = 读设备输出 (给闸门 / 第 2 层模型看)
+        之前的 send_mark; 之后槽位又发过别的就不发."""
         if gate.get("verdict") != "pass":
             raise ValueError("闸门没放行的只能 submit 挂起")
         self.writer(slot, token, now)
@@ -593,13 +640,16 @@ class Book:
             raise Refused("pending", f"槽位 {slot} 有挂起等人确认的命令 ({ids}), 这期间不许直发任何命令或按键 "
                                      "(会改变设备上下文, 让人批准的命令落到别的对象上). 先等人确认 / 拒绝, "
                                      "或 lease_release 撤回")
+        self._check_mark(slot, mark, "闸门判断")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "sending")
         self._start(it, now)
         return _public(it)
 
     def send_mark(self, slot, token, now):
-        """读设备输出之前取下发送序号 (顺带查租约 / 急停); 挂起时带回来, 中间发过别的就不挂."""
+        """读设备输出之前取下发送序号 (顺带查租约 / 急停 / 在途); 发送或挂起时带回来, 中间发过别的就不发不挂.
+        在途时不给: 那条的回显还没到, 读到的是它生效前的上下文."""
         self.writer(slot, token, now)
+        self._idle(slot)
         return self._sent(slot)
 
     def submit(self, slot, token, who, kind, cmd, gate, now, timeout, name=None, context=None, mark=None):
@@ -607,24 +657,25 @@ class Book:
         在途时不挂: 那条还没生效, 现在看到的上下文是假的."""
         self.writer(slot, token, now)
         self._idle(slot)
-        if mark is not None and mark != self._sent(slot):
-            raise Refused("stale", f"读设备输出之后槽位 {slot} 又发过别的命令, 那份上下文已经旧了; "
-                                   "重新看现场再提交 (一个字节都没发)")
+        self._check_mark(slot, mark, "挂起")
+        ctx = device_context(context)
+        if not ctx:
+            raise Refused("context", f"读不到槽位 {slot} 设备最近的输出, 没法让人核对现场, 不挂起 (一个字节都没发); "
+                                     "检查串口服务后重试")
         if len(self._pending(slot)) >= PENDING_MAX:
             raise Refused("busy", f"槽位 {slot} 已经有 {PENDING_MAX} 条等人确认, 先等人处理")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "pending")
         it["sent_mark"] = self._sent(slot)
-        it["prompt"] = _prompt(context)
-        ctx = device_context(context)
-        if ctx:
-            it["context"] = ctx
+        it["tail_hash"] = _tail_hash(context)            # 不进 _public; 确认时重读整段比对
+        it["context"] = ctx
         self._ev("pending", slot, now, who=who, id=it["id"], kind=kind, cmd=cmd, gate=gate, name=name)
         return _public(it)
 
     def confirm(self, iid, by, now, current):
         """人确认 -> 标在途, 返回要发的那条 (调用方发完 finish). 租约没了 / 急停 / 已经不在挂起: 不发.
-        current = 确认前刚读的设备输出 (读不到给 None): 最后一行和挂起时不一样就作废 —— 兜住人用通道
-        (网页 / 车机直接敲, 不计发送序号) 和 conbroker 超时后迟到的字节改了设备视图."""
+        current = 确认前刚读的设备输出 (同样的行数, 读不到给 None): 和挂起时那段整体比 (删转义 + NFKC 后的原文,
+        不打码), 有任何新输出就作废 —— 兜住人用通道 (网页 / 车机直接敲, 不计发送序号)、conbroker 超时后迟到的字节,
+        以及提示符不带对象名的厂商 (思科 (config-if)# 前后一样). 设备自己吐日志也会作废, 宁可重新提交."""
         self.tick(now)
         it = self._item(iid)
         if not it or it["status"] != "pending":
@@ -638,8 +689,8 @@ class Book:
             raise Refused("lease", "提交它的 Agent 租约已失效, 这条作废")
         self._idle(slot)
         why = None
-        if "sent_mark" not in it:
-            why = "升级前就挂着的条目没有发送序号, 不知道之后发没发过别的; 这条作废, 要 Agent 重新提交"
+        if "sent_mark" not in it or "tail_hash" not in it:
+            why = "升级前就挂着的条目没有发送序号 / 设备输出指纹, 不知道之后发没发过别的; 这条作废, 要 Agent 重新提交"
         elif it["sent_mark"] != self._sent(slot):
             why = "提交后这个槽位又发过别的命令, 设备上下文可能变了; 这条作废, 要 Agent 看过现场后重新提交"
         if why:
@@ -647,10 +698,10 @@ class Book:
             raise Refused("stale", why)
         if current is None:
             raise Refused("prompt", f"读不到槽位 {slot} 设备现在停在哪, 没法核对上下文, 不发 (还挂着, 稍后再确认)")
-        was, now_at = it.get("prompt", ""), _prompt(current)
-        if now_at != was:
-            why = (f"设备视图变了: 挂起时停在 {was!r}, 现在停在 {now_at!r} (人敲过键或有迟到的输出); "
-                   "这条作废, 要 Agent 看过现场后重新提交")
+        if _tail_hash(current) != it["tail_hash"]:
+            last = _ctx_line(last_line(current))[0][:CONTEXT_LINE_MAX]
+            why = (f"挂起后设备有新输出 (人敲过键、迟到的字节或设备自己吐的日志; 现在最后一行 {last!r}), "
+                   "设备上下文可能变了; 这条作废, 要 Agent 看过现场后重新提交")
             self._close(it, "dropped", now, why=why)
             raise Refused("stale", why)
         it["by"] = by
@@ -724,6 +775,13 @@ class Book:
 
     # ---- 给人 / Agent 看的 (不含令牌)
 
+    def _recent(self, slot):
+        """可信信息: 推车自己记的这个槽位最近实际交给 conbroker 的命令 (Agent 直发和人确认的都算; 人在车机 /
+        网页直接敲的键不在这里). 状态文件只留最近 HISTORY_MAX 条, 更早的看执行绪日志."""
+        out = [{k: it[k] for k in ("id", "kind", "cmd", "status", "who", "by", "t") if k in it}
+               for it in self.doc["items"] if it["slot"] == slot and it["status"] in SENT_STATES]
+        return out[-RECENT_MAX:]
+
     def view(self, now, slot=None):
         self.tick(now)
         slots = []
@@ -737,6 +795,8 @@ class Book:
                           "expires_in": int(lz["expires"] - now) if lz else None,
                           "inflight": {"id": inf["id"], "cmd": inf["cmd"]} if inf else None,
                           "pending": len(self._pending(n))})
+        for e in slots:
+            e["recent"] = self._recent(e["slot"])
         want = (lambda it: True) if slot is None else (lambda it: it["slot"] == slot)
         pend = [dict(_public(it), age_s=int(now - it["ts"])) for it in self._pending() if want(it)]
         hist = [_public(it) for it in self.doc["items"] if it["status"] != "pending" and want(it)]

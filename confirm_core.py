@@ -104,6 +104,25 @@ def _context(item):
     return ("设备最近输出（来自设备，不可信，仅供参考）：\n" + "\n".join(lines)) if lines else ""
 
 
+
+
+def _note(item):
+    v = (item.get("gate") or {}).get("vendor")
+    if v == "huawei":
+        return ""
+    return "注意：这类设备的提示符不带对象名，提示符不能证明作用对象；先看上面的可信记录再确认"
+
+
+def _trusted(slot_view):
+    """推车自己记的本槽位最近实际发出的命令 (#65): 可信, 和设备输出分开显示."""
+    rec = slot_view.get("recent") or []
+    if not rec:
+        return ""
+    rows = [f"#{r['id']} {r['cmd']}" + (f"（人确认 {r['by']}）" if r.get("by") else "") +
+            ("" if r.get("status") == "sent" else f"［{r.get('status')}］") for r in rec]
+    return "可信记录（推车自己记的，本槽位最近实际发出的命令；不含人在车机 / 网页直接敲的键）：\n" + "\n".join(rows)
+
+
 def card(view, n):
     """槽位 n 的确认框 -> {title, status, stopped, items}. items 每条 {id, head, meta, reason, danger}."""
     s = next(x for x in view["slots"] if x["slot"] == n)
@@ -125,9 +144,9 @@ def card(view, n):
                     "meta": f"#{p['id']} · 来自 {p['who']} · {p.get('age_s', 0)} 秒前",
                     "reason": f"闸门理由：{p.get('reason') or '-'}",
                     "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else "",
-                    "context": _context(p)})
+                    "context": _context(p), "note": _note(p)})
     return {"title": f"操作头 {n}" + (f" · {name}" if name else ""), "status": status,
-            "stopped": bool(s["estop"]), "items": out}
+            "stopped": bool(s["estop"]), "items": out, "trusted": _trusted(s) if out else ""}
 
 
 # ------------------------------------------------------------ 键鼠 (#42 #43): 同一套配色, 灯在下排
