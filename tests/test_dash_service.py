@@ -10,6 +10,11 @@ import dash_core as dc
 import dash_service as ds
 
 
+# 假时钟的起点: 钉在整分钟 (秒 = 0). 版面里的 "HH:MM" 变了会多推一帧, 起点要是取真时间, 碰上快到整分钟
+# 的那几秒, 测试中途分钟一跳就多推一帧, 偶发失败 (#62). 每次调用 time.time 才走 1 秒, 离下一分钟有 59 秒余量.
+T0 = time.mktime((2026, 10, 30, 14, 3, 0, 0, 0, -1))
+
+
 def _ctx(**over):
     ctx = {"now": time.time, "net": lambda: "on",   # 快照 ts 用真时间, 不然 layout 判成过期
            "rows": lambda: [{"label": "LAN2", "state": "OK"}],
@@ -133,7 +138,7 @@ def test_view_key_ignores_clock_and_stale():
     assert ds._view_key(a) != ds._view_key(c)
 
 
-def test_loop_pushes_only_on_change():
+def test_loop_pushes_only_on_change(tmp_path, monkeypatch):
     """同一版面连续几轮只推一次; 数据变了再推."""
     disp = FakeDisp()
     state = {"net": "on"}
@@ -141,15 +146,11 @@ def test_loop_pushes_only_on_change():
     class Stop(Exception):
         pass
 
-    rounds = {"n": 0}
-
     def ctx():
         return _ctx(**{"net": lambda: state["net"]})
 
     sleeps = {"n": 0}
-    t = {"v": 1000.0}
-
-    real_sleep = ds.time.sleep
+    t = {"v": T0}
 
     def fake_time():
         t["v"] += 1.0
@@ -162,22 +163,14 @@ def test_loop_pushes_only_on_change():
         if sleeps["n"] == 3:
             state["net"] = "warn"
 
-    ds.time.sleep = fake_sleep
-    real_time = ds.time.time
-    ds.time.time = fake_time
+    # 快照写进本测试自己的目录: 写死 /tmp 下的同一个文件, 并行跑的几个进程会互相 replace / unlink (#62)
+    monkeypatch.setattr(ds.time, "sleep", fake_sleep)
+    monkeypatch.setattr(ds.time, "time", fake_time)
     try:
-        ds.run(state_path="/tmp/_ds_test.json", ctx=ctx(), out=io.StringIO(),
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=ctx(), out=io.StringIO(),
                display_factory=lambda: FakeFactory(disp), render=lambda v: v["net"].encode())
     except Stop:
         pass
-    finally:
-        ds.time.sleep = real_sleep
-        ds.time.time = real_time
-        import os
-        try:
-            os.unlink("/tmp/_ds_test.json")
-        except OSError:
-            pass
     assert disp.sent == [b"on", b"warn"]
 
 
@@ -224,7 +217,7 @@ def test_loop_shows_boot_screen_until_kiosk_alive_and_again_when_it_dies(tmp_pat
         if n["round"] >= len(kiosk):
             raise Stop()
 
-    t = {"v": time.time()}
+    t = {"v": T0}
     monkeypatch.setattr(ds.time, "sleep", fake_sleep)
     monkeypatch.setattr(ds.time, "time", lambda: t.__setitem__("v", t["v"] + 1) or t["v"])
     try:
@@ -253,7 +246,7 @@ def test_loop_switches_theme_on_the_next_frame(tmp_path, monkeypatch):
         if n["round"] >= len(modes):
             raise Stop()
 
-    t = {"v": time.time()}
+    t = {"v": T0}
     monkeypatch.setattr(ds.time, "sleep", fake_sleep)
     monkeypatch.setattr(ds.time, "time", lambda: t.__setitem__("v", t["v"] + 1) or t["v"])
     try:
