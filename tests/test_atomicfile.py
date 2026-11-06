@@ -48,3 +48,10 @@ def test_failed_write_leaves_old_file_and_no_tmp(tmp_path):
         af.write_json(str(p), {"bad": object()})
     assert p.read_text() == '{"ok": 1}'
     assert os.listdir(tmp_path) == ["c.json"]
+
+
+def test_write_bytes_atomic(tmp_path):
+    p = tmp_path / "d" / "x.efi"
+    af.write_bytes(str(p), b"\x00MZ\xff")
+    assert p.read_bytes() == b"\x00MZ\xff" and _mode(p) == 0o644
+    assert os.listdir(p.parent) == ["x.efi"]
