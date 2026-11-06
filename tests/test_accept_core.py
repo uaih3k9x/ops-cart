@@ -459,7 +459,37 @@ def test_judge_memtest_missing_is_manual():
     assert st == M and "setup-memtest.sh" in why
 
 
-def test_judge_memtest_match_is_pass_and_mismatch_manual():
+def test_judge_memtest_match_is_pass_and_mismatch_fail():
+    """文件在但 sha256 不符 = 被换过或残缺: FAIL, 不是人工."""
     assert ac.judge_memtest("a" * 64, "A" * 64)[0] == P
     st, why = ac.judge_memtest("b" * 64, "a" * 64)
-    assert st == M and "setup-memtest.sh" in why
+    assert st == F and "setup-memtest.sh" in why
+
+
+def _cart_accept(monkeypatch, opt, py_out):
+    spec = importlib.util.spec_from_file_location("cart_accept_t", os.path.join(ROOT, "scripts", "cart_accept.py"))
+    ca = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ca)
+    monkeypatch.setattr(ca, "OPT", str(opt))
+    calls = []
+    monkeypatch.setattr(ca, "py", lambda code, **kw: (calls.append(code), py_out)[1])
+    return ca, calls
+
+
+@pytest.mark.parametrize("content,want", [(None, M), (b"memtest", P), (b"evil", F)])
+def test_cart_accept_memtest_file_wiring(tmp_path, monkeypatch, content, want):
+    """cart_accept 从 /opt/pxe 读 MEMTEST_EFI 和 MEMBER_SHA256, 拼 tftp/ 路径算 sha256 交给 judge_memtest."""
+    import hashlib
+    expect = hashlib.sha256(b"memtest").hexdigest()
+    ca, calls = _cart_accept(monkeypatch, tmp_path, (0, f"memtest/memtest64.efi {expect}", ""))
+    if content is not None:
+        (tmp_path / "tftp" / "memtest").mkdir(parents=True)
+        (tmp_path / "tftp" / "memtest" / "memtest64.efi").write_bytes(content)
+    assert ca.memtest_file()[0] == want
+    assert "MEMTEST_EFI" in calls[0] and "MEMBER_SHA256" in calls[0]
+
+
+def test_cart_accept_memtest_file_import_error_is_fail(tmp_path, monkeypatch):
+    ca, _ = _cart_accept(monkeypatch, tmp_path, (1, "", "ModuleNotFoundError: memtest_core"))
+    st, why = ca.memtest_file()
+    assert st == F and "memtest_core" in why

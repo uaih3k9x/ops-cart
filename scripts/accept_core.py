@@ -637,10 +637,10 @@ def judge_rapid(installed, rc, out):
 
 
 def judge_memtest(actual_sha, expect_sha):
-    """#55: tftp/memtest/memtest64.efi 的 sha256 (None = 没有) 对 memtest_core 钉的值. 没放或对不上只算人工:
-    菜单项照样出现, 选了会报找不到文件 / 跑的是旧版本."""
+    """#55: tftp/memtest/memtest64.efi 的 sha256 (None = 没有) 对 memtest_core 钉的值. 没放只算人工
+    (菜单项照样出现, 选了报找不到文件); 在但对不上 = 被换过或残缺, FAIL."""
     if actual_sha is None:
         return MANUAL, "tftp/memtest/memtest64.efi 没放: 菜单里的 Memtest86+ 选了会报找不到文件 (跑 scripts/setup-memtest.sh)"
     if actual_sha.lower() != (expect_sha or "").lower():
-        return MANUAL, "tftp/memtest/memtest64.efi 和 memtest_core 钉的版本对不上 (重跑 scripts/setup-memtest.sh)"
+        return FAIL, "tftp/memtest/memtest64.efi 和 memtest_core 钉的 sha256 对不上 (被换过或残缺, 重跑 scripts/setup-memtest.sh)"
     return PASS, "tftp/memtest/memtest64.efi 在, sha256 对得上"

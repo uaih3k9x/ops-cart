@@ -11,6 +11,7 @@ MEMBER_SHA256 是解出来那个文件的 sha256 (自己下载核对后填). 两
 
 import argparse
 import hashlib
+import http.client
 import io
 import os
 import re
@@ -105,7 +106,7 @@ def main(argv=None, fetch=fetch):
             print(f"下载 {ZIP_URL}")
             blob = fetch(ZIP_URL)
         path = install(blob, a.root)
-    except (ChecksumError, OSError, ValueError) as e:
+    except (ChecksumError, OSError, ValueError, http.client.HTTPException) as e:   # IncompleteRead 等不是 OSError
         print(f"中止, 没写任何文件: {e}", file=sys.stderr)
         return 1
     print(f"Memtest86+ {VERSION} 已写入 {path} (sha256 {MEMBER_SHA256})")

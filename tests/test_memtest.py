@@ -2,6 +2,7 @@
 部署时按固定版本下载, zip 整包和解出的文件各校验一次 sha256, 不符就中止、什么都不写."""
 
 import hashlib
+import http.client
 import io
 import pathlib
 import re
@@ -79,7 +80,7 @@ def test_disarm_rewrites_pxelinux_default_with_current_ip(tmp_path, monkeypatch)
 
 
 def test_disarm_scrubs_unlock_menus_under_pxelinux_cfg(tmp_path, monkeypatch):
-    """推车不生成按 MAC/IP 命名的 pxelinux 配置; 手工放进来带装机/WinPE/克隆的一律删, 别的不动."""
+    """推车不生成按 MAC/IP 命名的 pxelinux 配置; default 以外的不看内容一律删 (审查第二轮)."""
     env = tmp_path / "pxe.env"
     env.write_text("PXE_IP=198.51.100.1\n")
     monkeypatch.setattr(kc, "PXE_ENV", str(env))
@@ -89,7 +90,7 @@ def test_disarm_scrubs_unlock_menus_under_pxelinux_cfg(tmp_path, monkeypatch):
     (d / "C0000201").write_text("LABEL c\n KERNEL clonezilla/vmlinuz\n")
     (d / "notes").write_text("LABEL r\n KERNEL vmlinuz\n APPEND inst.rescue\n")
     kc.pxe_disarm(root=tmp_path, path=tmp_path / "pxe-mode.json")
-    assert sorted(p.name for p in d.iterdir()) == ["default", "notes"]
+    assert sorted(p.name for p in d.iterdir()) == ["default"]
     assert not ps.unlock_only_menu((d / "default").read_text())
 
 
@@ -207,6 +208,16 @@ def test_main_aborts_on_bad_checksum(fake_release, tmp_path, capsys):
     rc = mt.main(["--root", str(tmp_path)], fetch=lambda url: b"evil")
     assert rc != 0 and not (tmp_path / ps.MEMTEST_EFI).exists()
     assert "sha256" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("exc", [http.client.IncompleteRead(b"abc", 100), http.client.BadStatusLine("x")])
+def test_main_aborts_on_http_exception(fake_release, tmp_path, capsys, exc):
+    """连接中途断 (IncompleteRead) 等 http.client 异常不是 OSError: 也按约定中止, 不抛栈."""
+    def boom(url):
+        raise exc
+    rc = mt.main(["--root", str(tmp_path)], fetch=boom)
+    assert rc == 1 and not (tmp_path / ps.MEMTEST_EFI).exists()
+    assert "中止" in capsys.readouterr().err
 
 
 def test_main_zip_over_limit_aborts(fake_release, tmp_path, monkeypatch, capsys):

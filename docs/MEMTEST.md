@@ -49,8 +49,11 @@ sudo bash scripts/setup-memtest.sh       # 在拷到推车上的仓库目录里�
 
 仓库只管菜单：`pxelinux.cfg/default` 由 `pxe_disarm` 写（车机开机 / 上锁，以及 `setup-cart.sh` 调的
 `kiosk_core.py --write-rescue`）。**BIOS 菜单只用 `pxelinux.cfg/default`，推车不生成按 MAC / IP 命名的 pxelinux 配置**，
-解锁用途（装机、WinPE、克隆）都只给 UEFI 的 GRUB。TFTP 发 pxelinux 配置时不像 `grub.cfg*` 那样再核一遍装机模式，
-所以上锁时 `pxelinux.cfg/` 下除 `default` 以外、带装机 / WinPE / 克隆项的文件（只可能是手工放的）会被删掉。
+解锁用途（装机、WinPE、克隆）都只给 UEFI 的 GRUB。所以 pxelinux 路径上：
+- 上锁时 `pxelinux.cfg/` 下除 `default` 以外的文件（只可能是手工放的）**不看内容一律删掉**；
+- TFTP / HTTP 对 `pxelinux.cfg/` 下 `default` 以外的请求一律回找不到，pxelinux 会落到 `default`；
+- `default` 内容疑似装机或链式加载（`pxeserver.pxelinux_suspect`）时，TFTP 换发救援菜单，HTTP 回 403；
+- 上锁时 `default` 写失败（如 `pxelinux.cfg` 被占成普通文件、只读）不拖住上锁，只记一条 pxe 事件。
 **`pxelinux.0` 和 `ldlinux.c32` 要另放**到 tftp 根（Rocky 9 的 `syslinux-nonlinux` 包，`/usr/share/syslinux/` 下），
 还没收进部署脚本。注意：
 

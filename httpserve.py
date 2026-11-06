@@ -11,6 +11,7 @@
   MAC (恢复一批时是 pxe-mode.json 的 macs 名单, pxeserver.install_allowed 判断);
   boot.ipxe、win/、clonezilla/ 不拦 (PE / live 系统本身不动硬盘, 写不写盘全看菜单里的参数;
   而且菜单被取走就上锁, 之后还得取得到)
+- pxelinux.cfg/ (#55): default 以外一律 404; default 内容疑似装机 (pxeserver.pxelinux_suspect) 403
 - *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希) 永远 404
 
 这是防"误装"的核对, 不是访问控制: MAC 头 (和 TFTP 的文件名一样) 是客户端自己报的, LAN1 上能抓到
@@ -28,7 +29,7 @@ import sys
 import time
 
 from pxeserver import (PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
-                       unlock_only_menu)
+                       pxelinux_cfg_gate, pxelinux_suspect, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -69,6 +70,21 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
         if ".bak" in base:
             self.send_error(404, "File not found")
             return None
+        cfg = pxelinux_cfg_gate(os.path.abspath(self.directory), path)
+        if cfg is not None and cfg != "default":
+            self.send_error(404, "File not found")
+            return None
+        if cfg == "default" and os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    suspect = pxelinux_suspect(f.read(64 * 1024).decode("utf-8", "replace"))
+            except OSError:
+                suspect = True
+            if suspect:
+                log.warning("拒绝 %s 取 pxelinux.cfg/default: 内容像装机, 不是推车写的救援菜单",
+                            self.client_address[0])
+                self.send_error(403, "Install mode is locked")
+                return None
         if is_ks(base):
             mode = pxe_mode(self.pxe_mode_path, self.now())
             macs = request_macs(self.headers)

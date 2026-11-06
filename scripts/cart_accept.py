@@ -139,6 +139,16 @@ def sha256(path):
     return h.hexdigest()
 
 
+def memtest_file():
+    """#55: 推车上装的 memtest_core 钉的 sha256 对 tftp/ 下实际文件."""
+    rc, out, e = py("import memtest_core as m, pxeserver as p; print(p.MEMTEST_EFI, m.MEMBER_SHA256)")
+    if rc != 0 or len(out.split()) != 2:
+        return ac.FAIL, f"memtest_core 读不了: {last_err(e) or out}"
+    rel, want = out.split()
+    path = f"{OPT}/tftp/{rel}"
+    return ac.judge_memtest(sha256(path) if os.path.isfile(path) else None, want)
+
+
 @functools.lru_cache(maxsize=None)
 def units_show():
     rc, out, err = sh(["systemctl", "show", "-p", ac.SHOW_PROPS] + sorted(ac.UNITS))
@@ -652,14 +662,6 @@ def issue_checks(expect_version):
         if miss:
             return ac.MANUAL, f"tftp/{d}/ 缺 {', '.join(miss)}: 克隆解锁会被拒 (见 docs/CLONE.md)"
         return ac.PASS, f"tftp/{d}/ 三个文件都在"
-
-    def memtest_file():
-        rc, out, e = py("import memtest_core as m, pxeserver as p; print(p.MEMTEST_EFI, m.MEMBER_SHA256)")
-        if rc != 0:
-            return ac.FAIL, f"memtest_core 读不了: {last_err(e)}"
-        rel, want = out.split()
-        path = f"{OPT}/tftp/{rel}"
-        return ac.judge_memtest(sha256(path) if os.path.isfile(path) else None, want)
 
     def netmode():
         doc, err = load_json("/var/lib/ops-cart/netmode.json")
