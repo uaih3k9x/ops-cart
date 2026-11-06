@@ -26,6 +26,7 @@ class FakeEngine:
         self.calls.append(("feed", ch))
         self.raw += ch
         self.page_no = 0
+        return True
 
     def backspace(self):
         self.calls.append(("backspace",))
@@ -68,8 +69,7 @@ class FakeEngine:
 
 def _zh():
     ime = ic.Ime()
-    ime.set_engine(FakeEngine())
-    ime.zh = True
+    ime.set_engine(FakeEngine(), zh=True)
     return ime
 
 
@@ -237,7 +237,7 @@ def test_first_toggle_without_engine_asks_for_one():
     assert r.need_engine and not ime.zh and ime.status == "loading"
     ime.press("Shift_L", "", 0)                       # 还在加载: 再按不重复要
     assert not ime.release("Shift_L").need_engine
-    ime.set_engine(FakeEngine())
+    ime.set_engine(FakeEngine(), zh=True)
     assert ime.zh and ime.status == "ready"
 
 
@@ -258,7 +258,7 @@ def test_engine_errors_degrade_to_unavailable():
         def feed(self, ch):
             raise OSError("段错误前的最后一声")
     ime = ic.Ime()
-    ime.set_engine(Broken())
+    ime.set_engine(Broken(), zh=True)
     r = ime.press("n", "n", 0)
     assert not r.consume and ime.status == "unavailable" and not ime.zh and "最后一声" in ime.reason
 
@@ -273,3 +273,69 @@ def test_close_closes_engine():
 def test_view_english():
     v = ic.Ime().view()
     assert v["mode"] == "en" and not v["composing"] and v["candidates"] == []
+
+
+# ------------------------------------------------------------ #72 审查: 吞键 / 默认不自动切 / 崩了能重开
+
+class Dead:
+    """方案没加载: process_key 不认, 不进拼音, 也不上屏."""
+
+    def __init__(self, handled=False):
+        self.handled, self.closed = handled, False
+
+    def feed(self, c):
+        return self.handled
+
+    def snapshot(self):
+        return ic.Snapshot("", "", [], 0, True, 0)
+
+    def take_commit(self):
+        return None
+
+    def clear(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("handled", [False, True])
+def test_dead_engine_does_not_swallow_letters(handled):
+    ime = ic.Ime()
+    eng = Dead(handled)
+    ime.set_engine(eng, zh=True)
+    r = ime.press("a", "a", 0)
+    assert not r.consume and ime.status == "unavailable" and not ime.zh and eng.closed
+    assert "方案" in ime.reason
+    assert not ime.press("b", "b", 0).consume
+
+
+def test_set_engine_keeps_mode_by_default():
+    ime = ic.Ime()
+    ime.set_engine(FakeEngine())
+    assert not ime.zh and ime.status == "ready"
+
+
+def test_crash_allows_limited_reopen():
+    class Crash(FakeEngine):
+        def feed(self, ch):
+            raise OSError("子进程退出了")
+    ime = ic.Ime()
+    for n in range(ic.MAX_REOPEN):
+        ime.set_engine(Crash(), zh=True)
+        assert not ime.press("n", "n", 0).consume and ime.status == "unavailable"
+        ime.press("Shift_L", "", 0)
+        assert ime.release("Shift_L").need_engine, n          # 运行时崩了: 下次 Shift 再开
+    ime.set_engine(Crash(), zh=True)
+    ime.press("n", "n", 0)
+    ime.press("Shift_L", "", 0)
+    assert not ime.release("Shift_L").need_engine             # 次数用完: 一直英文
+
+
+def test_open_failure_does_not_reopen():
+    ime = ic.Ime()
+    ime.press("Shift_L", "", 0)
+    ime.release("Shift_L")
+    ime.set_unavailable("没有词库")
+    ime.press("Shift_L", "", 0)
+    assert not ime.release("Shift_L").need_engine

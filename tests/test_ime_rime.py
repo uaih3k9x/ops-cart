@@ -114,7 +114,7 @@ def test_real_librime_roundtrip(tmp_path, monkeypatch):
     assert eng is not None, why
     try:
         ime = ic.Ime()
-        ime.set_engine(eng)
+        ime.set_engine(eng, zh=True)
         for ch in "nihao":
             assert ime.press(ch, ch, 0).consume
         v = ime.view()
@@ -146,8 +146,7 @@ def test_undeployed_schema_is_unavailable(tmp_path, monkeypatch):
     """方案没部署 (没列进 schema_list): select_schema 照样成功、按键全不认, 所以先看 build/ 里有没有."""
     (tmp_path / "s").mkdir()
     closed = []
-    api = {"create_session": lambda: 7, "destroy_session": lambda sid: closed.append(sid),
-           "select_schema": lambda sid, s: 1, "set_option": lambda *a: None}
+    api = _fake_api(closed)
     monkeypatch.setattr(ir, "_ensure", lambda shared, user: api)
     eng, why = ir.open_engine(shared_dir=str(tmp_path / "s"), user_dir=str(tmp_path / "u"), schema="rime_ice")
     assert eng is None and "rime_ice" in why and "没部署" in why and closed == [7]
@@ -155,3 +154,32 @@ def test_undeployed_schema_is_unavailable(tmp_path, monkeypatch):
     (tmp_path / "u" / "build" / "rime_ice.schema.yaml").write_text("x")
     eng, why = ir.open_engine(shared_dir=str(tmp_path / "s"), user_dir=str(tmp_path / "u"), schema="rime_ice")
     assert eng is not None and why == ""
+
+
+
+def _fake_api(closed, schema_id=b"rime_ice"):
+    def get_status(sid, ref):
+        ref._obj.schema_id = schema_id
+        return 1
+    return {"create_session": lambda: 7, "destroy_session": lambda sid: closed.append(sid),
+            "select_schema": lambda sid, s: 1, "set_option": lambda *a: None,
+            "get_status": get_status, "free_status": lambda ref: 1}
+
+
+def test_default_schema_also_checked(tmp_path, monkeypatch):
+    """没指定方案时用 get_status 看当前方案, 一样检查部署产物 (#72: 没部署就会吞键)."""
+    (tmp_path / "s").mkdir()
+    closed = []
+    monkeypatch.setattr(ir, "_ensure", lambda shared, user: _fake_api(closed))
+    eng, why = ir.open_engine(shared_dir=str(tmp_path / "s"), user_dir=str(tmp_path / "u"))
+    assert eng is None and "rime_ice" in why and closed == [7]
+    monkeypatch.setattr(ir, "_ensure", lambda shared, user: _fake_api(closed, schema_id=None))
+    eng, why = ir.open_engine(shared_dir=str(tmp_path / "s"), user_dir=str(tmp_path / "u"))
+    assert eng is None and "方案" in why
+
+
+def test_feed_returns_process_key_result():
+    eng = ir.RimeEngine({"process_key": lambda sid, code, mask: 0}, 7)
+    assert eng.feed("a") is False
+    eng = ir.RimeEngine({"process_key": lambda sid, code, mask: 1}, 7)
+    assert eng.feed("a") is True

@@ -54,6 +54,12 @@ class RimeContext(ctypes.Structure):
                 ("commit_text_preview", _cp), ("select_labels", ctypes.POINTER(_cp))]
 
 
+class RimeStatus(ctypes.Structure):
+    _fields_ = [("data_size", _c_int), ("schema_id", _cp), ("schema_name", _cp), ("is_disabled", _c_int),
+                ("is_composing", _c_int), ("is_ascii_mode", _c_int), ("is_full_shape", _c_int),
+                ("is_simplified", _c_int), ("is_traditional", _c_int), ("is_ascii_punct", _c_int)]
+
+
 class RimeCommit(ctypes.Structure):
     _fields_ = [("data_size", _c_int), ("text", _cp)]
 
@@ -115,6 +121,7 @@ _SIGS = {   # 名字: (返回, 参数...)
     "get_context": (_c_int, _sid, ctypes.POINTER(RimeContext)),
     "free_context": (_c_int, ctypes.POINTER(RimeContext)),
     "set_option": (None, _sid, _cp, _c_int), "select_schema": (_c_int, _sid, _cp),
+    "get_status": (_c_int, _sid, ctypes.POINTER(RimeStatus)), "free_status": (_c_int, ctypes.POINTER(RimeStatus)),
 }
 _OPTIONAL = {"get_input": (_cp, _sid), "get_version": (_cp,),
              "select_candidate_on_current_page": (_c_int, _sid, _sid)}
@@ -189,10 +196,11 @@ class RimeEngine:
         self.api, self.sid = api, session
 
     def _key(self, code):
-        self.api["process_key"](self.sid, code, 0)
+        return bool(self.api["process_key"](self.sid, code, 0))
 
     def feed(self, ch):
-        self._key(ord(ch))
+        """-> librime 认没认这个键 (方案没加载时一律 False)."""
+        return self._key(ord(ch))
 
     def backspace(self):
         self._key(_BACKSPACE)
@@ -234,6 +242,15 @@ class RimeEngine:
         finally:
             self.api["free_commit"](ctypes.byref(c))
 
+    def schema_id(self):
+        st = _init(RimeStatus)
+        if not self.api["get_status"](self.sid, ctypes.byref(st)):
+            return ""
+        try:
+            return _s(st.schema_id)
+        finally:
+            self.api["free_status"](ctypes.byref(st))
+
     def close(self):
         if self.sid:
             self.api["destroy_session"](self.sid)
@@ -253,13 +270,17 @@ def open_engine(shared_dir=None, user_dir=None, schema=None):
         if not sid:
             return None, "中文输入不可用: librime 开不了会话 (方案没部署成功? 看 stderr 里的 librime 日志)"
         eng = RimeEngine(api, sid)
-        if schema:
-            # 没列进 schema_list 的方案不会部署, select_schema 照样返回成功, 之后按键全不认; 先看部署产物在不在
-            built = [os.path.join(d, "build", schema + ".schema.yaml") for d in (user_dir, shared_dir)]
-            if not any(os.path.exists(b) for b in built) or not api["select_schema"](sid, schema.encode()):
-                eng.close()
-                return None, (f"中文输入不可用: 方案 {schema} 没部署 (要列进 default.custom.yaml 的 schema_list, "
-                              f"或者词库里没有它)")
+        if schema and not api["select_schema"](sid, schema.encode()):
+            eng.close()
+            return None, f"中文输入不可用: 选不了方案 {schema}"
+        # 没列进 schema_list 的方案不会部署, select_schema 照样返回成功, 之后按键全不认; 默认方案部署失败也一样.
+        # 所以不管指没指定, 都看当前方案的部署产物在不在
+        cur = schema or eng.schema_id()
+        built = [os.path.join(d, "build", f"{cur}.schema.yaml") for d in (user_dir, shared_dir)] if cur else []
+        if not any(os.path.exists(b) for b in built):
+            eng.close()
+            return None, (f"中文输入不可用: 方案 {cur or '(没有)'} 没部署 (要列进 default.custom.yaml 的 "
+                          f"schema_list, 或者词库里没有它 / 部署失败)")
         api["set_option"](sid, b"ascii_mode", 0)       # 中英由 ime_core 管, librime 自己保持中文
         return eng, ""
     except Exception as e:

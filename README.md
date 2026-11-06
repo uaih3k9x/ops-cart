@@ -59,7 +59,7 @@
 | [`netmode_panel.py`](netmode_panel.py) · [`netmode_core.py`](netmode_core.py) | 网口模式(#12):LAN1 / LAN2 每个口一个模式(关闭 / DHCP / 静态),切换 = undo 当前 → apply 新,失败撤新的、恢复原来的,再不行落到干净状态(LAN1 关闭、LAN2 DHCP);每个模式记下自己建的 `cart-` 连接(按 uuid)和改过的内核参数原值,状态写 `/var/lib/ops-cart/netmode.json`;第一次接管一个口时,新模式起来后把这个口上的旧连接备份到 `/var/lib/ops-cart/nm-backup/` 再删(备份不成就不删);网关一直能填,主出口只有 Wi-Fi,LAN2 填了网关自动当备用出口(metric 排在 Wi-Fi 后面,常量在 `wifi_core`,#7 共用),LAN1 永不当出口、网关只走「经网关去的网段」;无线永远不碰。设计见 [`docs/NETMODE.md`](docs/NETMODE.md) |
 | [`netprof_core.py`](netprof_core.py) | 网口共用小件:认旧连接名、静态地址校验 `static_form` / 按对端预填(不猜 /24)、DHCP 探测(没插线不探测,结果算"未知";pxeserver 守卫用) |
 | [`wol_panel.py`](wol_panel.py) · [`wol_core.py`](wol_core.py) | 网络唤醒:常用目标清单 + 临时输 MAC,从选定网口广播魔术包 |
-| [`ime_tk.py`](ime_tk.py) · [`ime_core.py`](ime_core.py) · [`ime_rime.py`](ime_rime.py) | 车机中文输入:librime(ctypes)+ Tk 自绘候选栏,Shift 切中英;没装 librime 就只打英文。目前只接了网络唤醒的"名字"框,见 [`docs/IME_RIME.md`](docs/IME_RIME.md) |
+| [`ime_tk.py`](ime_tk.py) · [`ime_core.py`](ime_core.py) · [`ime_proc.py`](ime_proc.py) · [`ime_worker.py`](ime_worker.py) · [`ime_rime.py`](ime_rime.py) | 车机中文输入:librime(ctypes,放沙箱子进程)+ Tk 自绘候选栏,Shift 切中英;没装 librime 就只打英文。目前只接了网络唤醒的"名字"框,见 [`docs/IME_RIME.md`](docs/IME_RIME.md) |
 | [`atomicfile.py`](atomicfile.py) | 防断电写文件:临时文件 → fsync → 改名,配置要么旧要么新 |
 | [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
 | [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版远程管理口(标准库 http.server + xterm.js);单独的 `webkiosk.service`,专用用户 `ops-web`,默认不开机自启 |
