@@ -354,3 +354,11 @@ def test_open_engine_unexpected_exception_kills(monkeypatch, fake):
     monkeypatch.setattr(ip.ProcEngine, "kill", lambda self: (killed.append(1), real_kill(self)))
     eng, why = ip.open_engine(cmd=fake("ok"))
     assert eng is None and "RecursionError" in why and killed
+
+
+def test_reply_drops_lone_surrogates():
+    """json 能解出孤立代理字符 (\\ud800); 插进 Tk 会出错, 清洗时去掉."""
+    eng = _engine_replying(json.loads('{"ok": true, "handled": true, "commit": "\\ud800\u4f60", '
+                                      '"snap": ["n\\udfff", "n", ["\\ud83d\u597d"], 0, true, 0]}'))
+    eng.feed("n")
+    assert eng.take_commit() == "你" and eng.snapshot().raw == "n" and eng.snapshot().candidates == ["好"]

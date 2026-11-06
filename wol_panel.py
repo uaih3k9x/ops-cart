@@ -50,6 +50,8 @@ class WolPanel(tk.Frame):           # 只发一个 UDP 广播, 不跑外部命�
             e = tk.Entry(row, textvariable=var, width=w, font=FONT_MONO, bg=th.BG, fg=FG,
                          insertbackground=FG, **th.SUNKEN)
             e.pack(side="left", padx=6, ipady=3)
+            if var is self.mac_var:
+                e.no_ime = True             # MAC 要人亲手敲 (中文输入的 NO_IME 约定)
             if var is self.name_var:        # 名字可以是中文 (#54 示范接入): Shift 切中英, 没有 librime 就只能英文
                 self.name_ime = ime_tk.attach(e, purpose="wol.name", font=FONT, bg=BOX, fg=FG)
         e.bind("<Return>", lambda _e: self.wake_form())

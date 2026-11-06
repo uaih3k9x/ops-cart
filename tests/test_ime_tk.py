@@ -64,6 +64,9 @@ class FakeEntry:
     def bind_class(self, tag, seq, fn):
         self.class_binds[(tag, seq)] = fn
 
+    def unbind_class(self, tag, seq):
+        self.class_binds.pop((tag, seq), None)
+
     def bind(self, seq, fn, add=None):
         self.binds[seq] = fn
 
@@ -94,6 +97,9 @@ class FakeLabel:
 
     def lift(self):
         pass
+
+    def destroy(self):
+        self.destroyed = True
 
 
 def _ev(keysym, char="", state=0):
@@ -273,17 +279,68 @@ def test_no_ime_marked_entry_refused():
         it.ImeEntry(e, "x.y", **kw)
 
 
-# 已知"要人亲手敲"的输入框打 no_ime 标记 (运行时兜底): 文件 -> 至少几处
-NO_IME = {"kiosk.py": 3, "pxe_req_panel.py": 1, "serial_panel.py": 1, "netmode_panel.py": 1}
+# kiosk.py 太大不好实例化, 还按源码数; 面板都实例化, 逐个看输入框
+NO_IME_SRC = {"kiosk.py": 3}
 
 
-def test_safety_entries_are_marked_no_ime():
+def test_kiosk_safety_entries_are_marked_no_ime():
     import os
     import re
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for name, n in NO_IME.items():
+    for name, n in NO_IME_SRC.items():
         src = open(os.path.join(root, name), encoding="utf-8").read()
-        assert len(re.findall(r"\.no_ime = True", src)) >= n, name
+        assert len(re.findall(r"\.no_ime = True", src)) == n, name
+
+
+@pytest.fixture
+def tkroot(monkeypatch):
+    tk = pytest.importorskip("tkinter")
+    try:
+        r = tk.Tk()
+    except tk.TclError:
+        pytest.skip("没有显示")
+    r.withdraw()
+    import wifi_panel
+    monkeypatch.setattr(wifi_panel, "_run", lambda *a, **k: (1, "", "测试里不跑命令"))
+    yield r
+    r.destroy()
+
+
+def _entries(w):
+    import tkinter as tk
+    out, stack = [], [w]
+    while stack:
+        x = stack.pop()
+        stack.extend(x.winfo_children())
+        if isinstance(x, tk.Entry):
+            out.append(x)
+    return out
+
+
+def _panels():
+    import ks_panel
+    import netmode_panel
+    import serial_panel
+    import wifi_panel
+    import wol_panel
+    return {"wol": wol_panel.WolPanel, "ks": ks_panel.KsPanel, "wifi": wifi_panel.WifiPanel,
+            "netmode": netmode_panel.NetModePanel, "serial": serial_panel.SerialPanel}
+
+
+@pytest.mark.parametrize("name", ["wol", "ks", "wifi", "netmode", "serial"])
+def test_panel_entries_are_password_ime_or_no_ime(tkroot, name):
+    """面板里每个输入框: 密码框 (show=)、接了中文的那一个 (白名单), 其余必须标 no_ime; 接了中文的不许标."""
+    panel = _panels()[name](tkroot)
+    attached = getattr(getattr(panel, "name_ime", None), "entry", None)
+    entries = _entries(panel)
+    assert entries
+    for e in entries:
+        if e is attached:
+            assert not getattr(e, "no_ime", False)
+        elif not e.cget("show"):
+            assert getattr(e, "no_ime", False) is True, (name, e.cget("textvariable"))
+    if name == "wol":
+        assert attached is not None and attached in entries
 
 
 def test_attach_requires_purpose():
@@ -359,3 +416,83 @@ def test_kiosk_counts_ime_input_as_activity():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src = open(os.path.join(root, "kiosk.py"), encoding="utf-8").read()
     assert it.INPUT_EVENT in src and "_note_input" in src
+
+
+# ------------------------------------------------------------ #72 第三轮
+
+def test_consumed_key_returns_break_even_if_insert_fails():
+    e, w, press, release = _attach(lambda: (FakeEngine(), ""))
+    _shift(e, w, press, release)
+    for ch in "ni":
+        press(_ev(ch, ch))
+
+    def boom(idx, s):
+        raise RuntimeError("Tcl 不收")
+    e.insert = boom
+    assert press(_ev("Return", "\r")) == "break"           # 回车绝不漏给输入框
+
+
+def test_close_destroys_labels_and_unbinds():
+    e, w, _p, _r = _attach(lambda: (FakeEngine(), ""))
+    w.close()
+    w.close()
+    assert w.bar.destroyed and w.mode.destroyed
+    assert (w.tag, "<KeyPress>") not in e.class_binds and (w.tag, "<KeyRelease>") not in e.class_binds
+
+
+def test_reopening_panel_does_not_accumulate(tkroot):
+    import tkinter as tk
+    before = len(tkroot.winfo_children())
+    tags = []
+    for _ in range(5):
+        f = tk.Frame(tkroot)
+        ent = tk.Entry(f)
+        w = it.attach(ent, purpose="test.demo", opener=lambda: (FakeEngine(), ""), spawn=lambda fn: None)
+        assert w is not None
+        tags.append(w.tag)
+        f.destroy()                                         # 关面板 -> <Destroy> -> close
+    tkroot.update_idletasks()
+    assert len(tkroot.winfo_children()) == before
+    assert all(tkroot.bind_class(t) == "" or tkroot.bind_class(t) == () for t in tags)
+
+
+def test_close_after_engine_arrived_before_poll_closes_it_at_once():
+    """引擎到了 (_result 写好) 但 _poll 还没跑, 这时关: close 当场关掉, 不靠之后的 _poll."""
+    eng = FakeEngine()
+    e = FakeEntry()
+    w = it.ImeEntry(e, "test.demo", opener=lambda: (eng, ""), label=FakeLabel, spawn=lambda f: f(),
+                    clock=lambda: 0.0)
+    press, release = e.class_binds[(w.tag, "<KeyPress>")], e.class_binds[(w.tag, "<KeyRelease>")]
+    press(_ev("Shift_L"))
+    release(_ev("Shift_L"))                                 # _open 同步跑完, _poll 还在 afters 里
+    w.close()
+    assert eng.closed
+    while e.afters:
+        e.afters.pop(0)()
+    assert w.ime.engine is None
+
+
+@pytest.mark.parametrize("order", ["close_first", "result_first"])
+def test_engine_closed_exactly_once(order):
+    closes = []
+
+    class E(FakeEngine):
+        def close(self):
+            closes.append(1)
+    eng = E()
+    holder = {}
+    e = FakeEntry()
+    w = it.ImeEntry(e, "test.demo", opener=lambda: (eng, ""), label=FakeLabel,
+                    spawn=lambda f: holder.setdefault("f", f), clock=lambda: 0.0)
+    press, release = e.class_binds[(w.tag, "<KeyPress>")], e.class_binds[(w.tag, "<KeyRelease>")]
+    press(_ev("Shift_L"))
+    release(_ev("Shift_L"))
+    if order == "close_first":
+        w.close()
+        holder["f"]()
+    else:
+        holder["f"]()
+        w.close()
+    while e.afters:
+        e.afters.pop(0)()
+    assert closes == [1]

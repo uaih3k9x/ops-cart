@@ -72,6 +72,7 @@ class ImeEntry:
         self.ime = ime_core.Ime()
         self._result, self._notice = None, ""          # _notice: 不可用的原因, 显示到下一次按键
         self._closed, self._asked_at, self._typed = False, 0.0, False
+        self._lock = threading.Lock()                  # _result / _closed: 后台 _open 和主线程 close 之间
         _seq[0] += 1
         self.tag = f"OpsCartIme{_seq[0]}"
         top = entry.winfo_toplevel()
@@ -93,16 +94,16 @@ class ImeEntry:
         if ev.keysym not in ("Shift_L", "Shift_R"):
             self._typed = True
         r = self.ime.press(ev.keysym, ev.char, ev.state)
-        if r.commit:
-            self.entry.insert("insert", r.commit)
-        self._redraw()
-        if not r.consume:
-            return None
         try:
-            self.entry.event_generate(INPUT_EVENT)
+            if r.commit:
+                self.entry.insert("insert", r.commit)
+            self._redraw()
+            if r.consume:
+                self.entry.event_generate(INPUT_EVENT)
         except Exception:
-            pass
-        return "break"
+            if not r.consume:
+                raise
+        return "break" if r.consume else None      # 吃掉的键 (含回车) 出了错也绝不漏给输入框
 
     def _release(self, ev):
         r = self.ime.release(ev.keysym)
@@ -121,18 +122,27 @@ class ImeEntry:
             res = self.opener()
         except Exception as e:
             res = (None, f"中文输入不可用: {type(e).__name__}: {e}")
-        if self._closed and res[0] is not None:      # 加载期间输入框没了: 拿到的引擎直接关, 不留子进程
-            res[0].close()
-            res = (None, "输入框已关闭")
-        self._result = res
+        with self._lock:                             # 先写结果再看 _closed: close 在哪一刻发生都只关一次
+            self._result = res
+            closed = self._closed
+        if closed:
+            self._discard()
+
+    def _discard(self):
+        """关掉已经到了、还没交给 ime 的引擎 (只关一次)."""
+        with self._lock:
+            res, self._result = self._result, (None, "输入框已关闭")
+        if res and res[0] is not None:
+            try:
+                res[0].close()
+            except Exception:
+                pass
 
     def _poll(self):
         if self._result is None and not self._closed:
             self.entry.after(100, self._poll)
             return
-        if self._closed:                    # 输入框已经没了: 引擎到了也直接关掉 (之后再到的由 _open 关)
-            if self._result and self._result[0] is not None:
-                self._result[0].close()
+        if self._closed:                    # 输入框已经没了: close / _open 已经关掉引擎
             return
         eng, why = self._result
         if eng is not None:
@@ -159,11 +169,25 @@ class ImeEntry:
             self.bar.place_forget()
 
     def close(self):
-        self._closed = True
+        with self._lock:
+            already, self._closed = self._closed, True
+        self._discard()
         try:
             self.ime.close()
         except Exception:
             pass
+        if already:
+            return
+        for seq in ("<KeyPress>", "<KeyRelease>"):     # 面板反复开关不累积绑定和控件
+            try:
+                self.entry.unbind_class(self.tag, seq)
+            except Exception:
+                pass
+        for w in (self.bar, self.mode):
+            try:
+                w.destroy()
+            except Exception:
+                pass
 
 
 def attach(entry, purpose, **kw):

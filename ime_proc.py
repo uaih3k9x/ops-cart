@@ -11,6 +11,7 @@ librime 是 C++, 在 kiosk (root) 进程里崩了会带崩车机, 还可能把 s
 
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -42,6 +43,7 @@ _SANDBOX = ("DynamicUser=yes", "StateDirectory=ops-cart-ime", "PrivateNetwork=ye
             "RuntimeMaxSec=900")
 _unit_seq = [0]
 _CTRL = {c: None for c in list(range(0x20)) + [0x7f]}
+_SURROGATE = re.compile("[\ud800-\udfff]")       # json 能解出孤立代理字符, 插进 Tk 会出错
 
 
 def _own_cgroup():
@@ -70,7 +72,7 @@ def _kill_unit(unit):
 
 
 def _clean(s, n):
-    return str(s).translate(_CTRL)[:n]
+    return _SURROGATE.sub("", str(s).translate(_CTRL))[:n]
 
 
 def worker_cmd():
