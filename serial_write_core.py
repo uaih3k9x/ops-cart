@@ -184,7 +184,7 @@ _PROMPT = {
                         r"|[a-z]{0,4}sh-\d+(?:\.\d+)*)?[#$]"),
 }
 _MARK = re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\n]*\]")                       # conbroker 自己写进日志的标记行
-_ESC = re.compile(r"\x1b\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)"                    # OSC (改窗口标题等) 整段剥掉
+_ESC = re.compile(r"\x1b\][^\x07\x1b\n]{0,512}(?:\x07|\x1b\\)"                  # OSC (改窗口标题等) 整段剥掉, 不跨行
                   "|" + serial_core._CSI.pattern.decode("ascii") + r"|\x1b.?")    # ANSI 转义 (同 serial_core), 再兜底孤立 ESC
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")                                    # 其余控制字符 (\t \n 之外)
 _PAGER = re.compile(r"-{2,}\s*More\s*-{2,}(?:\s*\(\d{1,3}%\))?", re.I)               # --More-- / ---- More ----
@@ -210,12 +210,13 @@ _ANSWER_NAMES = {"y", "n", "yes", "no", "ok", "continue", "confirm", "proceed", 
                  "delete", "all", "none", "default", "quit", "exit"}
 _BOOT_NAMES = {"u-boot", "uboot", "boot", "grub", "loader", "bootloader", "bootrom", "rommon", "cfe", "pmon",
                "redboot", "ipxe", "efi", "shell"}
-_NAME = re.compile(r"[<\[][~*]?(.*?)[>\]]|(.*?)(?:\([^()]*\))?[#>$]")
+_NAME = re.compile(r"[<\[][~*]?(.*?)[>\]]|(.*?)(?:\(([^()]*)\))?[#>$]")
 
 
-def _prompt_name(line):
+def _prompt_names(line):
+    """提示符的名字和括号里的部分 (Reboot(y)> -> {"reboot", "y"}), 都小写."""
     m = _NAME.fullmatch(line)
-    return ((m.group(1) if m.group(1) is not None else m.group(2)) or "").strip().lower() if m else ""
+    return {(g or "").strip().lower() for g in m.groups() if g is not None} if m else {""}
 
 
 def at_any_prompt(line, vendor=None):
@@ -228,7 +229,7 @@ def at_any_prompt(line, vendor=None):
     pats = [_PROMPT[vendor]] if vendor in _PROMPT else list(_PROMPT.values())
     if not any(p.fullmatch(line) for p in pats):
         return False
-    return _prompt_name(line) not in _ANSWER_NAMES | _BOOT_NAMES
+    return not (_prompt_names(line) & (_ANSWER_NAMES | _BOOT_NAMES))
 
 
 def slot_vendor(slot, rules, text):
@@ -317,7 +318,7 @@ KEYS = {
 _YN = r"\[?(?:y(?:es)?|n(?:o)?)\]?"
 _CONFIRM_PROMPT = re.compile(
     r"\[confirm\]"                                     # 思科 Proceed with reload? [confirm]
-    rf"|[\[(（]\s*{_YN}\s*[/|,]\s*{_YN}\s*(?:[/|,][^\])）]*)?[\])）]"   # [Y/N] [N/y] (y/n) (yes|no) (y,N) ([y]/n) (yes/no/[fingerprint])
+    rf"|[\[(（<]\s*{_YN}\s*[/|,]\s*{_YN}\s*(?:[/|,][^\])）>]*)?[\])）>]"   # [Y/N] [N/y] (y/n) (yes|no) (y,N) ([y]/n) (yes/no/[fingerprint])
     r"|\[y\]es\s*/\s*\[n\]o"                           # [Y]es/[N]o
     r"|\by\s+or\s+n\b|\byes\s+or\s+no\b|是\s*[/|]\s*否"   # y or n / Save(yes or no)> / 是/否
     r"|\bare\s+you\s+sure\b|\btype\s+['\"]?yes\b"       # Are you sure / Type 'yes' to continue
@@ -326,6 +327,14 @@ _CONFIRM_PROMPT = re.compile(
 CONFIRM_SCAN = 512          # 只在最后这么多字里找确认提示: 长行上的 \s*$ 会退化成平方
 LINE_SHOWN = 200
 KEY_ANSWERS = ("enter", "space")    # 可能替人回答确认提示的键
+
+
+def is_answer(kind, cmd):
+    """这一条会不会是在回答确认提示: 回车 / 空格, 或者 y / yes / n / no / continue 这类回答词、单个字符 (#74 第三轮)."""
+    if kind == "key":
+        return cmd in KEY_ANSWERS
+    c = (cmd or "").strip().lower()
+    return len(c) <= 1 or c in _ANSWER_NAMES - {"quit", "exit"}
 HUMAN_QUIET_S = 5           # 设备日志这么多秒内动过 = 可能有人在敲 (conbroker 人类优先窗口 3 秒, 取长)
 
 
@@ -580,10 +589,21 @@ class Book:
         if inf:
             raise Refused("inflight", f"槽位 {slot} 上一条 ({inf['cmd']!r}) 还没回来, 一次一条")
 
-    def begin(self, slot, token, who, kind, cmd, gate, now, timeout, name=None):
-        """闸门放行的直接发: 标在途 -> 调用方交给 conbroker -> finish."""
+    def touched(self, slot):
+        """槽位上人确认 / 发送结果的次数 (直发先判后占用, #74 第三轮). 只在内存和状态文件里, 不对外."""
+        return self._s(slot).get("touch", 0)
+
+    def _touch(self, slot):
+        s = self._s(slot)
+        s["touch"] = s.get("touch", 0) + 1
+
+    def begin(self, slot, token, who, kind, cmd, gate, now, timeout, name=None, snap=None):
+        """闸门放行的直接发: 标在途 -> 调用方交给 conbroker -> finish.
+        snap = 判闸门之前 touched() 的值: 之后槽位上有过人确认或发送结果 (设备可能变了), 不发."""
         if gate.get("verdict") != "pass":
             raise ValueError("闸门没放行的只能 submit 挂起")
+        if snap is not None and self.touched(slot) != snap:
+            raise Refused("changed", f"槽位 {slot} 在推车看设备之后有人确认过或刚发完一条, 设备可能变了, 没发; 重新发一次")
         self.writer(slot, token, now)
         self._idle(slot)
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "sending")
@@ -594,9 +614,10 @@ class Book:
         """挂起等人确认. 同槽位已有挂起项时不收新的回车 / 空格 (#74 第二轮: 先挂 reload 再挂 enter,
         人批了 reload 后 enter 会替人回答 [confirm]); 打断键和命令行照旧能排."""
         self.writer(slot, token, now)
-        if kind == "key" and cmd in KEY_ANSWERS and self._pending(slot):
+        if is_answer(kind, cmd) and self._pending(slot):
+            what = KEYS[cmd]["label"] if kind == "key" else repr(cmd)
             raise Refused("busy", f"槽位 {slot} 前面还有 {len(self._pending(slot))} 条等人确认, "
-                                  f"{KEYS[cmd]['label']} 不能排在后面 (前面那条批了以后它可能替人回答), 等前面处理完再发")
+                                  f"{what} 不能排在后面 (前面那条批了以后它可能替人回答), 等前面处理完再发")
         if len(self._pending(slot)) >= PENDING_MAX:
             raise Refused("busy", f"槽位 {slot} 已经有 {PENDING_MAX} 条等人确认, 先等人处理")
         it = self._new_item(slot, token, who, kind, cmd, gate, now, timeout, name, "pending")
@@ -618,6 +639,7 @@ class Book:
             raise Refused("lease", "提交它的 Agent 租约已失效, 这条作废")
         self._idle(slot)
         it["by"] = by
+        self._touch(slot)
         self._start(it, now)
         self._ev("confirm", slot, now, src="human", who=by, id=it["id"], kind=it["kind"], cmd=it["cmd"],
                  agent=it["who"], name=it.get("name"))
@@ -639,6 +661,7 @@ class Book:
         s = self._s(slot)
         if s["inflight"] and s["inflight"]["id"] == iid:
             s["inflight"] = None
+        self._touch(slot)
         it["status"] = result.get("status") or "error"
         it["echo"] = echo_summary(result.get("echo"))
         if result.get("note"):

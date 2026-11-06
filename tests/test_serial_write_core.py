@@ -912,3 +912,34 @@ def test_ctrl_c_and_lines_still_queue_behind_pending():
     b.submit(1, tok, "agent", "line", "reload", sw._gate("confirm", "x"), 1000.0, 30)
     b.submit(1, tok, "agent", "key", "ctrl_c", sw.classify_key("ctrl_c"), 1001.0, 5)    # 打断键照旧能挂
     assert len(b.view(1002.0)["pending"]) == 2
+
+
+# ---- 审查 #74 第三轮: 尖括号是否选项、括号里的回答词、OSC 不跨行
+
+@pytest.mark.parametrize("line", ["Reboot now <Y/N>", "<yes/no>", "Continue <y/n>?", "Reboot(y)>", "R(yes)#", "Sw(n)#"])
+def test_angle_brackets_and_paren_answers_need_human(line):
+    assert sw.classify_key("enter", line, QUIET)["verdict"] == "confirm", line
+    assert not sw.at_any_prompt(line), line
+
+
+def test_angle_yes_no_is_confirm_prompt():
+    assert sw.is_confirm_prompt("<Y/N>") and sw.is_confirm_prompt("Save? <yes/no>")
+    assert not sw.is_confirm_prompt("<HUAWEI>")
+
+
+@pytest.mark.parametrize("text,keep", [
+    ("\x1b]0;x\nProceed with reload? [confirm]\x07", "[confirm]"),      # OSC 没在本行收尾: 不能跨行吞掉确认提示
+    ("\x1b]2;t\nContinue? [Y/N]:\x07", "[Y/N]"),
+])
+def test_osc_does_not_cross_lines(text, keep):
+    assert keep in sw.clean(text)
+    assert sw.classify_key("enter", text, QUIET)["verdict"] == "confirm"
+
+
+def test_answer_line_cannot_queue_behind_pending():
+    b, tok = _book_with_lease()
+    b.submit(1, tok, "agent", "line", "reload", sw._gate("confirm", "x"), 1000.0, 30)
+    for ans in ("y", "YES", "n", "no", "c", "confirm", "continue"):
+        with pytest.raises(sw.Refused):
+            b.submit(1, tok, "agent", "line", ans, sw._gate("confirm", "x"), 1001.0, 30)
+    b.submit(1, tok, "agent", "line", "display version", sw._gate("confirm", "x"), 1001.0, 30)   # 普通命令照旧能排

@@ -277,7 +277,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         except OSError as e:
             raise mc.ToolError(f"写状态文件失败, 不发: {e}") from None
 
-    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw):
+    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw, snap=None):
         me = who()
         if gate["verdict"] != "pass":
             it = _run(lambda b, now: b.submit(n, lease, me, kind, cmd, gate, now, timeout, name), n, kind, cmd)
@@ -286,7 +286,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                 "danger": gate["danger"],
                 "hint": "已挂起, 一个字节都没发. 要人在推车上确认才发; 用 pending_list 看结果. "
                         "等的时候继续 lease_renew, 租约过期这条就作废."})]
-        it = _run(lambda b, now: b.begin(n, lease, me, kind, cmd, gate, now, timeout, name), n, kind, cmd)
+        it = _run(lambda b, now: b.begin(n, lease, me, kind, cmd, gate, now, timeout, name, snap=snap), n, kind, cmd)
         t0 = time.monotonic()
         try:
             status, out, note = send(dev, text, timeout, raw)
@@ -333,6 +333,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         vendor, at = sw.slot_vendor(n, r, text)
         judge = gm.make_judge(r, lambda: tail(s["dev"], CONTEXT_LINES), intent, llm=llm)
         gate = sw.classify(cmd, vendor, at, r, judge=judge)
+        if text:
+            gate["line"] = sw.last_line(text)[-sw.LINE_SHOWN:]     # 挂起时设备停在哪: 确认时比对 (#74 第三轮)
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
@@ -341,6 +343,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
     def send_key(a):
         n, key = a["slot"], a["key"]
         s = _slot(n)
+        snap = store.run(lambda b, now: b.touched(n))     # 先记下, 看完设备再占: 中间有人确认过就不直发
         try:
             text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
@@ -350,7 +353,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         gate = sw.classify_key(key, text, quiet, vendor=(rules().get("slots") or {}).get(n))
         name = mc.thread_name(text) if text is not None else None
         k = sw.KEYS[key]
-        return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"])
+        return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"], snap=snap)
 
     def pending_list(a):
         return [mc.json_content(_run(lambda b, now: b.view(now, a.get("slot"))))]
@@ -410,6 +413,19 @@ def real_slots():
 
 
 TAIL_TIMEOUT = 10
+LIVE_BYTES = 4096
+
+
+def log_last_line(dev, ddir=None):
+    """车机确认框用 (#74 第三轮): 直接读 conbroker 日志末尾, 取设备当前最后一行; 读不到 None. 不起子进程, 主线程能调."""
+    try:
+        ddir = ddir or serial_core.data_dir(serial_core.serial_conf_read())
+        with open(os.path.join(ddir, "logs", f"{lamps_core._safe(dev)}.log"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - LIVE_BYTES))
+            return sw.last_line(f.read().decode("utf-8", "replace")) or None
+    except (OSError, ValueError):
+        return None
 
 
 def conbroker_tail(dev, n):
@@ -431,22 +447,32 @@ def real_tools(tail, store=None):
 
 # ------------------------------------------------------------ 人确认后发送 / 网页请求
 
-def recheck_key(it, dev, tail, rules):
-    """挂起的回车 / 空格, 人确认时重看设备 (#74 第二轮): 停在确认提示 / 不在白名单 / 看不到 -> 不发的说明; 能发 -> None.
-    确认的人就在场, 不再看 5 秒窗口; 打断键 (ctrl_c) 不重看."""
-    if it["kind"] != "key" or it["cmd"] not in sw.KEY_ANSWERS:
+def recheck(it, dev, tail, rules):
+    """人确认时重看设备 -> 不发的说明; 能发 -> None.
+    回车 / 空格 (#74 第二轮): 停在确认提示 / 不在白名单 / 看不到就不发; 确认的人在场, 不再看 5 秒窗口.
+    命令 (#74 第三轮): 设备现在停在确认提示上而挂起时不是 (人先批了前面那条 reload), 或者看不到, 就不发.
+    打断键 (ctrl_c) 不重看."""
+    if it["kind"] == "key" and it["cmd"] not in sw.KEY_ANSWERS:
         return None
     try:
         text = tail(dev, TAIL_LINES)
     except Exception:                   # noqa: BLE001  看不到 = 不知道会回答什么
         text = None
-    vendor = (rules().get("slots") or {}).get(it["slot"])
-    g = sw.classify_key(it["cmd"], text, float("inf"), vendor=vendor)
-    if g["verdict"] == "pass":
-        return None
     now_line = sw.last_line(text)
-    return (f"确认时重看设备, 没发: {g['reason']}; 设备现在最后一行: {now_line[-sw.LINE_SHOWN:] or '(看不到)'}. "
-            f"要发请让 Agent 重新挂起 (要回答确认提示请用 send_command 发 y / yes, 或在终端上自己敲)")
+    shown = now_line[-sw.LINE_SHOWN:] or "(看不到)"
+    if it["kind"] == "key":
+        vendor = (rules().get("slots") or {}).get(it["slot"])
+        g = sw.classify_key(it["cmd"], text, float("inf"), vendor=vendor)
+        if g["verdict"] == "pass":
+            return None
+        why = g["reason"]
+    else:
+        was = (it.get("gate") or {}).get("line")
+        if now_line and not (sw.is_confirm_prompt(now_line) and not sw.is_confirm_prompt(was)):
+            return None
+        why = ("看不到设备现在停在哪" if not now_line else
+               f"设备现在停在确认提示上, 挂起时不是 (挂起时最后一行: {was or '(没记)'}), 这条发出去可能替人回答")
+    return f"确认时重看设备, 没发: {why}; 设备现在最后一行: {shown}. 要发请让 Agent 重新挂起"
 
 
 def send_confirmed(store, iid, by, slots, send, tail=None, rules=sw.load_rules):
@@ -461,7 +487,7 @@ def send_confirmed(store, iid, by, slots, send, tail=None, rules=sw.load_rules):
             text, raw = sw.KEYS[it["cmd"]]["text"], sw.KEYS[it["cmd"]]["raw"]
         else:
             text, raw = it["cmd"], False
-        held = recheck_key(it, dev, tail or conbroker_tail, rules)
+        held = recheck(it, dev, tail or conbroker_tail, rules)
     except Exception as e:              # noqa: BLE001  在途标记一定要收掉
         dev, err = None, f"{type(e).__name__}: {e}"
     t0 = time.monotonic()
@@ -479,11 +505,11 @@ def send_confirmed(store, iid, by, slots, send, tail=None, rules=sw.load_rules):
     return it, status, output, note
 
 
-def human_action(store, op, arg, by, slots, send, tail=None):
+def human_action(store, op, arg, by, slots, send, tail=None, rules=sw.load_rules):
     """车机上人的按钮 (#23) -> 一句结果: confirm (arg = 编号, 会阻塞到发完) / reject (编号) / estop / resume
     (槽位, None = 全部). Book 不让抛 sw.Refused. 调用方保证是本机人 (车机进程), 放后台线程调."""
     if op == "confirm":
-        it, status, output, note = send_confirmed(store, arg, by, slots, send, tail=tail)
+        it, status, output, note = send_confirmed(store, arg, by, slots, send, tail=tail, rules=rules)
         tail = sw.echo_summary(output).strip().splitlines()[-1:] if output else []
         return f"#{it['id']} {it['cmd']} -> {status}" + (f" ({note})" if note else "") + \
             (f": {tail[0]}" if tail and not note else "")
