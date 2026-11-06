@@ -110,11 +110,6 @@ def peek_id(frame):
     return int.from_bytes(frame[1:3], "big") if len(frame) >= 3 and frame[0] in (T_START, T_CONT) else None
 
 
-def peek_crc(frame):
-    """START 帧里声明的 CRC (回错误时带上, 手机据此认领); 读不出是 None."""
-    return int.from_bytes(frame[5:9], "big") if len(frame) >= START_HDR and frame[0] == T_START else None
-
-
 def _bad_char(ch):
     if ch in ALLOWED_CTRL or ch == ZWJ:
         return False
@@ -218,7 +213,8 @@ class Receiver:
         out = self.expire(now)
         frame = bytes(frame)
         if not trusted:
-            return out + [Event("err", src, peek_id(frame), code="unpaired", crc=peek_crc(frame))]
+            # 不带 crc: 这条要广播, crc 是写入方正文的指纹 (短文本可反推)
+            return out + [Event("err", src, peek_id(frame), code="unpaired")]
         try:
             kind, mid, a, crc, chunk = decode_frame(frame)
         except Bad as e:

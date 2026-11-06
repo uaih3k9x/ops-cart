@@ -274,8 +274,8 @@
    "kind": "err",
    "id": 1,
    "code": "unpaired",
-   "crc": 3640732332,
-   "json": "{\"t\":\"err\",\"id\":1,\"crc\":3640732332,\"code\":\"unpaired\"}"
+   "crc": null,
+   "json": "{\"t\":\"err\",\"id\":1,\"crc\":null,\"code\":\"unpaired\"}"
   }
  ]
 }
