@@ -49,11 +49,15 @@ sudo bash scripts/setup-memtest.sh       # 在拷到推车上的仓库目录里�
 
 仓库只管菜单：`pxelinux.cfg/default` 由 `pxe_disarm` 写（车机开机 / 上锁，以及 `setup-cart.sh` 调的
 `kiosk_core.py --write-rescue`）。**BIOS 菜单只用 `pxelinux.cfg/default`，推车不生成按 MAC / IP 命名的 pxelinux 配置**，
-解锁用途（装机、WinPE、克隆）都只给 UEFI 的 GRUB。所以 pxelinux 路径上：
-- 上锁时 `pxelinux.cfg/` 下除 `default` 以外的文件（只可能是手工放的）**不看内容一律删掉**；
-- TFTP / HTTP 对 `pxelinux.cfg/` 下 `default` 以外的请求一律回找不到，pxelinux 会落到 `default`；
-- `default` 内容疑似装机或链式加载（`pxeserver.pxelinux_suspect`）时，TFTP 换发救援菜单，HTTP 回 403；
-- 上锁时 `default` 写失败（如 `pxelinux.cfg` 被占成普通文件、只读）不拖住上锁，只记一条 pxe 事件。
+解锁用途（装机、WinPE、克隆）都只给 UEFI 的 GRUB。pxelinux 路径是**白名单**（`pxeserver.pxelinux_cfg_gate`）：
+- TFTP 收到 `pxelinux.cfg/default`（大小写、反斜杠、`./`、`../` 归一后）**不读磁盘**，直接发 `pxeserver.pxelinux_menu` 按当前地址生成的内容；
+  磁盘上那份被改成什么（`INCLUDE`、`CONFIG`、自带 ks 的 initrd、memdisk……）都不会发出去；
+- `pxelinux.cfg` 下别的（按 MAC / IP 命名、任意深度子目录、`bios/pxelinux.cfg/…`、符号链接别名）TFTP 一律回找不到，pxelinux 落到 `default`；
+- HTTP（`pxe-http-boot` 出的就是 tftp 根）对 `pxelinux.cfg` 下任何东西一律 404（`pxelinux.0` 只走 TFTP，用不着），也不列任何目录；
+- 生成的菜单带 `ALLOWOPTIONS 0` 和 `IMPLICIT 0`：`boot:` 下只能敲 `rescue` / `memtest`，不能加内核参数、不能敲别的内核或配置文件名。
+  要临时加参数（如串口 `console=ttyS0`）请走 UEFI 的 GRUB 菜单（按 `e` 编辑），或改 `pxelinux_menu` 加一项；
+- 上锁时先删状态文件，再把 `pxelinux.cfg` 下根 `default` 以外的全删（含子目录、非常规文件；符号链接只删链接本身），
+  删不掉 / `default` 写不进去都只记 pxe 事件，不拖住上锁。
 **`pxelinux.0` 和 `ldlinux.c32` 要另放**到 tftp 根（Rocky 9 的 `syslinux-nonlinux` 包，`/usr/share/syslinux/` 下），
 还没收进部署脚本。注意：
 

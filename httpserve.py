@@ -11,7 +11,9 @@
   MAC (恢复一批时是 pxe-mode.json 的 macs 名单, pxeserver.install_allowed 判断);
   boot.ipxe、win/、clonezilla/ 不拦 (PE / live 系统本身不动硬盘, 写不写盘全看菜单里的参数;
   而且菜单被取走就上锁, 之后还得取得到)
-- pxelinux.cfg/ (#55): default 以外一律 404; default 内容疑似装机 (pxeserver.pxelinux_suspect) 403
+- pxelinux.cfg/ 下任何东西 (#55, 含 default、子目录、别名) 一律 404: pxelinux.0 只走 TFTP, TFTP 发的是生成的
+- grub.cfg* 超过 pxeserver.MENU_MAX 的当装机菜单 (不再只看前 64KB 却发整个文件)
+- 不列目录 (一律 404)
 - *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希) 永远 404
 
 这是防"误装"的核对, 不是访问控制: MAC 头 (和 TFTP 的文件名一样) 是客户端自己报的, LAN1 上能抓到
@@ -28,8 +30,8 @@ import socket
 import sys
 import time
 
-from pxeserver import (PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
-                       pxelinux_cfg_gate, pxelinux_suspect, unlock_only_menu)
+from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac,
+                       pxe_mode, pxelinux_cfg_gate, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -70,21 +72,9 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
         if ".bak" in base:
             self.send_error(404, "File not found")
             return None
-        cfg = pxelinux_cfg_gate(os.path.abspath(self.directory), path)
-        if cfg is not None and cfg != "default":
+        if pxelinux_cfg_gate(os.path.abspath(self.directory), path) is not None:
             self.send_error(404, "File not found")
             return None
-        if cfg == "default" and os.path.isfile(path):
-            try:
-                with open(path, "rb") as f:
-                    suspect = pxelinux_suspect(f.read(64 * 1024).decode("utf-8", "replace"))
-            except OSError:
-                suspect = True
-            if suspect:
-                log.warning("拒绝 %s 取 pxelinux.cfg/default: 内容像装机, 不是推车写的救援菜单",
-                            self.client_address[0])
-                self.send_error(403, "Install mode is locked")
-                return None
         if is_ks(base):
             mode = pxe_mode(self.pxe_mode_path, self.now())
             macs = request_macs(self.headers)
@@ -98,13 +88,19 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
         elif base.startswith("grub.cfg") and os.path.isfile(path):
             try:
                 with open(path, "rb") as f:
-                    armed = unlock_only_menu(f.read(64 * 1024).decode("utf-8", "replace"))
+                    head = f.read(MENU_MAX + 1)
+                armed = len(head) > MENU_MAX or unlock_only_menu(head.decode("utf-8", "replace"))
             except OSError:
                 armed = False
             if armed and not install_allowed(menu_mac(base), pxe_mode(self.pxe_mode_path, self.now())):
                 self.send_error(403, "Install mode is locked")
                 return None
         return super().send_head()
+
+    def list_directory(self, path):
+        """不列目录 (#55 审查): 装机文件布局不对外展示; 要的文件名都写在菜单里."""
+        self.send_error(404, "File not found")
+        return None
 
 
 def make_server(ip, port, directory, sleep=time.sleep, sock_factory=None, activate=True,

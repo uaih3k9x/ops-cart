@@ -785,8 +785,9 @@ def grub_menu(ip, install=False):
 
 def pxelinux_menu(ip):
     """BIOS 机器的 pxelinux.cfg/default: 默认救援 (10 秒), 另一项 Memtest86+. 不用 menu.c32,
-    boot: 提示符下敲标签名. pxelinux.0 只会 TFTP, 路径相对 tftp 根. 没有任何自动装机项."""
-    return ("DEFAULT rescue\nPROMPT 1\nTIMEOUT 100\n"
+    boot: 提示符下敲标签名. pxelinux.0 只会 TFTP, 路径相对 tftp 根. 没有任何自动装机项.
+    ALLOWOPTIONS 0: 不能给标签加内核参数; IMPLICIT 0: 只能起 LABEL 里写的, 不能敲任意内核 / 配置文件名."""
+    return ("DEFAULT rescue\nPROMPT 1\nTIMEOUT 100\nALLOWOPTIONS 0\nIMPLICIT 0\n"
             "SAY Rescue shell in 10 s. Type memtest and Enter for Memtest86+.\n\n"
             "LABEL rescue\n    KERNEL vmlinuz\n"
             f"    APPEND initrd=initrd.img ip=dhcp {_rescue_args(f'http://{ip}:8000')}\n\n"
@@ -884,22 +885,20 @@ def unlock_only_menu(text):
     return "inst.ks=" in text or WINPE_CHAIN in text or CLONE_KERNEL in text or "ocs_live_run" in text
 
 
-# pxelinux 里"疑似装机"的记号 (不分大小写): 各发行版自动安装参数、链式加载. 推车自己的 pxelinux_menu 一个都不带.
-PXELINUX_SUSPECT = ("ks=", "auto=true", "auto url=", "preseed", "autoinstall", "ds=nocloud", "autoyast",
-                    "unattend", "url=", "com32", ".c32", "pxechn", "chain", "kickstart", "ocs_")
-
-
-def pxelinux_suspect(text):
-    """pxelinux.cfg/default 看着像装机 / 链式加载 (不是推车写的救援菜单)? 宁可误判成可疑."""
-    low = text.lower()
-    return unlock_only_menu(text) or any(t in low for t in PXELINUX_SUSPECT)
+MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 当装机菜单对待 (不读一半就放行)
 
 
 def pxelinux_cfg_gate(root, path):
-    """tftp 根下 pxelinux.cfg/<name> -> name; 不在 pxelinux.cfg/ 下返回 None.
-    推车只生成 default (救援), 别的名字 (按 MAC/IP) 一律当没有, 让 pxelinux 落到 default."""
-    rel = os.path.relpath(path, root).replace(os.sep, "/").lower().split("/")   # Windows 部署大小写不敏感
-    return rel[1] if len(rel) == 2 and rel[0] == "pxelinux.cfg" else None
+    """pxelinux 门禁 (#55, 白名单): "default" = 根下 pxelinux.cfg/default (发 pxelinux_menu 生成的, 不读盘);
+    "deny" = 请求路径或解开符号链接后的真实路径里任何一级叫 pxelinux.cfg (子目录、bios/pxelinux.cfg、别名);
+    None = 跟 pxelinux.cfg 无关. 比较不分大小写、去掉尾部点和空格 (Windows 部署的文件系统会这么归一)."""
+    def parts(p, r):
+        return [c.rstrip(". ") for c in os.path.relpath(p, r).replace(os.sep, "/").lower().split("/")]
+    rel = parts(path, root)
+    if rel == ["pxelinux.cfg", "default"]:
+        return "default"
+    real = parts(os.path.realpath(path), os.path.realpath(root))
+    return "deny" if "pxelinux.cfg" in rel or "pxelinux.cfg" in real else None
 
 
 def norm_mac(mac):
@@ -1024,7 +1023,7 @@ def tftp_safe_name(root, name):
 
 
 class TftpServer:
-    MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的不当菜单看
+    MENU_MAX = MENU_MAX
 
     def __init__(self, ip, root, log, blksize=1428, timeout=2.0, retries=5, port=69,
                  sock_factory=None, pxe_mode_path=PXE_MODE, now=time.time, event=cart_event):
@@ -1053,26 +1052,24 @@ class TftpServer:
         """-> (文件对象, 大小, 日志前缀). 找不到/越界抛 OSError.
         GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 或 WinPE 项的 (unlock_only_menu), 只有已解锁、
         没过期、文件名就是那台 MAC 时才照发, 否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走).
-        pxelinux.cfg/ (#55): default 以外一律找不到; default 疑似装机 (pxelinux_suspect) 就换 pxelinux_menu 救援."""
+        超过 MENU_MAX 的 grub.cfg* 也按装机菜单对待.
+        pxelinux (#55, 白名单, pxelinux_cfg_gate): pxelinux.cfg/default 不读盘, 发 pxelinux_menu 生成的;
+        pxelinux.cfg 下别的 (任意深度、别名) 一律找不到, pxelinux 会落到 default."""
         path = tftp_safe_name(self.root, name)
         cfg = pxelinux_cfg_gate(self.root, path)
-        if cfg is not None and cfg != "default":
-            raise FileNotFoundError(f"pxelinux.cfg/{cfg} 不发 (推车只出 default)")
+        if cfg == "default":
+            data = pxelinux_menu(self.ip).encode()
+            return io.BytesIO(data), len(data), f"TFTP RRQ {name} (推车生成)"
+        if cfg == "deny":
+            raise FileNotFoundError(f"{name} 不发 (pxelinux 只出推车生成的 default)")
         f = open(path, "rb")
         size = os.fstat(f.fileno()).st_size
         base = os.path.basename(path)
-        if cfg == "default":
-            with f:
-                data = f.read(self.MENU_MAX + 1)
-            if len(data) > self.MENU_MAX or pxelinux_suspect(data.decode("utf-8", "replace")):
-                data = pxelinux_menu(self.ip).encode()
-                return io.BytesIO(data), len(data), f"TFTP RRQ {name} 未解锁, 回救援菜单"
-            return io.BytesIO(data), len(data), f"TFTP RRQ {name}"
-        if not base.startswith("grub.cfg") or base.startswith("grub.cfg.") or size > self.MENU_MAX:
+        if not base.startswith("grub.cfg") or base.startswith("grub.cfg."):
             return f, size, f"TFTP RRQ {name}"
         with f:
             data = f.read()
-        if unlock_only_menu(data.decode("utf-8", "replace")):
+        if len(data) > self.MENU_MAX or unlock_only_menu(data.decode("utf-8", "replace")):
             mac = menu_mac(base)
             if not install_allowed(mac, pxe_mode(self.pxe_mode_path, self.now())):
                 data = grub_menu(self.ip).encode()
