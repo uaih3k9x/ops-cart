@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import subprocess
 import time
 
@@ -205,6 +206,10 @@ class LeaseStore:
         with self._tx() as (st, now, _evs):
             return public_view(st, now, self.stopped())
 
+    def peek(self):
+        """只读档用 (#49): 不加锁不写盘不写日志; 过期 / 急停只在视图里算."""
+        return peek(self.path, self.clock, self.stopped)
+
 
 def _item_text(item):
     return "+".join(item["keys"]) if item["kind"] == "key" else item["text"] + (" + 回车" if item["enter"] else "")
@@ -328,9 +333,10 @@ def redact_type(args):
     return args
 
 
-def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
+def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who, readonly=False):
     """ports() -> {序列号: 路径}; opener(port, who) -> 代理连接 (send_keys / type_text / close);
-    ocr(dev|None, lang) -> (行, 哪块卡的说明, 引擎); wol(mac, iface); broker_up(port) -> bool. 测试里全换成假的."""
+    ocr(dev|None, lang) -> (行, 哪块卡的说明, 引擎); wol(mac, iface); broker_up(port) -> bool. 测试里全换成假的.
+    readonly (#49): 只回只读工具, kvm_status 走 store.peek (不加锁不写盘); 动手档照旧."""
 
     def _port(serial):
         online = ports()
@@ -373,7 +379,8 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
     def kvm_status(_a):
         online = ports()
         up = any(broker_up(p) for p in online.values()) if online else None
-        return [mc.json_content(dict(store.view(), all_stopped=store.stopped(), keyboards=sorted(online), broker=up))]
+        view = store.peek() if readonly else store.view()
+        return [mc.json_content(dict(view, all_stopped=store.stopped(), keyboards=sorted(online), broker=up))]
 
     def kvm_lease_acquire(a):
         return [mc.json_content(store.acquire(who(), a["ttl_s"]))]
@@ -416,37 +423,38 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
     LEASE = {"type": "string", "required": True, "maxLength": 64, "description": "kvm_lease_acquire 给的令牌"}
     SERIAL = {"type": "string", "maxLength": 32, "description": "键鼠序列号, 只有一块时不用给"}
     T = ms.Tool
-    return [
+    tools = [
         T("kvm_status", "键鼠状态 (只读): 在线的键鼠序列号、代理在不在、写入者、全部急停、挂起等确认的和最近结果.",
-          {}, kvm_status, read_only=True),
+          {}, kvm_status, kind=mc.READONLY),
         T("kvm_lease_acquire", "申请键鼠写租约 (同时一个写入者), 返回令牌. 全部急停时不给.",
           {"ttl_s": {"type": "integer", "minimum": TTL_MIN_S, "maximum": TTL_MAX_S, "default": TTL_S,
-                     "description": "期限秒"}}, kvm_lease_acquire),
-        T("kvm_lease_renew", "续键鼠写租约. 过期了要重新申请.", {"lease": LEASE}, kvm_lease_renew),
-        T("kvm_lease_release", "交还键鼠写租约.", {"lease": LEASE}, kvm_lease_release),
+                     "description": "期限秒"}}, kvm_lease_acquire, kind=mc.ACT, destructive=False),
+        T("kvm_lease_renew", "续键鼠写租约. 过期了要重新申请.", {"lease": LEASE}, kvm_lease_renew, kind=mc.ACT, destructive=False),
+        T("kvm_lease_release", "交还键鼠写租约.", {"lease": LEASE}, kvm_lease_release, kind=mc.ACT, destructive=False),
         T("kvm_key", "往被测机按键或组合键, 如 enter / esc / f12. 高危组合键 (ctrl+alt+delete 等) 挂起等人确认. "
           "人最近 3 秒动过键鼠会排队. 按之前先 screen_ocr 确认焦点对.",
           {"keys": {"type": "string", "required": True, "maxLength": 64, "pattern": r"[A-Za-z0-9_+-]+",
                     "description": "键名, 组合键用 + 连"}, "lease": LEASE, "serial": SERIAL},
-          kvm_key, destructive=True),
+          kvm_key, kind=mc.ACT, destructive=True),
         T("kvm_type", "往被测机打一段 ASCII (被测机输入法要在英文). 整行带高危词 (format、diskpart 等) 就挂起等人确认, "
           "可能误拦普通文字. 内容进审计日志, 密码给 secret=true. 敲之前先 screen_ocr 确认焦点对.",
           {"text": {"type": "string", "required": True, "maxLength": TEXT_MAX, "description": "要打的字"},
            "enter": {"type": "boolean", "description": "打完按回车"},
            "secret": {"type": "boolean", "description": "密码等: 内容不进审计和日志; 带高危词直接拒绝"},
            "lease": LEASE, "serial": SERIAL},
-          kvm_type, destructive=True, redact=redact_type),
+          kvm_type, kind=mc.ACT, destructive=True, redact=redact_type),
         T("screen_ocr", "读被测机屏幕上的字 (OCR, 带坐标), 比 screenshot 省得多, 看画面先用这个. readable=false 时再用 "
           "screenshot. engine 写明用的引擎; 可能有形近字错误, 命令和路径回车前要核对.",
           {"device": {"type": "string", "pattern": r"(/dev/)?video[0-9]{1,2}", "maxLength": 16,
                       "description": "采集设备, 默认正在预览的那块, 没预览就有信号的采集卡"},
            "lang": {"type": "string", "enum": ["eng", "eng+chi_sim"], "default": "eng",
                     "description": "只对退回 Tesseract 时有用; RapidOCR 中英都读"}},
-          screen_ocr, read_only=True),
+          screen_ocr, kind=mc.READONLY),
         T("wol_send", "往 LAN1 (装机口) 发网络唤醒魔术包. 不保证醒.",
           {"mac": {"type": "string", "required": True, "maxLength": 17,
-                   "pattern": r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}", "description": "目标 MAC"}}, wol_send),
+                   "pattern": r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}", "description": "目标 MAC"}}, wol_send, kind=mc.ACT),
     ]
+    return [t for t in tools if t.kind == mc.READONLY] if readonly else tools
 
 
 # ------------------------------------------------------------ 真机
@@ -463,18 +471,33 @@ def real_opener(port, who):
     return kvm_broker.BrokerCh(port, src="agent", who=who)
 
 
-def broker_up(port):
+def broker_probe(sock_path=None, timeout=2.0):
+    """代理在不在: 连上发一条 status (控制操作, 不 open 设备, 不占键鼠; #49 审查). 连不上 / 回不来 = 不在."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
     try:
-        kvm_broker.BrokerCh(port, src="agent", who="status").close()
-        return True
-    except (FileNotFoundError, ConnectionRefusedError):
+        s.connect(sock_path or kvm_broker.default_sock())
+        s.sendall(json.dumps({"op": "status", "src": "agent", "who": "kvm_status"}).encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n") and len(buf) < 65536:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return bool(json.loads(buf or b"{}").get("ok"))
+    except (OSError, ValueError):
         return False
-    except OSError:                     # 代理在, 设备忙 / 拔了
-        return True
+    finally:
+        s.close()
 
 
-def real_ocr(dev, lang):
-    path, why, used = cart_snap.grab(dev)
+def broker_up(_port):
+    """kvm_status 用; 和哪块键鼠无关, 只问代理在不在."""
+    return broker_probe()
+
+
+def real_ocr(dev, lang, readonly=False):
+    path, why, used = cart_snap.grab(dev, readonly=readonly)     # 只读档限速更紧 (#49)
     if path is None:
         raise mc.ToolError(why)
     try:
@@ -489,6 +512,7 @@ def real_ocr(dev, lang):
     return lines, describe_dev(used), engine
 
 
-def real_tools(store=None):
-    return build_tools(store or LeaseStore(), ports=kvm_core.ports, opener=real_opener, ocr=real_ocr,
-                       wol=wol_core.send, broker_up=broker_up)
+def real_tools(store=None, readonly=False):
+    ocr = (lambda dev, lang: real_ocr(dev, lang, readonly=True)) if readonly else real_ocr
+    return build_tools(store or LeaseStore(), ports=kvm_core.ports, opener=real_opener, ocr=ocr,
+                       wol=wol_core.send, broker_up=broker_up, readonly=readonly)

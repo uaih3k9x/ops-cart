@@ -171,3 +171,95 @@ send_command/send_key ─┬─ 闸门放行 ─► sending ─(conbroker send �
 - **插话**：有人持键鼠租约时，其他 agent 的输入一律拒绝；没人持租约时命令行和配方照旧能用。配方运行中被别人拿走租约会停下。
 - **`recent_output`**：往前最多看 200 行，按时间判断：一小时内有设备输出才算最近，`last_output_age_s` 给出大约多少秒前。输出行本身没有时间，后面有标记行就按标记算，在日志尾巴上就按日志修改时间。仍然只是日志判断，要确认对端就拿租约 `send_key enter`；推车不会自动发。
 - **PXE 卡在 `NBP filesize`（被测机上的 EFI 程序，推车改不了）**：有的机器开机时没拿到地址、空等一轮后才拿到的话，问完启动文件大小就不再发 TFTP 请求，转而往服务器的 UDP 5526 发 549 字节的包（带 MAC 和一串标识），之后卡住或退回本地系统。2026-11-03 在一台联想上试了 6 次：开机时已在发地址 3 次都成功，抓包的那次没有这种包；开机时没地址 3 次都失败。这台机器的 EFI 分区里，`bootmgfw.efi` 被换过（原版改名 `bootmgfwold.efi`），旁边有 `HookDisk.efi`、`lenovoEDU.efi` 和一整套 UEFI 网络驱动（DHCP、UDP、TFTP、PXE）。所以很可能是：固件第一轮 PXE 失败后转去 Windows 启动项，这个 EFI 程序自己再拉起 PXE，拿到推车的地址后去找它的服务端。包内容没在这些文件里直接搜到，这条链还没完全证实。**办法：先让推车发地址，再开机；卡住了重启一次。**
+
+## 十六、只读档和动手档（#49）
+
+- **为什么在服务端分**：有的 Agent 底座作为 MCP 客户端调用工具时不走它自己的审批，它的"只读模式"也拦不住 MCP 工具。所以权限边界只能放在推车这头：只读档的进程里**根本没有**会动手的工具，不是注册了再拒绝。
+- **同一程序，按档位启动**：`cart_mcp.py stdio|http --profile readonly|act`。不认识的档位直接起不来。
+  - `readonly`：`list_threads` `read_output` `screenshot` `screen_ocr` `cart_status` `pxe_status` `pxe_clients` `pxe_requests` `pending_list` `kvm_status` `label_preview` `label_printer_status` `label_abbrev_propose`。
+  - `act`：上面这些 + 键鼠（`kvm_lease_*` `kvm_key` `kvm_type`）、写串口（`lease_*` `send_command` `send_key`）、`estop`、`wol_send`、`pxe_request` `pxe_retire`、`label_print`。闸门、挂起确认、急停全部照旧，一条没放宽；Agent 侧仍然没有任何"确认"工具。
+- **标注**：每个工具构造时必须给 `kind=mc.READONLY` 或 `kind=mc.ACT`，不给就构造失败（`TypeError`），给错值也失败。`mc.select_tools` 遇到标注不认识的工具直接报错；`mc.Server` 只收档位允许的工具，收到别的就报错，绕开 `select_tools` 也塞不进去。`readOnlyHint` 由标注推出来。`estop` 和 `pxe_retire` 只收紧，但它们会撤别人的租约、删菜单，按会动手算，不进只读档。
+- **默认档位**：现在是 `act`。现有接法（Claude Code 的 `cart_mcp.py stdio`、开机验收按工具表核对）依赖全部工具，改默认会把它们弄坏。新接法一律写明 `--profile`。默认改不改成 `readonly` 待拍板。
+- **HTTP**：两档各起一个进程。动手档用 `mcp.json` 顶层 `port` / `tokens`，和以前一样；只读档用 `readonly.port`（默认 8766）/ `readonly.tokens`。没有 `readonly` 段时只读档谁都进不来，不借用动手令牌。动手档不认和任何只读令牌同值的令牌：手抖把只读令牌也填进顶层，也拿不到动手权限。只读令牌拿到动手档是 401，反过来也是。
+- **stdio**：没有令牌，边界在 ssh 那一层。只读 Agent 要用**专用身份**（下面叫 `agent-ro`，是示例名）。不能和动手档共用那个能 sudo、甚至能拿 root shell 的身份，否则它自己把 `--profile` 改成 `act` 就绕过去了。下面四条**都要配**，不是挑一条：
+  1. **sudoers 只放一条精确命令**（参数也写全，sudo 会按整条命令行比对，多一个少一个参数都不放）：
+     `agent-ro ALL=(root) NOPASSWD: /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly`
+  2. **`authorized_keys` 把这把钥匙钉死在这条命令上**：
+     `command="sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly",restrict ssh-ed25519 AAAA…示例… agent-ro`
+     `command=` 会忽略客户端要跑的命令；`restrict` 关掉端口转发、X11 / agent 转发和 pty。
+  3. **这个账号没有密码**（`passwd -l agent-ro`），不能用密码登录，也不能 `su`。
+  4. **不进设备组**（`dialout` `video` `lp`，也不进 `wheel`），也不进 serial.conf 里那个 user 的组。
+  5. **sshd 服务端兜底**：`authorized_keys` 里的选项靠这个文件本身没被改过，账号自己能写的话它就能把 `command=` 删掉。所以还要：
+     - `authorized_keys` 归 root 所有（`root:root 0644`，目录也一样），或者干脆放在 `/etc/ssh/authorized_keys/%u`；
+     - 在 `sshd_config` 末尾加上：
+
+```
+Match User agent-ro
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+    ForceCommand sudo /usr/bin/python3 /opt/pxe/cart_mcp.py stdio --profile readonly
+    DisableForwarding yes
+    PermitTTY no
+    PermitTunnel no
+    PasswordAuthentication no
+    PermitUserRC no
+    MaxSessions 1
+```
+
+     `ForceCommand` 由 sshd 强制执行，不看 `authorized_keys`。`DisableForwarding` 一次关掉端口转发、X11 和 agent 转发。
+     `MaxSessions 1`：一条 ssh 连接里只开一个会话（不让一条连接复用出多个只读进程）。**连接数**sshd 这里不好按用户限，靠应用层的槽位：只读档进程启动时抢 `/run/ops-cart/mcp-ro-slot{0,1}.lock`（flock，不等），同时最多 2 个只读进程（stdio 会话和 `cart-mcp-ro` 单元一起算），抢不到就退出（退出码 3，stderr 说明）。
+     `PermitUserRC no` 让 sshd 不跑 `~/.ssh/rc`（`PermitUserEnvironment` 默认就是 no，`~/.ssh/environment` 也不读）。
+     账号要有**真的登录 shell**：sshd 是用登录 shell 去跑 `ForceCommand`（`<shell> -c "<命令>"`）的，设成 `nologin` 的话服务根本起不来。用 `/bin/sh`（`usermod -s /bin/sh agent-ro`）：非交互的 `sh -c` 不读 `~/.profile`、`~/.bashrc` 这类 rc 文件，`ForceCommand` 和 `authorized_keys` 的 `command=` 都是这样跑的，所以两者都照常能用（Rocky 上 `/bin/sh` 是 bash 的 sh 模式，非交互时也不读 `$ENV`）。
+     **家目录归 root、账号自己不能写**：`chown root:root ~agent-ro && chmod 0755 ~agent-ro`（`.ssh` 同样），这样它没法自己放 rc 文件、改 `authorized_keys`。别的口子已经由上面这几条堵住。
+  - **为什么要同时配**：
+    - 只配 sudoers：钥匙还能拿普通 shell、开端口转发，去连本机的键鼠代理 socket、conbroker、动手档 HTTP 口。
+    - 只配 `command=`：哪天这把钥匙或 `command=` 配错了，sudo 也不会再兜底。
+    - sshd 的 `Match`：哪怕 `authorized_keys` 被改了，它也照样生效。
+    - 不进设备组是最后一道：就算拿到 shell，也碰不到串口、采集卡和打印机。
+- **已知限制：stdio 只读档不受 systemd 单元收紧保护**。`cart-mcp-ro.service` 里的 `ProtectSystem=strict`、`ProtectHome=read-only` 只管 HTTP 那个进程；stdio 只读档是 sshd → sudo 起的 root 进程，不在这个单元里，文件系统不是只读的。它的边界是：只注册只读工具（代码层）、sudoers 只放一条命令、ssh 身份锁死（上面几条）、进程槽位。要同样的收紧，可以改成用 `systemd-run --pipe --wait -p ProtectSystem=strict …` 包一层，待拍板。
+- **审计**：`mcp-audit.log` 每行多一个 `profile`。HTTP 认证失败那行也带。
+- **只读档限速**（第三轮审查）：只读档不接受 JSON-RPC 批量请求（一个请求塞 2000 条调用以前能绕开所有冷却之外的节流），整个请求回一条错误，一条都不跑；`tools/call` 过一个进程内的令牌桶（每秒补 3 次，一口气最多 10 次），超出的回"调用太频繁"。被限速的调用审计合并：1 秒内只记一条，下一条带上中间没逐条记的次数。令牌桶在查工具名之前（第四轮）：乱填工具名、被拒的批量请求也先扣令牌，被限的合并记录。令牌桶是进程内的，靠上面 sshd 段说的进程槽位（同时最多 2 个只读进程）把总量封顶在 2 倍；没做跨进程令牌桶，是因为每次调用都要拿文件锁读写状态，只为把 2 倍压回 1 倍不值得。动手档不限速、批量照旧（那边有租约、闸门和人确认）。
+- **审计行数的上限**（终审）：能被不认证的人刷出来的审计都按类合并，每类每秒最多 1 行，下一行带上中间没逐条记的次数。这里的"类"包括：被限速的 `tools/call`、只读档里乱填的工具名、被拒的批量；HTTP 认证失败按 (档位, 状态码, 原因) 分类（401 令牌错或缺；403 再按来源不可信 / Host 不在白名单 / 跨站 / 缺同源标记分开，刷一种压不掉另一种），**两档都一样**，每个监听地址各算一份。所以刷请求时审计的增长速度是"类数 × 监听地址数"行每秒，和请求数无关。被压掉的那几次在下一行（或刷出时）写明次数和"来自 N 个不同来源"（只记去重后的个数，最多数到 1000，不列 IP）。尾巴计数不会丢：HTTP 服务每轮补绑地址时刷出一次，进程退出时（含 systemd 停服务的 SIGTERM、ssh 断开的 SIGHUP）由 atexit 写出。真正执行了的调用照旧一条一行。慢连接：单次读写 30 秒没动静就断；读完请求头和请求体有 10 秒整体时限（每次只滴一个字节、单次不超时的连接也在 10 秒后断开）；读完之后工具执行多久不受这个时限管。两个 HTTP 单元都设了 `TasksMax=64`，并发慢连接最多占这么多线程，超出的连接建不了线程，不影响已有的。
+- **协议**：只读档 `serverInfo.name` 是 `ops-cart-readonly`，说明文字里不提租约和写工具；动手档还是 `ops-cart`。
+- **Agent 接法示例**（地址、令牌、名字都是示例值）：
+
+```
+# 只读档, 走 ssh (推荐先只接这个; 要跑什么由 authorized_keys 的 command= 决定, 客户端不用写)
+claude mcp add cart-ro -- ssh agent-ro@192.0.2.10
+# 只读档, 走 HTTP (推车上: sudo systemctl enable --now cart-mcp-ro.service,
+#   单元里就是 cart_mcp.py http --profile readonly; 临时手跑: sudo python3 /opt/pxe/cart_mcp.py http --profile readonly)
+claude mcp add --transport http cart-ro http://192.0.2.10:8766/mcp --header "Authorization: Bearer <只读令牌>"
+# 动手档 (人盯着的会话才接)
+claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act
+```
+
+  其他 MCP 客户端照同样的命令行 / URL 配，两个服务用不同的服务名（如 `cart-ro` / `cart`），可以分别启用。
+- **只读档不碰状态文件**（审查后补）：只读档的 `list_threads`（写入者）、`pending_list`、`kvm_status`、`pxe_requests` 走 `mcp_serial.peek` / `mcp_kvm.peek` / `mcp_pxe.Store.public_view`。这几个入口不加锁、不写盘、不写日志，过期和读不懂只在视图里算掉。动手档的工具读状态时照旧加锁落盘，比如过期租约要作废、状态读不懂要全部急停并落盘。所以只读调用不会因为状态文件坏了就触发全部急停，也不会作废别人在等的命令或 PXE 申请。`public_view` 固定 `secret=False`，确认码和清单摘要不会出现在 Agent 的回包里。`tests/test_mcp_readonly_invariant.py` 用真的 Store 在临时目录里覆盖几种情况：状态文件坏了、租约过期、PXE 申请过期、空目录。逐个调用只读档的每个工具，断言没拿锁、没写事件、文件内容和 mtime 都不变。
+- **只读档会写什么（白名单，有意的例外）**：只读档不改任何状态文件、不写执行绪日志和 `events.log`，但下面这些会写：
+  1. **审计** `/var/log/ops-cart/mcp-audit.log`：每次调用一行，带 `profile=readonly`。查"只读 Agent 都看了什么"要靠它，所以这是有意的。
+  2. **设备互斥锁** `/run/ops-cart/printer.lock`、`/run/ops-cart/snap.lock`：只用 flock，`snap.lock` 里还记着上次抓帧的时刻。
+  3. **临时截图** `/run/ops-cart/cart-snap-*.png`：私有文件，抓完马上删。
+  4. **往打印机写 `ESC !?`**：`label_printer_status` 读状态要先写这个查询，不出纸。
+  5. **打印机锁打不开时**（`/run/ops-cart` 不在之类），在 `events.log` 记一条 `[label]`。
+  6. **标签机状态缓存** `/run/ops-cart/printer-status.json`（root 0600，只有时间和状态字节）：只读档查状态 3 秒内回缓存，两个只读进程共用。
+
+  不变量测试 `tests/test_mcp_readonly_invariant.py` 分两层：
+  - 直接调 `cm.real_tools("readonly")`：把真 Store 指到临时目录，把 `Store.run` / `LeaseStore._tx` / PXE `Store.run` / `BrokerCh` 打桩成"一调就记账并报错"，逐个调只读档的每个工具。断言这些一次都没走到；锁只拿了 `printer.lock` 和 `snap.lock`；目录里只有这两个文件变了，临时 PNG 没留下。
+  - 用变异确认这些测试真能抓到接线错误：把接线改回动手档的入口、去掉打印机锁、`kvm_status` 改回 `open` 设备、截图 / OCR 不传只读限速，这些改法测试都会红。
+- **共享设备**：
+  - **标签机**：`label_printer_status` 和 `label_print` 用进程间锁 `/run/ops-cart/printer.lock`（flock，等 10 秒拿不到就报忙），两档各起一个进程也不会抢 `ESC !?` 的回字节；进程内原来的锁还在。
+    - **只读档查状态不抢锁**（第三轮审查）：只读档 `label_printer_status` 3 秒内回缓存（`/run/ops-cart/printer-status.json`，两个只读进程共用），过了冷却才去读打印机，而且拿锁不等（拿不到就回缓存并标 `busy`，没缓存就说忙）。flock 不排队，只读 Agent 循环查状态以前能让动手档打印 10 秒都拿不到锁，现在只读档每 3 秒最多碰一次打印机，动手档一定等得到。
+    - 锁文件打不开时**不拒打**：退回只用进程内锁，并在 `events.log` 记一条（打印行为和以前一样）。
+    - 人手工 `cat > /dev/usb/lp0` 不经过这把锁。Agent 正在打印或查状态时手工打，可能遇到 `EBUSY` 或者内容交错，所以别同时进行。
+  - **截图 / OCR** 用 `/run/ops-cart/snap.lock`，两档规则不一样：
+    - 动手档只在走 ffmpeg 时排队：等锁，上次抓完 3 秒内就等冷却过去，最多等 25 秒，不直接拒。
+    - 只读档不管走 mpv 还是 ffmpeg、是截图还是 OCR，都要过这把锁：两次之间至少 10 秒，有人在抓或者还在冷却就直接拒（回"刚抓过，N 秒后再试"），免得只读 Agent 把采集卡和 CPU 一直占着，挤掉人盯着的会话。
+    - 冷却时刻写在 `snap.lock` 里：动手档**走 ffmpeg** 抓完、只读档任何一次抓完都会写；只读档看到动手档刚用 ffmpeg 抓过也会等冷却，所以让着动手档。动手档走 mpv 不占采集卡、不拿锁，也不写时刻，只读档的冷却不把它算进去。
+    - 只读档先拿锁、过冷却，再去看是哪块卡、预览开没开（冷却期内不读 `/proc`、不起探测子进程）。
+  - **mpv 截图**先发命名参数形式，带 `"_flags": ["no-osd"]`，预览画面上不闪提示字。mpv 明确回错误时（老版本不认命名参数），退回旧的数组形式再试一次。取舍：老 mpv 上截图照样能用，代价是预览上可能闪一下提示字。超时、连不上不重试。
+  - **`kvm_status`** 探测键鼠代理时只发 `status` 控制操作，不 `open` 设备。
+- **只读 `pxe_requests`**：在内存里的那份状态上算一次过期和急停作废（事件丢掉、不落盘），所以过期或作废的申请会出现在 `history` 里，和动手档看到的一致。
+- **`destructiveHint`**：只读工具一律 `false`。动手工具按实际标：
+  - `true`：`send_command` `send_key` `kvm_key` `kvm_type` `pxe_request` `pxe_retire`。
+  - `false`：`estop`（只停、不动设备；标成破坏性的话，客户端会先问人，急停不能等）、`label_print`（最坏废一张）、各个租约工具（只是记账）。
+  - 不写：`wol_send`。客户端按"可能有破坏"处理。
+
