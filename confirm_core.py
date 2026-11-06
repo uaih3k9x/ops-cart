@@ -98,17 +98,22 @@ def _want(item):
     return f"Agent 想执行：{item['cmd']}"
 
 
-def _line_info(p, live=None):
+def _line_info(p, live=None, vendor=None):
     """挂起时设备停在哪一行 (按键和命令都记, #74 第二、三轮); 给了 live 再附上当前最后一行. 都是设备输出, 只当数据显示.
-    挂起时那一行不代表现在: 人确认时推车会重看一次."""
+    挂起时那一行不代表现在: 人确认时推车会重看一次. 车机确认框和命令行共用 (第五轮).
+    醒目警告: 挂起时就停在确认提示上 (这条在回答它); 设备现在不在 (本槽位厂商的) 提示符上."""
     line = (p.get("gate") or {}).get("line")
     out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{line}" if line else ""
     if line and p.get("kind") == "line" and sw.is_confirm_prompt(line):
         out = "\n！！这条会回答设备的确认提示（挂起时设备就停在上面），确认前看清楚" + out
-    return out + (f"\n当前最后一行：{live}" if live else "")
+    if live:
+        out += f"\n当前最后一行：{live}"
+        if not sw.at_any_prompt(live, vendor):
+            out += "\n！！设备现在不在提示符上，这条发出去可能替人回答问题"
+    return out
 
 
-def card(view, n, live=None):
+def card(view, n, live=None, vendor=None):
     """槽位 n 的确认框 -> {title, status, stopped, items}. items 每条 {id, head, meta, reason, danger}."""
     s = next(x for x in view["slots"] if x["slot"] == n)
     items = [p for p in view["pending"] if p["slot"] == n]
@@ -127,7 +132,7 @@ def card(view, n, live=None):
     for p in items:
         out.append({"id": p["id"], "head": _want(p),
                     "meta": f"#{p['id']} · 来自 {p['who']} · {p.get('age_s', 0)} 秒前",
-                    "reason": f"闸门理由：{p.get('reason') or '-'}" + _line_info(p, live),
+                    "reason": f"闸门理由：{p.get('reason') or '-'}" + _line_info(p, live, vendor),
                     "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else ""})
     return {"title": f"操作头 {n}" + (f" · {name}" if name else ""), "status": status,
             "stopped": bool(s["estop"]), "items": out}

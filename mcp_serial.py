@@ -315,6 +315,21 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         _run(lambda b, now: b.release(a["slot"], a["lease"], now))
         return [mc.json_content({"slot": a["slot"], "released": True})]
 
+    def _settled(n, s, text, gate):
+        """第 2 层放行后再看一次设备 -> 原 gate 或转挂起的 gate. 最后一行变了 / 读不到 / 日志 HUMAN_QUIET_S 内动过 -> 挂起."""
+        try:
+            now_text = tail(s["dev"], TAIL_LINES)
+        except mc.ToolError:
+            now_text = None
+        mtime = slots()[n - 1].get("mtime")
+        quiet = store.clock() - mtime if mtime else None
+        before, now_line = sw.last_line(text), sw.last_line(now_text)
+        if now_text is not None and now_line == before and quiet is not None and quiet >= sw.HUMAN_QUIET_S:
+            return gate
+        why = ("模型判的时候设备变了 (最后一行: " + (now_line[-80:] or "看不到") + ")" if now_line != before or now_text is None
+               else "模型判的时候设备日志还有动静, 可能有人正在敲")
+        return dict(gate, verdict="confirm", layer=3, reason=f"{why}; 模型原本放行 ({gate.get('reason')}), 改为要人确认")
+
     def send_command(a):
         n, cmd = a["slot"], a["command"]
         intent = (a.get("intent") or "").strip() or None
@@ -334,8 +349,12 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         vendor, at = sw.slot_vendor(n, r, text)
         judge = gm.make_judge(r, lambda: tail(s["dev"], CONTEXT_LINES), intent, llm=llm)
         gate = sw.classify(cmd, vendor, at, r, judge=judge)
+        if gate["verdict"] == "pass" and gate.get("layer") == 2:
+            gate = _settled(n, s, text, gate)         # 模型判了几十秒: 设备还停在原处、日志也安静才直发 (#74 第五轮)
         if text:
             gate["line"] = sw.last_line(text)[-sw.LINE_SHOWN:]     # 挂起时设备停在哪: 确认时比对 (#74 第三轮)
+        if s.get("count") is not None:
+            gate["log_size"] = s["count"]             # 挂起时 conbroker 日志多大: 例外 (同一确认行) 要求没新字节
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
@@ -449,7 +468,7 @@ def real_tools(tail, store=None):
 
 # ------------------------------------------------------------ 人确认后发送 / 网页请求
 
-def recheck(it, dev, tail, rules):
+def recheck(it, dev, tail, rules, size=None):
     """人确认时重看设备 -> 不发的说明; 能发 -> None.
     回车 / 空格 (#74 第二轮): 停在确认提示 / 不在白名单 / 看不到就不发; 确认的人在场, 不再看 5 秒窗口.
     命令 (#74 第三、四轮): 当前最后一行要是本槽位厂商的提示符才发; 挂起时就停在确认提示上的 (回答它), 要还是同一行.
@@ -472,8 +491,10 @@ def recheck(it, dev, tail, rules):
         was = (it.get("gate") or {}).get("line")
         if sw.at_any_prompt(now_line, vendor):
             return None
-        if was and sw.is_confirm_prompt(was) and now_line == sw.last_line(was):
-            return None                 # 挂起时就停在这个确认提示上: 人看过、明确要回答它, 还是同一行才发
+        was_size = (it.get("gate") or {}).get("log_size")
+        if (was and sw.is_confirm_prompt(was) and now_line == sw.last_line(was)
+                and was_size is not None and size == was_size):
+            return None                 # 挂起时就停在这个确认提示上: 人看过、明确要回答它; 还是同一行、日志没新字节才发
         why = ("看不到设备现在停在哪" if not now_line else
                f"设备现在不在提示符上 (挂起时最后一行: {was or '(没记)'}), 这条发出去可能替人回答")
     return f"确认时重看设备, 没发: {why}; 设备现在最后一行: {shown}. 要发请让 Agent 重新挂起"
@@ -491,7 +512,7 @@ def send_confirmed(store, iid, by, slots, send, tail=None, rules=sw.load_rules):
             text, raw = sw.KEYS[it["cmd"]]["text"], sw.KEYS[it["cmd"]]["raw"]
         else:
             text, raw = it["cmd"], False
-        held = recheck(it, dev, tail or conbroker_tail, rules)
+        held = recheck(it, dev, tail or conbroker_tail, rules, size=slots()[it["slot"] - 1].get("count"))
     except Exception as e:              # noqa: BLE001  在途标记一定要收掉
         dev, err = None, f"{type(e).__name__}: {e}"
     t0 = time.monotonic()
@@ -666,7 +687,14 @@ def _intent(item):
     return f"\n      意图: {it}" if it else ""
 
 
-def _print_view(v, out):
+def _live_line(tail, dev):
+    try:
+        return sw.last_line(tail(dev, TAIL_LINES)) or None
+    except Exception:                   # noqa: BLE001  读不到就不显示当前行
+        return None
+
+
+def _print_view(v, out, live=lambda slot: None, rules=lambda: {}):
     for s in v["slots"]:
         bits = [f"槽位 {s['slot']}:"]
         bits.append(f"急停 (by {s['estop']['by']} {s['estop']['t']})" if s["estop"] else "正常")
@@ -678,13 +706,16 @@ def _print_view(v, out):
     for p in v["pending"]:
         warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"
-              f"\n      {p.get('reason')}{_intent(p)}", file=out)
+              f"\n      {p.get('reason')}{_intent(p)}"
+              f"{cc._line_info(p, live(p['slot']), (rules().get('slots') or {}).get(p['slot'])).replace(chr(10), chr(10) + '      ')}",
+              file=out)
     for h in v["history"][-5:]:
         print(f"  最近 #{h['id']} 槽位 {h['slot']} {h['cmd']!r} -> {h['status']}"
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)
 
 
-def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None, tail=None):
+def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None, tail=None,
+        rules=sw.load_rules):
     store = store or Store()
     send = send or conbroker_send
     slots = slots or real_slots
@@ -716,8 +747,9 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
             print(f"不行: {e}", file=out)
             return None
 
+    live = lambda slot: _live_line(tail or conbroker_tail, slots()[slot - 1]["dev"])  # noqa: E731
     if a.cmd == "pending":
-        _print_view(store.view(), out)
+        _print_view(store.view(), out, live, rules)
         return 0
     if a.cmd == "estop":
         dropped = store.run(lambda b, now: b.estop(a.slot, by.replace("@local", ""), "human", now))
@@ -747,14 +779,16 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         print(f"没有挂起的 #{a.id}", file=out)
         return 1
     warn = f"\n  !!! 高危词: {', '.join(item['danger'])}" if item.get("danger") else ""
+    lines = cc._line_info(item, live(item["slot"]), (rules().get("slots") or {}).get(item["slot"]))
     print(f"槽位 {item['slot']} ({item.get('name') or '名字未知'}) 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
-          f"\n  {item.get('reason')}{_intent(item).replace('      ', '  ')}{warn}\n确认发送? 输入 yes: ", end="", file=out)
+          f"\n  {item.get('reason')}{_intent(item).replace('      ', '  ')}{warn}{lines.replace(chr(10), chr(10) + '  ')}"
+          f"\n确认发送? 输入 yes: ", end="", file=out)
     out.flush()
     if stdin.readline().strip() != "yes":
         print("没输 yes, 不发 (还挂着)", file=out)
         return 1
     try:
-        it, status, output, note = send_confirmed(store, a.id, by, slots, send, tail=tail)
+        it, status, output, note = send_confirmed(store, a.id, by, slots, send, tail=tail, rules=rules)
     except sw.Refused as e:
         print(f"不行: {e}", file=out)
         return 1

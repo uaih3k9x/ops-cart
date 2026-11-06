@@ -408,8 +408,28 @@ def test_poc_a_model_judging_while_human_confirms_other(rig):
         return orig(i, d, c)
     rig.llm = slow
     r = rig.call("send_command", {"slot": 1, "command": "y", "lease": tok})
-    assert r["isError"] and "变" in r["content"][0]["text"]
+    out = r["content"][0]["text"]
+    assert r["isError"] or '"pending"' in out                            # 第五轮起: 设备变了先转挂起
     assert [x[1] for x in rig.sent] == ["reload"]
+
+
+def test_send_command_snap_catches_confirm_even_if_device_line_same(rig):
+    """设备最后一行没变、日志也安静, 但模型判的时候人确认过别的挂起项: 靠 snap 拦下, 不直发."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "interface g0/1", "lease": tok, "timeout_s": 1})
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail,
+                          rules=lambda: rig.rules)
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.call("send_command", {"slot": 1, "command": "description x", "lease": tok})
+    assert r["isError"] and "变" in r["content"][0]["text"]
+    assert [x[1] for x in rig.sent] == ["interface g0/1"]
 
 
 def test_poc_c_syslog_after_confirm_prompt_still_refused(rig):
@@ -457,3 +477,122 @@ def test_card_flags_answer_to_confirm_prompt():
     b.submit(1, tok, "a", "line", "y", dict(sw_._gate("confirm", "x"), line="Continue? [Y/N]:"), 1000.0, 10)
     reason = cc.card(b.view(1000.0), 1)["items"][0]["reason"]
     assert "这条会回答设备的确认提示" in reason
+
+
+# ------------------------------------------------------------ 审查 #74 第五轮
+
+def _before_prompt(text):
+    return text.split("确认发送?")[0]
+
+
+def test_cli_confirm_answer_no_warning(rig):
+    """停在 Destination filename [startup-config]? 时挂起 show running-config: 命令行确认前必须醒目警告."""
+    from test_mcp_serial import cli
+    rig.tail_text["/dev/con-1"] = "Router#copy run start\nDestination filename [startup-config]?"
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "show running-config", "lease": tok})
+    assert p["status"] == "pending"
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="n\n")
+    head = _before_prompt(text)
+    assert "这条会回答设备的确认提示" in head and "挂起时" in head
+    assert "当前最后一行：Destination filename [startup-config]?" in head
+    assert "设备现在不在提示符上" in head
+
+
+def test_cli_confirm_warns_when_device_off_prompt_for_any_command(rig):
+    from test_mcp_serial import cli
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "interface g0/1", "lease": tok})
+    rig.tail_text["/dev/con-1"] = "Router#\n  Input: 12 packets"                 # 现在停在半截输出上
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="n\n")
+    head = _before_prompt(text)
+    assert "设备现在不在提示符上" in head and "当前最后一行：Input: 12 packets" in head
+    rig.tail_text["/dev/con-1"] = "Router#"                                      # 回到提示符: 不警告
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="n\n")
+    assert "设备现在不在提示符上" not in _before_prompt(text)
+
+
+def test_cli_pending_shows_lines(rig):
+    from test_mcp_serial import cli
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "y", "lease": tok})
+    rc, text = cli(rig, "pending")
+    assert "这条会回答设备的确认提示" in text and "当前最后一行：Continue? [Y/N]:" in text
+
+
+def test_layer2_pass_rechecks_device_before_send(rig):
+    """第 2 层放行后、begin 之前再看一次: 模型判的时候现场的人在车机上敲了 copy run start, 就不直发."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        rig.tail_text["/dev/con-1"] = "Router#copy run start\nDestination filename [startup-config]?"
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.ok("send_command", {"slot": 1, "command": "terminal length 0", "lease": tok})
+    assert r["status"] == "pending" and rig.sent == []
+
+
+def test_layer2_pass_held_if_log_moved_recently(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        rig.slots[0]["mtime"] = rig.store.clock() - 1                         # 判的时候日志动过
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.ok("send_command", {"slot": 1, "command": "terminal length 0", "lease": tok})
+    assert r["status"] == "pending" and rig.sent == []
+
+
+def test_layer2_pass_still_sends_when_unchanged(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    rig.model()
+    r = rig.ok("send_command", {"slot": 1, "command": "terminal length 0", "lease": tok})
+    assert r["status"] == "sent"
+
+
+def test_same_confirm_line_exception_needs_log_unchanged(rig):
+    """唯一例外 (挂起时和确认时同一确认行) 还要日志大小没变: 挂起后日志有新字节就不走例外."""
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    rig.slots[0]["count"] = 1000
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "y", "lease": tok})
+    rig.slots[0]["count"] = 1040                                               # 中间有人敲过又删掉 / 刷新了同一行
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "refused" and rig.sent == []
+
+
+def test_same_confirm_line_exception_sends_when_log_unchanged(rig):
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    rig.slots[0]["count"] = 1000
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "y", "lease": tok})
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "sent"
+
+
+@pytest.mark.parametrize("line", ["Overwrite? [N]o/[Y]es", "Password:", "  Input: 12 packets, 5678 bytes"])
+def test_off_prompt_both_times_is_refused(rig, line):
+    """挂起时和确认时都停在不在提示符上、也不是确认提示的行: 不发."""
+    rig.tail_text["/dev/con-1"] = f"<SW1>x\n{line}"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})
+    assert p["status"] == "pending"
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "refused" and rig.sent == []

@@ -433,6 +433,7 @@ def test_read_stat_parses_comm_with_spaces(tmp_path):
 def cli(rig, *argv, stdin="yes\n", local=True):
     out = io.StringIO()
     rc = ms.cli(list(argv), store=rig.store, send=rig.send, slots=lambda: rig.slots, tail=rig.tail,
+                rules=lambda: rig.rules,
                 local=lambda: (local, "测试" if local else "经 sshd 进来的"), stdin=io.StringIO(stdin), out=out,
                 env={"SUDO_USER": "ops"})
     return rc, out.getvalue()

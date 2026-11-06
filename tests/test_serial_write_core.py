@@ -955,3 +955,15 @@ def test_any_line_cannot_queue_behind_pending(ans):
         b.submit(1, tok, "agent", "line", ans, sw._gate("confirm", "x"), 1001.0, 30)
     with pytest.raises(sw.Refused):
         b.begin(1, tok, "agent", "line", ans, sw._gate("pass", "x"), 1001.0, 30)
+
+
+def test_finish_touch_only():
+    """第五轮: Agent 自己先前的直发在"看设备"和"占用"之间回来了 (只有 finish 动了计数), 也不直发."""
+    b = sw.Book.from_text(None, 1000.0)
+    tok = b.acquire(1, "a", 1000.0)["lease"]
+    it = b.begin(1, tok, "a", "line", "show x", sw._gate("pass", "x"), 1000.0, 10)
+    snap = b.touched(1)
+    b.finish(it["id"], {"status": "sent", "echo": "Proceed? [confirm]"}, 1001.0)
+    with pytest.raises(sw.Refused) as e:
+        b.begin(1, tok, "a", "key", "enter", sw._gate("pass", "x"), 1002.0, 10, snap=snap)
+    assert e.value.code == "changed"
