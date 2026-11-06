@@ -676,3 +676,25 @@ def test_ruijie_gets_layer1_whitelist_from_survey_rules():
     assert sw.classify("terminal length 0", "ruijie", True, RULES)["verdict"] == "pass"
     for cmd in ("configure terminal", "write memory", "reload", "terminal length 0 ; reload"):
         assert sw.classify(cmd, "ruijie", True, RULES)["verdict"] == "confirm", cmd
+
+
+
+@pytest.mark.parametrize("vendor,ok,bad", [
+    ("huawei", "screen-length 0 temporary", ["screen-length 0", "screen-length 0 temporary ; save",
+                                              "screen-length  0 temporary", "Screen-length 0 temporary"]),
+    ("cisco", "terminal length 0", ["terminal length 0 x", "terminal length 24", "TERMINAL length 0",
+                                    "terminal monitor"]),
+])
+def test_paging_layer1_exact_only(vendor, ok, bad):
+    assert sw.classify(ok, vendor, True, RULES)["verdict"] == "pass"
+    for cmd in bad:
+        assert sw.classify(cmd, vendor, True, RULES)["verdict"] == "confirm", cmd
+
+
+def test_ruijie_extra_verbs_take_effect(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"vendors": {"ruijie": {"extra_verbs": ["ping"]}}}))
+    r = sw.load_rules(str(p))
+    assert r["vendors"]["ruijie"]["extra_verbs"] == ["ping"]
+    assert sw.classify("ping 192.0.2.1", "ruijie", True, r)["verdict"] == "pass"
+    assert sw.classify("ping 192.0.2.1", "ruijie", True, RULES)["verdict"] == "confirm"

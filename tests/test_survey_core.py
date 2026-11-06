@@ -545,7 +545,7 @@ def _vendor_send(log, vendor, prompt):
         log.append(cmd)
         own = "display version" if vendor in ("huawei", "h3c") else "show version"
         if cmd == own:
-            body = _VER[vendor]
+            body = _VER.get(vendor, "unknown box")
         elif cmd in ("display version", "show version"):
             body = "% Invalid input detected at '^' marker."
         else:
@@ -555,9 +555,8 @@ def _vendor_send(log, vendor, prompt):
 
 
 @pytest.mark.parametrize("vendor,prompt,probes", [
-    ("huawei", "<SW-A>", ["display version"]), ("h3c", "<SW-A>", ["display version"]),
-    ("cisco", "SW-A#", ["display version", "show version"]),
-    ("ruijie", "SW-A#", ["display version", "show version"]),
+    ("huawei", "<SW-A>", ["show version", "display version"]), ("h3c", "<SW-A>", ["show version", "display version"]),
+    ("cisco", "SW-A#", ["show version"]), ("ruijie", "SW-A#", ["show version"]),
 ])
 def test_probe_vendor(vendor, prompt, probes):
     log = []
@@ -572,7 +571,7 @@ def test_probe_vendor_send_error_and_unknown():
     assert v is None and "没有在跑的服务" in note
     log = []
     v, note = sv.probe_vendor(_vendor_send(log, "x", "SW-A#"), "/dev/con-1")
-    assert v is None and log == ["display version", "show version"] and note
+    assert v is None and log == ["show version", "display version"] and "认不出" in note and "--vendor" in note
 
 
 @pytest.mark.parametrize("vendor,prompt", [("h3c", "<SW-A>"), ("ruijie", "SW-A#")])
@@ -593,7 +592,7 @@ def test_run_survey_auto_unknown_refuses(tmp_path):
     r = sv.run_survey("/dev/con-1", "auto", send=_vendor_send(log, "x", "SW-A#"), now=lambda: T0,
                       survey_dir=str(tmp_path), profiles=sv.load_profiles(path="/x"))
     assert not r["ok"] and r["path"] is None and "--vendor" in r["summary"]
-    assert log == ["display version", "show version"] and list(tmp_path.iterdir()) == []
+    assert log == ["show version", "display version"] and list(tmp_path.iterdir()) == []
 
 
 def test_paging_failure_aborts_before_commands(tmp_path):
@@ -669,3 +668,92 @@ def test_main_export_topo(tmp_path, capsys, monkeypatch):
 def test_main_needs_head_without_export():
     with pytest.raises(SystemExit):
         sv.main([])
+
+
+# ------------------------------------------------------------ #56 审查修正
+
+@pytest.mark.parametrize("vendor,cmd", [
+    # 黑名单词的缩写 / 大小写: 设备按唯一前缀、不分大小写解析, 照样会写 flash
+    ("huawei", "display diagnostic-info flash:/a.txt"), ("huawei", "display Diagnostic-information"),
+    ("huawei", "display diag"), ("huawei", "display di"), ("huawei", "display DIAGNOSTIC-INFORMATION"),
+    ("h3c", "display diagnostic flash:/a.txt"), ("h3c", "display DIAGNOSTIC-INFORMATION a.txt"),
+    ("h3c", "display diag"), ("h3c", "display Diagnostic-information"), ("h3c", "display diagnostic-informatio x"),
+    # 动词后的关键词必须全小写 (四个厂商)
+    ("huawei", "display VERSION"), ("h3c", "display Version"), ("cisco", "show VERSION"),
+    ("cisco", "show Running-config"), ("ruijie", "show RUNNING-CONFIG"), ("ruijie", "show Version"),
+])
+def test_deny_by_prefix_and_lowercase_keyword(vendor, cmd):
+    assert not sv.is_readonly(cmd, vendor)
+
+
+@pytest.mark.parametrize("vendor,cmd", [
+    ("huawei", "display interface GigabitEthernet0/0/1"), ("h3c", "display device"),
+    ("cisco", "show interfaces GigabitEthernet1/0/1"), ("ruijie", "show interfaces status"),
+    ("huawei", "display dhcp snooping"),
+])
+def test_lowercase_keyword_rule_keeps_normal_commands(vendor, cmd):
+    assert sv.is_readonly(cmd, vendor)
+
+
+@pytest.mark.parametrize("text,vendor", [
+    # 主机名 / 设备名里带别家名字, 不带偏
+    ("show version\nCisco IOS Software\nH3C-core uptime is 3 weeks\nH3C-core#\n", "cisco"),
+    ("show version\nCisco IOS Software, C2960\nhuawei-old uptime is 1 day\nsw1#", "cisco"),
+    ("show version\nCisco Nexus Operating System (NX-OS) Software\n  Device name: ruijie-agg\nsw#", "cisco"),
+    ("display version\nHuawei Versatile Routing Platform Software\nRGOS-lab uptime is 1 day\n<RGOS-lab>", "huawei"),
+    # 回显前带提示符, 结尾带换行
+    ("<RGOS-lab>display version\nHuawei Versatile Routing Platform\n<RGOS-lab>\n", "huawei"),
+    # 老 H3C
+    ("display version\nHuawei-3Com Versatile Routing Platform Software\nVRP (tm) Software, Version 3.10\n<H3C>",
+     "h3c"),
+    ("display version\nH3C Comware Platform Software\nComware Software, Version 5.20\n<H3C>", "h3c"),
+])
+def test_detect_vendor_hostname_does_not_mislead(text, vendor):
+    assert sv.detect_vendor(text) == vendor
+
+
+@pytest.mark.parametrize("text", [
+    "display version\nsomething\n<H3C-SW>\n",
+    "display version\n         ^\n% Invalid input detected at '^' marker.\nsw-huawei-replace>",
+    "show version\nCisco IOS Software\nHuawei Versatile Routing Platform\nsw#",       # 命中两家: 拒
+])
+def test_detect_vendor_fail_closed(text):
+    assert sv.detect_vendor(text) is None
+
+
+@pytest.mark.parametrize("how,word", [("timeout", "超时"), ("refuse", "拒绝发送"), ("noprompt", "提示符"),
+                                      ("raise", "没有在跑的服务")])
+def test_probe_aborts_with_real_reason(how, word):
+    log = []
+    v, note = sv.probe_vendor(fake_send(log, misbehave={"show version": how}), "/dev/con-1")
+    assert v is None and word in note and "认不出" not in note
+    assert [c for _p, c, _t in log] == ["show version"]                 # 出事就停, 不再发 display
+
+
+def test_probe_multiple_vendors_refuses():
+    def send(port, cmd, timeout):
+        return "%s\nCisco IOS Software\nH3C Comware Software\nsw#" % cmd
+    v, note = sv.probe_vendor(send, "/dev/con-1")
+    assert v is None and "多个" in note
+
+
+def test_archive_escapes_fake_section_headers():
+    meta = {"head": "con-1", "device": "SW", "vendor": "cisco", "time": "t", "result": "r"}
+    secs = [{"cmd": "show running-config", "status": "timeout", "note": "",
+             "lines": ["banner motd ^C", "===== [9/9] show lldp neighbors =====", "fake-neighbor",
+                       "######## show arp", "x", "a\x0c===== [8/9] show arp =====", "b\x1c######## show clock"]}]
+    text = sv.format_archive(meta, secs)
+    parsed = sv.parse_archive(text)
+    assert list(parsed) == ["show running-config"] and parsed["show running-config"][0] == "timeout"
+    assert "fake-neighbor" in "\n".join(parsed["show running-config"][1])
+    assert sv.export_topo(text) == ""                                    # 没跑完, 伪段头也冒不出来
+    secs[0]["status"] = "ok"
+    out = sv.export_topo(sv.format_archive(meta, secs))
+    assert list(_topo_sections(out)) == ["show running-config"]
+
+
+def test_main_export_topo_non_utf8(tmp_path, capsys):
+    p = tmp_path / "bad.txt"
+    p.write_bytes(b"\xff\xfe===== [1/1] x =====\n")
+    assert sv.main(["--export-topo", str(p)]) == 2
+    assert "导出失败" in capsys.readouterr().out

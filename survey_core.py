@@ -64,7 +64,9 @@ def is_readonly(cmd, vendor, extra_verbs=()):
       - 不许 ; & < > ` $ # ! —— 多命令拼接、重定向、命令替换、注释.
       - "|" 必须单独成词, 后面只许接过滤词 include/exclude/begin/section (要带参数)、count/no-more (不带);
         save/append/redirect/tee 这类写文件的管道全拒. 过滤词同样不许缩写、不许大写.
-      - display 后面紧跟的子命令不许在 deny 里 (diagnostic-information 能把输出写进 flash).
+      - 动词后紧跟的关键词必须全小写 (后面的接口名等参数不限), 且不许是 deny 里任何一个词的前缀
+        (含全称): 设备按"唯一前缀、不分大小写"解析, diag / diagnostic-info 照样落到
+        diagnostic-information (能把输出写进 flash), 所以黑名单按前缀拦, 宁可多拦.
       - 动词后至少要有一个词.
 
     缩写 (dis / disp / sh) 不放, 理由:
@@ -83,7 +85,10 @@ def is_readonly(cmd, vendor, extra_verbs=()):
     words = cmd.split(" ")
     if not all(_TOKEN.fullmatch(w) for w in words):       # 空词 = 前后空白或连续空格
         return False
-    if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2 or words[1] in rules["deny"]:
+    if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2:
+        return False
+    kw = words[1]
+    if kw != kw.lower() or any(d.startswith(kw) for d in rules["deny"]):
         return False
     segs, cur = [], []
     for w in words[1:]:
@@ -256,6 +261,13 @@ def _split_output(out, cmd):
     return lines
 
 
+_HEAD_LIKE = ("=====", "########")                # 撞存档段头 / 拓扑段头的正文行, 写存档时前面加一个空格
+
+
+def _esc(ln):
+    return " " + ln if ln.startswith(_HEAD_LIKE) else ln
+
+
 def format_archive(meta, sections):
     out = ["# ops-cart 只读巡检 (survey_core.py)",
            f"# 操作头: {meta['head']}  设备: {meta['device'] or '未知'}  厂商: {meta['vendor']}  时间: {meta['time']}",
@@ -266,7 +278,7 @@ def format_archive(meta, sections):
         if s["status"] != "ok":
             tag = f" ({s['status']}: {_STATUS[s['status']]}{'; ' + s['note'] if s['note'] else ''})"
         out.append(f"===== [{i}/{total}] {s['cmd']} ====={tag}")
-        out.extend(s["lines"])
+        out.extend(_esc(ln) for ln in s["lines"])
         out.append("")
     return "\n".join(out) + "\n"
 
@@ -274,7 +286,7 @@ def format_archive(meta, sections):
 def parse_archive(text):
     """存档 -> {命令: (状态, 正文行)}; 认不出的文件给空 dict."""
     secs, cur = {}, None
-    for ln in text.splitlines():
+    for ln in text.split("\n"):                     # 只按 \n 切: splitlines 会把正文里的 \x0c \x1c 也当换行
         m = _SECTION.fullmatch(ln)
         if m:
             cur = m.group(3)
@@ -331,41 +343,48 @@ def not_comparable(old, new, prof):
 
 # ------------------------------------------------------------ 认厂商 (#56)
 
-# 按顺序找, 先中先得: H3C 早年的版本信息里带过 Huawei 字样, 所以 H3C 排在华为前面
-_VENDOR_KEYS = [("h3c", re.compile(r"\bH3C\b|Comware", re.I)),
-                ("ruijie", re.compile(r"Ruijie|RGOS", re.I)),
-                ("huawei", re.compile(r"Huawei|\bVRP\b", re.I)),
-                ("cisco", re.compile(r"Cisco|NX-OS", re.I))]
-_PROBES = ("display version", "show version")            # 两条在各自厂商下都过白名单
+# 只认版本信息里的具体软件名, 不认裸厂商名 (主机名 / Device name / uptime 行里常带别家名字).
+# 老 H3C 自称 "Huawei-3Com Versatile Routing Platform", 不含 "Huawei Versatile", 和华为不重叠.
+# 命中不止一家 = 认不准, 拒 (fail-closed), 不按顺序取第一个.
+_VENDOR_KEYS = [("h3c", re.compile(r"Comware (?:Platform )?Software|Huawei-3Com", re.I)),
+                ("ruijie", re.compile(r"Ruijie Networks|Ruijie General Operating System|RGOS \d", re.I)),
+                ("huawei", re.compile(r"Huawei Versatile Routing Platform", re.I)),
+                ("cisco", re.compile(r"Cisco IOS|Cisco Internetwork Operating System|Cisco Nexus Operating System",
+                                     re.I))]
+# 先 show 后 display: 华为 / H3C 收到 show 只报错; 思科收到 display 可能当主机名去解析 / telnet
+_PROBES = ("show version", "display version")             # 两条在各自厂商下都过白名单
+
+
+def _vendor_hits(lines):
+    body = "\n".join(lines)
+    return [v for v, pat in _VENDOR_KEYS if pat.search(body)]
 
 
 def detect_vendor(text):
-    """version 命令的输出 -> 厂商 或 None. 只看正文: 回显和最后一行提示符 (设备名可能带别家名字) 去掉."""
+    """version 命令的输出 -> 厂商 或 None (认不出 / 命中多家). 和巡检同样去掉回显和最后一行提示符."""
     if not isinstance(text, str):
         return None
-    lines = (text or "").replace("\r", "").split("\n")
-    if lines and lines[0].strip() in _PROBES:
-        lines = lines[1:]
-    if lines and parse_device(lines[-1]):
-        lines = lines[:-1]
-    body = "\n".join(lines)
-    for vendor, pat in _VENDOR_KEYS:
-        if pat.search(body):
-            return vendor
-    return None
+    text = text.replace("\r", "").rstrip("\n")
+    first = text.split("\n", 1)[0].strip()
+    cmd = next((c for c in _PROBES if first.endswith(c)), "\0")
+    hits = _vendor_hits(_split_output(text, cmd))
+    return hits[0] if len(hits) == 1 else None
 
 
 def probe_vendor(send, port, timeout=DEFAULT_TIMEOUT):
-    """先 display version, 认不出再 show version -> (厂商, "") 或 (None, 说明). 不抛异常."""
+    """先 show version, 认不出再 display version -> (厂商, "") 或 (None, 说明). 不抛异常.
+
+    每条探测和巡检命令一样判状态: 超时 / 被 conbroker 拒 / 没回提示符 / 发送失败就中止, 说明里写真实原因."""
     for cmd in _PROBES:
-        try:
-            out = send(port, cmd, timeout)
-        except Exception as e:
-            return None, f"认厂商时发 {cmd} 失败: {str(e) or type(e).__name__}"
-        v = detect_vendor(out)
-        if v:
-            return v, ""
-    return None, "display version / show version 的输出里认不出厂商"
+        st, note, lines, _dev = _send_one(send, port, cmd, timeout, None)
+        if st != "ok":
+            return None, f"认厂商时 {cmd} {_STATUS[st]}: {note}"
+        hits = _vendor_hits(lines)
+        if len(hits) > 1:
+            return None, f"{cmd} 的输出命中多个厂商 ({' / '.join(hits)}), 认不准; 用 --vendor 指定"
+        if hits:
+            return hits[0], ""
+    return None, "show version / display version 的输出里认不出厂商; 用 --vendor 指定"
 
 
 # ------------------------------------------------------------ 执行
@@ -381,6 +400,11 @@ def _one(send, port, vendor, cmd, timeout, device):
     """发一条 -> (状态, 说明, 正文行, 设备名)."""
     if not is_readonly(cmd, vendor):                    # 发前再过一次, 不信预检之后清单没被动过
         return "refused", "白名单不放", [], device
+    return _send_one(send, port, cmd, timeout, device)
+
+
+def _send_one(send, port, cmd, timeout, device):
+    """send 一条并判状态 (调用方先过白名单) -> (状态, 说明, 正文行, 设备名)."""
     try:
         out = send(port, cmd, timeout)
     except Exception as e:                              # 真 send: conbroker 退出码非 0 / 子进程超时
@@ -434,8 +458,8 @@ def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_D
     if vendor == "auto":
         vendor, why = probe_vendor(send, port)
         if not vendor:
-            return _result(head=head, summary=f"巡检拒绝执行: {why}; 用 --vendor (面板: serial.conf 的 survey_vendor) "
-                                              f"指定 {' / '.join(_RULES)}")
+            return _result(head=head, summary=f"巡检没跑: {why} (可选 {' / '.join(_RULES)}; "
+                                              f"面板在 serial.conf 的 survey_vendor 里指定)")
     if vendor not in _RULES:
         return _result(head=head, summary=f"巡检拒绝执行: 厂商 {vendor} 没有内置只读规则")
     prof = (profiles if profiles is not None else load_profiles()).get(vendor) or {}
@@ -547,7 +571,7 @@ def main(argv=None):
                     f.write(out)
             else:
                 sys.stdout.write(out)
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             print(f"导出失败: {e}")
             return 2
         return 0
