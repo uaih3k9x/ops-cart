@@ -6,7 +6,7 @@ BlueZ D-Bus 上注册一个 GATT 服务 + LE 广播: 手机往 RX 特征写分�
 /run/ops-cart/ble-input/reply/ 下的回复摘要经 TX 特征 notify 回去. **不执行任何命令**.
 契约: 文字只进输入框, 换行不得触发提交; 送往 HID 或串口必须再走现有危险操作确认.
 
-RX 用 secure-write、TX 用 secure-notify: BlueZ 只在 LE Secure Connections 加密的连接上放行; 外壳再查一遍
+RX 用 secure-write、TX 用 secure-notify: 要最高一级链路安全 (目标是 LE Secure Connections, 待实机验证); 外壳再查一遍
 设备属性 (Paired + Trusted, 有 Bonded 时还要 Bonded), 并只认 org.bluez 属主的 D-Bus 调用. 启动时把适配器的
 Pairable 关掉; bluetoothd 换了属主 (重启) 就退出, 交给 systemd 重拉.
 
@@ -246,7 +246,8 @@ def _build(dbus, service, GLib, bus, adapter, handler_box):
             if self.notifying:
                 self.PropertiesChanged(CHRC, {"Value": dbus.Array(frame, signature="y")}, [])
 
-    # secure-*: 要 LE Secure Connections 加密 (BlueZ 在 ATT 层就拒别的连接); 外壳再查一遍 Paired/Trusted/Bonded.
+    # secure-*: 单独就设了 write / notify 属性并要最高一级链路安全 (目标 LE Secure Connections, 待实机验证);
+    # "notify" 是多写的, 无害. 外壳再查一遍 Paired/Trusted/Bonded.
     rx = Chrc(0, bc.RX_UUID, ["secure-write"])
     tx = Chrc(1, bc.TX_UUID, ["notify", "secure-notify"])
 
