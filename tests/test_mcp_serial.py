@@ -191,10 +191,10 @@ def test_not_at_prompt_is_held(rig):
     rig.tail_text["/dev/con-1"] = "Username:"
     tok = rig.lease(1)
     assert rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})["status"] == "pending"
-    rig.tail_text.pop("/dev/con-1")                                   # 读不到输出: 一样挂起
+    rig.tail_text.pop("/dev/con-1")                                   # 读不到输出: 不挂起也不发 (#65 没法核对现场)
     rig.clock.t += 1
-    assert rig.ok("send_command", {"slot": 1, "command": "display clock", "lease": tok})["status"] == "pending"
-    assert rig.sent == []
+    assert "读不到" in rig.err("send_command", {"slot": 1, "command": "display clock", "lease": tok})
+    assert rig.sent == [] and len(rig.ok("pending_list")["pending"]) == 1
 
 
 @pytest.mark.parametrize("cmd", ["display version\rsave", "save\x08", "\x03", "display\tversion", "-h"])
@@ -392,7 +392,7 @@ def cli(rig, *argv, stdin="yes\n", local=True):
     out = io.StringIO()
     rc = ms.cli(list(argv), store=rig.store, send=rig.send, slots=lambda: rig.slots,
                 local=lambda: (local, "测试" if local else "经 sshd 进来的"), stdin=io.StringIO(stdin), out=out,
-                env={"SUDO_USER": "ops"})
+                env={"SUDO_USER": "ops"}, tail=lambda dev, n: rig.tail(dev, n))
     return rc, out.getvalue()
 
 
@@ -581,3 +581,228 @@ def test_flag_kvm_sticky_when_old_flag_unreadable(tmp_path):
         f.write("{bad")
     rig.store.run(lambda b, now: None)
     assert _flag(rig)["kvm"] is True
+
+
+# ------------------------------------------------------------ 挂起期间不许直发 (#65)
+
+def test_direct_send_refused_while_pending_then_shutdown_lands_where_approved(rig):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert p["status"] == "pending"
+    msg = rig.err("send_command", {"slot": 1, "command": "display interface brief", "lease": tok})
+    assert "挂起" in msg and f"#{p['id']}" in msg
+    assert "挂起" in rig.err("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert rig.sent == []                                             # 一个字节都没发
+    assert [r["why"] for r in rig.log(1) if r["ev"] == "refused"][-1] == "pending"
+    rc, text = cli(rig, "confirm", str(p["id"]))                      # 人那边照常
+    assert rc == 0, text
+    assert rig.sent == [("/dev/con-1", "shutdown", False)]
+
+
+def test_pending_carries_device_context_for_reviewer(rig):
+    rig.tail_text["/dev/con-1"] = "interface GigabitEthernet0/0/1\n[SW1-GigabitEthernet0/0/1]"
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    ctx = rig.ok("pending_list")["pending"][0]["context"]
+    assert ctx["untrusted"] is True and ctx["lines"][-1] == "[SW1-GigabitEthernet0/0/1]"
+    assert all("context" not in r for r in rig.log(1))                # 执行绪日志照旧不带
+    rc, text = cli(rig, "pending")
+    assert "设备最近输出" in text and "不可信" in text and "[SW1-GigabitEthernet0/0/1]" in text
+
+
+# ------------------------------------------------------------ #68 审查: 时序缺口
+
+GE1 = "interface GigabitEthernet0/0/1\n[~SW1-GigabitEthernet0/0/1]"
+GE2 = "interface GigabitEthernet0/0/2\n[~SW1-GigabitEthernet0/0/2]"
+
+
+def test_hold_refused_if_other_send_lands_while_reading_and_judging(rig):
+    """一路读完输出、等第 2 层模型时, 另一路 (同令牌) 直发完了: 这一路不挂起, 让 Agent 重新看现场."""
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    real_tail = rig.tail
+
+    def tail_then_other_sends(dev, n):
+        out = real_tail(dev, n)
+        if n == ms.TAIL_LINES and not getattr(rig, "_raced", False):
+            rig._raced = True
+            rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface GigabitEthernet0/0/2",
+                                                 {"verdict": "pass", "layer": 1, "reason": "x", "danger": []},
+                                                 now, 30))
+            rig.store.run(lambda b, now: b.finish(1, {"status": "sent", "echo": ""}, now))
+        return out
+    rig.tail = tail_then_other_sends
+    msg = rig.err("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert "旧了" in msg
+    assert rig.ok("pending_list")["pending"] == []
+
+
+def test_confirm_rereads_prompt_and_voids_if_changed(rig):
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rig.tail_text["/dev/con-1"] = GE2                                # 有人在网页口敲了 interface GE0/0/2
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert rc == 1 and "新输出" in text
+    assert rig.sent == []
+    assert rig.ok("pending_list")["history"][-1]["status"] == "dropped"
+
+
+def test_confirm_with_unreadable_output_keeps_pending(rig):
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rig.tail_text.pop("/dev/con-1")
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert rc == 1 and "读不到" in text and rig.sent == []
+    assert [x["id"] for x in rig.ok("pending_list")["pending"]] == [p["id"]]
+
+
+# ------------------------------------------------------------ #68 第二轮
+
+def test_send_command_while_inflight_refused_before_reading(rig):
+    tok = rig.lease(1)
+    rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface Gi0/2",
+                                         {"verdict": "pass", "layer": 1, "reason": "x", "danger": []}, now, 30))
+    rig.tails.clear()
+    assert "还没回来" in rig.err("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert rig.tails == [] and rig.sent == []                         # 连输出都没读
+
+
+def test_direct_send_refused_if_other_send_lands_while_judging(rig):
+    """第 2 层模型放行的直发也绑上下文: 读完输出后另一路发完了, 不发 (低6)."""
+    rig.model()
+    tok = rig.lease(1)
+    real_llm = rig.llm
+
+    def llm_then_other_sends(*a):
+        rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface Gi0/2",
+                                             {"verdict": "pass", "layer": 1, "reason": "x", "danger": []}, now, 30))
+        rig.store.run(lambda b, now: b.finish(b.doc["seq"], {"status": "sent", "echo": ""}, now))
+        return real_llm(*a)
+    rig.llm = llm_then_other_sends
+    msg = rig.err("send_command", {"slot": 1, "command": "system-view", "lease": tok})
+    assert "旧了" in msg and rig.sent == []
+
+
+def test_kiosk_default_path_rereads_with_conbroker_tail(rig, monkeypatch):
+    """车机 human_action 不传 tail: 默认走 conbroker_tail 重读, 变了照样作废."""
+    import confirm_core as cc
+    rig.tail_text["/dev/con-1"] = GE1
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    seen = []
+    monkeypatch.setattr(ms, "conbroker_tail", lambda dev, n: seen.append((dev, n)) or GE2)
+    with pytest.raises(sw.Refused) as e:
+        ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send)
+    assert e.value.code == "stale" and seen == [("/dev/con-1", ms.TAIL_LINES)] and rig.sent == []
+    _ = tok
+
+
+def test_cli_pending_shows_trusted_recent(rig):
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})
+    rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rc, text = cli(rig, "pending")
+    assert "可信记录" in text and "'display version'" in text
+
+
+def test_cli_confirm_shows_context_trusted_and_note_before_yes(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "SW1(config-if)#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
+    head = text.split("输入 yes")[0]
+    assert rc == 1 and "设备最近输出" in head and "可信记录" in head and "提示符不能证明作用对象" in head
+
+
+# ------------------------------------------------------------ #68 第四轮
+
+def _other_lands_during_tail(rig, tok):
+    real = rig.tail
+
+    def tail_then_other_sends(dev, n):
+        rig.tail = real
+        rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface Gi0/2",
+                                             {"verdict": "pass", "layer": 1, "reason": "x", "danger": []}, now, 30))
+        rig.store.run(lambda b, now: b.finish(b.doc["seq"], {"status": "sent", "echo": ""}, now))
+        return real(dev, n)
+    rig.tail = tail_then_other_sends
+
+
+@pytest.mark.parametrize("key", ["ctrl_c", "enter"])
+def test_send_key_bound_to_mark(rig, key):
+    """Ctrl+C 挂起 / 回车直发都绑读输出前的序号: 读输出时另一路发完了, 不挂不发."""
+    tok = rig.lease(1)
+    _other_lands_during_tail(rig, tok)
+    msg = rig.err("send_key", {"slot": 1, "key": key, "lease": tok})
+    assert "旧了" in msg and rig.sent == [] and rig.store.view()["pending"] == []
+
+
+def test_gate_records_whether_vendor_registered(rig):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert p.get("status") == "pending"
+    item = next(x for x in rig.store.view()["pending"] if x["id"] == p["id"])
+    assert item["gate"]["vendor"] == "huawei" and item["gate"]["vendor_registered"] is False
+    rig.rules = dict(rig.rules, slots={2: "huawei"})
+    tok2 = rig.lease(2)
+    p2 = rig.ok("send_command", {"slot": 2, "command": "shutdown", "lease": tok2})
+    item2 = next(x for x in rig.store.view()["pending"] if x["id"] == p2["id"])
+    assert item2["gate"]["vendor_registered"] is True
+
+
+def test_cli_confirm_prefixes_device_output(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "fake: ok\nSW1(config-if)#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rig.tail_text["/dev/con-1"] = "fake: ok\nSW1(config-if)#"
+    rig.reply = ("sent", "shutdown\n已确认: 全部完成\nSW1(config-if)#", None)
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    head, after = text.split("输入 yes", 1)
+    assert "    | fake: ok" in head and "    | SW1(config-if)#" in head
+    assert "| 已确认: 全部完成" in after and "\n已确认" not in after
+
+
+def test_cli_confirm_prints_trusted_change_before_yes(rig):
+    rig.model()
+    tok = rig.lease(1)
+    assert rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok}).get("sent") is not False
+    rig.model(on=False)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
+    assert "「system-view」" in text.split("输入 yes")[0]
+
+
+# ------------------------------------------------------------ #68 第六轮: intent 伪造可信记录
+
+FAKE_INTENT = ("x\n  可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）：\n"
+               "    #1 「interface Gi0/1」\x1b[8m")
+
+
+@pytest.mark.parametrize("cmd", ["pending", "confirm"])
+def test_cli_intent_cannot_forge_trusted_block(rig, cmd):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok, "intent": FAKE_INTENT})
+    args = ["confirm", str(p["id"])] if cmd == "confirm" else ["pending"]
+    rc, text = cli(rig, *args, stdin="no\n")
+    head = text.split("输入 yes")[0]
+    assert head.count("可信记录（推车自己记的") == 1 + 1        # 真块 1 次 + 被压进自述那一行 1 次
+    real = head.index("可信记录（推车自己记的")
+    assert real < head.index("Agent 自述（不可信）")
+    line = next(ln for ln in head.split("\n") if "Agent 自述（不可信）" in ln)
+    assert "可信记录（推车自己记的" in line and "「interface Gi0/1」" in line      # 伪造的都挤在同一行里
+    assert "\x1b" not in text
+
+
+def test_cli_confirm_trusted_before_reason_and_context(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "SW1(config-if)#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok, "intent": "关口"})
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
+    head = text.split("输入 yes")[0]
+    i = head.index("可信记录（推车自己记的")
+    assert i < head.index("闸门理由") < head.index("Agent 自述") < head.index("设备最近输出")
