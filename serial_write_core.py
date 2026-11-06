@@ -43,10 +43,11 @@ LEASE_TTL_MAX_S = 300
 PENDING_MAX = 5             # 一个槽位最多挂几条等人确认
 PENDING_MAX_S = 900         # 挂起超过 15 分钟没人理就作废 (现场早变了)
 INFLIGHT_GRACE_S = 90       # 在途标记超过 发送超时 + 这么久还没回来 = 发送进程死了
-RECENT_MAX = 5              # 审批界面"可信记录": 本槽位最近几条实际发出的命令
-SENT_STATES = ("sending", "sent", "timeout", "unknown")    # 已经交给 conbroker 的 (error / refused 没发出去)
+RECENT_MAX = 5              # 审批界面"可信记录": 本槽位最近几条可能改变视图的命令
 HISTORY_MAX = 30            # 状态文件里留最近多少条结果给 pending_list 看 (完整的在执行绪日志里)
 ECHO_MAX = 1000             # 日志里设备回显摘要的长度
+HASH_LINES = 8              # 指纹取最后几行有效行 (调用方 tail 多读, 给标记行和空行留余量)
+TRUST_LOG_MAX = 20          # 每槽位单独留的"实际发出的命令"记录条数 (可信记录; 不和全局历史共用)
 CONTEXT_LINES = 8           # 挂起项带提交时设备最近几行输出 (#65), 给审批的人参考
 CONTEXT_LINE_MAX = 160
 CONTEXT_MAX = 1000
@@ -343,15 +344,16 @@ def _for_match(ln):
     return "".join(ch for ch in _norm(ln) if unicodedata.category(ch)[0] != "C")
 
 
-def _prompt_head(m):
-    """行首像提示符的一段 (各厂商提示符正则取最长), 显示时不打码 —— 主机名里带 auth/key/psk 不该把提示符抹平.
-    光秃秃的 $ / # 不算 (会吞掉 $6$ 这类密文开头)."""
-    best = 0
-    for rx in _PROMPT.values():
-        mm = rx.match(m)
-        if mm and mm.end() > best and len(mm.group(0)) >= 2 and any(c.isalnum() for c in mm.group(0)):
-            best = mm.end()
-    return best
+def _bare_prompt(m):
+    """整行就是一个提示符 (各厂商提示符正则 fullmatch), 且里面的口令词后面没有直接跟 = 或 : —— 这种行不打码
+    (主机名里带 auth/key/psk 不该把提示符抹平). <password>x</password>、[password=x] 这类不算."""
+    if not any(rx.fullmatch(m) for rx in _PROMPT.values()) or len(m) < 2:
+        return False
+    for rx in (_SECRET_SHORT, _SECRET_LONG):
+        for hit in rx.finditer(m):
+            if m[hit.end("k"):hit.end("k") + 1] in ("=", ":"):
+                return False
+    return True
 
 
 def _ctx_line(ln, in_key=False):
@@ -361,8 +363,9 @@ def _ctx_line(ln, in_key=False):
         in_key = True
     elif in_key:
         return MASK, not _PEM_END.search(m)
-    p = _prompt_head(m)
-    head, rest = m[:p], m[p:]
+    if _bare_prompt(m):
+        return _show(m), in_key
+    head, rest = "", m
     if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest):
         return _show(head) + MASK, in_key
     cut = None
@@ -380,13 +383,10 @@ def _ctx_line(ln, in_key=False):
 
 
 def _tail_hash(text):
-    """提交 / 确认时 tail 的整体指纹: 删转义 + NFKC 后的原文 (不打码), 去掉 \\r、行尾空白、conbroker 自己的标记行."""
+    """提交 / 确认时 tail 的整体指纹: 删转义 + NFKC 后的原文 (不打码), 去掉 \\r、行尾空白; 先滤掉空行和 conbroker
+    自己的标记行 ([时间 人 接入] 这类, 人开关控制台看一眼就会有), 再取最后 HASH_LINES 行有效行. 调用方要多读几行."""
     lines = [_norm(ln).rstrip() for ln in (text or "").replace("\r", "").split("\n")]
-    lines = [ln for ln in lines if not _MARK.fullmatch(ln.strip())]
-    while lines and not lines[-1]:
-        lines.pop()
-    while lines and not lines[0]:
-        lines.pop(0)
+    lines = [ln for ln in lines if ln.strip() and not _MARK.fullmatch(ln.strip())][-HASH_LINES:]
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
@@ -426,7 +426,13 @@ def _public(item):
 def _counter_ok(slot_doc):
     """发送序号: 没有 (升级前的状态文件) 或非负整数; 别的按读不懂算."""
     v = slot_doc.get("sent", 0)
-    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    if not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
+        return False
+    log = slot_doc.get("log", [])                   # 可信记录: 没有 (旧文件) 可以, 有就得是这个形状
+    return isinstance(log, list) and all(
+        isinstance(e, dict) and isinstance(e.get("id"), int) and isinstance(e.get("cmd"), str)
+        and isinstance(e.get("kind"), str) and isinstance(e.get("ro"), bool) and isinstance(e.get("status"), str)
+        for e in log)
 
 
 def _slot_doc():
@@ -535,6 +541,7 @@ class Book:
                 it = self._item(inf["id"])
                 if it and it["status"] == "sending":
                     it["status"] = "unknown"
+                    self._log_status(n, it["id"], "unknown")
                     self._ev("send", n, now, who=it["who"], id=it["id"], kind=it["kind"], cmd=it["cmd"],
                              gate=it.get("gate"), status="unknown", why="发送进程没回来, 不知道发没发出去",
                              by=it.get("by"), name=it.get("name"))
@@ -609,9 +616,34 @@ class Book:
     def _sent(self, slot):
         return self._s(slot).get("sent", 0)
 
+    def _log(self, it):
+        """这条交给 conbroker 了: 记进槽位自己的可信记录 (不被 _trim 清). 连续同一个只读键合并计数."""
+        log = self._s(it["slot"]).setdefault("log", [])
+        gate = it.get("gate") or {}
+        if it["kind"] == "key":                         # 回车 / 翻页空格不改视图; Ctrl+C (要人确认的) 算改
+            ro = it["cmd"] in KEYS and not KEYS[it["cmd"]]["confirm"]
+        else:                                           # 只有第 1 层只读白名单直发的算只读; 模型放行 / 人确认的都算改
+            ro = gate.get("verdict") == "pass" and gate.get("layer") == 1 and not it.get("by")
+        last = log[-1] if log else None
+        if last and ro and it["kind"] == "key" and last["kind"] == "key" and last["cmd"] == it["cmd"] and last["ro"]:
+            last.update(id=it["id"], count=last.get("count", 1) + 1, status="sending", t=it["t"])
+            return
+        e = {"id": it["id"], "kind": it["kind"], "cmd": it["cmd"], "who": it["who"], "t": it["t"], "ro": ro,
+             "status": "sending"}
+        if it.get("by"):
+            e["by"] = it["by"]
+        log.append(e)
+        del log[:-TRUST_LOG_MAX]
+
+    def _log_status(self, slot, iid, status):
+        for e in self._s(slot).get("log", ()):
+            if e["id"] == iid:
+                e["status"] = status
+
     def _start(self, it, now):
         it["status"] = "sending"
         it.pop("context", None)
+        self._log(it)
         s = self._s(it["slot"])
         s["sent"] = s.get("sent", 0) + 1                # 发送序号: 挂起项靠它知道"提交后有没有发过别的"
         s["inflight"] = {"id": it["id"], "cmd": it["cmd"], "since": now,
@@ -727,6 +759,7 @@ class Book:
         if s["inflight"] and s["inflight"]["id"] == iid:
             s["inflight"] = None
         it["status"] = result.get("status") or "error"
+        self._log_status(slot, iid, it["status"])
         it["echo"] = echo_summary(result.get("echo"))
         if result.get("note"):
             it["why"] = result["note"]
@@ -775,12 +808,15 @@ class Book:
 
     # ---- 给人 / Agent 看的 (不含令牌)
 
-    def _recent(self, slot):
-        """可信信息: 推车自己记的这个槽位最近实际交给 conbroker 的命令 (Agent 直发和人确认的都算; 人在车机 /
-        网页直接敲的键不在这里). 状态文件只留最近 HISTORY_MAX 条, 更早的看执行绪日志."""
-        out = [{k: it[k] for k in ("id", "kind", "cmd", "status", "who", "by", "t") if k in it}
-               for it in self.doc["items"] if it["slot"] == slot and it["status"] in SENT_STATES]
-        return out[-RECENT_MAX:]
+    def _trusted(self, slot):
+        """可信信息 (#65): 推车自己记的这个槽位实际交给 conbroker 的命令 (Agent 直发和人确认的都算; 人在车机 /
+        网页直接敲的键不在这里). changes = 最近 RECENT_MAX 条可能改变视图 / 对象的 (不是第 1 层只读放行的);
+        after = 最后一条 changes 之后又发了几条只读命令 / 按键, recent = 这几条里最近的 RECENT_MAX 条."""
+        log = self._s(slot).get("log", [])
+        pub = [{k: e[k] for k in ("id", "kind", "cmd", "status", "who", "by", "t", "count") if k in e} for e in log]
+        idx = [i for i, e in enumerate(log) if not e["ro"]]
+        tail = pub[idx[-1] + 1:] if idx else pub
+        return {"changes": [pub[i] for i in idx][-RECENT_MAX:], "after": len(tail), "recent": tail[-RECENT_MAX:]}
 
     def view(self, now, slot=None):
         self.tick(now)
@@ -796,7 +832,7 @@ class Book:
                           "inflight": {"id": inf["id"], "cmd": inf["cmd"]} if inf else None,
                           "pending": len(self._pending(n))})
         for e in slots:
-            e["recent"] = self._recent(e["slot"])
+            e["trusted"] = self._trusted(e["slot"])
         want = (lambda it: True) if slot is None else (lambda it: it["slot"] == slot)
         pend = [dict(_public(it), age_s=int(now - it["ts"])) for it in self._pending() if want(it)]
         hist = [_public(it) for it in self.doc["items"] if it["status"] != "pending" and want(it)]

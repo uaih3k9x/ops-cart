@@ -55,7 +55,7 @@ REQ_POLL_S = 0.2                # 半截请求文件隔多久再看
 REQ_ROUNDS = 10                 # 最多看几轮 (= 等半截文件写完最多 2 秒)
 LOG_DIR = cartlog.LOG_DIR
 OUTPUT_MAX = 64 * 1024          # 回给 Agent 的设备输出上限
-TAIL_LINES = 8                  # 发前看几行认厂商 / 提示符 / 名字
+TAIL_LINES = 24                 # 发前看几行认厂商 / 提示符 / 名字; 挂起 / 确认的指纹再从里面滤掉标记行取最后 8 行
 CONTEXT_LINES = 40              # 第 2 层: 给决策模型看几行最近输出 (再按规则文件 context_chars 掐尾)
 INTENT_MAX = 500                # Agent 声明的意图
 SEND_TIMEOUT = 30
@@ -642,10 +642,8 @@ def _print_view(v, out):
         print(" ".join(bits), file=out)
     print("挂起等确认:" if v["pending"] else "挂起等确认: 无", file=out)
     for s in v["slots"]:
-        if s.get("recent") and any(p["slot"] == s["slot"] for p in v["pending"]):
-            print(f"  槽位 {s['slot']} 可信记录 (推车自己记的最近实际发出的命令, 不含人直接敲的键): "
-                  + "; ".join(f"#{r['id']} {r['cmd']!r}" + (f" 人确认 {r['by']}" if r.get("by") else "")
-                              for r in s["recent"]), file=out)
+        if any(p["slot"] == s["slot"] for p in v["pending"]):
+            print(f"  槽位 {s['slot']} " + cc.card(v, s["slot"])["trusted"].replace("\n", "\n    "), file=out)
     for p in v["pending"]:
         warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"
@@ -718,6 +716,10 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         print(f"没有挂起的 #{a.id}", file=out)
         return 1
     warn = f"\n  !!! 高危词: {', '.join(item['danger'])}" if item.get("danger") else ""
+    shown = next(x for x in cc.card(store.view(), item["slot"])["items"] if x["id"] == a.id)
+    for extra in (shown.get("note"), cc.card(store.view(), item["slot"])["trusted"], shown.get("context")):
+        if extra:
+            warn += "\n  " + extra.replace("\n", "\n    ")
     print(f"槽位 {item['slot']} ({item.get('name') or '名字未知'}) 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
           f"\n  {item.get('reason')}{_intent(item).replace('      ', '  ')}{warn}\n确认发送? 输入 yes: ", end="", file=out)
     out.flush()

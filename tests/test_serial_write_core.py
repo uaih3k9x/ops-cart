@@ -999,8 +999,8 @@ def test_prompt_shown_unmasked(prompt):
 
 def test_prompt_prefix_kept_but_rest_masked():
     assert sw.device_context("[SW1-aaa]local-user admin password Foo")["lines"] == ["[SW1-aaa]local-user admin password ******"]
-    line = sw.device_context("root@key-host:~# mysql -uroot -pHunter2")["lines"][0]
-    assert line.startswith("root@key-host:~# mysql") and "Hunter2" not in line
+    line = sw.device_context("root@db1:~# mysql -uroot -pHunter2")["lines"][0]
+    assert line.startswith("root@db1:~# mysql") and "Hunter2" not in line
 
 
 def test_tail_hash_not_public_and_old_items_without_it_voided():
@@ -1016,35 +1016,23 @@ def test_tail_hash_not_public_and_old_items_without_it_voided():
     assert e.value.code == "stale" and "升级前" in str(e.value)
 
 
-def test_view_lists_recent_sent_commands_per_slot():
-    """可信信息: 推车自己记的本槽位最近实际发出的命令 (含人确认的), 和设备输出分开 (中1b)."""
+def test_view_lists_trusted_commands_per_slot():
+    """可信信息: 推车自己记的本槽位实际发出的命令 (含人确认的), 和设备输出分开 (中1b); 拒绝的 / 没发的不算."""
     b = book()
     b.acquire(1, "agentA", T0, token="tokA")
     b.acquire(2, "agentA", T0, token="tokB")
-    b.begin(1, "tokA", "agentA", "line", "interface Gi0/2", _gate_pass(), T0, timeout=30)
-    b.finish(1, {"status": "sent", "echo": ""}, T0 + 1)
-    b.begin(2, "tokB", "agentA", "line", "display version", _gate_pass(), T0, timeout=30)
-    b.finish(2, {"status": "sent", "echo": ""}, T0 + 1)
+    _direct(b, 1, "tokA", "line", "interface Gi0/2", gate=_gate_model())
+    _direct(b, 2, "tokB", "line", "display version")
     r = b.submit(1, "tokA", "agentA", "line", "reboot", _gate_confirm(), T0 + 2, timeout=30, context="<SW1>")
     b.reject(r["id"], "human", T0 + 3)
     c = b.submit(1, "tokA", "agentA", "line", "undo shutdown", _gate_confirm(), T0 + 4, timeout=30, context="<SW1>")
     b.confirm(c["id"], "human:ops", T0 + 5, current="<SW1>")
     b.finish(c["id"], {"status": "timeout", "echo": ""}, T0 + 6)
     b.submit(1, "tokA", "agentA", "line", "shutdown", _gate_confirm(), T0 + 7, timeout=30, context="<SW1>")
-    recent = b.view(T0 + 8)["slots"][0]["recent"]
-    assert [(x["cmd"], x["status"]) for x in recent] == [("interface Gi0/2", "sent"), ("undo shutdown", "timeout")]
-    assert recent[-1]["by"] == "human:ops" and "lease" not in json.dumps(recent)
-    assert [x["cmd"] for x in b.view(T0 + 8)["slots"][1]["recent"]] == ["display version"]
-
-
-def test_recent_capped():
-    b = book()
-    b.acquire(1, "agentA", T0, token="tokA")
-    for i in range(sw.RECENT_MAX + 3):
-        b.begin(1, "tokA", "agentA", "line", f"display x{i}", _gate_pass(), T0 + i, timeout=30)
-        b.finish(i + 1, {"status": "sent", "echo": ""}, T0 + i)
-    recent = b.view(T0 + 50)["slots"][0]["recent"]
-    assert len(recent) == sw.RECENT_MAX and recent[-1]["cmd"] == f"display x{sw.RECENT_MAX + 2}"
+    tr = b.view(T0 + 8)["slots"][0]["trusted"]
+    assert [(x["cmd"], x["status"]) for x in tr["changes"]] == [("interface Gi0/2", "sent"), ("undo shutdown", "timeout")]
+    assert tr["changes"][-1]["by"] == "human:ops" and "lease" not in json.dumps(tr)
+    assert [x["cmd"] for x in b.view(T0 + 8)["slots"][1]["trusted"]["recent"]] == ["display version"]
 
 
 def test_begin_with_stale_mark_refused():
@@ -1099,3 +1087,134 @@ def test_round2_plain_lines_not_masked():
     for ln in ("interface GigabitEthernet0/0/1", " description uplink-keyboard", "ping -c 3 192.0.2.1",
                "show interfaces status", "root@h:~# ls -la /tmp"):
         assert sw.device_context(ln)["lines"] == [ln], ln
+
+
+# ------------------------------------------------------------ #68 第三轮审查
+
+def _direct(b, slot, tok, kind, cmd, now=T0, gate=None, status="sent"):
+    it = b.begin(slot, tok, "agentA", kind, cmd, gate or _gate_pass(), now, timeout=5,
+                 mark=b.send_mark(slot, tok, now))
+    b.finish(it["id"], {"status": status, "echo": ""}, now)
+    return it
+
+
+def _gate_model():
+    return {"verdict": "pass", "layer": 2, "reason": "模型放行", "danger": [], "vendor": "cisco"}
+
+
+def test_trusted_log_not_flushed_by_enters_or_readonly():
+    """5 次回车 / 5 条只读 show 冲不掉 interface Gi0/2 (中1)."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    _direct(b, 1, "tokA", "line", "interface Gi0/2", gate=_gate_model())
+    for _ in range(5):
+        _direct(b, 1, "tokA", "key", "enter")
+    for i in range(5):
+        _direct(b, 1, "tokA", "line", f"show run int gi0/{i}")
+    tr = b.view(T0)["slots"][0]["trusted"]
+    assert [x["cmd"] for x in tr["changes"]] == ["interface Gi0/2"]
+    assert tr["after"] == 6                                   # 之后: 回车 (合并成一条 ×5) + 5 条只读
+    assert [x["cmd"] for x in tr["recent"]] == [f"show run int gi0/{i}" for i in range(5)]
+
+
+def test_trusted_log_merges_repeated_keys():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    _direct(b, 1, "tokA", "line", "interface Gi0/2", gate=_gate_model())
+    for _ in range(sw.TRUST_LOG_MAX * 2):
+        _direct(b, 1, "tokA", "key", "enter")
+    tr = b.view(T0)["slots"][0]["trusted"]
+    assert [x["cmd"] for x in tr["changes"]] == ["interface Gi0/2"]
+    assert [(x["cmd"], x["count"]) for x in tr["recent"]] == [("enter", sw.TRUST_LOG_MAX * 2)]
+
+
+def test_trusted_log_survives_global_history_flood():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    b.acquire(2, "agentA", T0, token="tokB")
+    _direct(b, 1, "tokA", "line", "interface Gi0/2", gate=_gate_model())
+    tok = "tokB"
+    for r in range(7):
+        for i in range(5):
+            b.submit(2, tok, "agentA", "line", f"x{i}", _gate_confirm(), T0, timeout=5, context="SW#")
+        b.release(2, tok, T0)
+        tok = b.acquire(2, "agentA", T0)["lease"]
+    tr = b.view(T0)["slots"][0]["trusted"]
+    assert [x["cmd"] for x in tr["changes"]] == ["interface Gi0/2"]
+
+
+def test_trusted_log_capped_per_slot():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    for i in range(sw.TRUST_LOG_MAX + 5):
+        _direct(b, 1, "tokA", "line", f"conf{i}", gate=_gate_model())
+    doc = json.loads(b.dumps())
+    assert len(doc["slots"]["1"]["log"]) == sw.TRUST_LOG_MAX
+    tr = b.view(T0)["slots"][0]["trusted"]
+    assert len(tr["changes"]) == sw.RECENT_MAX and tr["changes"][-1]["cmd"] == f"conf{sw.TRUST_LOG_MAX + 4}"
+
+
+def test_trusted_log_includes_human_confirmed_and_status():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "undo shutdown", _gate_confirm(), T0, timeout=5, context="<SW1>")
+    b.confirm(p["id"], "human:ops", T0, current="<SW1>")
+    b.finish(p["id"], {"status": "timeout", "echo": ""}, T0)
+    (e,) = b.view(T0)["slots"][0]["trusted"]["changes"]
+    assert e["cmd"] == "undo shutdown" and e["by"] == "human:ops" and e["status"] == "timeout"
+
+
+@pytest.mark.parametrize("bad", ["x", [1], [{"cmd": 1}], {"a": 1}])
+def test_bad_trusted_log_means_all_stopped(bad):
+    doc = json.loads(book().dumps())
+    doc["slots"]["1"]["log"] = bad
+    assert all(sw.Book.from_text(json.dumps(doc), T0).stopped(n) for n in sw.SLOTS)
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("<password>Hunter2</password>", "Hunter2"), ("<key>S3cr3tKey</key>", "S3cr3tKey"),
+    ("<secret>abc123</secret>", "abc123"), ("<community>pr1vate</community>", "pr1vate"), ("<psk>abc</psk>", "abc"),
+    ("  <password>Hunter2</password>", "Hunter2"), ("[password=Hunter2]", "Hunter2"), ("[key:S3cr3t]", "S3cr3t"),
+    ("[client]password=Hunter2", "Hunter2"), ("root@key-host:~# mysql -pHunter2", "Hunter2"),
+    ("<AUTH-SW1>display current | include Hunter2", "Hunter2"),
+    ("[mysqld]\npassword = Hunter2", "Hunter2"),
+])
+def test_prompt_shaped_prefix_does_not_hide_secrets(line, secret):
+    blob = "\n".join(sw.device_context(line + "\n<SW1>")["lines"])
+    assert secret not in blob, blob
+
+
+def test_marks_and_blank_lines_do_not_void_approval():
+    """人开 / 关控制台看一眼, conbroker 写的标记行 (加空行) 不让批准作废 (低3)."""
+    body = "\n".join(f"line{i}" for i in range(20)) + "\n<HUAWEI>"
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=5, context=body)
+    later = body + "\n\n[2026-11-06 10:00:00 人 接入]\n\n[2026-11-06 10:01:00 人 断开]\n"
+    assert b.confirm(p["id"], "human", T0 + 1, current=later)["status"] == "sending"
+
+
+def test_short_log_mark_does_not_void():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "save", _gate_confirm(), T0, timeout=5, context="<HUAWEI>")
+    assert b.confirm(p["id"], "human", T0 + 1, current="<HUAWEI>\n[2026-11-06 10:00:00 人 接入]\n")["status"] == "sending"
+
+
+def test_hash_uses_last_effective_lines_only():
+    a = "\n".join(f"old{i}" for i in range(30)) + "\n" + "\n".join(f"l{i}" for i in range(sw.HASH_LINES))
+    c = "\n".join(f"other{i}" for i in range(30)) + "\n" + "\n".join(f"l{i}" for i in range(sw.HASH_LINES))
+    assert sw._tail_hash(a) == sw._tail_hash(c)
+    assert sw._tail_hash(a) != sw._tail_hash(a + "\n<HUAWEI>")
+
+
+def test_trusted_keys_readonly_even_without_layer():
+    """闸门结果缺 layer 也不让回车把 interface 挤出"可能改视图"那一栏."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    nolayer = {"verdict": "pass", "reason": "x", "danger": []}
+    _direct(b, 1, "tokA", "line", "interface Gi0/2", gate=nolayer)
+    for _ in range(5):
+        _direct(b, 1, "tokA", "key", "enter", gate=nolayer)
+    tr = b.view(T0)["slots"][0]["trusted"]
+    assert [x["cmd"] for x in tr["changes"]] == ["interface Gi0/2"] and tr["recent"][0]["count"] == 5

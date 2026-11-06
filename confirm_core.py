@@ -113,14 +113,38 @@ def _note(item):
     return "注意：这类设备的提示符不带对象名，提示符不能证明作用对象；先看上面的可信记录再确认"
 
 
+TRUST_CMD_MAX = 60          # 可信记录里每条命令显示多少字
+UNSURE = {"timeout": "超时", "unknown": "发送进程没回来", "error": "出错"}
+
+
+def _entry(e):
+    """一条可信记录 -> 一行: 连续空白压成一个、超长截断、命令用「」括起来 (防止折行 / 补空格伪造成多条)."""
+    if e.get("kind") == "key":
+        cmd = KEY_LABEL.get(e["cmd"], e["cmd"]) + (f" ×{e['count']}" if e.get("count", 1) > 1 else "")
+    else:
+        cmd = " ".join(str(e.get("cmd", "")).split())
+    if len(cmd) > TRUST_CMD_MAX:
+        cmd = cmd[:TRUST_CMD_MAX] + "…"
+    st = e.get("status")
+    mark = (f"［{UNSURE[st]}：可能已发/可能未发］" if st in UNSURE else "［发送中］" if st == "sending"
+            else "［conbroker 拒发，没发出］" if st == "refused" else "")
+    by = f"（人确认 {e['by']}）" if e.get("by") else ""
+    return f"  #{e['id']} 「{cmd}」{by}{mark}"
+
+
 def _trusted(slot_view):
-    """推车自己记的本槽位最近实际发出的命令 (#65): 可信, 和设备输出分开显示."""
-    rec = slot_view.get("recent") or []
-    if not rec:
-        return ""
-    rows = [f"#{r['id']} {r['cmd']}" + (f"（人确认 {r['by']}）" if r.get("by") else "") +
-            ("" if r.get("status") == "sent" else f"［{r.get('status')}］") for r in rec]
-    return "可信记录（推车自己记的，本槽位最近实际发出的命令；不含人在车机 / 网页直接敲的键）：\n" + "\n".join(rows)
+    """推车自己记的本槽位实际发出的命令 (#65): 可信, 和设备输出分开显示; 没有记录也明说."""
+    tr = slot_view.get("trusted") or {}
+    changes, recent = tr.get("changes") or [], tr.get("recent") or []
+    head = "可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）："
+    if not changes and not recent:
+        return head + "无记录"
+    rows = [head]
+    rows += [_entry(e) for e in changes] if changes else ["  （无可能改变视图 / 对象的命令记录）"]
+    if tr.get("after"):
+        rows.append(f"之后还有 {tr['after']} 条只读命令 / 按键" + ("，最近的：" if recent else ""))
+        rows += [_entry(e) for e in recent]
+    return "\n".join(rows)
 
 
 def card(view, n):

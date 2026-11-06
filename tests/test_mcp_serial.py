@@ -705,3 +705,13 @@ def test_cli_pending_shows_trusted_recent(rig):
     rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
     rc, text = cli(rig, "pending")
     assert "可信记录" in text and "'display version'" in text
+
+
+def test_cli_confirm_shows_context_trusted_and_note_before_yes(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "SW1(config-if)#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
+    head = text.split("输入 yes")[0]
+    assert rc == 1 and "设备最近输出" in head and "可信记录" in head and "提示符不能证明作用对象" in head

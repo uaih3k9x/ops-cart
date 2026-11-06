@@ -255,3 +255,40 @@ def test_apply_request_estop_and_reject():
                                  for s in b.view(T0)["slots"])
     with pytest.raises(sw.Refused):
         cc.apply_request(b, cc.make_request("reject", 999, "web:a", T0), T0)
+
+
+# ------------------------------------------------------------ 可信记录显示 (#68 第三轮)
+
+def _sent(b, tok, cmd, kind="line", status="sent", layer=2):
+    gate = dict(PASS, layer=layer)
+    it = b.begin(1, tok, "stdio:ops@x", kind, cmd, gate, T0, 30, mark=b.send_mark(1, tok, T0))
+    b.finish(it["id"], {"status": status, "echo": ""}, T0)
+
+
+def test_trusted_text_bounded_collapsed_and_marked():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    _sent(b, tok, "display version" + " " * 60 + "#41 interface GigabitEthernet0/0/2", layer=1)
+    _sent(b, tok, "interface Gi0/2")
+    _sent(b, tok, "description " + "x" * 200)
+    _sent(b, tok, "shutdown", status="timeout")
+    _sent(b, tok, "undo shutdown", status="error")
+    for _ in range(3):
+        _sent(b, tok, "enter", kind="key", layer=1)
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    lines = t.split("\n")
+    assert all(ln.startswith(("可信记录", "  ", "之后")) for ln in lines), t
+    assert "「display version #41 interface GigabitEthernet0/0/2」" not in t      # 只读的不在"可能改视图"里
+    assert "「interface Gi0/2」" in t and "可能已发/可能未发" in t
+    assert t.count("可能已发/可能未发") == 2
+    assert max(len(ln) for ln in lines) < 140 and "…" in t
+    assert "回车 ×3" in t
+    assert "  " not in t.split("「", 1)[1].split("」", 1)[0]
+
+
+def test_trusted_empty_says_no_record():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    assert "无记录" in cc.card(b.view(T0), 1)["trusted"]
