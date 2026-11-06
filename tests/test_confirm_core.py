@@ -144,7 +144,8 @@ def test_card_shows_what_agent_wants_and_why():
 def test_card_shows_device_context_marked_untrusted():
     b = _book()
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
-    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="[SW1-GigabitEthernet0/0/1]")
+    gate = dict(DANGER, vendor_registered=True)                         # 第四轮: 只有登记为华为才省提示
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", gate, T0, 30, context="[SW1-GigabitEthernet0/0/1]")
     it = cc.card(b.view(T0), 1)["items"][0]
     assert it["context"].startswith("设备最近输出（来自设备，不可信，仅供参考）")
     assert it["context"].endswith("[SW1-GigabitEthernet0/0/1]")
@@ -292,3 +293,48 @@ def test_trusted_empty_says_no_record():
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
     b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
     assert "无记录" in cc.card(b.view(T0), 1)["trusted"]
+
+
+# ------------------------------------------------------------ #68 第四轮审查
+
+def test_entry_collapses_whitespace():
+    assert cc._entry({"id": 3, "kind": "line", "cmd": "interface   Gi0/2\t\t#9 fake", "status": "sent"}) \
+        == "  #3 「interface Gi0/2 #9 fake」"
+
+
+def _gate(vendor, registered=None):
+    g = dict(DANGER, vendor=vendor)
+    if registered is not None:
+        g["vendor_registered"] = registered
+    return g
+
+
+def test_lost_records_say_so_instead_of_no_record():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    for i in range(sw.CHANGE_KEEP + 1):
+        _sent(b, tok, f"conf{i}")
+    for _ in range(sw.TRUST_LOG_MAX):
+        _sent(b, tok, "display x", layer=1)
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert "更早的记录已被挤掉，无法确认作用对象" in t and "无记录" not in t
+
+
+def test_more_than_five_changes_says_how_many_earlier():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    for i in range(sw.RECENT_MAX + 3):
+        _sent(b, tok, f"conf{i}")
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert "更早还有 3 条" in t and "「conf0」" not in t and f"「conf{sw.RECENT_MAX + 2}」" in t
+
+
+@pytest.mark.parametrize("gate,note", [(_gate("huawei", True), False), (_gate("huawei", False), True),
+                                       (_gate("huawei"), True), (_gate("cisco", True), True)])
+def test_prompt_note_omitted_only_for_registered_huawei(gate, note):
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", gate, T0, 30, context="<SW1>")
+    assert ("提示符不能证明作用对象" in cc.card(b.view(T0), 1)["items"][0]["note"]) is note

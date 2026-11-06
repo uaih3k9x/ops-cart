@@ -348,6 +348,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         vendor, at = sw.slot_vendor(n, r, text)
         judge = gm.make_judge(r, lambda: tail(s["dev"], CONTEXT_LINES), intent, llm=llm)
         gate = sw.classify(cmd, vendor, at, r, judge=judge)
+        gate["vendor_registered"] = bool(r.get("slots", {}).get(n))    # 自动认出来的华为不算 (#65 第四轮)
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
@@ -632,6 +633,11 @@ def _context(item):
     return f"\n      设备最近输出 (来自设备, 不可信, 仅供参考):{body}"
 
 
+def _device_lines(text):
+    """设备输出 -> 每行前加 "| " (命令行上和推车自己的话分开)."""
+    return "\n".join("| " + ln for ln in (text or "").split("\n"))
+
+
 def _print_view(v, out):
     for s in v["slots"]:
         bits = [f"槽位 {s['slot']}:"]
@@ -717,7 +723,11 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
         return 1
     warn = f"\n  !!! 高危词: {', '.join(item['danger'])}" if item.get("danger") else ""
     shown = next(x for x in cc.card(store.view(), item["slot"])["items"] if x["id"] == a.id)
-    for extra in (shown.get("note"), cc.card(store.view(), item["slot"])["trusted"], shown.get("context")):
+    ctx = shown.get("context")
+    if ctx:                             # 设备输出每行前加 "| ": 设备打出来的字不能伪装成推车自己的提示 (#65 第四轮)
+        head_line, _, body = ctx.partition("\n")
+        ctx = head_line + "\n" + _device_lines(body)
+    for extra in (shown.get("note"), cc.card(store.view(), item["slot"])["trusted"], ctx):
         if extra:
             warn += "\n  " + extra.replace("\n", "\n    ")
     print(f"槽位 {item['slot']} ({item.get('name') or '名字未知'}) 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
@@ -731,7 +741,8 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
     except sw.Refused as e:
         print(f"不行: {e}", file=out)
         return 1
-    print(f"#{it['id']} -> {status}{' (' + note + ')' if note else ''}\n{sw.echo_summary(output)}", file=out)
+    print(f"#{it['id']} -> {status}{' (' + note + ')' if note else ''}\n{_device_lines(sw.echo_summary(output))}",
+          file=out)
     return 0 if status == "sent" else 1
 
 

@@ -991,10 +991,15 @@ def test_compare_not_fooled_by_masked_hostname(host):
     assert e.value.code == "stale"
 
 
-@pytest.mark.parametrize("prompt", ["[AUTH-SW1-GigabitEthernet0/0/1]", "<key-core>", "[SW-PSK]", "R1(config-keychain-key)#",
-                                    "root@key-host:~#"])
+@pytest.mark.parametrize("prompt", ["root@key-host:~#", "auth-sw1#", "<SW1>", "[~SW1-GigabitEthernet0/0/1]"])
 def test_prompt_shown_unmasked(prompt):
     assert sw.device_context(prompt)["lines"] == [prompt]
+
+
+@pytest.mark.parametrize("prompt", ["[AUTH-SW1-GigabitEthernet0/0/1]", "<key-core>", "[SW-PSK]", "R1(config-keychain-key)#"])
+def test_prompt_with_secret_word_in_brackets_no_longer_exempt(prompt):
+    """第四轮低3: 括号 / 尖括号 / 方括号里出现口令词一律不豁免 (第二轮这几个曾是整行原样显示)."""
+    assert sw.MASK in sw.device_context(prompt)["lines"][0]
 
 
 def test_prompt_prefix_kept_but_rest_masked():
@@ -1149,7 +1154,8 @@ def test_trusted_log_capped_per_slot():
     for i in range(sw.TRUST_LOG_MAX + 5):
         _direct(b, 1, "tokA", "line", f"conf{i}", gate=_gate_model())
     doc = json.loads(b.dumps())
-    assert len(doc["slots"]["1"]["log"]) == sw.TRUST_LOG_MAX
+    assert len(doc["slots"]["1"]["log"]) == sw.CHANGE_KEEP           # 第四轮: 改视图的最多留 CHANGE_KEEP 条
+    assert doc["slots"]["1"]["log_lost"] is True
     tr = b.view(T0)["slots"][0]["trusted"]
     assert len(tr["changes"]) == sw.RECENT_MAX and tr["changes"][-1]["cmd"] == f"conf{sw.TRUST_LOG_MAX + 4}"
 
@@ -1218,3 +1224,92 @@ def test_trusted_keys_readonly_even_without_layer():
         _direct(b, 1, "tokA", "key", "enter", gate=nolayer)
     tr = b.view(T0)["slots"][0]["trusted"]
     assert [x["cmd"] for x in tr["changes"]] == ["interface Gi0/2"] and tr["recent"][0]["count"] == 5
+
+
+# ------------------------------------------------------------ #68 第四轮审查
+
+@pytest.mark.parametrize("keys", [["enter", "space"], ["enter"], ["space"]])
+def test_change_entry_survives_readonly_flood(keys):
+    """中1: interface 之后交替 / 连续按 20 次只读键, 改视图的那条不能被挤掉."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    _direct(b, 1, "tokA", "line", "interface g2", gate=_gate_model())
+    for i in range(sw.TRUST_LOG_MAX * 2):
+        _direct(b, 1, "tokA", "key", keys[i % len(keys)])
+    tr = b.view(T0)["slots"][0]["trusted"]
+    assert [x["cmd"] for x in tr["changes"]] == ["interface g2"] and not tr["lost"]
+    assert len(json.loads(b.dumps())["slots"]["1"]["log"]) <= sw.TRUST_LOG_MAX
+
+
+def test_change_entries_capped_and_loss_flagged():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    for i in range(sw.CHANGE_KEEP + 3):
+        _direct(b, 1, "tokA", "line", f"conf{i}", gate=_gate_model())
+    log = json.loads(b.dumps())["slots"]["1"]["log"]
+    assert [e["cmd"] for e in log] == [f"conf{i}" for i in range(3, sw.CHANGE_KEEP + 3)]
+    tr = b.view(T0)["slots"][0]["trusted"]
+    assert tr["lost"] is True and tr["more"] == sw.CHANGE_KEEP - sw.RECENT_MAX
+    assert [x["cmd"] for x in tr["changes"]][-1] == f"conf{sw.CHANGE_KEEP + 2}"
+
+
+def test_readonly_dropped_before_changes():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    _direct(b, 1, "tokA", "line", "interface g2", gate=_gate_model())
+    for i in range(sw.TRUST_LOG_MAX + 5):
+        _direct(b, 1, "tokA", "line", f"display x{i}")
+    log = json.loads(b.dumps())["slots"]["1"]["log"]
+    assert log[0]["cmd"] == "interface g2" and len(log) == sw.TRUST_LOG_MAX
+    assert not b.view(T0)["slots"][0]["trusted"]["lost"]
+
+
+@pytest.mark.parametrize("bad", ["yes", 1, None])
+def test_bad_lost_flag_means_all_stopped(bad):
+    doc = json.loads(book().dumps())
+    doc["slots"]["1"]["log_lost"] = bad
+    assert all(sw.Book.from_text(json.dumps(doc), T0).stopped(n) for n in sw.SLOTS)
+
+
+def test_inflight_timeout_marks_trusted_entry_unknown():
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    it = b.begin(1, "tokA", "agentA", "line", "interface g2", _gate_model(), T0, timeout=5,
+                 mark=b.send_mark(1, "tokA", T0))
+    b.tick(T0 + 5 + sw.INFLIGHT_GRACE_S + 1)
+    (e,) = [x for x in json.loads(b.dumps())["slots"]["1"]["log"] if x["id"] == it["id"]]
+    assert e["status"] == "unknown"
+
+
+@pytest.mark.parametrize("line", ["R1(snmp-server community Pub1ic RO)#", "<secret-Abc123>",
+                                  "[~HUAWEI-cipher%^%#abc]", "<SW-password-x>", "[key-Abc123]"])
+def test_prompt_with_secret_word_in_brackets_masked(line):
+    shown = "\n".join(sw.device_context(line)["lines"])
+    assert shown != line and sw.MASK in shown, shown
+
+
+@pytest.mark.parametrize("line", ["<SW1>", "[SW1-GigabitEthernet0/0/1]", "auth-sw1#", "key-host(config)#"])
+def test_prompt_without_bracketed_secret_still_unmasked(line):
+    assert sw.device_context(line)["lines"] == [line]
+
+
+def test_registered_vendor_prompt_regex_only():
+    """槽位登记了华为: 思科式 auth-sw1# 不算整行提示符, 照常打码 (没登记时用合集, 原样显示)."""
+    assert sw.MASK in sw.device_context("auth-sw1#", vendor="huawei")["lines"][0]
+    assert sw.device_context("auth-sw1#")["lines"] == ["auth-sw1#"]
+    assert sw.device_context("core-sw1#", vendor="cisco")["lines"] == ["core-sw1#"]
+    assert sw.device_context("<SW1>", vendor="huawei")["lines"] == ["<SW1>"]
+
+
+@pytest.mark.parametrize("line", ["Qx7pL2mZ9vR4tY8wK3nB", "aB3$dE6^gH9*jK2@mN5!", "U2FsdGVkX19vR4tY8wK3nBqZ",
+                                  "%^%#Qx7pL2mZ9vR4tY8%^%#"])
+def test_wrapped_cipher_like_line_masked(line):
+    assert sw.device_context(line)["lines"] == [sw.MASK]
+
+
+@pytest.mark.parametrize("line", ["GigabitEthernet0/0/1", "--------------------------", "/etc/sysconfig/network",
+                                  "00e0-fc12-3456-7890", "2026-11-06T10:00:00Z", "XGigabitEthernet0/0/12",
+                                  "192.0.2.10/255.255.255.0", "Ethernet1/0/1(10G)", "==========================",
+                                  "https://example.com/doc", "abcdefghijklmnopqrstu"])
+def test_ordinary_unspaced_lines_not_masked(line):
+    assert sw.device_context(line)["lines"] == [line]

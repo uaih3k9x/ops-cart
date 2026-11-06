@@ -26,8 +26,10 @@
 - 状态文件读不懂 (坏了 / 版本不对) = 全部急停.
 """
 
+import collections
 import hashlib
 import json
+import math
 import re
 import secrets
 import time
@@ -48,6 +50,7 @@ HISTORY_MAX = 30            # 状态文件里留最近多少条结果给 pending
 ECHO_MAX = 1000             # 日志里设备回显摘要的长度
 HASH_LINES = 8              # 指纹取最后几行有效行 (调用方 tail 多读, 给标记行和空行留余量)
 TRUST_LOG_MAX = 20          # 每槽位单独留的"实际发出的命令"记录条数 (可信记录; 不和全局历史共用)
+CHANGE_KEEP = 10            # 其中"可能改视图"的最多留几条; 裁剪先丢只读的, 丢过改视图的就记 log_lost
 CONTEXT_LINES = 8           # 挂起项带提交时设备最近几行输出 (#65), 给审批的人参考
 CONTEXT_LINE_MAX = 160
 CONTEXT_MAX = 1000
@@ -325,6 +328,8 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)
 _PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY")
 _PEM_END = re.compile(r"(?i)-----END [A-Z0-9 ]*PRIVATE KEY")
 _B64 = re.compile(r"\s*[A-Za-z0-9+/=]{32,}\s*")
+_IFNAME = re.compile(r"[A-Za-z][A-Za-z-]*\d+(?:[/:.]\d+)+(?:\([\w.]+\))?")          # GigabitEthernet0/0/1(10G)
+_HEXSEP = re.compile(r"[0-9A-Fa-f]+(?:[-:.][0-9A-Fa-f]+)+")                          # MAC / IPv6 / 序列号分段
 MASK = "******"
 
 
@@ -344,29 +349,52 @@ def _for_match(ln):
     return "".join(ch for ch in _norm(ln) if unicodedata.category(ch)[0] != "C")
 
 
-def _bare_prompt(m):
-    """整行就是一个提示符 (各厂商提示符正则 fullmatch), 且里面的口令词后面没有直接跟 = 或 : —— 这种行不打码
-    (主机名里带 auth/key/psk 不该把提示符抹平). <password>x</password>、[password=x] 这类不算."""
-    if not any(rx.fullmatch(m) for rx in _PROMPT.values()) or len(m) < 2:
+_BRACKETED = re.compile(r"\([^()]*\)|<[^<>]*>|\[[^\[\]]*\]")
+
+
+def _cipher_like(m):
+    """折行后的密文续行 (#65 第四轮低4): 整行 16 字起、不含空白、至少三类字符 (小写 / 大写 / 数字 / 符号)、
+    字符熵接近这个长度的上限 (>= 0.9 * log2(min(长度, 32))). 接口名、MAC / IPv6 这类分段十六进制不算.
+    往"别误伤普通输出"偏: 32 字以上的 base64 另有 _B64, 华为 %^%# 另有 _SECRET_CONT."""
+    s = m.strip()
+    if len(s) < 16 or any(ch.isspace() for ch in s) or _IFNAME.fullmatch(s) or _HEXSEP.fullmatch(s):
+        return False
+    classes = sum(any(f(ch) for ch in s) for f in (str.islower, str.isupper, str.isdigit,
+                                                     lambda ch: not ch.isalnum()))
+    if classes < 3:
+        return False
+    n = len(s)
+    ent = -sum(c / n * math.log2(c / n) for c in collections.Counter(s).values())
+    return ent >= 0.9 * math.log2(min(n, 32))
+
+
+def _bare_prompt(m, vendor=None):
+    """整行就是一个提示符 —— 这种行不打码 (主机名里带 auth/key/psk 不该把提示符抹平). 槽位登记了厂商就只认那家的
+    正则, 没登记才用合集 (#65 第四轮). 口令词后面直接跟 = 或 :, 或者口令词出现在 () <> [] 里 (R1(snmp-server
+    community x)#、<secret-x>、[~x-cipher%^%#..]) 一律不豁免."""
+    rxs = (_PROMPT[vendor],) if vendor in _PROMPT else tuple(_PROMPT.values())
+    if not any(rx.fullmatch(m) for rx in rxs) or len(m) < 2:
         return False
     for rx in (_SECRET_SHORT, _SECRET_LONG):
         for hit in rx.finditer(m):
             if m[hit.end("k"):hit.end("k") + 1] in ("=", ":"):
                 return False
+        if any(rx.search(span.group()) for span in _BRACKETED.finditer(m)):
+            return False
     return True
 
 
-def _ctx_line(ln, in_key=False):
+def _ctx_line(ln, in_key=False, vendor=None):
     """一行设备输出 -> (给人看的一行, 是否在私钥块里)."""
     m = _for_match(ln)
     if _PEM_BEGIN.search(m):
         in_key = True
     elif in_key:
         return MASK, not _PEM_END.search(m)
-    if _bare_prompt(m):
+    if _bare_prompt(m, vendor):
         return _show(m), in_key
     head, rest = "", m
-    if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest):
+    if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest) or _cipher_like(rest):
         return _show(head) + MASK, in_key
     cut = None
     for rx in (_SECRET_SHORT, _SECRET_LONG, _SECRET_DASH, _SECRET_URL):
@@ -390,12 +418,13 @@ def _tail_hash(text):
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
-def device_context(text):
+def device_context(text, vendor=None):
     """挂起时设备最近几行输出 -> {src, untrusted, lines}; 没有 -> None. 来自被测设备, 只给人看, 不当指令:
-    整段先过一遍 (私钥块跨行), 再掐尾 CONTEXT_LINES 行、每行 CONTEXT_LINE_MAX 字、总共 CONTEXT_MAX 字."""
+    整段先过一遍 (私钥块跨行), 再掐尾 CONTEXT_LINES 行、每行 CONTEXT_LINE_MAX 字、总共 CONTEXT_MAX 字.
+    vendor = 槽位在规则文件里登记的厂商 (只认那家的提示符); 没登记给 None."""
     shown, in_key = [], False
     for ln in (text or "").replace("\r", "").split("\n"):
-        ln, in_key = _ctx_line(ln, in_key)
+        ln, in_key = _ctx_line(ln, in_key, vendor)
         shown.append(ln[:CONTEXT_LINE_MAX])
     while shown and not shown[-1].strip():
         shown.pop()
@@ -429,10 +458,26 @@ def _counter_ok(slot_doc):
     if not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
         return False
     log = slot_doc.get("log", [])                   # 可信记录: 没有 (旧文件) 可以, 有就得是这个形状
+    if not isinstance(slot_doc.get("log_lost", False), bool):
+        return False
     return isinstance(log, list) and all(
         isinstance(e, dict) and isinstance(e.get("id"), int) and isinstance(e.get("cmd"), str)
         and isinstance(e.get("kind"), str) and isinstance(e.get("ro"), bool) and isinstance(e.get("status"), str)
         for e in log)
+
+
+def _trim_log(slot_doc, log):
+    """可信记录裁剪 (#65 第四轮): 改视图的最多 CHANGE_KEEP 条 (丢了就记 log_lost, 界面明说"更早的被挤掉"),
+    总数超 TRUST_LOG_MAX 先丢最早的只读条目. 只读的回车 / 空格再多也挤不掉 interface 这类命令."""
+    changes = [i for i, e in enumerate(log) if not e["ro"]]
+    drop = set(changes[:-CHANGE_KEEP]) if len(changes) > CHANGE_KEEP else set()
+    if drop:
+        slot_doc["log_lost"] = True
+    ro = [i for i, e in enumerate(log) if e["ro"]]
+    over = len(log) - len(drop) - TRUST_LOG_MAX
+    if over > 0:
+        drop |= set(ro[:over])
+    log[:] = [e for i, e in enumerate(log) if i not in drop]
 
 
 def _slot_doc():
@@ -633,7 +678,7 @@ class Book:
         if it.get("by"):
             e["by"] = it["by"]
         log.append(e)
-        del log[:-TRUST_LOG_MAX]
+        _trim_log(self._s(it["slot"]), log)
 
     def _log_status(self, slot, iid, status):
         for e in self._s(slot).get("log", ()):
@@ -690,7 +735,7 @@ class Book:
         self.writer(slot, token, now)
         self._idle(slot)
         self._check_mark(slot, mark, "挂起")
-        ctx = device_context(context)
+        ctx = device_context(context, gate.get("vendor") if gate.get("vendor_registered") else None)
         if not ctx:
             raise Refused("context", f"读不到槽位 {slot} 设备最近的输出, 没法让人核对现场, 不挂起 (一个字节都没发); "
                                      "检查串口服务后重试")
@@ -811,12 +856,14 @@ class Book:
     def _trusted(self, slot):
         """可信信息 (#65): 推车自己记的这个槽位实际交给 conbroker 的命令 (Agent 直发和人确认的都算; 人在车机 /
         网页直接敲的键不在这里). changes = 最近 RECENT_MAX 条可能改变视图 / 对象的 (不是第 1 层只读放行的);
-        after = 最后一条 changes 之后又发了几条只读命令 / 按键, recent = 这几条里最近的 RECENT_MAX 条."""
+        after = 最后一条 changes 之后又发了几条只读命令 / 按键, recent = 这几条里最近的 RECENT_MAX 条;
+        more = 记录里还留着、但没显示的更早的改视图条数; lost = 改视图的记录被裁掉过 (更早的看不到了)."""
         log = self._s(slot).get("log", [])
         pub = [{k: e[k] for k in ("id", "kind", "cmd", "status", "who", "by", "t", "count") if k in e} for e in log]
         idx = [i for i, e in enumerate(log) if not e["ro"]]
         tail = pub[idx[-1] + 1:] if idx else pub
-        return {"changes": [pub[i] for i in idx][-RECENT_MAX:], "after": len(tail), "recent": tail[-RECENT_MAX:]}
+        return {"changes": [pub[i] for i in idx][-RECENT_MAX:], "more": max(0, len(idx) - RECENT_MAX),
+                "lost": bool(self._s(slot).get("log_lost")), "after": len(tail), "recent": tail[-RECENT_MAX:]}
 
     def view(self, now, slot=None):
         self.tick(now)

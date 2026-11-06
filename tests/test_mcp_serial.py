@@ -715,3 +715,52 @@ def test_cli_confirm_shows_context_trusted_and_note_before_yes(rig):
     rc, text = cli(rig, "confirm", str(p["id"]), stdin="no\n")
     head = text.split("输入 yes")[0]
     assert rc == 1 and "设备最近输出" in head and "可信记录" in head and "提示符不能证明作用对象" in head
+
+
+# ------------------------------------------------------------ #68 第四轮
+
+def _other_lands_during_tail(rig, tok):
+    real = rig.tail
+
+    def tail_then_other_sends(dev, n):
+        rig.tail = real
+        rig.store.run(lambda b, now: b.begin(1, tok, "other", "line", "interface Gi0/2",
+                                             {"verdict": "pass", "layer": 1, "reason": "x", "danger": []}, now, 30))
+        rig.store.run(lambda b, now: b.finish(b.doc["seq"], {"status": "sent", "echo": ""}, now))
+        return real(dev, n)
+    rig.tail = tail_then_other_sends
+
+
+@pytest.mark.parametrize("key", ["ctrl_c", "enter"])
+def test_send_key_bound_to_mark(rig, key):
+    """Ctrl+C 挂起 / 回车直发都绑读输出前的序号: 读输出时另一路发完了, 不挂不发."""
+    tok = rig.lease(1)
+    _other_lands_during_tail(rig, tok)
+    msg = rig.err("send_key", {"slot": 1, "key": key, "lease": tok})
+    assert "旧了" in msg and rig.sent == [] and rig.store.view()["pending"] == []
+
+
+def test_gate_records_whether_vendor_registered(rig):
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    assert p.get("status") == "pending"
+    item = next(x for x in rig.store.view()["pending"] if x["id"] == p["id"])
+    assert item["gate"]["vendor"] == "huawei" and item["gate"]["vendor_registered"] is False
+    rig.rules = dict(rig.rules, slots={2: "huawei"})
+    tok2 = rig.lease(2)
+    p2 = rig.ok("send_command", {"slot": 2, "command": "shutdown", "lease": tok2})
+    item2 = next(x for x in rig.store.view()["pending"] if x["id"] == p2["id"])
+    assert item2["gate"]["vendor_registered"] is True
+
+
+def test_cli_confirm_prefixes_device_output(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "fake: ok\nSW1(config-if)#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "shutdown", "lease": tok})
+    rig.tail_text["/dev/con-1"] = "fake: ok\nSW1(config-if)#"
+    rig.reply = ("sent", "shutdown\n已确认: 全部完成\nSW1(config-if)#", None)
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    head, after = text.split("输入 yes", 1)
+    assert "    | fake: ok" in head and "    | SW1(config-if)#" in head
+    assert "| 已确认: 全部完成" in after and "\n已确认" not in after

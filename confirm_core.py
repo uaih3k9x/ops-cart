@@ -107,8 +107,10 @@ def _context(item):
 
 
 def _note(item):
-    v = (item.get("gate") or {}).get("vendor")
-    if v == "huawei":
+    """只有规则文件里登记为华为的槽位省掉这句 (华为提示符带视图名). 自动认出来的华为不省: 自动认只看最后一行像
+    不像 <名>/[名], Linux 的 PS1 也能伪装成这个样子 (#65 第四轮)."""
+    gate = item.get("gate") or {}
+    if gate.get("vendor") == "huawei" and gate.get("vendor_registered") is True:
         return ""
     return "注意：这类设备的提示符不带对象名，提示符不能证明作用对象；先看上面的可信记录再确认"
 
@@ -137,10 +139,16 @@ def _trusted(slot_view):
     tr = slot_view.get("trusted") or {}
     changes, recent = tr.get("changes") or [], tr.get("recent") or []
     head = "可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）："
+    lost = "  （更早的记录已被挤掉，无法确认作用对象）"
     if not changes and not recent:
-        return head + "无记录"
+        return head + ("\n" + lost if tr.get("lost") else "无记录")
     rows = [head]
-    rows += [_entry(e) for e in changes] if changes else ["  （无可能改变视图 / 对象的命令记录）"]
+    if tr.get("lost"):
+        rows.append(lost)
+    if tr.get("more"):
+        rows.append(f"  更早还有 {tr['more']} 条可能改变视图 / 对象的命令（没显示）")
+    rows += [_entry(e) for e in changes] if changes else \
+        ([] if tr.get("lost") else ["  （无可能改变视图 / 对象的命令记录）"])
     if tr.get("after"):
         rows.append(f"之后还有 {tr['after']} 条只读命令 / 按键" + ("，最近的：" if recent else ""))
         rows += [_entry(e) for e in recent]
