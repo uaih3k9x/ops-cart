@@ -222,7 +222,7 @@ def test_r4_m2_prefix_options_with_args(cmd):
 
 
 @pytest.mark.parametrize("cmd", ["ls -la 2>/dev/null", "grep foo /var/log/syslog 2>/dev/null", "do show run",
-                                 "mount", "sysctl -a", "find /etc -name '*.conf'", "cat /tmp/sa", "ls /home/de",
+                                 "mount", "sysctl -a", "find /etc -name '*.conf'", "cat /tmp/sa", "ls /srv/de",
                                  "iptables -L -n -v -x", "iptables -A INPUT -p tcp --dport 22 -j ACCEPT"])
 def test_r4_l1_read_only_not_l3(cmd):
     assert serial(cmd)["tier"] == ac.L2, cmd
