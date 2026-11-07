@@ -329,3 +329,12 @@ def test_r7_combined_short_options(cmd):
 @pytest.mark.parametrize("cmd", ["sudo -iu root ls", "sudo -nu root cat /etc/hosts"])
 def test_r7_combined_short_options_read_only(cmd):
     assert serial(cmd)["tier"] == ac.L2, cmd
+
+
+# ------------------------------------------------------------ 第八轮审查回归
+
+@pytest.mark.parametrize("cmd", ["sudo -uroot kill 1", "sudo -uroot chmod 600 /etc/x", "sudo -uroot mv a b",
+                                 "sudo -groot kill 1", "strace -ofile kill 1", "sudo -ugit kill 1",
+                                 "strace -fo log kill 1"])
+def test_r8_glued_option_argument(cmd):
+    assert serial(cmd)["tier"] == ac.L3, cmd

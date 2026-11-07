@@ -155,11 +155,17 @@ _POSITIONAL = {"timeout": 1, "chroot": 1}
 
 
 def _takes_arg(cmd, opt):
-    """这个选项后面跟不跟一个参数. 合并短选项 (sudo -iu root) 看最后一个字母; --x=y 自带参数."""
+    """这个选项后面跟不跟一个参数 (按 getopt 规则). 合并短选项 sudo -iu root: 从左扫, 第一个带参数的字母
+    是最后一个字母才吃下一个词; 不是 (sudo -uroot) 说明参数已经贴在后面了. --x=y 自带参数."""
     table = _ARG_OPTS.get(cmd, ())
     if opt in table:
         return True
-    return bool(re.fullmatch(r"-[A-Za-z]{2,}", opt)) and f"-{opt[-1]}" in table
+    if not re.fullmatch(r"-[A-Za-z0-9]{2,}", opt):
+        return False
+    for k, ch in enumerate(opt[1:], 1):
+        if f"-{ch}" in table:
+            return k == len(opt) - 1
+    return False
 _SEG = re.compile(r"[;&|\n]+")
 _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # 子命令组合: 第一个词 + 后面任一词 -> L3
