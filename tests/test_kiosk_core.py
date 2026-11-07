@@ -1633,3 +1633,40 @@ def test_disarm_one_failed_remove_does_not_stop_others(tmp_path, monkeypatch):
     kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
     assert not (tmp_path / "grub.cfg-01-02-00-00-00-00-02").exists()
     assert _is_local(default_entry((tmp_path / "grub.cfg").read_text()))
+
+
+# ---- #70 第四轮: 解锁写菜单前自检, 会被当成救援默认 / 超长的菜单不写
+
+def test_arm_clone_save_refused_when_menu_would_look_like_rescue(tmp_path):
+    env = _clone_env(tmp_path, image=False)
+    conf = json.loads(env["conf_path"].read_text())
+    conf["password"] = "Example-inst.sshd"                 # 密码进 ocs_repository, 落在默认项里
+    env["conf_path"].write_text(json.dumps(conf))
+    with pytest.raises(ValueError):
+        _carm(env, "clone-save", mac=MAC)
+    assert _menu(env, MAC) is None and not env["path"].exists()
+
+
+@pytest.mark.parametrize("bad", ["rescue", "big"])
+def test_arm_refuses_bad_generated_menu_and_writes_nothing(tmp_path, monkeypatch, bad):
+    menu = (_px.grub_menu("192.0.2.1").replace("set default=0", "set default=1") if bad == "rescue"
+            else "# " + "x" * _px.MENU_MAX + "\n" + _px.grub_menu("192.0.2.1", install=True))
+    monkeypatch.setattr(kc, "grub_cfg_install", lambda env_path=None: menu)
+    with pytest.raises(ValueError):
+        kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_disarm_reports_unreadable_menu(tmp_path, monkeypatch):
+    import os
+    events = []
+    monkeypatch.setattr(kc, "_pxe_event", events.append)
+    p = tmp_path / "grub.cfg-C0000201"
+    p.write_text("x")
+    os.chmod(p, 0)
+    try:
+        kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
+    finally:
+        os.chmod(p, 0o644)
+    if os.geteuid() != 0:
+        assert "grub.cfg-C0000201" in events[-1] and "删不掉" in events[-1]

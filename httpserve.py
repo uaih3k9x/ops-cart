@@ -79,7 +79,12 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(403, "Install mode is locked")
                 return None
             self.event(f"ks 被取走 {base} mac={mac} from {self.client_address[0]}")
-        elif base.startswith("grub.cfg") and os.path.isfile(path):
+        elif base.startswith("grub.cfg") and os.path.lexists(path):
+            # 跟 TFTP 的差别: TFTP 只查 grub.cfg / grub.cfg-* (grub.cfg.* GRUB 不取, 原样发);
+            # HTTP 这里连 grub.cfg.* 一起查 (.bak 上面已经 404), 宁严. 不是普通文件的一律 403 (不打开 FIFO).
+            if not os.path.isfile(path):
+                self.send_error(403, "Not a regular file")
+                return None
             try:
                 with open(path, "rb") as f:
                     raw = f.read(MENU_MAX + 1)

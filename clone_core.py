@@ -17,7 +17,7 @@ import hashlib
 import json
 import re
 
-from pxeserver import norm_mac
+from pxeserver import _RESCUE_KW, norm_mac
 
 CLONE_PURPOSES = ("clone-save", "clone-restore")
 
@@ -68,8 +68,6 @@ def image_name_error(name):
         return f"镜像名不合格: {name!r} (只许字母数字和 . _ -, 不以 . 开头, 最长 64)"
     if name in _IMAGE_RESERVED or name.startswith("autoname-"):
         return f"镜像名 {name!r} 是 Clonezilla 保留字"
-    if "inst." in name.lower():                 # 进 GRUB 菜单; 带安装器参数字样会被当成救援菜单换掉 (#70)
-        return f"镜像名 {name!r} 不许带 inst."
     return None
 
 
@@ -92,6 +90,9 @@ def ocs_sr_cmd(purpose, image, device, multicast=None):
     err = image_name_error(image)
     if err:
         raise ValueError(err)
+    if purpose == "clone-save" and any(k in image for k in _RESCUE_KW):
+        # 抓镜像菜单的默认项就是这条; 带救援关键字会被 pxeserver 当成救援默认菜单换掉 (#70)
+        raise ValueError(f"抓镜像的镜像名不能带 {' / '.join(_RESCUE_KW)}: {image!r}")
     if not isinstance(device, str) or not _SERIAL_RE.match(device):
         raise ValueError(f"目标盘只认 SERIALNO=<序列号>, 不是 {device!r}")
     if multicast is not None:

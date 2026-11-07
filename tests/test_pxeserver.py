@@ -1680,6 +1680,17 @@ def _all_generated_menus():
                                                                        conf, "192.0.2.1"))
         out[pur + " test params"] = _px.grub_menu_clone("192.0.2.1", pur, CLONE_PARAMS)
     import pathlib
+    smb = [{"proto": "smb", "save_share": "clone-rw", "user": "u.s-r_1", "password": "p.w-d_9",
+            "restore_share": "a/b.c", "local_dir": "/x"},
+           {"proto": "smb", "smb_version": "smb3.1.1", "save_share": "s", "user": "u", "password": "p",
+            "restore_share": "r", "restore_user": "ru", "restore_password": "rp", "local_dir": "/x"}]
+    img = "Az09._-" + "a" * 57                                       # 用满允许字符集和长度
+    ser = "SERIALNO=SN-EX.am_ple:01"
+    for i, c in enumerate(smb):
+        for pur in ("clone-save", "clone-restore"):
+            head = f"# 推车生成: Clonezilla {pur}, 只下发给解锁时确认过的机器\n"     # kiosk 写的头
+            out[f"{pur} smb{i} kiosk"] = head + _px.grub_menu_clone("192.0.2.1", pur,
+                                                                     cc.boot_params(pur, img, ser, c, "192.0.2.1"))
     out["windows/grub.cfg"] = (pathlib.Path(__file__).resolve().parent.parent / "windows" / "grub.cfg").read_text()
     import kiosk_core as kc
     out["kiosk default"] = kc.grub_cfg_rescue()
@@ -1717,3 +1728,23 @@ def test_tftp_oversized_menu_replaced_with_default(tmp_path):
     big = "# " + "x" * TftpServer.MENU_MAX + "\n" + LEGACY_RESCUE
     (root / "grub.cfg-C0000201").write_text(big)
     assert _fetch(root, mode, "grub.cfg-C0000201") == grub_menu("192.0.2.1")
+
+
+# ---- #70 第四轮
+
+def test_rescue_default_menu_ignores_utf8_bom():
+    assert not _px.rescue_default_menu("﻿" + grub_menu("192.0.2.1"))
+    assert _px.rescue_default_menu("﻿" + LEGACY_RESCUE)
+
+
+def test_tftp_non_regular_menu_not_served(tmp_path):
+    import os
+    import threading
+    root, mode = _tree(tmp_path)
+    os.mkfifo(root / "grub.cfg-C0000201")
+    got = {}
+    t = threading.Thread(target=lambda: got.update(v=_fetch(root, mode, "grub.cfg-C0000201")), daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "卡在打开 FIFO 上"
+    assert got["v"] == grub_menu("192.0.2.1")

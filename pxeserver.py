@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -889,7 +890,7 @@ def rescue_default_menu(text):
     default 没设按 0, 越界按 GRUB 回落第 0 项. 推车生成的所有菜单和 windows/grub.cfg 都在这个子集里.
     只针对 #70 之前的老菜单和普通手写菜单, 不防能写 tftp 树的对抗者 (发送时兜底, 不是访问控制).
     关键字被 GRUB 转义藏起来 (inst.res\cue 这种) 认不出, 同理不防."""
-    text = text.replace("\r\n", "\n")
+    text = text.lstrip("\ufeff").replace("\r\n", "\n")
     if not any(k in text for k in _RESCUE_KW):
         return False
     entries, body, default = [], None, None
@@ -1077,28 +1078,28 @@ class TftpServer:
         没过期、文件名就是那台 MAC 时才照发, 否则换成默认菜单 (超时本地盘; 日志前缀不同, 车机不会当成菜单被取走).
         默认项可能是救援的 (rescue_default_menu, #70 之前留下的; 已放行的解锁菜单也查), 一律换成默认菜单."""
         path = tftp_safe_name(self.root, name)
-        f = open(path, "rb")
-        size = os.fstat(f.fileno()).st_size
         base = os.path.basename(path)
-        if not base.startswith("grub.cfg") or base.startswith("grub.cfg."):
-            return f, size, f"TFTP RRQ {name}"
-        if size > self.MENU_MAX:
-            f.close()
-            data = grub_menu(self.ip).encode()
-            return io.BytesIO(data), len(data), f"TFTP RRQ {name} 菜单超长, 回默认菜单"
-        with f:
-            data = f.read()
-        text = data.decode("utf-8", "replace")
-        unlock = unlock_only_menu(text)
+        if not base.startswith("grub.cfg") or base.startswith("grub.cfg."):   # grub.cfg.bak-* 这类 GRUB 不取
+            f = open(path, "rb")
+            return f, os.fstat(f.fileno()).st_size, f"TFTP RRQ {name}"
         why = None
-        if unlock and not install_allowed(menu_mac(base), pxe_mode(self.pxe_mode_path, self.now())):
-            why = "未解锁"
-        elif rescue_default_menu(text):
-            why = "默认项是救援"
+        if not stat.S_ISREG(os.stat(path).st_mode):        # FIFO / 设备: 不打开 (会卡住), 不当菜单发
+            why = "不是普通文件"
+        else:
+            with open(path, "rb") as f:
+                data = f.read(self.MENU_MAX + 1)           # 按读到的长度判断, 不信 fstat (可能还在写)
+            text = data.decode("utf-8", "replace")
+            if len(data) > self.MENU_MAX:
+                why = "菜单超长"
+            elif unlock_only_menu(text) and not install_allowed(menu_mac(base),
+                                                                pxe_mode(self.pxe_mode_path, self.now())):
+                why = "未解锁"
+            elif rescue_default_menu(text):
+                why = "默认项是救援"
         if why:
             data = grub_menu(self.ip).encode()
             return io.BytesIO(data), len(data), f"TFTP RRQ {name} {why}, 回默认菜单"
-        if unlock:
+        if unlock_only_menu(text):
             self.event(f"装机菜单被取走 mac={menu_mac(base)} from {client[0]}")
         return io.BytesIO(data), len(data), f"TFTP RRQ {name}"
 

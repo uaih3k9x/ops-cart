@@ -55,7 +55,7 @@ PXE 菜单里的 Rescue shell 带 `inst.sshd`：Anaconda 救援环境是 root，
 #70 之前留下的老菜单（默认项可能是救援的 `grub.cfg-*`、`EFI/BOOT/grub.cfg`）上锁扫树时会删掉，
 TFTP 发菜单时换成默认菜单，HTTP 直接 403。超过 64KB 的 `grub.cfg*` 一样处理（上锁删、TFTP 换默认菜单、HTTP 403）。
 这套判定只针对 #70 之前的老菜单和普通手写菜单：含救援关键字的菜单必须落在一个很小的语法子集里才照发，
-但关键字本身被 GRUB 转义藏起来（如 `inst.res\cue`）认不出，所以不防能写 tftp 树的对抗者；
+但关键字本身被 GRUB 转义藏起来（如 `inst.res\cue`）认不出，默认项里用 `configfile` / `source` 引入的别的文件也不检查，同属能写 tftp 树的对抗者场景，所以不防这类对抗者；
 上锁扫树用 `os.walk`，不进符号链接目录，那里的菜单靠发送时的检查兜底。
 
 本地盘启动用 GRUB 的 `exit` 退回固件按启动顺序走：空盘 / 坏盘的机器 `exit` 后固件可能又回到 PXE，
