@@ -32,6 +32,7 @@ import time
 import unicodedata
 
 import atomicfile
+import serial_write_core as swc
 import totp_core as tc
 
 L0, L1, L2, L3, L4 = 0, 1, 2, 3, 4
@@ -66,7 +67,7 @@ _NATIVE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 _ID_RE = re.compile(r"(?:%s):[0-9a-f]{8}:[A-Za-z0-9_-]{1,32}" % "|".join(KINDS))
 _DIGEST_RE = re.compile(r"[0-9a-f]{16}")
 _NONCE_RE = re.compile(r"[0-9a-f]{16,64}")
-_BY_RE = re.compile(r"[\x21-\x7e]{1,64}")
+_BY_RE = re.compile(r"[\x21-\x7e]{1,80}")
 _CODE_RE = re.compile(r"[0-9]{6}")
 _TS_LOGIN_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}")
 _TS_NODE_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
@@ -77,29 +78,38 @@ _KEYWORD = re.compile(
     r"(?<![A-Za-z0-9_])(password|passwd|pwd|passphrase|secret|community|cipher|simple|psk|key|key-string|token"
     r"|credential|md5|sha|sha1|sha256|sha384|sha512|auth|priv|authentication-mode|privacy-mode)(?=\s)", re.I)
 _MODIFIER = re.compile(
-    r"(?:\d{1,2}|cipher|simple|irreversible-cipher|hash|encrypted|plain|plaintext|md5|sha\d*|aes\d*|des|3des"
-    r"|hmac-\S+|level|read|write)", re.I)
+    r"(?:\d{1,3}|cipher|simple|irreversible-cipher|hash|encrypted|plain|plaintext|md5|sha\d*|aes\d*|des|3des"
+    r"|hmac-\S+|level|read|write|ascii|hex|pass-phrase|config-key|password-encrypt)", re.I)
+# 被打的值后面只许跟这些尾词 (或别的口令关键词); 跟别的词说明"值"可能是命令 (strace -o key iptables ...), 看不清只能拒
+_TAIL_OK = re.compile(r"(?:\d+|ro|rw|aes\d*|des|3des|encrypted|level|\d+-\d+)", re.I)
 _NOT_VALUE = frozenset(("zeroize", "generate", "export", "import", "chain", "pubkey-chain", "rsa", "dsa", "ecdsa"))
 _TOKEN = re.compile(r"\s+(\"[^\"]*\"|'[^']*'|\S+)")
 # 2) 固定写法: 只打括号里最后一组
 _VALUE_RULES = [re.compile(r, re.I) for r in (
-    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]*(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*\s*[=:]\s*"
-    r"(\"[^\"]*\"|'[^']*'|\S+)",                                  # DB_PASSWORD=x / --password=x / pass:x
+    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]*(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*[=:]"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)",     # 值必须紧贴 = (KEY= cmd 是在执行 cmd)                                  # DB_PASSWORD=x / --password=x / pass:x
     r"://[^/@\s:]+:([^@\s/]+)@",                                   # URL 里的 user:pass@
     r"(?<!\S)-u\s*[^\s:]+:(\S+)",                                  # curl -u user:pass
     r"(?<!\S)-U\s*[^\s%]+%(\S+)",                                  # smbclient -U user%pass
     r"\bwpa_passphrase\s+\S+\s+(\S+)",
     r"\bversion\s+(?:1|2c)\s+(\S+)",                               # snmp-server host H version 2c <community>
+    r"\bAuthorization:\s*(?:Bearer\s+|Basic\s+|Token\s+)?([^\s'\"]+)",  # curl -H 'Authorization: Bearer X'
 )]
 _CTX_RULES = [(re.compile(c, re.I), re.compile(r, re.I)) for c, r in (
     (r"\b(?:mysql\w*|mariadb\w*)\b", r"(?<!\S)-p(\S+)"),          # mysql -pX
     (r"\bldap\w+", r"(?<!\S)-[wy]\s+(\S+)"),                       # ldapsearch -w X
+    (r"\bipmitool\b", r"(?<!\S)-P\s*(\S+)"),                      # ipmitool -P X
+    (r"\bredis-cli\b", r"(?<!\S)-a\s*(\S+)"),                     # redis-cli -a X
+    (r"\b(?:un)?zip\b|\b7za?\b", r"(?<!\S)-P\s*(\S+)"),            # zip / unzip -P X
+    (r"\bssh-keygen\b", r"(?<!\S)-[NP]\s*(\S+)"),                  # ssh-keygen -N X
 )]
 # 3) 这些工具整条命令都可能是口令: 只显示长度, 只能拒
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9_-])(?:chpasswd|passwd|htpasswd|sshpass)(?![A-Za-z0-9_-])|\bnet\s+user\b", re.I)
 _UNSAFE_HIDDEN = re.compile(r"[\s;&|<>`]|\$\(")
 # 设备停在密码提示符时, 这条动作本身就是密码
-_PW_PROMPT = re.compile(r"(?i)(?:password|passwd|pass ?phrase|密码)\s*[:：]?\s*$")
+_PW_PROMPT = re.compile(r"(?i)(?:password|passwd|pass ?phrase|secret|密码|口令|\bPIN)\b[^\n]{0,80}[:：]\s*$"
+                        r"|(?:password|passwd|pass ?phrase|密码|口令)\s*$")
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 _BAD_CATS = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
 
 
@@ -111,12 +121,68 @@ class StateUnreadable(Exception):
     pass
 
 
+# ------------------------------------------------------------ 串口高危判定 (审查三轮 H1)
+# 黑名单补不完 (维护者 11-07 拍板: 飞书 L2 仍直点, 接受残余风险), 这里只把已知的变形写法往 L3 推, 往"多拦"错.
+# 首词 (去掉 sudo / env / VAR=x 这类前缀后) 是这些 -> L3
+_L3_LEAD = frozenset(("no", "undo", "do", "clear", "default", "rollback", "commit", "test", "debug", "crypto",
+                      "reset", "delete", "format", "erase", "kill", "pkill", "killall", "sysctl", "mount", "umount",
+                      "chmod", "chown", "mv", "truncate", "tee", "exec", "eval", "source"))
+# 任意位置出现 (含带路径时的 basename) -> L3
+_L3_WORDS = frozenset(("blkdiscard", "wipefs", "shred", "telinit", "init", "kexec", "zeroize", "sysrq-trigger",
+                       "ifdown", "parted", "sgdisk", "lvremove", "vgremove", "pvremove", "cryptsetup", "mdadm",
+                       "dd", "fdisk", "halt", "poweroff", "reboot", "shutdown", "rm", "rmdir", "find"))
+_PREFIX_CMDS = frozenset(("sudo", "env", "nohup", "time", "nice", "ionice", "command", "builtin", "xargs",
+                          "strace", "ltrace", "timeout", "watch", "doas", "busybox", "chroot", "setsid", "stdbuf"))
+_SEG = re.compile(r"[;&|\n]+")
+_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+# 子命令组合: 第一个词 + 后面任一词 -> L3
+_L3_PAIRS = {"systemctl": {"isolate", "poweroff", "reboot", "halt", "kexec", "rescue", "emergency", "stop", "mask",
+                           "disable", "kill"},
+             "iptables": {"-f", "--flush", "-x", "-p"}, "ip6tables": {"-f", "--flush", "-x", "-p"},
+             "nft": {"flush", "delete"}, "ip": {"down", "del", "delete", "flush"},
+             "nmcli": {"down", "delete", "off"}, "ifconfig": {"down"}, "echo": {"/proc/sysrq-trigger"}}
+
+
+def serial_danger(text, extra=()):
+    """串口命令的高危理由 (规范写法, 去重). 闸门的 danger_words 加上这里的变形规则; 不信调用方传的 danger."""
+    out = list(swc.danger_words(text, extra))
+
+    def add(w):
+        if w not in out:
+            out.append(w)
+    low = (text or "").lower()
+    if "$'" in low or "`" in low or "$(" in low:
+        add("命令替换/转义")
+    if re.search(r">\s*/(?:proc|sys|dev)/", low):
+        add("写 /proc /sys /dev")
+    for seg in _SEG.split(low):
+        toks = [t for t in re.split(r"\s+", seg.strip()) if t]
+        # 去掉前缀命令和它的选项 / 环境变量赋值, 找到真正的命令词
+        i = 0
+        while i < len(toks) and (toks[i] in _PREFIX_CMDS or _ASSIGN.match(toks[i]) or
+                                 (i > 0 and toks[i].startswith("-") and toks[i - 1] in _PREFIX_CMDS)):
+            i += 1
+        base = [os.path.basename(t.strip("'\"\\")) or t for t in toks]
+        if i < len(toks) and base[i] in _L3_LEAD:
+            add(base[i])
+        for t, b in zip(toks, base):
+            for cand in {b, t.lstrip("-")}:
+                if cand in _L3_WORDS or cand in swc.DANGER:
+                    add(cand)
+            for w in swc.danger_words(b, extra) if "/" in t else ():
+                add(w)
+        if i < len(toks) and base[i] in _L3_PAIRS and _L3_PAIRS[base[i]] & set(toks[i + 1:]):
+            add(base[i])
+    return out
+
+
 # ------------------------------------------------------------ 审批请求模型
 
 def tier_of(item):
     kind, act = item.get("kind"), item.get("action") or {}
     if kind == "serial":
-        return L3 if item.get("danger") else L2
+        text = str(act.get("text", ""))
+        return L3 if item.get("danger") or serial_danger(text) or _spans(text) else L2   # 有打码的也升 L3
     if kind == "kvm":
         keys = frozenset(str(k).lower() for k in act.get("keys") or ())
         return L2 if act.get("type") == "key" and keys in KVM_L2_KEYS else L3
@@ -185,13 +251,20 @@ def make_item(kind, native_id, epoch, target, created, action, danger=(), ctx=No
     if not math.isfinite(created):
         raise ValueError("created 要是有限的数")
     it = {"id": f"{kind}:{epoch}:{native_id}", "kind": kind, "target": target, "action": dict(action),
-          "danger": [str(w) for w in danger or ()], "created": created, "ctx": ctx,
+          "danger": _union_danger(kind, action, danger), "created": created, "ctx": ctx,
           "agent": agent, "intent": intent, "model_reason": model_reason, "target_label": target_label,
           "evidence": list(evidence or ())}
     it["tier"] = tier_of(it)
     it["expires"] = expires_of(it)
     it["digest"] = digest(it)
     return it
+
+
+def _union_danger(kind, action, danger):
+    out = [str(w) for w in danger or ()]
+    if kind == "serial":
+        out += [w for w in serial_danger(str(action.get("text", ""))) if w not in out]
+    return out
 
 
 def expires_of(item):
@@ -215,22 +288,47 @@ def requirement(tier, channel, kind):
 
 # ------------------------------------------------------------ 打码 / 清洗
 
-def _spans(text):
-    """要打码的 [start, end) 区间, 已合并."""
+def _is_keyword(tok):
+    m = _KEYWORD.match(tok + " ")
+    return bool(m) and m.end() == len(tok)
+
+
+def _keyword_hits(text):
+    """关键词规则命中的值: [(start, end, 看不清)]. 跳完修饰词没有值了 -> 打最后一个被跳过的 (password 12).
+    值后面还跟着不是尾词、也不是口令关键词的词 -> 这个"值"可能是命令, 标看不清."""
     out = []
     for m in _KEYWORD.finditer(text):
-        pos, skipped = m.end(), 0
-        while True:
+        pos, last = m.end(), None
+        for _ in range(5):
             t = _TOKEN.match(text, pos)
             if not t:
                 break
             tok = t.group(1)
-            if skipped < 4 and _MODIFIER.fullmatch(tok):
-                pos, skipped = t.end(), skipped + 1
+            if _MODIFIER.fullmatch(tok) and _TOKEN.match(text, t.end()):
+                pos, last = t.end(), t
                 continue
-            if tok.lower() not in _NOT_VALUE and tok[0] not in ";|&":
-                out.append((t.start(1), t.end(1)))
+            if tok.lower() in _NOT_VALUE or tok[0] in ";|&":
+                t = None
             break
+        else:
+            t = None
+        if t is None and last is not None and not _TOKEN.match(text, last.end()):
+            t = last
+        if t is None:
+            if last is not None and not _TOKEN.match(text, pos):
+                t = last
+            else:
+                continue
+        nxt = _TOKEN.match(text, t.end())
+        unclear = bool(nxt) and not (_TAIL_OK.fullmatch(nxt.group(1)) or _is_keyword(nxt.group(1))
+                                     or _MODIFIER.fullmatch(nxt.group(1)))
+        out.append((t.start(1), t.end(1), unclear))
+    return out
+
+
+def _spans(text):
+    """要打码的 [start, end) 区间, 已合并."""
+    out = [(a, b) for a, b, _ in _keyword_hits(text)]
     for rx in _VALUE_RULES:
         out += [(m.start(1), m.end(1)) for m in rx.finditer(text)]
     for ctx, rx in _CTX_RULES:
@@ -279,6 +377,8 @@ def _unclear(text):
         return True
     if any(ch not in "\n\t" and unicodedata.category(ch) in _BAD_CATS for ch in text):
         return True
+    if any(u for _, _, u in _keyword_hits(text)):
+        return True
     return any(hid and _UNSAFE_HIDDEN.search(p) for p, hid in _masked_parts(text))
 
 
@@ -315,7 +415,12 @@ def at_password_prompt(item):
     """串口挂起时设备最后一行输出是密码提示符."""
     if item.get("kind") != "serial":
         return False
-    lines = [_norm(str(ln)) for ln in item.get("evidence") or () if str(ln).strip()]
+    lines = []
+    for ln in item.get("evidence") or ():
+        s = _ANSI.sub("", str(ln))
+        s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc",) or ch == "\t")
+        if s.strip():
+            lines.append(_norm(s).rstrip())
     return bool(lines) and bool(_PW_PROMPT.search(lines[-1]))
 
 
@@ -415,9 +520,9 @@ def render(item, now):
     if item.get("danger"):
         lines.append(f"闸门: 带高危词 {', '.join(untrusted(w, 32) for w in item['danger'])}, 要人确认")
     mr = item.get("model_reason")
-    lines.append(f"模型意见(不可信): {untrusted(mr)}" if mr else "模型意见: (没开)")
+    lines.append(f"模型意见(不可信): {_untrusted_masked(mr)}" if mr else "模型意见: (没开)")
     if item.get("intent"):
-        lines.append(f"Agent 自述(未核实, 不可信): {untrusted(item['intent'])}")
+        lines.append(f"Agent 自述(未核实, 不可信): {_untrusted_masked(item['intent'])}")
     lines.append(f"digest: {item['digest']}")
     lines.append(SAFETY_LINE)
     return {"title": title, "lines": lines, "text": "\n".join(lines)}
@@ -551,7 +656,7 @@ def prune(state, now):
     return st
 
 
-_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,64}")
+_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,54}")
 
 
 _ACCOUNT_KEYS = {"feishu", "ts_login", "ts_nodes"}
@@ -631,7 +736,7 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
         return done("expired")
     def record(op):
         st["decisions"][item["id"]] = {"op": op, "account": acct, "channel": channel, "t": now,
-                                       "digest": item["digest"]}
+                                       "digest": digest(item)}
 
     prev = st["decisions"].get(item["id"])
     if prev and prev["op"] == req["op"]:
@@ -730,8 +835,14 @@ class ApprovalStore:
                 return "state_unreadable"
             out, st, rec = decide(state, item, req, channel, seed_of, accounts, now, ts_login, ts_node)
             try:
-                self._audit(rec)                    # 先记审计; 记不上就不提交 (没有审计的批准不算数)
+                self._audit(rec)                    # 先记审计; 记不上就不登记这次批准 / 拒绝 (没有审计的批准不算数)
             except OSError:
+                # 但输错计数、冷却、nonce 照样落盘: 否则能让审计写失败 (写满日志盘) 来绕过 TOTP 退避
+                st = dict(st, decisions=prune(state, now)["decisions"])
+                try:
+                    atomicfile.write_json(self.path, st, mode=0o600)
+                except OSError:
+                    pass
                 return "audit_fail"
             try:
                 atomicfile.write_json(self.path, st, mode=0o600)

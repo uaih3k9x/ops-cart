@@ -727,7 +727,8 @@ def test_store_audit_failure_does_not_commit(tmp_path):
     store = ac.ApprovalStore(p, audit_path=bad_audit)
     r = ac.parse_request(raw(), NOW)
     assert store.decide(serial(), r, "feishu", seeds, ACCOUNTS, NOW) == "audit_fail"
-    assert not os.path.exists(p)
+    doc = json.load(open(p))                            # 审查三轮 L2: 不登记批准, 但 nonce / 输错计数照样落盘
+    assert doc["decisions"] == {} and r["nonce"] in doc["nonces"]
 
 
 @pytest.mark.parametrize("doc", [
