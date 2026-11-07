@@ -27,7 +27,7 @@ import socket
 import sys
 import time
 
-from pxeserver import (PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
+from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
                        rescue_default_menu, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
@@ -82,9 +82,13 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
         elif base.startswith("grub.cfg") and os.path.isfile(path):
             try:
                 with open(path, "rb") as f:
-                    text = f.read(64 * 1024).decode("utf-8", "replace")
+                    raw = f.read(MENU_MAX + 1)
             except OSError:
-                text = ""
+                raw = b""
+            if len(raw) > MENU_MAX:                         # 超长不当菜单发, 同 TFTP
+                self.send_error(403, "Menu too large")
+                return None
+            text = raw.decode("utf-8", "replace")
             if unlock_only_menu(text) and not install_allowed(menu_mac(base),
                                                               pxe_mode(self.pxe_mode_path, self.now())):
                 self.send_error(403, "Install mode is locked")

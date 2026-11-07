@@ -1666,3 +1666,54 @@ def test_tftp_armed_unlock_menu_with_rescue_default_is_replaced(tmp_path):
     assert _fetch(root, mode, "/" + ARMED_CFG) == grub_menu("192.0.2.1")
     (root / ARMED_CFG).write_text(_px.grub_menu_winpe("192.0.2.1"))
     assert _fetch(root, mode, "/" + ARMED_CFG) == _px.grub_menu_winpe("192.0.2.1")
+
+
+# ---- #70 第三轮审查: 正向语法白名单 + 超长菜单
+
+def _all_generated_menus():
+    import clone_core as cc
+    conf = {"proto": "nfs", "save_share": "/x", "restore_share": "/x", "local_dir": "/x"}
+    out = {"default": grub_menu("192.0.2.1"), "install": grub_menu("192.0.2.1", install=True),
+           "winpe": _px.grub_menu_winpe("192.0.2.1")}
+    for pur in ("clone-save", "clone-restore"):
+        out[pur] = _px.grub_menu_clone("192.0.2.1", pur, cc.boot_params(pur, "img1", "SERIALNO=SN-EXAMPLE-1",
+                                                                       conf, "192.0.2.1"))
+        out[pur + " test params"] = _px.grub_menu_clone("192.0.2.1", pur, CLONE_PARAMS)
+    import pathlib
+    out["windows/grub.cfg"] = (pathlib.Path(__file__).resolve().parent.parent / "windows" / "grub.cfg").read_text()
+    import kiosk_core as kc
+    out["kiosk default"] = kc.grub_cfg_rescue()
+    out.update({k + " crlf": v.replace("\n", "\r\n") for k, v in list(out.items())})
+    return out
+
+
+@pytest.mark.parametrize("name", sorted(_all_generated_menus()))
+def test_generated_menus_pass_strict_whitelist(name):
+    assert not _px.rescue_default_menu(_all_generated_menus()[name]), name
+
+
+@pytest.mark.parametrize("cfg", [
+    "set timeout=5; set default=1\n" + _L + _R,                                 # 分号后再设
+    'set "default=1"\n' + _L + _R,                                              # 带引号
+    "set default=010\n" + _L * 8 + _R + _L * 3,                                 # GRUB 按八进制 = 8
+    "set default=0\neval set default=1\n" + _L + _R,
+    "set default=0\n. (tftp)/x.cfg\n" + _L + _R,
+    "set default=0\nload_env -f (tftp)/env\n" + _L + _R,
+    "set default=0\nextract_entries_source (tftp)/x.cfg\n" + _L + _R,
+    "set default=1\nmenuentry 'A' {\n exit\n}; " + _R + _L,                     # 一行多个 menuentry
+    "set default=0\nuntil false; do set default=1; done\n" + _L + _R,
+    "set \\\ndefault=1\n" + _L + _R,                                            # 续行
+    "set default=0\nmenuentry 'L' {\n exit }\n" + _R,                           # } 不独占一行
+    "set default=0\n" + _L.replace("exit", "exit; menuentry 'x' {") + _R,      # 项里开新项
+    "set default=0\nset default=0\n" + _L + _R,                                 # 设两次
+    "set default=0\n" + _L + _R.rstrip("}\n"),                                  # 没闭合
+])
+def test_rescue_default_menu_whitelist_catches_tricks(cfg):
+    assert _px.rescue_default_menu(cfg)
+
+
+def test_tftp_oversized_menu_replaced_with_default(tmp_path):
+    root, mode = _tree(tmp_path)
+    big = "# " + "x" * TftpServer.MENU_MAX + "\n" + LEGACY_RESCUE
+    (root / "grub.cfg-C0000201").write_text(big)
+    assert _fetch(root, mode, "grub.cfg-C0000201") == grub_menu("192.0.2.1")

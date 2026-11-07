@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import stat
 import subprocess
 import threading
 import sys
@@ -1136,6 +1137,24 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, p
     _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟; 用途 {what}")
 
 
+def _stale_menu(full, always=False):
+    """上锁时该删的菜单: 只看普通文件 (含指向普通文件的符号链接; FIFO/设备跳过, 免得卡在 open 上).
+    always 的直接删; 别的读至多 MENU_MAX+1 字节: 超长、解锁专用、默认项可能是救援的都删."""
+    try:
+        if not stat.S_ISREG(os.stat(full).st_mode):
+            return False
+        if always:
+            return True
+        with open(full, "rb") as f:
+            raw = f.read(pxeserver.MENU_MAX + 1)
+    except OSError:
+        return False
+    if len(raw) > pxeserver.MENU_MAX:
+        return True
+    text = raw.decode("utf-8", "replace")
+    return pxeserver.unlock_only_menu(text) or pxeserver.rescue_default_menu(text)
+
+
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     """删掉所有按 MAC 的装机菜单, 主菜单写回默认 (超时本地盘). 开机时也调一次, 保证默认安全.
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
@@ -1144,31 +1163,27 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     手工备份 GRUB 不会去取, 不动. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
     再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
-    removed = []
+    try:
+        os.remove(path)                     # 先撤状态: 后面哪步出错, 服务端也已经当没解锁
+    except FileNotFoundError:
+        pass
+    removed, failed = [], []
     for d, _dirs, files in os.walk(root):
         for name in files:
             full = os.path.join(d, name)
             fetched = name == "grub.cfg" or name.startswith("grub.cfg-")
             if not fetched or full == os.path.join(root, "grub.cfg"):
                 continue
-            always = (name.startswith("grub.cfg-01-") and d == root) or \
-                full == os.path.join(root, "EFI", "BOOT", "grub.cfg")
-            if not always:
+            if _stale_menu(full, always=(name.startswith("grub.cfg-01-") and d == root) or
+                           full == os.path.join(root, "EFI", "BOOT", "grub.cfg")):
                 try:
-                    with open(full, errors="replace") as f:
-                        text = f.read()
-                    if not (pxeserver.unlock_only_menu(text) or pxeserver.rescue_default_menu(text)):
-                        continue
-                except OSError:
-                    continue
-            os.remove(full)
-            removed.append(os.path.relpath(full, root))
+                    os.remove(full)
+                    removed.append(os.path.relpath(full, root))
+                except OSError as e:
+                    failed.append(f"{os.path.relpath(full, root)} ({e.strerror or e})")
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-    _pxe_event("装机模式上锁, 只剩默认菜单 (超时本地盘)" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else ""))
+    _pxe_event("装机模式上锁, 只剩默认菜单 (超时本地盘)" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else "")
+               + (f"; 删不掉 {', '.join(sorted(failed))}" if failed else ""))
 
 
 def pxe_retire(macs, root=TFTP_ROOT):

@@ -1599,3 +1599,37 @@ def test_disarm_removes_legacy_rescue_default_menus(tmp_path, monkeypatch):
     left = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("grub.cfg*"))
     assert left == ["grub.cfg", "grub.cfg-C0000202", "grub.cfg.bak-1"]
     assert _is_local(default_entry((tmp_path / "grub.cfg").read_text()))
+
+
+def test_disarm_robust_oversized_fifo_and_state_first(tmp_path, monkeypatch):
+    """超长菜单删; FIFO 这类非普通文件跳过 (不能卡在 open 上); 状态文件先删, 再写主菜单."""
+    import os
+    monkeypatch.setattr(kc, "_pxe_event", lambda *a, **k: None)
+    (tmp_path / "grub.cfg-C0000201").write_text("# " + "x" * _px.TftpServer.MENU_MAX + "\n")
+    os.mkfifo(tmp_path / "grub.cfg-C0000202")
+    state = tmp_path / "m.json"
+    state.write_text("{}")
+    seen = []
+    real = kc._write_atomic
+    monkeypatch.setattr(kc, "_write_atomic", lambda p, d: (seen.append(state.exists()), real(p, d)))
+    kc.pxe_disarm(root=tmp_path, path=state)
+    assert not (tmp_path / "grub.cfg-C0000201").exists()
+    assert (tmp_path / "grub.cfg-C0000202").exists()                # FIFO 不碰
+    assert seen == [False] and not state.exists()
+
+
+def test_disarm_one_failed_remove_does_not_stop_others(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setattr(kc, "_pxe_event", lambda *a, **k: None)
+    for n in ("01-02-00-00-00-00-01", "01-02-00-00-00-00-02"):
+        (tmp_path / f"grub.cfg-{n}").write_text("inst.ks=x\n")
+    real = os.remove
+
+    def flaky(p, *a, **k):
+        if str(p).endswith("-01"):
+            raise PermissionError(p)
+        return real(p, *a, **k)
+    monkeypatch.setattr(kc.os, "remove", flaky)
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
+    assert not (tmp_path / "grub.cfg-01-02-00-00-00-00-02").exists()
+    assert _is_local(default_entry((tmp_path / "grub.cfg").read_text()))

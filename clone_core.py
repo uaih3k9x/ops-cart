@@ -68,6 +68,8 @@ def image_name_error(name):
         return f"镜像名不合格: {name!r} (只许字母数字和 . _ -, 不以 . 开头, 最长 64)"
     if name in _IMAGE_RESERVED or name.startswith("autoname-"):
         return f"镜像名 {name!r} 是 Clonezilla 保留字"
+    if "inst." in name.lower():                 # 进 GRUB 菜单; 带安装器参数字样会被当成救援菜单换掉 (#70)
+        return f"镜像名 {name!r} 不许带 inst."
     return None
 
 

@@ -871,32 +871,52 @@ def grub_menu_clone(ip, purpose, params):
             LOCAL_ENTRY + "\n" + _rescue_entries(ip))
 
 
-_MENU_ENTRY = re.compile(r"^\s*menuentry\b", re.M)
-_MENU_PICK = re.compile(r"^\s*(?:set\s+)?(default|fallback)=[\"']?([^\"'\s]*)", re.M)
-_MENU_TRICKY = re.compile(r"^\s*(?:submenu|if|for|while|function|configfile|source)\b", re.M)
 _RESCUE_KW = ("inst.rescue", "inst.sshd")
+MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 不发 (TFTP 换默认菜单, HTTP 403), 上锁时删
+_TOP_DEFAULT = re.compile(r"set default=(0|[1-9][0-9]*)")
+_TOP_TIMEOUT = re.compile(r"set timeout=[0-9]+")
+_TOP_ENTRY = re.compile(r"menuentry '[^'\\]*' \{")
+_BODY_BAD = set(";{}$\"'\\")
 
 
 def rescue_default_menu(text):
-    """默认项可能是救援 (inst.rescue / inst.sshd: root 可能无密码) 的菜单, #70 之前的老菜单就是.
-    白名单判法: 文本里没有救援关键字的放过; 有的话, 只有能可靠确认默认项不是救援才放过:
-    恰好一行 default=<数字> (带不带 set 都算, 越界按 GRUB 回落第 0 项), 没有 fallback,
-    没有 submenu / if / configfile 这类会让下标错位的结构, 菜单项之前的头部不带关键字,
-    默认项本身不带关键字也不引用变量. 别的一律当救援默认."""
+    r"""默认项可能是救援 (inst.rescue / inst.sshd: root 可能无密码) 的菜单, #70 之前的老菜单就是.
+    不带这两个关键字的放过. 带的话用正向语法白名单, 只有完全落在这个子集里、且默认项不带关键字才放过:
+      顶层每行 (去掉首尾空白, CRLF 当 LF) 只能是: 空行; # 注释; set default=<十进制, 无前导零> (至多一次);
+      set timeout=<数字>; menuentry '<不含引号和反斜杠的标题>' {
+      菜单项里每行任意命令, 但不许出现 ; { } $ " ' \ (只许 \" 这种转义引号, 克隆参数要用), 不许再开 menuentry
+      / submenu; 收尾的 } 必须独占一行; 文末不能有没闭合的项.
+    default 没设按 0, 越界按 GRUB 回落第 0 项. 推车生成的所有菜单和 windows/grub.cfg 都在这个子集里.
+    只针对 #70 之前的老菜单和普通手写菜单, 不防能写 tftp 树的对抗者 (发送时兜底, 不是访问控制).
+    关键字被 GRUB 转义藏起来 (inst.res\cue 这种) 认不出, 同理不防."""
     text = text.replace("\r\n", "\n")
     if not any(k in text for k in _RESCUE_KW):
         return False
-    picks = _MENU_PICK.findall(text)
-    if _MENU_TRICKY.search(text) or len(picks) > 1 or any(k == "fallback" for k, _ in picks):
+    entries, body, default = [], None, None
+    for line in text.split("\n"):
+        s = line.strip()
+        if body is not None:
+            if s == "}":
+                entries.append("\n".join(body))
+                body = None
+            elif _BODY_BAD & set(s.replace('\\"', "")) or re.match(r"(menuentry|submenu)\b", s):
+                return True
+            else:
+                body.append(s)
+            continue
+        if not s or s.startswith("#") or _TOP_TIMEOUT.fullmatch(s):
+            continue
+        m = _TOP_DEFAULT.fullmatch(s)
+        if m and default is None:
+            default = int(m.group(1))
+        elif _TOP_ENTRY.fullmatch(s):
+            body = []
+        else:
+            return True
+    if body is not None or not entries:
         return True
-    value = picks[0][1] if picks else "0"
-    parts = _MENU_ENTRY.split(text)
-    head, entries = parts[0], parts[1:]
-    if not value.isdigit() or not entries or any(k in head for k in _RESCUE_KW):
-        return True
-    idx = int(value) if int(value) < len(entries) else 0
-    entry = entries[idx]
-    return "$" in entry or any(k in entry for k in _RESCUE_KW)
+    idx = default if default is not None and default < len(entries) else 0
+    return any(k in entries[idx] for k in _RESCUE_KW)
 
 
 def unlock_only_menu(text):
@@ -1026,7 +1046,7 @@ def tftp_safe_name(root, name):
 
 
 class TftpServer:
-    MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的不当菜单看
+    MENU_MAX = MENU_MAX
 
     def __init__(self, ip, root, log, blksize=1428, timeout=2.0, retries=5, port=69,
                  sock_factory=None, pxe_mode_path=PXE_MODE, now=time.time, event=cart_event):
@@ -1060,8 +1080,12 @@ class TftpServer:
         f = open(path, "rb")
         size = os.fstat(f.fileno()).st_size
         base = os.path.basename(path)
-        if not base.startswith("grub.cfg") or base.startswith("grub.cfg.") or size > self.MENU_MAX:
+        if not base.startswith("grub.cfg") or base.startswith("grub.cfg."):
             return f, size, f"TFTP RRQ {name}"
+        if size > self.MENU_MAX:
+            f.close()
+            data = grub_menu(self.ip).encode()
+            return io.BytesIO(data), len(data), f"TFTP RRQ {name} 菜单超长, 回默认菜单"
         with f:
             data = f.read()
         text = data.decode("utf-8", "replace")

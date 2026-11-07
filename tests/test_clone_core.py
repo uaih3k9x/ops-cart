@@ -412,3 +412,9 @@ def test_examples_make_a_valid_plan():
     assert "smb3://192.0.2.1/clone-ro/" in run and "change-me" not in run
     p = cc.plan("clone-save", conf, batch, IP, mac="02:00:00:00:00:01", image_exists=lambda n: False)
     assert p["error"] is None and "smb3://clonesave:change-me-example@192.0.2.1/clone-rw/" in " ".join(p["rows"][0]["params"])
+
+
+@pytest.mark.parametrize("name", ["inst.rescue", "lab-inst.sshd", "INST.x"])
+def test_image_name_refuses_installer_keywords(name):
+    """#70: 镜像名进 GRUB 菜单, 带 inst. 会让合法的克隆菜单被当成救援默认菜单换掉."""
+    assert cc.image_name_error(name)

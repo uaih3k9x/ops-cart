@@ -53,7 +53,10 @@ PXE 菜单里的 Rescue shell 带 `inst.sshd`：Anaconda 救援环境是 root，
 `vmlinuz`、`initrd.img`、stage2 不管解没解锁都照发。维护者决定不设 GRUB 密码，依靠人在场盯着，以及键鼠通道
 本身的访问控制（人经网页口直通靠登录 / PIN，agent 发键走键鼠闸门和远程审批），接受此残余风险。
 #70 之前留下的老菜单（默认项可能是救援的 `grub.cfg-*`、`EFI/BOOT/grub.cfg`）上锁扫树时会删掉，
-TFTP 发菜单时换成默认菜单，HTTP 直接 403。
+TFTP 发菜单时换成默认菜单，HTTP 直接 403。超过 64KB 的 `grub.cfg*` 一样处理（上锁删、TFTP 换默认菜单、HTTP 403）。
+这套判定只针对 #70 之前的老菜单和普通手写菜单：含救援关键字的菜单必须落在一个很小的语法子集里才照发，
+但关键字本身被 GRUB 转义藏起来（如 `inst.res\cue`）认不出，所以不防能写 tftp 树的对抗者；
+上锁扫树用 `os.walk`，不进符号链接目录，那里的菜单靠发送时的检查兜底。
 
 本地盘启动用 GRUB 的 `exit` 退回固件按启动顺序走：空盘 / 坏盘的机器 `exit` 后固件可能又回到 PXE，
 菜单会循环出现，这不是推车的问题；个别 UEFI 固件 `exit` 后会停在启动管理器或 setup 界面，要人选一下。只支持 UEFI（GRUB）；BIOS / pxelinux 菜单不支持，也不要手放进 tftp 树。

@@ -173,3 +173,14 @@ def test_http_rescue_default_menu_refused(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_http_oversized_menu_refused(tmp_path):
+    import pxeserver
+    srv = serve(tmp_path)
+    (tmp_path / "http" / "grub.cfg-C0000201").write_text("# " + "x" * pxeserver.TftpServer.MENU_MAX + "\n")
+    try:
+        assert get(srv, "grub.cfg-C0000201") == 403
+    finally:
+        srv.shutdown()
+        srv.server_close()
