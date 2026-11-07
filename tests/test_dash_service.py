@@ -253,7 +253,8 @@ def test_loop_switches_theme_on_the_next_frame(tmp_path, monkeypatch):
         if n["round"] >= len(modes):
             raise Stop()
 
-    t = {"v": time.time()}
+    # 假钟每调一次 +1 s, 整个用例只走十来秒; 起点对齐整分钟, 免得中途时钟跳分钟多推一帧 (#80)
+    t = {"v": time.time() // 60 * 60}
     monkeypatch.setattr(ds.time, "sleep", fake_sleep)
     monkeypatch.setattr(ds.time, "time", lambda: t.__setitem__("v", t["v"] + 1) or t["v"])
     try:
