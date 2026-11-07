@@ -285,6 +285,43 @@ def test_menu_main_keeps_hot_buttons():
     assert ("toggle_pane", "preview") in main and ("toggle_pane", "serial") in main and ("lock_now", None) in main
 
 
+# ---- 开关按钮跟随真实状态: 不再写死 "开 / 关"
+
+def test_toggle_texts_follow_pane_and_pxe_service():
+    rows = [{"label": "PXE SERVER", "state": "OK", "detail": "RUNNING"}]
+    t = ui.toggle_texts("preview", rows)
+    assert t == {"btn_video": "UVC 预览:  开", "btn_serial": "串口会话:  关", "btn_pxe": "PXE 装机服务:  开"}
+    t = ui.toggle_texts("serial", [{"label": "PXE SERVER", "state": "WARN", "detail": "NOT RUNNING"}])
+    assert t == {"btn_video": "UVC 预览:  关", "btn_serial": "串口会话:  开", "btn_pxe": "PXE 装机服务:  关"}
+    assert ui.toggle_texts(None, [{"label": "PXE SERVER", "state": "FAIL"}])["btn_pxe"] == "PXE 装机服务:  关"
+
+
+@pytest.mark.parametrize("rows", [None, [], [{"label": "PXE SERVER", "state": "--"}],
+                                  [{"label": "OCR", "state": "OK"}]])
+def test_toggle_texts_pxe_unknown_until_checked(rows):
+    # 自检还没出结果 / 没这一行: 不猜, 显示 "读取中"
+    assert ui.toggle_texts(None, rows)["btn_pxe"] == "PXE 装机服务:  读取中"
+
+
+def test_toggle_buttons_exist_in_menu_with_same_attrs():
+    attrs = {it.get("attr"): it["text"] for items in ui.MENU.values() for it in items}
+    for attr, text in ui.toggle_texts(None, None).items():
+        assert attr in attrs
+        assert text.split(":")[0] == attrs[attr].split(":")[0]
+
+
+def test_kiosk_syncs_toggle_texts_on_pane_change_and_check_result():
+    src = _src("kiosk.py")
+    tree = ast.parse(src)
+    calls = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef):
+            calls[fn.name] = {ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call)}
+    for name in ("_show_status", "_pane_open", "checks_done", "_build_menu"):
+        assert "self._sync_toggles" in calls[name], name
+    assert "kui.toggle_texts" in calls["_sync_toggles"]
+
+
 # ------------------------------------------------------------ B6 键鼠
 
 def test_rel_split_clamps_and_keeps_remainder():

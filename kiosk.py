@@ -223,6 +223,12 @@ class Kiosk(tk.Tk):
                 if "do" in it and "arg" not in it:
                     self._menu_btns[it["do"]] = b
         self.show_page("main")
+        self._sync_toggles()
+
+    def _sync_toggles(self):
+        """UVC 预览 / 串口会话 / PXE 装机服务三颗按钮写当前状态: 面板开关时、自检出结果时刷新."""
+        for attr, text in kui.toggle_texts(self.pane.current, self._check_rows).items():
+            getattr(self, attr).config(text=text)
 
     def show_page(self, name):
         for page in self.pages.values():
@@ -251,6 +257,7 @@ class Kiosk(tk.Tk):
             if not isinstance(res, Exception):
                 self._render_net(*res[0])
                 self._check_rows = res[1]
+                self._sync_toggles()
 
         rows = self._check_rows
 
@@ -704,6 +711,7 @@ class Kiosk(tk.Tk):
                 w.destroy()
 
     def _pane_open(self, name, select=None):
+        self._sync_toggles()
         self.status_wrap.pack_forget()
         if name == "preview":
             self._start_preview()
@@ -725,6 +733,7 @@ class Kiosk(tk.Tk):
         self.banner.config(text=kui.PANES[name])
 
     def _show_status(self):
+        self._sync_toggles()
         self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.banner.config(text="")
 
@@ -1060,9 +1069,12 @@ class Kiosk(tk.Tk):
             if not messagebox.askyesno("确认", f"确定要{verb} PXE 装机服务?"):
                 return
             cmd = ["systemctl", "stop" if active else "start", *units]
-            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30), lambda r: self.banner.config(
-                text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
-                else f"PXE 装机服务{verb}失败, 详见 journalctl"), f"正在{verb} PXE 装机服务…")
+
+            def done(r):
+                self._check_ts = 0.0        # 下一轮 refresh 就重跑自检, 按钮上的开/关跟着变
+                self.banner.config(text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
+                                   else f"PXE 装机服务{verb}失败, 详见 journalctl")
+            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30), done, f"正在{verb} PXE 装机服务…")
         self._bg_action("toggle_pxe", lambda: kc.services_status(("pxe-server",)), asked, "读取服务状态…")
 
     def confirm_power(self, off):

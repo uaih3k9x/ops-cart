@@ -371,6 +371,19 @@ MENU = {
 }
 
 
+TOGGLES = (("btn_video", "UVC 预览"), ("btn_serial", "串口会话"), ("btn_pxe", "PXE 装机服务"))
+
+
+def toggle_texts(pane, rows):
+    """三颗开关按钮显示当前状态. pane = 左侧开着的面板; rows = 自检结果 (PXE 服务看 "PXE SERVER" 那行).
+    自检还没出结果就写 "读取中", 不猜."""
+    pxe = next((r.get("state") for r in rows or [] if r.get("label") == "PXE SERVER"), None)
+    on = {"btn_video": pane == "preview", "btn_serial": pane == "serial",
+          "btn_pxe": {"OK": True, "WARN": False, "FAIL": False}.get(pxe)}
+    return {attr: "%s:  %s" % (label, {True: "开", False: "关", None: "读取中"}[on[attr]])
+            for attr, label in TOGGLES}
+
+
 # ---------------------------------------------------------------- 键鼠透传
 
 REL_MAX = 127

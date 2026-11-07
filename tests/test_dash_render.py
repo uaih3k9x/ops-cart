@@ -318,3 +318,45 @@ def test_render_light_palette(locked):
         th.use("dark")
     assert r.render(dc.layout_view(_full_snap(), locked=locked)).getpixel((5, 5)) == \
         tuple(int(th.DARK["DASH_BG"][i:i + 2], 16) for i in (1, 3, 5))
+
+
+# ---- 底部红条 "数据源停了" 出现时, 上面的待办 / 昨夜整理不许压进去
+
+_LONG_DREAM = "昨夜整理 10-30 · Wi-Fi 优先级调整完成但 Lan2 临时路由仍未清理, 另外两条串口线需要重新标记并补记录"
+
+
+def _stale_work_view(todo=("换 con-2 的线", "补 CART-LOG")):
+    return dc.layout_view(_full_snap(ts=1.0, todo=list(todo), dream=_LONG_DREAM), locked=False)
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_work_tail_stays_above_footer(stale):
+    v = _stale_work_view() if stale else dc.layout_view(_full_snap(dream=_LONG_DREAM), locked=False)
+    assert bool(v.get("stale")) == stale
+    top = r.footer_top(v)
+    rows = r.work_tail(v)
+    assert any(k == "dream" for k, _, _, _ in rows)
+    for kind, y, bottom, text in rows:
+        assert bottom <= top, (kind, text, bottom, top)        # 文本底边不越过横条顶边
+    spans = sorted((y, b) for _, y, b, _ in rows)
+    for (_, b0), (y1, _) in zip(spans, spans[1:]):
+        assert b0 <= y1                                       # 待办和昨夜整理互不重叠
+
+
+def test_work_tail_truncates_dream_with_ellipsis_when_squeezed():
+    rows = r.work_tail(_stale_work_view())
+    dream = [t for k, _, _, t in rows if k == "dream"]
+    assert dream and dream[-1].endswith("…")
+
+
+def test_stale_footer_strip_above_bar_is_blank():
+    # 红条是最后画的, 压进去的字会被它盖掉半截, 只剩红条顶边上方一排残墨 (预览里半个 "化").
+    # 所以查红条顶边上方那几行: 必须是纯底色
+    from PIL import ImageColor
+    v = _stale_work_view()
+    img = r.render(v)
+    bg = ImageColor.getrgb(r.BG)
+    top = r.footer_top(v)
+    for y in range(top - 6, top):
+        for x in range(r.PANEL_W):
+            assert img.getpixel((x, y)) == bg, (x, y)
