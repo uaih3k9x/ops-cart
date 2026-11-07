@@ -298,3 +298,20 @@ def test_r5_l4_long_serial_text_short_circuits():
                       action={"type": "line", "text": "-" * 20000 + ":"})
     assert it["tier"] == ac.L3 and ac.truncated(it)
     assert time.time() - t0 < 1.0
+
+
+# ------------------------------------------------------------ 第六轮审查回归
+
+@pytest.mark.parametrize("cmd", ["sudo -n iptables -F", "sudo -s iptables -F", "sudo -i systemctl stop sshd",
+                                 "sudo -S sysctl -w a=1", "sudo -k nft flush ruleset", "sudo -n chmod 777 /",
+                                 "sudo -n mount /dev/sda1 /mnt", "env -i kill 1", "sudo -u root -i kill 1",
+                                 "timeout 10 iptables -F", "timeout 5 systemctl stop sshd", "chroot /mnt iptables -F",
+                                 "timeout -s KILL 5 kill 1", "mount -a", "mount --all"])
+def test_r6_prefix_flags_without_args_still_l3(cmd):
+    assert serial(cmd)["tier"] == ac.L3, cmd
+
+
+@pytest.mark.parametrize("cmd", ["sudo grep mount /etc/fstab", "sudo -n cat /etc/hosts", "sudo -i", "sudo dmesg",
+                                 "sudo iptables -nL", "sudo journalctl -u sshd", "timeout 5 ping -c 1 192.0.2.1"])
+def test_r6_read_only_with_prefix_flags_l2(cmd):
+    assert serial(cmd)["tier"] == ac.L2, cmd

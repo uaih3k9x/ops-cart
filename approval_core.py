@@ -139,9 +139,19 @@ _L3_WORDS = frozenset(("blkdiscard", "wipefs", "shred", "telinit", "init", "kexe
                        "dd", "fdisk", "halt", "poweroff", "reboot", "shutdown", "rm", "rmdir"))
 _PREFIX_CMDS = frozenset(("sudo", "env", "nohup", "time", "nice", "ionice", "command", "builtin", "xargs",
                           "strace", "ltrace", "timeout", "watch", "doas", "busybox", "chroot", "setsid", "stdbuf"))
-# 前缀命令里带一个参数的选项 (sudo -u root / nice -n 10 / strace -o f / timeout -s KILL ...)
-_ARG_OPTS = frozenset(("-u", "-g", "-n", "-C", "-o", "-e", "-s", "-k", "-c", "-p", "-t", "-U", "-D", "-h", "-r",
-                       "-i", "-S", "-P", "--user", "--group", "--chdir", "--signal", "--kill-after", "--output"))
+# 前缀命令各自带一个参数的选项 (sudo -u root / nice -n 10 / strace -o f ...); 不在表里的选项当不带参数.
+# 位置参数: timeout 的时长、chroot 的根目录各剥一个.
+_ARG_OPTS = {
+    "sudo": {"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D", "--user", "--group", "--host", "--prompt",
+             "--role", "--type", "--other-user", "--chdir", "--close-from"},
+    "doas": {"-u", "-C"}, "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+    "nice": {"-n", "--adjustment"}, "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
+    "strace": {"-o", "-e", "-p", "-s", "-u", "-E", "-a", "-P"}, "ltrace": {"-o", "-e", "-p", "-s", "-u", "-n"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"}, "stdbuf": {"-i", "-o", "-e"},
+    "xargs": {"-n", "-I", "-L", "-P", "-d", "-a", "-s", "-E"}, "time": {"-f", "-o", "--format", "--output"},
+    "chroot": {"--userspec", "--groups"}, "watch": {"-n", "-d", "--interval"},
+}
+_POSITIONAL = {"timeout": 1, "chroot": 1}
 _SEG = re.compile(r"[;&|\n]+")
 _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # 子命令组合: 第一个词 + 后面任一词 -> L3
@@ -168,23 +178,39 @@ def serial_danger(text, extra=()):
         raw = [t for t in re.split(r"\s+", seg_raw.strip()) if t]
         toks = [t.lower() for t in raw]
         base = [os.path.basename(t.strip("'\"\\")) or t for t in toks]
-        # 去掉环境变量赋值和前缀命令; 前缀命令后面的选项和选项参数分不清, 往多拦错:
-        # 前缀之后的前 4 个词都当候选命令词
-        i = 0
-        while i < len(toks):                    # 前缀命令、它的选项和选项参数、环境变量赋值, 可以叠好几层
-            if base[i] in _PREFIX_CMDS or _ASSIGN.match(toks[i]):
+        # 去掉环境变量赋值和前缀命令 (按各自的选项表剥选项参数), 剩下第一个词是真正的命令词
+        i, cur, first_prefix = 0, None, None    # cur: 正在剥的前缀命令
+        while i < len(toks):                    # 前缀命令、它的选项和选项参数、位置参数、环境变量赋值, 可叠好几层
+            if base[i] in _PREFIX_CMDS:
+                cur, first_prefix = base[i], i if first_prefix is None else first_prefix
                 i += 1
-            elif toks[i].startswith("-") and i > 0:
-                i += 2 if raw[i] in _ARG_OPTS else 1
+                n = _POSITIONAL.get(cur, 0)
+                while n and i < len(toks):
+                    if toks[i].startswith("-"):
+                        i += 2 if raw[i] in _ARG_OPTS.get(cur, ()) else 1
+                    else:
+                        i, n = i + 1, n - 1
+            elif _ASSIGN.match(toks[i]):
+                i += 1
+            elif toks[i].startswith("-") and cur:
+                i += 2 if raw[i] in _ARG_OPTS.get(cur, ()) else 1
             else:
                 break
-        for j in range(i, min(len(toks), i + 1)):
+        # 子命令组合类判断 (systemctl stop / iptables -F / sysctl -w / mount 设备) 另外在前缀之后 4 个词的窗口里查,
+        # 剥离判错时也不漏 (这几类要命令词和子命令同时出现, 误报少)
+        window = range(first_prefix + 1, min(len(toks), first_prefix + 5)) if first_prefix is not None else ()
+        for j in sorted(set(range(i, min(len(toks), i + 1))) | set(window)):
+            precise = j == i
             b = base[j]
-            if b in _L3_LEAD and not (b == "do" and j + 1 < len(toks) and toks[j + 1].startswith(("sh", "dis"))):
+            if precise and b in _L3_LEAD and not (b == "do" and j + 1 < len(toks) and toks[j + 1].startswith(("sh", "dis"))):
                 add(b)
-            if b == "mount":                    # 只有 -l / -t ext4 这类只列出; 带设备或挂载点才改东西
+            b = base[j]
+            if precise and b == "mount":        # 只有 -l / -t ext4 这类只列出; 带设备或挂载点才改东西
                 rest, k = toks[j + 1:], 0
                 while k < len(rest):
+                    if rest[k] in ("-a", "--all"):
+                        add("mount")
+                        break
                     if rest[k] in ("-t", "-o", "-O"):
                         k += 2
                     elif rest[k].startswith("-"):
