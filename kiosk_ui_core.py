@@ -181,7 +181,7 @@ def pxe_tick_decide(st, log_text, now, consumed=kc.pxe_consumed):
 def pxe_button_texts(view):
     """-> (装机页按钮, 主页按钮) 的文字."""
     if view["mode"] != "install":
-        return "装机模式:  救援 (安全)", "装机"
+        return "装机模式:  本地盘 (安全)", "装机"
     left = view["left"]
     mmss = f"{left // 60:02d}:{left % 60:02d}"
     who = f"{view['count']} 台" if view.get("count", 1) > 1 else view["mac"][-8:]
@@ -356,7 +356,7 @@ MENU = {
     ],
     "install": [
         _act("PXE 装机服务:  开 / 关", "toggle_pxe", attr="btn_pxe"),
-        _act("装机模式:  救援 (安全)", "toggle_install_mode", attr="btn_install"),
+        _act("装机模式:  本地盘 (安全)", "toggle_install_mode", attr="btn_install"),
         _pane("Kickstart 编辑", "ks", attr="btn_ks"),
     ],
     "net": [

@@ -664,7 +664,7 @@ def test_check_ch9329_shows_counts():
 
 
 # ------------------------------------------------------------ 装机模式 (2026-10-21)
-# 默认只有救援菜单; 推车上输屏幕随机码解锁, 只对选定 MAC 下发装机菜单, 30 分钟或被取走即上锁
+# 默认菜单超时本地盘, 救援要手选; 推车上输屏幕随机码解锁, 只对选定 MAC 下发装机菜单, 30 分钟或被取走即上锁
 
 MAC = "02:00:00:00:00:01"
 
@@ -679,7 +679,8 @@ def test_mac_cfg_name_is_grub_per_mac_file():
 def test_rescue_menu_never_installs():
     cfg = kc.grub_cfg_rescue()
     assert "inst.rescue" in cfg and "inst.ks" not in cfg and "set default=0" in cfg
-    assert default_entry(cfg).strip().endswith("{\n    exit\n}")                 # #70 默认本地盘
+    from test_grub_templates import _is_local, default_entry
+    assert _is_local(default_entry(cfg))                                           # #70 默认本地盘
 
 
 def test_install_menu_has_kickstart():
@@ -1318,7 +1319,7 @@ import pxeserver as _px  # noqa: E402
 
 WINPE_MARK = "/win/ipxe.efi"
 
-from test_grub_templates import default_entry  # noqa: E402
+from test_grub_templates import _is_local, default_entry  # noqa: E402
 
 
 def _winpe_files(root, skip=()):
@@ -1347,7 +1348,7 @@ def test_arm_winpe_menu_has_no_ks_and_writes_boot_ipxe(tmp_path, monkeypatch):
     cfg = (tmp_path / "grub.cfg-01-02-00-00-00-00-01").read_text()
     assert "inst.ks" not in cfg and "set timeout=15" in cfg
     assert WINPE_MARK in default_entry(cfg) and _px.WINPE_TITLE in cfg
-    assert WINPE_MARK not in (tmp_path / "grub.cfg").read_text()          # 救援菜单里永远没有
+    assert WINPE_MARK not in (tmp_path / "grub.cfg").read_text()          # 默认菜单里永远没有
     assert (tmp_path / "boot.ipxe").read_text() == _px.ipxe_script()
     assert kc.pxe_mode_read(path=tmp_path / "m.json", now=1001)["mode"] == "install"
     assert "winpe" in events[0]
@@ -1450,7 +1451,7 @@ def test_arm_clone_restore_writes_each_batch_mac_menu(tmp_path, monkeypatch):
     for mac, serial in ((MAC, "SN-EXAMPLE-1"), (CMAC2, "SN-EXAMPLE-2")):
         cfg = _menu(env, mac)
         assert f"restoredisk lab-img SERIALNO={serial}" in cfg.split("menuentry ")[1]
-        assert default_entry(cfg).strip().endswith("{\n    exit\n}")    # 恢复要人手选, 倒计时落本地盘 (#70)
+        assert _is_local(default_entry(cfg))                             # 恢复要人手选, 倒计时落本地盘 (#70)
         assert "inst.ks" not in cfg and "smb://192.0.2.1/clone-ro/" in cfg
         assert "clonesave" not in cfg                                     # 恢复不带可写账号
     rescue = (env["root"] / "grub.cfg").read_text()
@@ -1581,3 +1582,20 @@ def test_pxe_guard_live_drops_state_of_dead_server(tmp_path):
     p.write_text('{"state": "serving"}')
     assert kc.pxe_guard_live(str(p), alive=lambda pid: True) == {}       # 没 pid: 判断不了, 不显示
     assert kc.pxe_guard_live(str(tmp_path / "nope.json")) == {}
+
+
+# ---- #70 审查: 上锁扫树时, #70 之前留下的救援默认菜单也要删
+
+def test_disarm_removes_legacy_rescue_default_menus(tmp_path, monkeypatch):
+    from test_pxeserver import FALLBACK_RESCUE, LEGACY_RESCUE
+    monkeypatch.setattr(kc, "_pxe_event", lambda *a, **k: None)
+    (tmp_path / "EFI" / "BOOT").mkdir(parents=True)
+    (tmp_path / "grub.cfg-C0000201").write_text(LEGACY_RESCUE)              # 按 IP 命名
+    (tmp_path / "EFI" / "BOOT" / "grub.cfg-C00002").write_text(FALLBACK_RESCUE)
+    (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text(_px.grub_menu("192.0.2.1"))   # 一律删
+    (tmp_path / "grub.cfg-C0000202").write_text(_px.grub_menu("192.0.2.1"))  # 默认本地盘的, 不动
+    (tmp_path / "grub.cfg.bak-1").write_text(LEGACY_RESCUE)                  # GRUB 不取, 不动
+    kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
+    left = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("grub.cfg*"))
+    assert left == ["grub.cfg", "grub.cfg-C0000202", "grub.cfg.bak-1"]
+    assert _is_local(default_entry((tmp_path / "grub.cfg").read_text()))

@@ -65,8 +65,6 @@ def test_template_default_entry_is_not_install(name, cfg):
     assert "inst.ks" not in entry, name
 
 
-
-
 def test_default_entry_parser_catches_install_default():
     bad = "set default=1\nmenuentry 'a' {\n linux /vmlinuz inst.rescue\n}\nmenuentry 'b' {\n linux /vmlinuz inst.ks=x\n}\n"
     assert "inst.ks" in default_entry(bad)
@@ -159,3 +157,10 @@ def test_unlocked_menus_never_default_to_rescue():
         entry = default_entry(cfg)
         assert "inst.rescue" not in entry and "inst.sshd" not in entry
         assert any(_is_local(e) for e in _ENTRY.split(cfg)[1:])      # 都能手选回本地盘
+
+
+@pytest.mark.parametrize("name,cfg", grub_texts() + [("generated", kc.grub_cfg_rescue())])
+def test_menu_has_single_default_and_no_fallback(name, cfg):
+    """fallback 会在默认项失败时落到别的项 (可能就是救援); 菜单里不许有, default 只设一次."""
+    assert not re.search(r"^\s*set\s+fallback\b", cfg, re.M), name
+    assert len(re.findall(r"^\s*set\s+default\b", cfg, re.M)) == 1, name

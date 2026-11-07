@@ -1590,3 +1590,44 @@ def test_client_log_write_failure_does_not_break_dhcp(tmp_path):
     d = dhcp_for_test()
     d.on_client = pxeserver_module.ClientLog(str(tmp_path / "no" / "such" / "dir" / "x.json"), clock=lambda: 1.0)
     assert d.handle(make_discover(), ("0.0.0.0", 68)) is not None
+
+
+# ---- #70 审查: #70 之前的老菜单 (默认/fallback 是救援 = root + sshd) 不能照发
+
+from test_grub_templates import _is_local, default_entry  # noqa: E402
+
+LEGACY_RESCUE = ("set default=0\nset timeout=10\n\n"
+                 "menuentry 'Rescue shell (HTTP fast)' {\n"
+                 "    linux (http,192.0.2.1)/vmlinuz ip=dhcp inst.stage2=http://192.0.2.1:8000/rocky "
+                 "inst.rescue inst.sshd inst.text\n    initrd (http,192.0.2.1)/initrd.img\n}\n")
+FALLBACK_RESCUE = ("set default=0\nset fallback=1\nset timeout=10\n\n" + _px.LOCAL_ENTRY + "\n" +
+                   LEGACY_RESCUE.split("\n\n", 1)[1])
+
+
+def test_rescue_default_menu_detects_default_and_fallback():
+    assert _px.rescue_default_menu(LEGACY_RESCUE)
+    assert _px.rescue_default_menu(FALLBACK_RESCUE)
+    assert _px.rescue_default_menu(LEGACY_RESCUE.replace("set default=0", "set default=saved"))
+    assert _px.rescue_default_menu(LEGACY_RESCUE.replace("inst.rescue ", ""))        # 只带 sshd 也算
+    for cfg in (grub_menu("192.0.2.1"), grub_menu("192.0.2.1", install=True), _px.grub_menu_winpe("192.0.2.1"),
+                _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS),
+                _px.grub_menu_clone("192.0.2.1", "clone-save", CLONE_PARAMS)):
+        assert not _px.rescue_default_menu(cfg)
+
+
+@pytest.mark.parametrize("name", ["grub.cfg-C0000201", "EFI/BOOT/grub.cfg", "grub.cfg-01-02-00-00-00-00-09"])
+@pytest.mark.parametrize("legacy", [LEGACY_RESCUE, FALLBACK_RESCUE])
+def test_tftp_legacy_rescue_default_menu_replaced_with_local(tmp_path, name, legacy):
+    root, mode = _tree(tmp_path)
+    (root / name).write_text(legacy)
+    got = _fetch(root, mode, name)
+    assert got == grub_menu("192.0.2.1") and _is_local(default_entry(got))
+
+
+def test_tftp_expired_mac_menu_falls_back_to_local_default(tmp_path):
+    root, mode = _tree(tmp_path, armed_until=50)
+    srv = TftpServer("192.0.2.1", str(root), FakeLog(), pxe_mode_path=str(mode), now=lambda: 51,
+                     event=lambda m: None)
+    f, size, tag = srv.open_file(ARMED_CFG, ("192.0.2.9", 1))
+    got = f.read().decode()
+    assert _is_local(default_entry(got)) and "inst.ks" not in got and "未解锁" in tag

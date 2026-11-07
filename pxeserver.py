@@ -18,6 +18,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import sys
@@ -870,6 +871,21 @@ def grub_menu_clone(ip, purpose, params):
             LOCAL_ENTRY + "\n" + _rescue_entries(ip))
 
 
+_MENU_ENTRY = re.compile(r"^\s*menuentry\b", re.M)
+_MENU_PICK = re.compile(r"^\s*set\s+(?:default|fallback)=[\"']?([^\"'\n]*)", re.M)
+
+
+def rescue_default_menu(text):
+    """默认项或 fallback 项是救援 (inst.rescue / inst.sshd: root 可能无密码) 的菜单, #70 之前的老菜单就是.
+    default/fallback 不是数字 (saved、按标题) 时按最坏情况: 有任何一项是救援就算."""
+    entries = _MENU_ENTRY.split(text)[1:]
+    rescue = [("inst.rescue" in e or "inst.sshd" in e) for e in entries]
+    picks = [t for m in _MENU_PICK.finditer(text) for t in m.group(1).split()] or ["0"]
+    if not all(t.isdigit() for t in picks):
+        return any(rescue)
+    return any(rescue[int(t)] for t in picks if int(t) < len(rescue))
+
+
 def unlock_only_menu(text):
     """只能给解锁那台机器的菜单: 带自动装机 (inst.ks=)、WinPE 链式加载项或 Clonezilla 克隆项."""
     return "inst.ks=" in text or WINPE_CHAIN in text or CLONE_KERNEL in text or "ocs_live_run" in text
@@ -886,7 +902,7 @@ def norm_mac(mac):
 def pxe_mode(path=PXE_MODE, now=None):
     """{"mode": "rescue"} / {"mode": "install", mac, since, until} / 过期则 mode="expired".
     恢复一批 (#18) 时文件里多一个 macs 名单, 结果里也带 macs. 文件没有、坏了、字段不对
-    (含 macs 不是非空 MAC 列表) 一律当救援."""
+    (含 macs 不是非空 MAC 列表) 一律当没解锁 (mode 仍叫 "rescue", 发默认菜单)."""
     now = time.time() if now is None else now
     try:
         with open(path) as f:
@@ -1025,7 +1041,8 @@ class TftpServer:
     def open_file(self, name, client):
         """-> (文件对象, 大小, 日志前缀). 找不到/越界抛 OSError.
         GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 或 WinPE 项的 (unlock_only_menu), 只有已解锁、
-        没过期、文件名就是那台 MAC 时才照发, 否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走)."""
+        没过期、文件名就是那台 MAC 时才照发, 否则换成默认菜单 (超时本地盘; 日志前缀不同, 车机不会当成菜单被取走).
+        别的菜单默认/fallback 是救援的 (#70 之前留下的), 一律换成默认菜单."""
         path = tftp_safe_name(self.root, name)
         f = open(path, "rb")
         size = os.fstat(f.fileno()).st_size
@@ -1038,8 +1055,11 @@ class TftpServer:
             mac = menu_mac(base)
             if not install_allowed(mac, pxe_mode(self.pxe_mode_path, self.now())):
                 data = grub_menu(self.ip).encode()
-                return io.BytesIO(data), len(data), f"TFTP RRQ {name} 未解锁, 回救援菜单"
+                return io.BytesIO(data), len(data), f"TFTP RRQ {name} 未解锁, 回默认菜单"
             self.event(f"装机菜单被取走 mac={mac} from {client[0]}")
+        elif rescue_default_menu(data.decode("utf-8", "replace")):
+            data = grub_menu(self.ip).encode()
+            return io.BytesIO(data), len(data), f"TFTP RRQ {name} 默认项是救援, 回默认菜单"
         return io.BytesIO(data), len(data), f"TFTP RRQ {name}"
 
     def _rrq(self, msg, addr):
