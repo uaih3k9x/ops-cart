@@ -348,10 +348,10 @@ send_command(cmd)
 
 代码：`serial_allowlist.py`（纯数据 + 纯逻辑）；接线在 `serial_write_core.classify` / `load_rules`、`mcp_serial`（`send_command` 传 mode，新工具 `gate_allowlist`）、`survey_core.run_survey`（预检影子）。测试：`tests/test_serial_allowlist.py`、`tests/test_layer1_shadow.py`。
 
-1. **放行结果不变**：`classify` 轮到第 1 层判（不带高危词、认得出厂商、停在提示符上）的命令，闸门结果多一个 `shadow = {allowlist: 条目 id 或 null, src, readonly, pass[, why]}`，随闸门结果进 `serial-slot<N>.log`。`pass` = 白名单命中且 `is_readonly` 也过。高危词 / 认不出厂商 / 不在提示符上的命令轮不到第 1 层，没有 `shadow`。测试断言：任意 mode、禁用全部条目，闸门结果（除 `shadow`）都和不算影子时一样。
+1. **放行结果不变**：`classify` 轮到第 1 层判（不带高危词、认得出厂商、停在提示符上）的命令，闸门结果多一个 `shadow = {allowlist: 条目 id 或 null, src, readonly, pass[, why]}`，随闸门结果进 `serial-slot<N>.log`。`pass` = 白名单命中且 `is_readonly` 也过。高危词 / 认不出厂商 / 不在提示符上的命令轮不到第 1 层，没有 `shadow`。测试断言：任意 mode、禁用全部条目，闸门结果（除 `shadow`）都和不算影子时一样；影子计算抛异常时写 `shadow.error`，结论照旧。`is_readonly` 的规则有快照测试（冻结黑名单补丁）。
 2. **大输出（拍板 4）**：条目上的 `big=True` 改成"只给巡检"：写闸门范围（`scope="gate"`）不命中，`why` 写明大输出；巡检预检（`scope="survey"`）命中。这样巡检默认清单仍 ⊆ 白名单（第四节），Agent 直发的 `display current-configuration` / `show running-config` / `mac-address` / `arp` 将来要模型或人确认。**这是对拍板 4 的解读，待维护者确认。**
 3. **mode**：`serial_allowlist.prompt_mode` 由最后一行判（华为 / H3C `<名>`，思科 / 锐捷不带括号的 `名#` / `名>` 为 exec，其余按 config）。main 上的 `slot_vendor` 还没有 mode（#57 才加），所以 mode 在 `mcp_serial` 里另算，`classify(..., mode=None)` 不给按 config。
-4. **规则文件**：`allowlist.disable` 只认已有条目 id；不认识的进 `allowlist_unknown`（`gate_allowlist` 返回，巡检命令行记 `[survey] allowlist-disable-unknown`）；`allowlist` 里别的键、`vendors.<厂商>.allowlist` 一律无效。影子期禁用只影响影子结论。
+4. **规则文件**：`allowlist.disable` 只认已有条目 id；不认识的进 `allowlist_unknown`（每条截断到 80 字符、最多 20 条，超出给计数；`gate_allowlist` 返回，巡检命令行和面板巡检都经 `survey_core.gate_disabled` 读、记 `[survey] allowlist-disable-unknown`）；`allowlist` 里别的键、`vendors.<厂商>.allowlist` 一律无效。影子期禁用只影响影子结论。
 5. **巡检预检影子**：整份清单在 `is_readonly` 预检通过后再按白名单（`mode="exec"`, `scope="survey"`）算一遍，不命中的每条记 `[survey] allowlist-miss vendor=… cmd=… why=…`，结果里 `allowlist_miss` 列出，巡检照常跑。
 6. **`conbroker_send` / `probe_vendor` 不动**：影子期它们仍按 `is_readonly`；main 上还没有 `probe_vendor`（#57）。阶段 3 再改。
 7. **和 `is_readonly` 的差异（3.7）**：main 上 `is_readonly` 只有 huawei / cisco，关分页还不放，所以 `KNOWN_DIFF` 暂时登记 `huawei:screen-length 0 temporary`、`cisco:terminal length 0`，#57 合并后删掉；H3C / 锐捷的一致性测试等 #57。

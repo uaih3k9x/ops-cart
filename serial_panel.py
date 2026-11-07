@@ -430,7 +430,8 @@ class SerialPanel(tk.Frame):
 
         def work():
             try:
-                r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head)
+                r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head,
+                                           disabled=survey_core.gate_disabled())
             except Exception as e:                 # run_survey 本不抛; 兜住, 免得按钮一直锁着
                 r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
             survey_core.record(r)

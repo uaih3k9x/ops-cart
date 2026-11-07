@@ -105,6 +105,7 @@ def test_survey_runs_in_background_and_reports_in_drain(monkeypatch):
                 "path": "/x/con-1_SW-A_20261030-1403.txt", "sections": [], "diff": None}
     monkeypatch.setattr(survey_core, "run_survey", fake_run)
     monkeypatch.setattr(survey_core, "record", lambda r: logged.append(r))
+    monkeypatch.setattr(survey_core, "gate_disabled", lambda: ["huawei:display arp"])
     p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
     sp.SerialPanel.survey(p)
     assert p._surveying
@@ -113,6 +114,7 @@ def test_survey_runs_in_background_and_reports_in_drain(monkeypatch):
     n = len(p.written)
     assert p.after_calls == [] and seen["port"] == "/dev/con-1" and seen["vendor"] == "huawei"
     assert seen["head"] == "con-1" and seen["send"] is survey_core.conbroker_send
+    assert seen["disabled"] == ["huawei:display arp"]          # 和命令行同一个口径 (#75)
     assert len(logged) == 1
     sp.SerialPanel._run_ui(p)
     assert not p._surveying and len(p.written) == n + 1

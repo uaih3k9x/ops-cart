@@ -359,6 +359,18 @@ def _shadow_precheck(cmds, vendor, disabled, event):
     return miss
 
 
+def gate_disabled(event=None):
+    """写闸门规则文件里的 allowlist.disable (#75), 命令行和面板巡检共用; 不认识的 id 记 cartlog. 不抛异常."""
+    import serial_write_core                          # 晚 import 避免循环
+    try:
+        rules = serial_write_core.load_rules(serial_write_core.RULES_PATH)
+    except Exception:                                 # noqa: BLE001  影子统计拿不到就当没禁用, 不挡巡检
+        return []
+    for u in rules["allowlist_unknown"]:
+        (event or cartlog.event)("survey", "allowlist-disable-unknown " + cartlog.fields(id=u))
+    return rules["allowlist_disable"]
+
+
 def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None,
                disabled=(), event=None):
     """跑一次巡检: 白名单预检 -> 逐条 send -> 存档 -> 和同设备上一份比. 不抛异常, 结果全在返回的 dict 里.
@@ -459,12 +471,8 @@ def main(argv=None):
     if not name:
         print(f"{port} 上没有在跑的 conbroker 服务, 先在串口面板开服务")
         return 2
-    import serial_write_core                          # 规则文件的 allowlist.disable (#75); 晚 import 避免循环
-    rules = serial_write_core.load_rules()
-    for u in rules["allowlist_unknown"]:
-        cartlog.event("survey", "allowlist-disable-unknown " + cartlog.fields(id=u))
     r = run_survey(name, a.vendor, send=conbroker_send, head=safe_name(os.path.basename(port)),
-                   survey_dir=a.dir, profiles=load_profiles(a.profiles), disabled=rules["allowlist_disable"])
+                   survey_dir=a.dir, profiles=load_profiles(a.profiles), disabled=gate_disabled())
     print(r["summary"])
     record(r)
     return 0 if r["ok"] else 1

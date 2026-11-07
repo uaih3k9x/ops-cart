@@ -21,6 +21,8 @@ FORBIDDEN = frozenset(";&<>`$#!?[]{}")
 FILE_WORDS = frozenset({"to-file", "file", "filename", "tftp", "ftp", "sftp", "scp", "http", "https",
                         "clear", "reset"})
 TYPES = ("ifname", "vlan", "ipv4", "mac", "filter")
+UNKNOWN_MAX = 20            # 不认识的禁用 id 最多回显几条 (会给 Agent 看), 超出给计数
+UNKNOWN_CHARS = 80          # 每条截断到多少字符
 
 Entry = namedtuple("Entry", "text src session big pipes")
 
@@ -281,17 +283,25 @@ def shadow(cmd, vendor, mode, readonly, disabled=(), scope="gate"):
     return out
 
 
+def _clip(v):
+    s = str(v)
+    return s if len(s) <= UNKNOWN_CHARS else s[:UNKNOWN_CHARS - 1] + "…"
+
+
 def parse_disable(value):
-    """规则文件 allowlist.disable -> (认识的 id 排好序去重, 不认识的原样转成字符串). 不是列表 = 全不认."""
+    """规则文件 allowlist.disable -> (认识的 id 排好序去重, 不认识的). 不是列表 = 全不认.
+    不认识的会回显给 Agent: 每条截断到 UNKNOWN_CHARS, 最多 UNKNOWN_MAX 条, 超出的只给计数."""
     known = all_ids()
     if not isinstance(value, list):
-        return [], ([] if value is None else [str(value)])
+        return [], ([] if value is None else [_clip(value)])
     ids, unknown = set(), []
     for v in value:
         if isinstance(v, str) and v in known:
             ids.add(v)
-        elif str(v) not in unknown:
-            unknown.append(str(v))
+        elif _clip(v) not in unknown:
+            unknown.append(_clip(v))
+    if len(unknown) > UNKNOWN_MAX:
+        unknown = unknown[:UNKNOWN_MAX] + [f"…另有 {len(unknown) - UNKNOWN_MAX} 条"]
     return sorted(ids), unknown
 
 

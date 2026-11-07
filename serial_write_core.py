@@ -245,7 +245,10 @@ def classify(cmd, vendor, at_prompt, rules, judge=None, mode=None):
     extra = rules.get("vendors", {}).get(vendor, {}).get("extra_verbs", ())
     ro = survey_core.is_readonly(cmd, vendor, extra_verbs=extra)
     g = _gate("pass", f"{vendor} 只读命令 (第 1 层放行)", vendor=vendor) if ro else _layer2(cmd, vendor, rules, judge)
-    g["shadow"] = serial_allowlist.shadow(cmd, vendor, mode, ro, rules.get("allowlist_disable", ()))
+    try:                                # 影子只记录: 它出错也不能让闸门出错或改结论
+        g["shadow"] = serial_allowlist.shadow(cmd, vendor, mode, ro, rules.get("allowlist_disable", ()))
+    except Exception as e:              # noqa: BLE001
+        g["shadow"] = {"error": repr(e)[:200]}
     return g
 
 

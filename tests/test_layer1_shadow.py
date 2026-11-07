@@ -237,3 +237,65 @@ def test_survey_refused_early_has_empty_miss(tmp_path):
     r = sv.run_survey("/dev/con-1", "ruijie", send=fake_send([]), now=lambda: T0, survey_dir=str(tmp_path),
                       profiles=sv.load_profiles(path="/x"))
     assert r["allowlist_miss"] == []
+
+
+# ------------------------------------------------------------ 审查低危 (PR #78)
+
+@pytest.mark.parametrize("cmd,vendor,at,mode,verdict", CASES)
+def test_shadow_exception_does_not_change_verdict(monkeypatch, cmd, vendor, at, mode, verdict):
+    """L1: 影子算出错也不能让闸门出错或改结论; 错误写进 shadow.error."""
+    r = sw.load_rules(None)
+    base = _strip(sw.classify(cmd, vendor, at, r, mode=mode))
+
+    def boom(*a, **k):
+        raise RuntimeError("x" * 500)
+    monkeypatch.setattr(sa, "shadow", boom)
+    g = sw.classify(cmd, vendor, at, r, mode=mode)
+    assert _strip(g) == base
+    if "shadow" in g:
+        assert set(g["shadow"]) == {"error"} and len(g["shadow"]["error"]) <= 200
+
+
+def test_gate_disabled_shared_by_cli_and_panel(tmp_path, monkeypatch):
+    """L2: 命令行和面板巡检用同一个入口拿 allowlist.disable, 不认识的 id 记 cartlog."""
+    p = tmp_path / "gate.json"
+    p.write_text(json.dumps({"allowlist": {"disable": ["huawei:display arp", "huawei:nope"]}}), encoding="utf-8")
+    monkeypatch.setattr(sw, "RULES_PATH", str(p))
+    ev = []
+    assert sv.gate_disabled(event=lambda k, m: ev.append((k, m))) == ["huawei:display arp"]
+    assert ev == [("survey", "allowlist-disable-unknown id=huawei:nope")]
+
+
+def test_gate_disabled_never_raises(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("坏了")
+    monkeypatch.setattr(sw, "load_rules", boom)
+    assert sv.gate_disabled(event=lambda k, m: None) == []
+
+
+def test_readonly_blacklist_frozen():
+    """L3: #75 拍板冻结 is_readonly 的黑名单补丁. 要改这里先过维护者 (新绕过只进反例集)."""
+    assert sv._RULES == {
+        "huawei": {"verbs": {"display"},
+                   "pipes": {"include": True, "exclude": True, "begin": True, "section": True,
+                             "count": False, "no-more": False},
+                   "deny": {"diagnostic-information"}},
+        "cisco": {"verbs": {"show"},
+                  "pipes": {"include": True, "exclude": True, "begin": True, "section": True, "count": False},
+                  "deny": set()},
+    }
+    assert sv._FORBIDDEN == set(";&<>`$#!")
+    assert sv.MAX_LEN == 200
+
+
+def test_unknown_disable_truncated():
+    """L4: 不认识的 id 回显给 Agent 前截断: 每条 80 字符, 最多 20 条, 超出给计数."""
+    ids, unknown = sa.parse_disable(["y" * 500] + [f"x{i}" for i in range(30)])
+    assert ids == []
+    assert len(unknown) == sa.UNKNOWN_MAX + 1
+    assert all(len(u) <= sa.UNKNOWN_CHARS for u in unknown[:sa.UNKNOWN_MAX])
+    assert unknown[0].startswith("y") and unknown[0].endswith("…")
+    assert unknown[-1] == "…另有 11 条"
+    assert sa.UNKNOWN_MAX == 20 and sa.UNKNOWN_CHARS == 80
+    _ids, u = sa.parse_disable("z" * 500)
+    assert len(u) == 1 and len(u[0]) <= sa.UNKNOWN_CHARS
