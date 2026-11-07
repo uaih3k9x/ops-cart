@@ -7,7 +7,7 @@
 可打印单键也计入这一行; 高危组合键也算, 命中就挂起等车机上的人确认; Agent 没有确认工具. 推车看不全这一行时
 (新租约 / 发键失败 / 挪了光标 / 补全 / 调出历史 / 前面是 secret) 接着打的字要人确认, 推不出这一行或带历史展开时
 回车也要 (见 press / advance). 发前对着芯片键表预检 (sendable), 不行就拒绝、状态不动.
-secret=true 的内容照样计入行检查, 但不进审计、日志和状态文件 (行缓冲里只记 <secret>), 命中高危词或看不全时直接拒绝. 这只是减速带: 推车看不懂屏幕, 鼠标 / 图形界面 / 脚本 / 编码都拦不住,
+secret=true 的内容照样计入行检查, 但不进审计、日志和状态文件 (行缓冲里只记 <secret>), 命中高危词直接拒绝, 带回车碰上看不全的行也拒绝 (不带回车放行, 这一行变看不清). 这只是减速带: 推车看不懂屏幕, 鼠标 / 图形界面 / 脚本 / 编码都拦不住,
 真正的兜底是人盯和急停.
 日志 (#43): /var/log/ops-cart/kvm-thread.log, JSONL; 确认 / 拒绝 / 急停收回另在 events.log 记摘要.
 这里没有一个工具能解锁 PXE, 也不碰串口写路径.
@@ -42,6 +42,7 @@ TTL_S, TTL_MIN_S, TTL_MAX_S = 60, 10, 300
 LAN1 = "eno1"                   # 魔术包只从装机口发: LAN2 / 无线上都是别人的机器
 TEXT_MAX = 1000
 HISTORY_MAX = 10
+SEND_GRACE_S = 30
 SUMMARY_EVS = {"confirm", "reject", "revoked"}
 OCR_MIN_LINE = 40.0             # 低于这个置信度的行当噪声扔掉
 OCR_MIN_MEAN = 60.0             # 平均低于这个: 明说读不出, 叫 Agent 看图
@@ -89,6 +90,20 @@ BLIND_WHY = ("推车看不全这一行 (新租约 / 发键失败过 / 前面有 
 def _opaque(s):
     """bash 历史展开 (!!、!-1、!foo、^a^b): 回车后真正执行的不是推车看到的这一行. 往多拦的方向错."""
     return "!" in s or s.lstrip().startswith("^")
+
+
+_RANK = {"": 0, PARTIAL: 1, UNKNOWN: 2}
+
+
+def _worse(a, b):
+    return a if _RANK[a] >= _RANK[b] else b
+
+
+def _clip(s, blind):
+    """行缓冲只留最后 TEXT_MAX 个字符; 丢了头就至少看不全, 丢掉的头里有历史展开就看不清."""
+    if len(s) <= TEXT_MAX:
+        return s, blind
+    return s[-TEXT_MAX:], _worse(blind, UNKNOWN if _opaque(s[:-TEXT_MAX]) else PARTIAL)
 
 
 def sendable(kind, keys=(), text="", secret=False):
@@ -148,15 +163,15 @@ def advance(line, blind, text, secret=False):
         if not text:
             return hits, blocked, line, blind
         mark = UNKNOWN if _opaque(line + text) or blind == UNKNOWN else PARTIAL
-        return hits, blocked, (line + SECRET_MARK)[-TEXT_MAX:], mark
+        return (hits, blocked) + _clip(line + SECRET_MARK, mark)
     tail = segs[-1] if len(segs) > 1 else line + segs[0]
-    return hits, blocked, tail[-TEXT_MAX:], ("" if len(segs) > 1 else blind)
+    return (hits, blocked) + _clip(tail, "" if len(segs) > 1 else blind)
 
 
 def press(line, blind, keys):
     """按一次键 -> (高危词, 是否因看不全要人确认, 新 line, 新 blind)."""
-    if danger_keys(keys):
-        return ["+".join(keys)], False, line, blind
+    if danger_keys(keys):                           # 确认发出后焦点可能换了窗口 (alt+f4)
+        return ["+".join(keys)], False, "", UNKNOWN
     eff = key_effect(keys)
     if eff[0] == "char":
         return advance(line, blind, eff[1])
@@ -221,7 +236,8 @@ class LeaseStore:
             raise mc.ToolError("没有有效的键鼠写租约 (过期了? 急停收回了?), 先 kvm_lease_acquire")
         return lease
 
-    def acquire(self, who, ttl):
+    def acquire(self, who, ttl, seen=None):
+        """seen: {键鼠口: 代理记的人工输入次数}, 之后 gate 拿来比, 租约期间人动过就算看不清."""
         ttl = int(max(TTL_MIN_S, min(TTL_MAX_S, ttl)))
         with self._tx() as (st, now, evs):
             if self.stopped():
@@ -230,6 +246,7 @@ class LeaseStore:
                 raise mc.ToolError(f"键鼠写租约在 {st['lease']['who']} 手里, 还剩 {int(st['lease']['until'] - now)} 秒")
             st["lease"] = {"token": secrets.token_urlsafe(16), "who": who, "until": now + ttl, "ttl": ttl}
             st["line"], st["blind"] = "", UNKNOWN       # 租约之间人可能留了半截命令: 第一个回车要人确认
+            st["human_seen"] = dict(seen or {})
             evs.append({"ev": "lease_acquire", "src": "agent", "who": who, "ttl": ttl})
             return {"lease": st["lease"]["token"], "ttl_s": ttl, "hint": "用完 kvm_lease_release; 令牌别给别人."}
 
@@ -247,8 +264,9 @@ class LeaseStore:
             st["lease"], st["line"], st["blind"] = None, "", UNKNOWN
             return {"released": True}
 
-    def gate(self, token, kind, keys=(), text="", enter=False, secret=False, serial=None):
-        """-> None 直接发 (已标在发); 挂起时 -> 回给 Agent 的说明. secret 命中高危词抛 ToolError."""
+    def gate(self, token, kind, keys=(), text="", enter=False, secret=False, serial=None, port=None, human=None):
+        """-> None 直接发 (已标在发); 挂起时 -> 回给 Agent 的说明. secret 命中高危词抛 ToolError.
+        port / human: 要发的键鼠口和代理记的人工输入次数; 跟上次看到的不一样 = 人在车机 / 网页口动过, 这一行看不清."""
         with self._tx() as (st, now, evs):
             who = self._need(st, token)["who"]
             if st["pending"]:           # 键盘是一条流: 接着发的话, 人确认后顺序就乱了
@@ -256,6 +274,10 @@ class LeaseStore:
             if st["sending_until"] > now:   # 同一令牌并发两路: 键会交错
                 raise mc.ToolError("上一条还在发, 等它发完; 一个键都没发")
             sendable(kind, keys, text, secret)
+            if port is not None:
+                if st["human_seen"].get(port, "?") != human:
+                    st["line"], st["blind"] = "", UNKNOWN
+                st["human_seen"][port] = human
             shown = "+".join(keys) if kind == "key" else _shown(text, secret)
             line, blind = st["line"], st["blind"]
             if kind == "key":
@@ -271,6 +293,8 @@ class LeaseStore:
                 why = "高危组合键, 要人确认"
             else:
                 why = f"这一行带高危词 {'、'.join(hits)}, 要人确认" if hits else None
+            if secret and blocked and not enter and not hits:
+                blocked, after_blind = False, UNKNOWN     # 密码框 (新租约 / tab 过来): 放行, 回车要人确认
             if blocked:
                 why = f"{why}; {BLIND_WHY}" if why else BLIND_WHY
             if why and secret:
@@ -291,14 +315,20 @@ class LeaseStore:
                 return {"status": "pending", "id": item["id"], "reason": why, "danger": hits,
                         "hint": "已挂起, 一个键都没发. 要人在推车上确认才发; 用 kvm_status 看结果. 等的时候继续 "
                                 "kvm_lease_renew, 租约过期这条就作废."}
+            st["before"] = [line, st["blind"]]
             st["line"], st["blind"] = after, after_blind
-            st["sending_until"] = now + max(2.0, len(text) / 20)
+            st["sending_until"] = _sending_until(now, text)
             return None
 
-    def finish(self, who, kind, shown, ok, why=None):
+    def finish(self, who, kind, shown, ok, why=None, started=True):
+        """发完 (清"在发"标志). 失败: 进了发送就可能发了一半, 这一行看不清; 一个键都没发出去就退回发之前."""
         with self._tx() as (st, _now, evs):
             st["sending_until"] = 0
-            if not ok:                  # 可能发了一半: 推不出屏幕上这一行
+            before = st.pop("before", None)
+            if not ok and not started and isinstance(before, list) and len(before) == 2 and \
+                    isinstance(before[0], str) and before[1] in _RANK:
+                st["line"], st["blind"] = before
+            elif not ok:
                 st["line"], st["blind"] = "", UNKNOWN
             evs.append({"ev": "send", "src": "agent", "who": who, "kind": kind, "text": shown, "ok": ok, "why": why})
 
@@ -313,7 +343,8 @@ class LeaseStore:
             if item is None:
                 raise ValueError(f"#{iid} 不在等确认 (租约过期或急停时作废)")
             st["pending"].remove(item)
-            st["sending_until"] = _now + max(2.0, len(item.get("text") or "") / 20)
+            st["before"] = [st["line"], st["blind"]]
+            st["sending_until"] = _sending_until(_now, item.get("text") or "")
             if isinstance(item.get("after"), str) and item.get("after_blind") in ("", PARTIAL, UNKNOWN):
                 st["line"], st["blind"] = item["after"], item["after_blind"]
             else:                       # 旧版本挂起的条目: 没有 after, 推不出这一行, 按看不见算
@@ -334,6 +365,11 @@ class LeaseStore:
     def view(self):
         with self._tx() as (st, now, _evs):
             return public_view(st, now, self.stopped())
+
+
+def _sending_until(now, text):
+    """"在发"标志由 finish 清; 这个时刻只是进程死了没 finish 时的兜底, 往宽了给 (每字符按 0.2 秒)."""
+    return now + SEND_GRACE_S + len(text) * 0.2
 
 
 def _item_text(item):
@@ -364,7 +400,9 @@ def read_state(path):
     return {"next": doc["next"] if isinstance(doc.get("next"), int) else 1, "lease": lease,
             "pending": [p for p in doc.get("pending") or () if isinstance(p, dict)] if isinstance(doc.get("pending"), list) else [],
             "line": doc["line"] if isinstance(doc.get("line"), str) else "",
-            "blind": doc.get("blind", "") if doc.get("blind", "") in ("", PARTIAL, UNKNOWN) else UNKNOWN,
+            "blind": doc.get("blind", UNKNOWN if lease else "") if doc.get("blind", "") in _RANK else UNKNOWN,
+            "human_seen": doc["human_seen"] if isinstance(doc.get("human_seen"), dict) else {},
+            **({"before": doc["before"]} if "before" in doc else {}),
             "sending_until": doc["sending_until"] if isinstance(doc.get("sending_until"), (int, float)) else 0,
             "history": doc["history"] if isinstance(doc.get("history"), list) else []}
 
@@ -419,11 +457,13 @@ def human_action(store, op, arg, by, opener=None, ports=None):
     port = online.get(item.get("serial")) if item.get("serial") else next(iter(online.values()), None)
     shown = _item_text(item)
     if not port:
-        store.finish(item["who"], item["kind"], shown, False, "键鼠不在线")
+        store.finish(item["who"], item["kind"], shown, False, "键鼠不在线", started=False)
         raise ValueError("键鼠不在线, 没发")
+    started = False
     try:
         ch = (opener or real_opener)(port, item["who"])
         try:
+            started = True
             if item["kind"] == "key":
                 ch.send_keys(item["keys"])
             else:
@@ -433,8 +473,11 @@ def human_action(store, op, arg, by, opener=None, ports=None):
         finally:
             ch.close()
     except (OSError, ValueError) as e:
-        store.finish(item["who"], item["kind"], shown, False, str(e))
+        store.finish(item["who"], item["kind"], shown, False, str(e), started=started)
         raise ValueError(f"发键失败: {e}") from None
+    except Exception as e:              # 兜底: 不留"在发"标志
+        store.finish(item["who"], item["kind"], shown, False, type(e).__name__, started=started)
+        raise
     store.finish(item["who"], item["kind"], shown, True)
     return f"已发键鼠 #{arg}: {shown}"
 
@@ -459,9 +502,10 @@ def redact_type(args):
     return args
 
 
-def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
+def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who, human_seq=lambda port: None):
     """ports() -> {序列号: 路径}; opener(port, who) -> 代理连接 (send_keys / type_text / close);
-    ocr(dev|None, lang) -> (行, 哪块卡的说明, 引擎); wol(mac, iface); broker_up(port) -> bool. 测试里全换成假的."""
+    ocr(dev|None, lang) -> (行, 哪块卡的说明, 引擎); wol(mac, iface); broker_up(port) -> bool;
+    human_seq(port) -> 代理记的这块键鼠人工输入次数 (拿不到 None). 测试里全换成假的."""
 
     def _port(serial):
         online = ports()
@@ -476,13 +520,15 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
         return next(iter(online.values()))
 
     def _send(a, kind, fn, keys=(), text="", enter=False, secret=False):
-        held = store.gate(a["lease"], kind, keys=keys, text=text, enter=enter, secret=secret, serial=a.get("serial"))
+        port = _port(a.get("serial"))           # 先挑口: 挑不出一个键都不动, 闸门状态也不动
+        held = store.gate(a["lease"], kind, keys=keys, text=text, enter=enter, secret=secret, serial=a.get("serial"),
+                          port=port, human=human_seq(port))
         if held:
             return [mc.json_content(held)]
         shown = "+".join(keys) if kind == "key" else _shown(text, secret) + (" + 回车" if enter else "")
         me = who()
+        started = False
         try:
-            port = _port(a.get("serial"))
             try:
                 ch = opener(port, me)
             except (FileNotFoundError, ConnectionRefusedError):
@@ -490,13 +536,18 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
             except (OSError, ValueError) as e:
                 raise mc.ToolError(f"键鼠打不开: {e}") from None
             try:
+                started = True
                 fn(ch)
             except (OSError, ValueError) as e:
                 raise mc.ToolError(f"发键失败: {e}") from None
             finally:
                 ch.close()
         except mc.ToolError as e:
-            store.finish(me, kind, shown, False, "secret 发送失败 (原因不记, 可能带内容)" if secret else str(e))
+            store.finish(me, kind, shown, False, "secret 发送失败 (原因不记, 可能带内容)" if secret else str(e),
+                         started=started)
+            raise
+        except Exception as e:                  # 兜底: 不留"在发"标志, 不把半截状态当真
+            store.finish(me, kind, shown, False, type(e).__name__, started=started)
             raise
         store.finish(me, kind, shown, True)
         return [mc.json_content({"sent": True, "hint": "发完等几秒, 用 screen_ocr 看结果"})]
@@ -507,7 +558,8 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
         return [mc.json_content(dict(store.view(), all_stopped=store.stopped(), keyboards=sorted(online), broker=up))]
 
     def kvm_lease_acquire(a):
-        return [mc.json_content(store.acquire(who(), a["ttl_s"]))]
+        seen = {p: human_seq(p) for p in ports().values()}
+        return [mc.json_content(store.acquire(who(), a["ttl_s"], seen))]
 
     def kvm_lease_renew(a):
         return [mc.json_content(store.renew(a["lease"]))]
@@ -605,6 +657,21 @@ def broker_up(port):
         return True
 
 
+def human_seq(port):
+    """代理记的这块键鼠人工输入次数 (车机 / 网页口; 实体 USB 键盘看不到). 代理不在 -> None."""
+    try:
+        ch = kvm_broker.BrokerCh(port, src="agent", who="status")
+    except OSError:
+        return None
+    try:
+        st = ch.status()
+    except (OSError, ValueError):
+        return None
+    finally:
+        ch.close()
+    return (st.get(os.path.realpath(port)) or {}).get("human_n", 0)
+
+
 def real_ocr(dev, lang):
     path, why, used = cart_snap.grab(dev)
     if path is None:
@@ -623,4 +690,4 @@ def real_ocr(dev, lang):
 
 def real_tools(store=None):
     return build_tools(store or LeaseStore(), ports=kvm_core.ports, opener=real_opener, ocr=real_ocr,
-                       wol=wol_core.send, broker_up=broker_up)
+                       wol=wol_core.send, broker_up=broker_up, human_seq=human_seq)

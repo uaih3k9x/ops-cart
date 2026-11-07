@@ -38,6 +38,7 @@ class Rig:
         self.ports = {"SER1": PORT}
         self.wols = []
         self.engine = "rapidocr"
+        self.human_n = 0                # 代理记的人工输入次数 (车机 / 网页口)
         self.ocr_lines = [{"text": "Media Present", "x": 1, "y": 2, "w": 3, "h": 4, "conf": 90.0}]
         self.log = tmp_path / "kvm-thread.log"
         self.events = []
@@ -47,7 +48,7 @@ class Rig:
         tools = mk.build_tools(self.store, ports=lambda: self.ports, opener=self.opener,
                                ocr=lambda dev, lang: (self.ocr_lines, "卡2 (/dev/video3) 当前画面", self.engine),
                                wol=lambda mac, iface: self.wols.append((mac, iface)),
-                               broker_up=lambda port: True)
+                               broker_up=lambda port: True, human_seq=lambda port: self.human_n)
         self.server = ms.Server(tools)
 
     def opener(self, port, who):
@@ -175,17 +176,23 @@ def test_send_errors_become_tool_errors(rig, exc):
 
 
 def test_port_choice(rig):
+    rig.ports = {"S1": "/p1", "S2": "/p2"}
     tok = rig.lease()
     rig.ports = {}
     err, msg = rig.call("kvm_key", keys="a", lease=tok)
     assert err and "键鼠" in msg
-    rig.ports = {"S1": "/p1", "S2": "/p2"}
-    rig.known()                                 # 发失败后这一行算看不清 (见 test_failed_send_makes_line_unknown)
+    rig.ports = {"S1": "/p1", "S2": "/p2"}      # 挑不出口时一个键都不动, 闸门状态也不动
     err, msg = rig.call("kvm_key", keys="a", lease=tok)
     assert err and "S1" in msg
-    rig.known()
-    assert not rig.call("kvm_key", keys="a", lease=tok, serial="S2")[0]
+    assert rig.call("kvm_key", keys="a", lease=tok, serial="S2")[1]["sent"]
     assert rig.opened[-1][0] == "/p2"
+
+
+def test_keyboard_plugged_after_lease_is_unknown(rig):
+    """申请租约时没看到这块键鼠的人工输入次数: 这一行算看不清."""
+    tok = rig.lease()
+    rig.ports = {"SER1": PORT, "S2": "/p2"}
+    assert rig.call("kvm_key", keys="a", lease=tok, serial="S2")[1]["status"] == "pending"
 
 
 # ---- OCR
@@ -527,12 +534,13 @@ def test_secret_then_enter_is_fine_and_resets(rig):
     assert rig.call("kvm_type", text="uname -r", enter=True, lease=tok)[1]["sent"]
 
 
-def test_secret_after_secret_on_same_line_refused(rig):
+def test_secret_after_secret_on_same_line_goes_but_enter_needs_human(rig):
+    """第三轮中2: 不带回车的 secret 打在看不全的行上放行, 这一行变成看不清, 回车要人确认 (人看得见屏幕)."""
     tok = rig.lease()
     assert rig.call("kvm_type", text="dis", secret=True, lease=tok)[1]["sent"]
-    err, msg = rig.call("kvm_type", text="kpart", secret=True, lease=tok)
-    assert err and [s for s in rig.sent if s[0] != "close"] == [("type", "dis", True)] and rig.store.view()["pending"] == []
+    assert rig.call("kvm_type", text="kpart", secret=True, lease=tok)[1]["sent"]
     assert "kpart" not in rig.log.read_text()
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
 
 
 def test_secret_completing_plain_prefix_refused(rig):
@@ -794,3 +802,170 @@ def test_same_token_concurrent_send_refused(rig):
         rig.store.gate(tok, "type", text="pwd")
     rig.store.finish("agent-a", "type", "ls", True)
     assert rig.store.gate(tok, "type", text="pwd") is None
+
+
+# ---- #64 第三轮
+
+@pytest.mark.parametrize("how", ["text", "keys"])
+def test_truncated_history_expansion_still_needs_human(rig, how):
+    """!! 之后用超长填充把 ! 挤出行缓冲: 回车照样要人确认."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="!!", lease=tok)[1]["sent"]
+    if how == "text":
+        assert rig.call("kvm_type", text=" " * mk.TEXT_MAX, lease=tok)[1]["sent"]
+    else:
+        line, blind = "!!" + " " * (mk.TEXT_MAX - 1), ""
+        _h, _b, line, blind = mk.press(line, blind, ["space"])
+        assert "!" not in line and blind == mk.UNKNOWN
+        return
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_truncated_plain_line_is_partial():
+    _h, _b, line, blind = mk.advance("x" * mk.TEXT_MAX, "", "y")
+    assert len(line) == mk.TEXT_MAX and blind == mk.PARTIAL
+
+
+def test_secret_on_new_lease_without_enter_goes(rig):
+    """新租约时屏幕停在 Password:, 密码要能打进去; 回车要人确认."""
+    tok = rig.lease(known=False)
+    err, r = rig.call("kvm_type", text="hunter2", secret=True, lease=tok)
+    assert not err and r["sent"] and rig.sent[0] == ("type", "hunter2", True)
+    err, r = rig.call("kvm_key", keys="enter", lease=tok)
+    assert r["status"] == "pending" and "hunter2" not in json.dumps(r)
+
+
+def test_secret_after_tab_in_form_goes(rig):
+    """用户名 -> tab -> 密码的表单."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="admin", lease=tok)[1]["sent"]
+    _keys(rig, tok, "tab")
+    assert rig.call("kvm_type", text="hunter2", secret=True, lease=tok)[1]["sent"]
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_secret_with_enter_on_unknown_line_still_refused(rig):
+    tok = rig.lease(known=False)
+    err, _ = rig.call("kvm_type", text="hunter2", secret=True, enter=True, lease=tok)
+    assert err and rig.sent == []
+
+
+def test_secret_with_danger_on_unknown_line_still_refused(rig):
+    tok = rig.lease(known=False)
+    err, _ = rig.call("kvm_type", text="diskpart", secret=True, lease=tok)
+    assert err and rig.sent == []
+
+
+def test_human_typed_during_lease_makes_line_unknown(rig):
+    """租约期间人经车机 / 网页口敲过键: 推车不知道这一行变成了什么."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]
+    rig.human_n += 1
+    err, r = rig.call("kvm_key", keys="enter", lease=tok)
+    assert r["status"] == "pending"
+    _confirm(rig, r)
+    assert rig.call("kvm_type", text="ls", enter=True, lease=tok)[1]["sent"]
+
+
+def test_human_typed_before_first_gate_counts(rig):
+    """人在申请租约之后、Agent 第一次发键之前敲的也算."""
+    tok = rig.lease()
+    rig.human_n += 1
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["status"] == "pending"
+
+
+def test_confirmed_danger_combo_makes_line_unknown(rig):
+    """alt+f4 之类确认发出后焦点可能换了窗口."""
+    tok = rig.lease()
+    err, r = rig.call("kvm_key", keys="alt+f4", lease=tok)
+    _confirm(rig, r)
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_sending_flag_cleared_by_finish_not_by_estimate(rig):
+    """发送中的标志由 finish 清, 不靠按长度估的时间: 估短了也不会放第二条进来."""
+    tok = rig.lease()
+    assert rig.store.gate(tok, "type", text="ls") is None
+    rig.t[0] += 10                               # 远超原来 len/20 的估算
+    with pytest.raises(mc.ToolError):
+        rig.store.gate(tok, "type", text="pwd")
+    rig.store.finish("agent-a", "type", "ls", True)
+    assert rig.store.gate(tok, "type", text="pwd") is None
+
+
+def test_take_refused_while_agent_sending(rig):
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text="diskpart", lease=tok)
+    with rig.store._tx() as (st, now, _evs):
+        st["sending_until"] = now + 100          # 假装 Agent 那边有一条还在发
+    with pytest.raises(ValueError):
+        rig.store.take(r["id"], "human:kiosk")
+    assert rig.store.view()["pending"]
+
+
+def test_agent_blocked_while_confirmed_item_sending(rig):
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text="diskpart", lease=tok)
+    rig.store.take(r["id"], "human:kiosk")       # 人确认了, 还没 finish = 正在发
+    rig.t[0] += 10
+    err, msg = rig.call("kvm_type", text="ls", lease=tok)
+    assert err and "在发" in msg
+
+
+def test_unexpected_exception_still_finishes(rig):
+    tok = rig.lease()
+    rig.fail = RuntimeError("bug")
+    try:
+        assert rig.call("kvm_type", text="ls", lease=tok)[0]
+    except RuntimeError:
+        pass
+    rig.fail = None
+    assert not rig.store.view()["sending"]
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_failure_before_any_key_keeps_line(rig):
+    """代理没在跑、一个键都没发出去: 这一行还是原样, 不算看不清."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", lease=tok)[1]["sent"]
+    rig.open_fail = FileNotFoundError("no sock")
+    assert rig.call("kvm_type", text="x", lease=tok)[0]
+    rig.open_fail = None
+    r = rig.call("kvm_type", text="kpart", lease=tok)[1]          # 缓冲还是 dis, 不是 disx, 也没变看不清
+    assert r["status"] == "pending" and "diskpart" in r["danger"] and "看不全" not in r["reason"]
+
+
+def test_state_without_blind_field_and_lease_is_unknown(rig):
+    tok = rig.lease()
+    doc = json.loads(open(rig.store.path).read())
+    doc.pop("blind")
+    open(rig.store.path, "w").write(json.dumps(doc))
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["status"] == "pending"
+
+
+def test_new_lease_ls_enter_needs_one_confirmation(rig):
+    """钉住: 新租约后 ls + enter=true 只要人确认一次, 之后的行照常放行."""
+    tok = rig.lease(known=False)
+    err, r = rig.call("kvm_type", text="ls", enter=True, lease=tok)
+    assert r["status"] == "pending"
+    _confirm(rig, r)
+    assert rig.call("kvm_type", text="pwd", enter=True, lease=tok)[1]["sent"]
+    assert len(rig.store.view()["history"]) == 1
+
+
+def test_real_human_seq_reads_broker_status(monkeypatch):
+    class Fake:
+        def __init__(self, port, src, who):
+            if port == "/gone":
+                raise FileNotFoundError(port)
+
+        def status(self):
+            return {"/dev/ttyX": {"human_n": 3}}
+
+        def close(self):
+            pass
+    monkeypatch.setattr(mk.kvm_broker, "BrokerCh", Fake)
+    monkeypatch.setattr(mk.os.path, "realpath", lambda p: "/dev/ttyX" if p == "/by-id/x" else p)
+    assert mk.human_seq("/by-id/x") == 3
+    assert mk.human_seq("/by-id/y") == 0
+    assert mk.human_seq("/gone") is None
