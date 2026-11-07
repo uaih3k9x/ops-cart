@@ -376,12 +376,21 @@ TOGGLES = (("btn_video", "UVC 预览"), ("btn_serial", "串口会话"), ("btn_px
 
 def toggle_texts(pane, rows):
     """三颗开关按钮显示当前状态. pane = 左侧开着的面板; rows = 自检结果 (PXE 服务看 "PXE SERVER" 那行).
-    自检还没出结果就写 "读取中", 不猜."""
-    pxe = next((r.get("state") for r in rows or [] if r.get("label") == "PXE SERVER"), None)
-    on = {"btn_video": pane == "preview", "btn_serial": pane == "serial",
-          "btn_pxe": {"OK": True, "WARN": False, "FAIL": False}.get(pxe)}
+    自检还没出结果 (rows is None) 写 "读取中"; 有结果时只有在跑 (OK) 算开, "--" (没自启没在跑) / 没这行都算关."""
+    pxe = None if rows is None else any(r.get("label") == "PXE SERVER" and r.get("state") == "OK" for r in rows)
+    on = {"btn_video": pane == "preview", "btn_serial": pane == "serial", "btn_pxe": pxe}
     return {attr: "%s:  %s" % (label, {True: "开", False: "关", None: "读取中"}[on[attr]])
             for attr, label in TOGGLES}
+
+
+def pxe_toggle_text(on):
+    """PXE 启停成功后先按结果写按钮, 自检回来再校正."""
+    return toggle_texts(None, [{"label": "PXE SERVER", "state": "OK" if on else "--"}])["btn_pxe"]
+
+
+def preview_died(pane, returncode):
+    """预览面板开着但 mpv 已经退出 (起不来 / 采集卡拔了): 该关面板."""
+    return pane == "preview" and returncode is not None
 
 
 # ---------------------------------------------------------------- 键鼠透传

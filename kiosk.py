@@ -279,6 +279,9 @@ class Kiosk(tk.Tk):
             self._checking, self._check_ts = True, time.time()
             self.ui.run_bg(checks, checks_done)
         self.ui.run_bg(board, self._render, key="board")
+        if kui.preview_died(self.pane.current, self.mpv.poll() if self.mpv else None):
+            self._close_pane()                  # mpv 自己退了 (采集卡拔了等): 关面板, 按钮回 "关"
+            self.banner.config(text="UVC 预览已退出 (采集设备断开?)")
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
 
@@ -774,6 +777,7 @@ class Kiosk(tk.Tk):
             os.makedirs("/run/ops-cart", exist_ok=True)    # mpv 的 IPC socket 放这 (cart_snap.py 用)
             self.mpv = Popen(kc.mpv_cmd(wid, dev), stdout=DEVNULL, stderr=DEVNULL)
         except OSError as ex:
+            self._close_pane()                  # 不留开着的黑面板, 按钮回 "关"
             self.banner.config(text=f"mpv 起不来: {ex}")
             return
         self._banner_idle()
@@ -1071,7 +1075,9 @@ class Kiosk(tk.Tk):
             cmd = ["systemctl", "stop" if active else "start", *units]
 
             def done(r):
-                self._check_ts = 0.0        # 下一轮 refresh 就重跑自检, 按钮上的开/关跟着变
+                self._check_ts = 0.0        # 下一轮 refresh 就重跑自检, 按钮上的开/关跟着校正
+                if not isinstance(r, Exception) and r[0] == 0:
+                    self.btn_pxe.config(text=kui.pxe_toggle_text(not active))
                 self.banner.config(text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
                                    else f"PXE 装机服务{verb}失败, 详见 journalctl")
             self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30), done, f"正在{verb} PXE 装机服务…")

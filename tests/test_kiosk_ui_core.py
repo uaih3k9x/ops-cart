@@ -296,11 +296,28 @@ def test_toggle_texts_follow_pane_and_pxe_service():
     assert ui.toggle_texts(None, [{"label": "PXE SERVER", "state": "FAIL"}])["btn_pxe"] == "PXE 装机服务:  关"
 
 
-@pytest.mark.parametrize("rows", [None, [], [{"label": "PXE SERVER", "state": "--"}],
+def test_toggle_texts_pxe_reading_only_before_first_check():
+    # 自检还没出结果 (rows is None) 才写 "读取中"
+    assert ui.toggle_texts(None, None)["btn_pxe"] == "PXE 装机服务:  读取中"
+
+
+@pytest.mark.parametrize("rows", [[], [{"label": "PXE SERVER", "state": "--", "detail": "OFF"}],
                                   [{"label": "OCR", "state": "OK"}]])
-def test_toggle_texts_pxe_unknown_until_checked(rows):
-    # 自检还没出结果 / 没这一行: 不猜, 显示 "读取中"
-    assert ui.toggle_texts(None, rows)["btn_pxe"] == "PXE 装机服务:  读取中"
+def test_toggle_texts_pxe_off_when_not_running_or_missing(rows):
+    # 没设自启又没在跑 = "--"; 自检计划里没这一行: 都按 "关", 不能一直 "读取中"
+    assert ui.toggle_texts(None, rows)["btn_pxe"] == "PXE 装机服务:  关"
+
+
+def test_pxe_toggle_text_matches_toggle_texts():
+    assert ui.pxe_toggle_text(True) == "PXE 装机服务:  开"
+    assert ui.pxe_toggle_text(False) == "PXE 装机服务:  关"
+
+
+@pytest.mark.parametrize("pane, rc, gone", [("preview", None, False), ("preview", 1, True),
+                                            ("preview", 0, True), ("serial", 1, False), (None, None, False)])
+def test_preview_died(pane, rc, gone):
+    # mpv 起不来 / 设备拔掉自己退出: 预览面板要关掉, 按钮回 "关"
+    assert ui.preview_died(pane, rc) is gone
 
 
 def test_toggle_buttons_exist_in_menu_with_same_attrs():
@@ -316,10 +333,14 @@ def test_kiosk_syncs_toggle_texts_on_pane_change_and_check_result():
     calls = {}
     for fn in ast.walk(tree):
         if isinstance(fn, ast.FunctionDef):
-            calls[fn.name] = {ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call)}
+            calls.setdefault(fn.name, set()).update(
+                ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call))
     for name in ("_show_status", "_pane_open", "checks_done", "_build_menu"):
         assert "self._sync_toggles" in calls[name], name
     assert "kui.toggle_texts" in calls["_sync_toggles"]
+    assert "kui.pxe_toggle_text" in calls["done"]               # 启停成功先写开/关, 再等自检校正
+    assert "self._close_pane" in calls["_start_preview"]        # mpv 起不来就关面板
+    assert "kui.preview_died" in calls["refresh"] and "self._close_pane" in calls["refresh"]
 
 
 # ------------------------------------------------------------ B6 键鼠
