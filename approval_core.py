@@ -86,7 +86,7 @@ _NOT_VALUE = frozenset(("zeroize", "generate", "export", "import", "chain", "pub
 _TOKEN = re.compile(r"\s+(\"[^\"]*\"|'[^']*'|\S+)")
 # 2) 固定写法: 只打括号里最后一组
 _VALUE_RULES = [re.compile(r, re.I) for r in (
-    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]*(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*[=:]"
+    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{0,64}(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*[=:]"
     r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)",     # 紧贴: DB_PASSWORD=x / --password=x / pass:x
     r"://[^/@\s:]+:([^@\s/]+)@",                                   # URL 里的 user:pass@
     r"(?<!\S)-u\s*[^\s:]+:(\S+)",                                  # curl -u user:pass
@@ -98,7 +98,7 @@ _VALUE_RULES = [re.compile(r, re.I) for r in (
 # 带空格的 KEY = x / key: x / key : x: 值后面再跟词就看不清. 不收 "KEY= x" (等号紧贴变量名、后面是空格:
 # shell 里是在 KEY 为空的环境下执行 x, x 是命令不是口令)
 _LOOSE_VALUE = re.compile(
-    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]*(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*"
+    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{0,64}(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*"
     r"(?:\s+=\s*|\s*:\s+|\s+:)(\"[^\"]*\"|'[^']*'|[^\s;&|'\"]+)", re.I)
 _CTX_RULES = [(re.compile(c, re.I), re.compile(r, re.I)) for c, r in (
     (r"\b(?:mysql\w*|mariadb\w*)\b", r"(?<!\S)-p(\S+)"),          # mysql -pX
@@ -112,8 +112,9 @@ _CTX_RULES = [(re.compile(c, re.I), re.compile(r, re.I)) for c, r in (
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9_-])(?:chpasswd|passwd|htpasswd|sshpass)(?![A-Za-z0-9_-])|\bnet\s+user\b", re.I)
 _UNSAFE_HIDDEN = re.compile(r"[\s;&|<>`]|\$\(")
 # 设备停在密码提示符时, 这条动作本身就是密码
-_PW_PROMPT = re.compile(r"(?i)(?:password|passwd|pass ?phrase|secret|密码|口令|\bPIN)\b[^\n?？\]]{0,80}[:：]\s*$"
+_PW_PROMPT = re.compile(r"(?i)(?:password|passwd|pass ?phrase|secret|密码|口令|\bPIN)\b[^\n?？]{0,80}[:：]\s*$"
                         r"|(?:password|passwd|pass ?phrase|密码|口令)\s*$")
+_YES_NO = re.compile(r"(?i)\[\s*y(?:es)?\s*/\s*n(?:o)?\s*\]\s*[:：]?\s*$")
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 _BAD_CATS = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
 
@@ -138,6 +139,9 @@ _L3_WORDS = frozenset(("blkdiscard", "wipefs", "shred", "telinit", "init", "kexe
                        "dd", "fdisk", "halt", "poweroff", "reboot", "shutdown", "rm", "rmdir"))
 _PREFIX_CMDS = frozenset(("sudo", "env", "nohup", "time", "nice", "ionice", "command", "builtin", "xargs",
                           "strace", "ltrace", "timeout", "watch", "doas", "busybox", "chroot", "setsid", "stdbuf"))
+# 前缀命令里带一个参数的选项 (sudo -u root / nice -n 10 / strace -o f / timeout -s KILL ...)
+_ARG_OPTS = frozenset(("-u", "-g", "-n", "-C", "-o", "-e", "-s", "-k", "-c", "-p", "-t", "-U", "-D", "-h", "-r",
+                       "-i", "-S", "-P", "--user", "--group", "--chdir", "--signal", "--kill-after", "--output"))
 _SEG = re.compile(r"[;&|\n]+")
 _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # 子命令组合: 第一个词 + 后面任一词 -> L3
@@ -166,17 +170,28 @@ def serial_danger(text, extra=()):
         base = [os.path.basename(t.strip("'\"\\")) or t for t in toks]
         # 去掉环境变量赋值和前缀命令; 前缀命令后面的选项和选项参数分不清, 往多拦错:
         # 前缀之后的前 4 个词都当候选命令词
-        i, prefixed = 0, False
-        while i < len(toks) and (base[i] in _PREFIX_CMDS or _ASSIGN.match(toks[i])):
-            prefixed = prefixed or base[i] in _PREFIX_CMDS
-            i += 1
-        cands = range(i, min(len(toks), i + 4)) if prefixed else range(i, min(len(toks), i + 1))
-        for j in cands:
+        i = 0
+        while i < len(toks):                    # 前缀命令、它的选项和选项参数、环境变量赋值, 可以叠好几层
+            if base[i] in _PREFIX_CMDS or _ASSIGN.match(toks[i]):
+                i += 1
+            elif toks[i].startswith("-") and i > 0:
+                i += 2 if raw[i] in _ARG_OPTS else 1
+            else:
+                break
+        for j in range(i, min(len(toks), i + 1)):
             b = base[j]
             if b in _L3_LEAD and not (b == "do" and j + 1 < len(toks) and toks[j + 1].startswith(("sh", "dis"))):
                 add(b)
-            if b == "mount" and len(toks) > j + 1:
-                add("mount")
+            if b == "mount":                    # 只有 -l / -t ext4 这类只列出; 带设备或挂载点才改东西
+                rest, k = toks[j + 1:], 0
+                while k < len(rest):
+                    if rest[k] in ("-t", "-o", "-O"):
+                        k += 2
+                    elif rest[k].startswith("-"):
+                        k += 1
+                    else:
+                        add("mount")
+                        break
             if b in _L3_PAIRS and _L3_PAIRS[b] & set(toks[j + 1:]):
                 add(b)
             if b in ("iptables", "ip6tables") and {"-F", "--flush", "-X", "-P", "-D", "-Z"} & set(raw[j + 1:]):
@@ -196,6 +211,8 @@ def tier_of(item):
     kind, act = item.get("kind"), item.get("action") or {}
     if kind == "serial":
         text = str(act.get("text", ""))
+        if len(text) > ACTION_MAX:
+            return L3                           # 超长不跑正则 (平方级), 卡片上也看不全, 只能拒
         return L3 if item.get("danger") or serial_danger(text) or _spans(text) else L2   # 有打码的也升 L3
     if kind == "kvm":
         keys = frozenset(str(k).lower() for k in act.get("keys") or ())
@@ -277,7 +294,9 @@ def make_item(kind, native_id, epoch, target, created, action, danger=(), ctx=No
 def _union_danger(kind, action, danger):
     out = [str(w) for w in danger or ()]
     if kind == "serial":
-        out += [w for w in serial_danger(str(action.get("text", ""))) if w not in out]
+        text = str(action.get("text", ""))
+        extra = ["超长"] if len(text) > ACTION_MAX else serial_danger(text)
+        out += [w for w in extra if w not in out]
     return out
 
 
@@ -438,7 +457,7 @@ def at_password_prompt(item):
         s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc",) or ch == "\t")
         if s.strip():
             lines.append(_norm(s).rstrip())
-    return bool(lines) and bool(_PW_PROMPT.search(lines[-1]))
+    return bool(lines) and bool(_PW_PROMPT.search(lines[-1])) and not _YES_NO.search(lines[-1])
 
 
 def truncated(item):

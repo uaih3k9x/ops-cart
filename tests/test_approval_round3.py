@@ -262,3 +262,39 @@ def test_r4_l4_audit_failure_keeps_existing_decisions_and_persists_reject(tmp_pa
     st = json.load(open(tmp_path / "a.json"))
     assert st["decisions"][old["id"]]["op"] == "approve"         # 已有决定不被清掉
     assert st["decisions"][other["id"]]["op"] == "reject"        # 拒绝是停的方向, 照样落盘
+
+
+# ------------------------------------------------------------ 第五轮审查回归
+
+@pytest.mark.parametrize("cmd", ["sudo ip route show default", "sudo cat /var/log/debug", "sudo ls /etc/default",
+                                 "sudo grep -r test /etc", "sudo journalctl -u test", "sudo docker logs commit",
+                                 "mount -l", "mount -t ext4"])
+def test_r5_m1_read_only_with_prefix_stays_l2(cmd):
+    assert serial(cmd)["tier"] == ac.L2, cmd
+
+
+@pytest.mark.parametrize("cmd", ["sudo -u root mount /dev/sda1 /mnt", "sudo -E -H chmod 777 /",
+                                 "nice -n 10 chmod 777 /", "sudo -u root systemctl stop sshd",
+                                 "sudo nice -n 5 env A=1 chmod 777 /", "sudo -u root -g wheel -E chmod 777 /",
+                                 "mount -t ext4 /dev/sdb1 /mnt"])
+def test_r5_m1_prefixed_commands_still_l3(cmd):
+    assert serial(cmd)["tier"] == ac.L3, cmd
+
+
+@pytest.mark.parametrize("last", ["Enter new password [8-16 chars]:", "Enter password [default: none]:"])
+def test_r5_m2_bracketed_password_prompt(last):
+    assert ac.at_password_prompt(serial("S3cretPw", evidence=[last]))
+
+
+@pytest.mark.parametrize("last", ["Change the password now? [Y/N]:", "Save the secret key [Y/N]:"])
+def test_r5_m2_yes_no_is_not_prompt(last):
+    assert not ac.at_password_prompt(serial("Y", evidence=[last]))
+
+
+def test_r5_l4_long_serial_text_short_circuits():
+    import time
+    t0 = time.time()
+    it = ac.make_item("serial", 19, "1a2b3c4d", target="slot:2", created=NOW - 60,
+                      action={"type": "line", "text": "-" * 20000 + ":"})
+    assert it["tier"] == ac.L3 and ac.truncated(it)
+    assert time.time() - t0 < 1.0
