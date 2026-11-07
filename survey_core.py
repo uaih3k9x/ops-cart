@@ -15,6 +15,7 @@ import sys
 import time
 
 import cartlog
+import serial_allowlist
 from serial_core import _conbroker_cmd, _run, match_service, parse_list, serve_error
 
 SURVEY_DIR = "/var/log/ops-cart/survey"
@@ -22,6 +23,8 @@ PROFILES_PATH = "/opt/pxe/survey_profiles.json"    # 可选: 覆盖下面的命�
 DEFAULT_TIMEOUT = 30                                # 单条命令等提示符的秒数
 
 # ------------------------------------------------------------ 只读规则 (写死在代码里, JSON 改不了)
+# #75 拍板: 冻结黑名单补丁. 新发现的绕过类别只进测试反例集, 不再往这里加 deny / 禁用字符;
+# 第 1 层往 serial_allowlist (按厂商的命令前缀白名单) 迁, 影子期见 docs/DESIGN_layer1_allowlist.md.
 # verbs: 第一个词; pipes: "|" 后允许的过滤词 (True=要带参数); deny: 动词后第二个词黑名单 (只读命令里会写文件的)
 _RULES = {
     "huawei": {"verbs": {"display"},
@@ -293,7 +296,7 @@ def not_comparable(old, new, prof):
 
 def _result(**kw):
     r = {"ok": False, "head": None, "device": None, "path": None, "sections": [], "diff": None,
-         "previous": None, "refused": [], "error": None, "summary": ""}
+         "previous": None, "refused": [], "allowlist_miss": [], "error": None, "summary": ""}
     r.update(kw)
     return r
 
@@ -345,8 +348,23 @@ def _compare(res, survey_dir, prof):
     return out
 
 
-def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None):
+def _shadow_precheck(cmds, vendor, disabled, event):
+    """#75 影子期: 清单里不在第 1 层白名单的命令记 cartlog [survey] allowlist-miss, 巡检照常跑. -> 不命中的命令."""
+    miss = []
+    for c in cmds:
+        m = serial_allowlist.match(c, vendor, mode="exec", scope="survey", disabled=disabled)
+        if not m["entry"]:
+            miss.append(c)
+            (event or cartlog.event)("survey", "allowlist-miss " + cartlog.fields(vendor=vendor, cmd=c, why=m["why"]))
+    return miss
+
+
+def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None,
+               disabled=(), event=None):
     """跑一次巡检: 白名单预检 -> 逐条 send -> 存档 -> 和同设备上一份比. 不抛异常, 结果全在返回的 dict 里.
+
+    disabled: 规则文件 allowlist.disable 的条目 id; event: cartlog.event 那样的 (测试换成假的).
+    预检同时算 #75 的命令前缀白名单, 只记录 (allowlist_miss), 不影响跑不跑.
 
     send(port, cmd, timeout) -> conbroker send 的输出 (回显 + 正文 + 提示符); 出错可以抛异常.
     任何一条超时 / 没回提示符 / 被拒 / 提示符变了就中止, 后面的不发, 存档里逐段写明.
@@ -363,6 +381,7 @@ def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_D
         return _result(head=head, refused=bad,
                        summary="巡检拒绝执行, 一条都没发: 清单里有白名单不放的命令: " + "; ".join(map(str, bad)))
 
+    miss = _shadow_precheck([c["cmd"] for c in cmds], vendor, disabled, event)
     t = time.localtime(now())
     sections, device, stop = [], None, None
     for i, c in enumerate(cmds, 1):
@@ -374,7 +393,7 @@ def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_D
         if st != "ok":
             stop = f"中止于 [{i}/{len(cmds)}] {c['cmd']}: {note}"
     done = sum(s["status"] == "ok" for s in sections)
-    res = _result(ok=stop is None, head=head, device=device, sections=sections, error=stop)
+    res = _result(ok=stop is None, head=head, device=device, sections=sections, error=stop, allowlist_miss=miss)
 
     try:
         os.makedirs(survey_dir, exist_ok=True)
@@ -440,8 +459,12 @@ def main(argv=None):
     if not name:
         print(f"{port} 上没有在跑的 conbroker 服务, 先在串口面板开服务")
         return 2
+    import serial_write_core                          # 规则文件的 allowlist.disable (#75); 晚 import 避免循环
+    rules = serial_write_core.load_rules()
+    for u in rules["allowlist_unknown"]:
+        cartlog.event("survey", "allowlist-disable-unknown " + cartlog.fields(id=u))
     r = run_survey(name, a.vendor, send=conbroker_send, head=safe_name(os.path.basename(port)),
-                   survey_dir=a.dir, profiles=load_profiles(a.profiles))
+                   survey_dir=a.dir, profiles=load_profiles(a.profiles), disabled=rules["allowlist_disable"])
     print(r["summary"])
     record(r)
     return 0 if r["ok"] else 1

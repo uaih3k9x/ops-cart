@@ -94,6 +94,7 @@
 - 工具：`lease_acquire` / `lease_renew` / `lease_release`、`send_command`（一行可打印 ASCII，不许控制字符 / 换行 / 全角 / 零宽，不许 `-` 开头）、`send_key`（`enter` / `space` 直发，`ctrl_c` 挂起等人）、`pending_list`（只读，不含令牌）、`estop`（单条或全部；Agent 能自停，**没有 resume 工具**）。
 - **写租约**：认令牌不认名字（两个 Agent 同一个 ssh 用户也分得开）；默认 60 秒，10–300 可选；`lease_renew` 续，过期不能续要重新申请；过期 / 释放 / 急停撤销时它挂着的命令一起作废；直发命令发完顺手续一个期限（Agent 等慢命令时自己续不了）。每槽位同时只有一条在途，上一条没回来不发下一条；发送进程死了，在途标记过"超时 + 90 秒"自动清掉并记 `status=unknown`。
 - **闸门第 1 层**：直发要同时满足——认得出厂商（规则文件登记了槽位，或最后一行是华为 `<名>` / `[名]`；思科 `名#` 和 Linux `bash-4.4#` 分不开，只能登记）、设备停在该厂商的提示符上（跳过 conbroker 自己的 `[时间 …]` 标记行；停在密码 / `[Y/N]` / 翻页 / 半截输出上都不算）、过 `survey_core.is_readonly`（规则文件只能给内置厂商加只读动词，如 `ping`）、不带高危词。高危词（save / reboot / reset / format / delete / write / copy / startup / shutdown …，含 VRP/IOS 式缩写 `sav` `wr` `del`）只增不减，永远要人确认。其余一律挂起。规则文件 `/etc/ops-cart/serial-gate.json`（样例 `examples/serial_gate.example.json`），坏了按内置默认。
+- **第 1 层改白名单（#75，影子期）**：`serial_allowlist.py` 按厂商列"固定词 + 参数槽"条目，写闸门和巡检预检同时算，结论进 `gate.shadow` / `[survey] allowlist-miss`，放行仍按 `is_readonly`；`is_readonly` 冻结黑名单补丁。见 `docs/DESIGN_layer1_allowlist.md`。
 - **状态机**（每条命令一个条目，编号在一次开机内递增）：
 
 ```

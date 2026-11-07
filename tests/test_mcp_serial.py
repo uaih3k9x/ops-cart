@@ -115,7 +115,7 @@ def test_tool_names_and_hints(rig):
     specs = {t["name"]: t for t in rig.tools().handle(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]}
     assert set(specs) == {"send_command", "send_key", "lease_acquire", "lease_renew", "lease_release",
-                          "pending_list", "estop"}
+                          "pending_list", "gate_allowlist", "estop"}
     assert specs["pending_list"]["annotations"]["readOnlyHint"] is True
     assert specs["send_command"]["annotations"]["readOnlyHint"] is False
     assert specs["send_command"]["annotations"]["destructiveHint"] is True
