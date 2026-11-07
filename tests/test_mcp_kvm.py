@@ -40,6 +40,7 @@ class Rig:
         self.engine = "rapidocr"
         self.human_n = 0                # 代理记的人工输入次数 (车机 / 网页口)
         self.boot = "boot1"             # 代理启动 id
+        self.queued = 0                 # 代理里 agent 排着没发的请求数
         self.ocr_lines = [{"text": "Media Present", "x": 1, "y": 2, "w": 3, "h": 4, "conf": 90.0}]
         self.log = tmp_path / "kvm-thread.log"
         self.events = []
@@ -49,7 +50,8 @@ class Rig:
         tools = mk.build_tools(self.store, ports=lambda: self.ports, opener=self.opener,
                                ocr=lambda dev, lang: (self.ocr_lines, "卡2 (/dev/video3) 当前画面", self.engine),
                                wol=lambda mac, iface: self.wols.append((mac, iface)),
-                               broker_up=lambda port: True, human_seq=lambda port: [self.boot, self.human_n])
+                               broker_up=lambda port: True, human_seq=lambda port: [self.boot, self.human_n],
+                               broker_queued=lambda: self.queued)
         self.server = ms.Server(tools)
 
     def opener(self, port, who):
@@ -1241,3 +1243,48 @@ def test_no_lease_right_after_estop_release(rig):
     assert err and "急停" in msg
     rig.t[0] += kbc.QUIET_S + 1.5
     rig.lease()
+
+
+
+# ---- #64 第七轮
+
+@pytest.mark.parametrize("val", [1e300, float("inf"), "nan"])
+def test_absurd_estop_seen_is_clamped(tmp_path, val):
+    """estop_seen 极大值 / Infinity / NaN (墙钟回拨): 截到 now, 先拒, 推过 ESTOP_SETTLE_S 后能拿到租约."""
+    t = [1000.0]
+    s = _store(tmp_path, t)
+    open(s.path, "w").write(json.dumps({"estop_seen": val}).replace('"nan"', "NaN"))
+    s.view()
+    with pytest.raises(mc.ToolError):
+        s.acquire("A", 60, {})
+    t[0] += mk.ESTOP_SETTLE_S
+    s.acquire("A", 60, {})
+
+
+def test_no_lease_while_broker_has_queued_agent_requests(rig):
+    """代理只在急停没解除时丢 agent 排队的请求; 解除后排着的照样会发: 有排队的就不给新租约."""
+    rig.queued = 1
+    err, msg = rig.call("kvm_lease_acquire", ttl_s=60)
+    assert err and "排" in msg
+    rig.queued = 0
+    rig.lease()
+
+
+def test_real_broker_queued_sums_status(monkeypatch):
+    class Fake:
+        def __init__(self, port, src, who):
+            if port == "/gone":
+                raise FileNotFoundError(port)
+
+        def boot_status(self):
+            return "b1", {"/dev/a": {"queued": 2}, "/dev/b": {"queued": 1}}
+
+        def close(self):
+            pass
+    monkeypatch.setattr(mk.kvm_broker, "BrokerCh", Fake)
+    monkeypatch.setattr(mk.kvm_core, "ports", lambda: {"S1": "/by-id/x"})
+    assert mk.broker_queued() == 3
+    monkeypatch.setattr(mk.kvm_core, "ports", lambda: {"S1": "/gone"})
+    assert mk.broker_queued() == 0
+    monkeypatch.setattr(mk.kvm_core, "ports", lambda: {})
+    assert mk.broker_queued() == 0

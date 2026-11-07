@@ -44,7 +44,7 @@ TTL_S, TTL_MIN_S, TTL_MAX_S = 60, 10, 300
 LAN1 = "eno1"                   # 魔术包只从装机口发: LAN2 / 无线上都是别人的机器
 TEXT_MAX = 1000
 HISTORY_MAX = 10
-ESTOP_SETTLE_S = kbc.QUIET_S + 1     # 急停解除后多久才给租约: 代理排着的请求要人停手 QUIET_S 才丢完
+ESTOP_SETTLE_S = kbc.QUIET_S + 1     # 急停解除后这段时间不给租约: 粗略兜底; 准的是 kvm_lease_acquire 看代理 queued
 SUMMARY_EVS = {"confirm", "reject", "revoked"}
 OCR_MIN_LINE = 40.0             # 低于这个置信度的行当噪声扔掉
 OCR_MIN_MEAN = 60.0             # 平均低于这个: 明说读不出, 叫 Agent 看图
@@ -248,7 +248,7 @@ class LeaseStore:
                 raise mc.ToolError(f"键鼠写租约在 {st['lease']['who']} 手里, 还剩 {int(st['lease']['until'] - now)} 秒")
             if st["sending_until"] > now:
                 raise mc.ToolError("上一个租约的键还在发, 等几秒再申请")
-            if st["estop_seen"] is not None and now - st["estop_seen"] < ESTOP_SETTLE_S:   # 代理排着的还没丢完
+            if st["estop_seen"] is not None and now - st["estop_seen"] < ESTOP_SETTLE_S:   # 粗略兜底, 见 ESTOP_SETTLE_S
                 raise mc.ToolError(f"全部急停刚解除, {ESTOP_SETTLE_S:g} 秒后再申请")
             st["lease"] = {"token": secrets.token_urlsafe(16), "who": who, "until": now + ttl, "ttl": ttl}
             _forget_line(st)            # 租约之间人可能留了半截命令: 第一个回车要人确认
@@ -578,10 +578,12 @@ def redact_type(args):
     return args
 
 
-def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who, human_seq=lambda port: None):
+def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who, human_seq=lambda port: None,
+                broker_queued=lambda: 0):
     """ports() -> {序列号: 路径}; opener(port, who) -> 代理连接 (send_keys / type_text / close);
     ocr(dev|None, lang) -> (行, 哪块卡的说明, 引擎); wol(mac, iface); broker_up(port) -> bool;
-    human_seq(port) -> 代理记的这块键鼠人工输入次数 (拿不到 None). 测试里全换成假的."""
+    human_seq(port) -> 代理记的这块键鼠人工输入次数 (拿不到 None); broker_queued() -> 代理里 agent 排着没发的请求数.
+    测试里全换成假的."""
 
     def _port(serial):
         online = ports()
@@ -634,6 +636,9 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who, h
         return [mc.json_content(dict(store.view(), all_stopped=store.stopped(), keyboards=sorted(online), broker=up))]
 
     def kvm_lease_acquire(a):
+        # 代理只在急停没解除时丢 agent 排队的请求, 解除后排着的照样会发: 有排着的就不给新租约, 免得跟新租约的键交错
+        if broker_queued() > 0:
+            raise mc.ToolError("键鼠代理里还有上一个写入者排着没发的键, 等它发完或丢掉再申请")
         seen = {p: human_seq(p) for p in ports().values()}
         return [mc.json_content(store.acquire(who(), a["ttl_s"], seen))]
 
@@ -750,6 +755,23 @@ def human_seq(port):
     return [boot, (st.get(os.path.realpath(port)) or {}).get("human_n", 0)]
 
 
+def broker_queued():
+    """代理里各块键鼠 agent 排着没发的请求数之和. 代理不在 / 没键鼠 -> 0 (没有代理就没有排队)."""
+    for port in kvm_core.ports().values():      # 连代理要带一块口; status 一次就报全部
+        try:
+            ch = kvm_broker.BrokerCh(port, src="agent", who="status")
+        except OSError:
+            continue
+        try:
+            _boot, st = ch.boot_status()
+        except (OSError, ValueError):
+            continue
+        finally:
+            ch.close()
+        return sum(int(d.get("queued") or 0) for d in st.values() if isinstance(d, dict))
+    return 0
+
+
 def real_ocr(dev, lang):
     path, why, used = cart_snap.grab(dev)
     if path is None:
@@ -768,4 +790,4 @@ def real_ocr(dev, lang):
 
 def real_tools(store=None):
     return build_tools(store or LeaseStore(), ports=kvm_core.ports, opener=real_opener, ocr=real_ocr,
-                       wol=wol_core.send, broker_up=broker_up, human_seq=human_seq)
+                       wol=wol_core.send, broker_up=broker_up, human_seq=human_seq, broker_queued=broker_queued)
