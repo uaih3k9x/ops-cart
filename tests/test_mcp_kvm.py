@@ -39,6 +39,7 @@ class Rig:
         self.wols = []
         self.engine = "rapidocr"
         self.human_n = 0                # 代理记的人工输入次数 (车机 / 网页口)
+        self.boot = "boot1"             # 代理启动 id
         self.ocr_lines = [{"text": "Media Present", "x": 1, "y": 2, "w": 3, "h": 4, "conf": 90.0}]
         self.log = tmp_path / "kvm-thread.log"
         self.events = []
@@ -48,7 +49,7 @@ class Rig:
         tools = mk.build_tools(self.store, ports=lambda: self.ports, opener=self.opener,
                                ocr=lambda dev, lang: (self.ocr_lines, "卡2 (/dev/video3) 当前画面", self.engine),
                                wol=lambda mac, iface: self.wols.append((mac, iface)),
-                               broker_up=lambda port: True, human_seq=lambda port: self.human_n)
+                               broker_up=lambda port: True, human_seq=lambda port: [self.boot, self.human_n])
         self.server = ms.Server(tools)
 
     def opener(self, port, who):
@@ -797,11 +798,12 @@ def test_secret_failure_reason_not_logged(rig):
 def test_same_token_concurrent_send_refused(rig):
     """同一令牌两路并发: 上一条还在发就不放第二条, 免得键交错."""
     tok = rig.lease()
-    assert rig.store.gate(tok, "type", text="ls") is None
+    sid = rig.store.gate(tok, "type", text="ls")
+    assert isinstance(sid, str)
     with pytest.raises(mc.ToolError):
         rig.store.gate(tok, "type", text="pwd")
-    rig.store.finish("agent-a", "type", "ls", True)
-    assert rig.store.gate(tok, "type", text="pwd") is None
+    rig.store.finish("agent-a", "type", "ls", True, send=sid)
+    assert isinstance(rig.store.gate(tok, "type", text="pwd"), str)
 
 
 # ---- #64 第三轮
@@ -885,12 +887,12 @@ def test_confirmed_danger_combo_makes_line_unknown(rig):
 def test_sending_flag_cleared_by_finish_not_by_estimate(rig):
     """发送中的标志由 finish 清, 不靠按长度估的时间: 估短了也不会放第二条进来."""
     tok = rig.lease()
-    assert rig.store.gate(tok, "type", text="ls") is None
+    sid = rig.store.gate(tok, "type", text="ls")
     rig.t[0] += 10                               # 远超原来 len/20 的估算
     with pytest.raises(mc.ToolError):
         rig.store.gate(tok, "type", text="pwd")
-    rig.store.finish("agent-a", "type", "ls", True)
-    assert rig.store.gate(tok, "type", text="pwd") is None
+    rig.store.finish("agent-a", "type", "ls", True, send=sid)
+    assert isinstance(rig.store.gate(tok, "type", text="pwd"), str)
 
 
 def test_take_refused_while_agent_sending(rig):
@@ -959,13 +961,145 @@ def test_real_human_seq_reads_broker_status(monkeypatch):
             if port == "/gone":
                 raise FileNotFoundError(port)
 
-        def status(self):
-            return {"/dev/ttyX": {"human_n": 3}}
+        def boot_status(self):
+            return "b1", {"/dev/ttyX": {"human_n": 3}}
 
         def close(self):
             pass
     monkeypatch.setattr(mk.kvm_broker, "BrokerCh", Fake)
     monkeypatch.setattr(mk.os.path, "realpath", lambda p: "/dev/ttyX" if p == "/by-id/x" else p)
-    assert mk.human_seq("/by-id/x") == 3
-    assert mk.human_seq("/by-id/y") == 0
+    assert mk.human_seq("/by-id/x") == ["b1", 3]
+    assert mk.human_seq("/by-id/y") == ["b1", 0]
     assert mk.human_seq("/gone") is None
+
+
+
+# ---- #64 第四轮
+
+def _store(tmp_path, t):
+    return mk.LeaseStore(str(tmp_path / "st.json"), clock=lambda: t[0], stopped=lambda: False)
+
+
+def _known(store):
+    with store._tx() as (st, _now, _evs):
+        st["line"], st["blind"] = "", ""
+
+
+def test_stale_rollback_across_leases_does_not_clear_new_lease(tmp_path):
+    """A 过闸门后卡住, 租约换成 B; A 的 finish(started=False) 不能把旧行写回 B."""
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 60, {"/p": ["b", 0]})["lease"]
+    _known(s)
+    sid = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
+    s.release(a)
+    t[0] += mk.SEND_GRACE_S + 10                 # 兜底时长过了, B 才申请得到
+    b = s.acquire("B", 60, {"/p": ["b", 0]})["lease"]
+    s.finish("A", "type", "ls", False, "no sock", started=False, send=sid)
+    r = s.gate(b, "type", text="", enter=True, port="/p", human=["b", 0])
+    assert isinstance(r, dict) and r["status"] == "pending"
+
+
+def test_acquire_refused_while_sending(tmp_path):
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 60, {"/p": ["b", 0]})["lease"]
+    _known(s)
+    assert isinstance(s.gate(a, "type", text="ls", port="/p", human=["b", 0]), str)
+    s.release(a)
+    with pytest.raises(mc.ToolError):
+        s.acquire("B", 60, {})
+
+
+def test_stale_rollback_across_sends_does_not_clobber(tmp_path):
+    """发送卡过兜底时长, 同一租约放了新的一条; 老的那条 finish 回滚不能盖掉新的状态."""
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 300, {"/p": ["b", 0]})["lease"]
+    _known(s)
+    old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
+    t[0] += mk.SEND_GRACE_S + 10
+    new = s.gate(a, "type", text="dis", port="/p", human=["b", 0])
+    assert new != old
+    s.finish("A", "type", "ls", False, "no sock", started=False, send=old)
+    s.finish("A", "type", "dis", True, send=new)
+    r = s.gate(a, "type", text="", enter=True, port="/p", human=["b", 0])     # 不一致按看不清
+    assert isinstance(r, dict) and r["status"] == "pending"
+
+
+def test_stale_finish_does_not_clear_new_sending_flag(tmp_path):
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 300, {"/p": ["b", 0]})["lease"]
+    _known(s)
+    old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
+    t[0] += mk.SEND_GRACE_S + 10
+    assert isinstance(s.gate(a, "type", text="pwd", port="/p", human=["b", 0]), str)
+    s.finish("A", "type", "ls", True, send=old)
+    assert s.view()["sending"]
+
+
+@pytest.mark.parametrize("field,val", [("blind", []), ("blind", {}), ("blind", 3), ("before", {"line": [], "blind": {}}),
+                                       ("before", [1, []]), ("human_seen", []), ("sending_id", [])])
+def test_corrupt_field_types_do_not_crash(rig, field, val):
+    tok = rig.lease()
+    doc = json.loads(open(rig.store.path).read())
+    doc[field] = val
+    open(rig.store.path, "w").write(json.dumps(doc))
+    rig.store.view()
+    err, r = rig.call("kvm_type", text="ls", lease=tok)
+    assert not err
+    if field == "blind":
+        assert r["status"] == "pending"
+
+
+def test_broker_restart_counter_collision_is_change(rig):
+    """代理重启后次数从 0 重数, 可能撞上旧值: 比 (启动 id, 次数)."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]
+    rig.boot = "boot2"
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_human_seq_unknown_both_sides_is_change(tmp_path):
+    """代理拿不到 (None) 两头都 None: 按变了算."""
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 60, {"/p": None})["lease"]
+    _known(s)
+    r = s.gate(a, "type", text="ls", port="/p", human=None)
+    assert isinstance(r, dict) and r["status"] == "pending"
+
+
+def test_who_failure_leaves_no_sending_flag(rig):
+    """who() 出错也不能留下"在发"标志 (挪到过闸门之前)."""
+    n = [0]
+
+    def who():
+        n[0] += 1
+        if n[0] > 1:
+            raise RuntimeError("bug")
+        return "agent-a"
+    tools = mk.build_tools(rig.store, ports=lambda: rig.ports, opener=rig.opener, ocr=None, wol=None,
+                           broker_up=lambda p: True, who=who, human_seq=lambda p: [rig.boot, rig.human_n])
+    srv = ms.Server(tools)
+
+    def call(name, **a):
+        return srv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": name, "arguments": a}}, "agent-a")
+    tok = json.loads(call("kvm_lease_acquire", ttl_s=60)["result"]["content"][0]["text"])["lease"]
+    rig.known()
+    try:
+        call("kvm_type", text="ls", lease=tok)
+    except RuntimeError:
+        pass
+    assert not rig.store.view()["sending"]
+
+
+def test_switching_keyboard_makes_line_unknown(rig):
+    """行缓冲不分键鼠: 换一块键鼠发, 这一行看不清."""
+    rig.ports = {"S1": "/p1", "S2": "/p2"}
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", lease=tok, serial="S1")[1]["sent"]
+    r = rig.call("kvm_type", text="ls", lease=tok, serial="S2")[1]
+    assert r["status"] == "pending" and "看不全" in r["reason"]

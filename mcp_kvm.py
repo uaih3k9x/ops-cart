@@ -244,8 +244,11 @@ class LeaseStore:
                 raise mc.ToolError("全部急停中, Agent 不能动键鼠; 要人在推车上解除")
             if st["lease"]:             # 认令牌不认名字: stdio 下两个 Agent 可能是同一个用户
                 raise mc.ToolError(f"键鼠写租约在 {st['lease']['who']} 手里, 还剩 {int(st['lease']['until'] - now)} 秒")
+            if st["sending_until"] > now:
+                raise mc.ToolError("上一个租约的键还在发, 等几秒再申请")
             st["lease"] = {"token": secrets.token_urlsafe(16), "who": who, "until": now + ttl, "ttl": ttl}
-            st["line"], st["blind"] = "", UNKNOWN       # 租约之间人可能留了半截命令: 第一个回车要人确认
+            _forget_line(st)            # 租约之间人可能留了半截命令: 第一个回车要人确认
+            st["sending_id"], st["line_port"] = None, None
             st["human_seen"] = dict(seen or {})
             evs.append({"ev": "lease_acquire", "src": "agent", "who": who, "ttl": ttl})
             return {"lease": st["lease"]["token"], "ttl_s": ttl, "hint": "用完 kvm_lease_release; 令牌别给别人."}
@@ -261,23 +264,27 @@ class LeaseStore:
             lease = self._need(st, token)
             evs.append({"ev": "lease_release", "src": "agent", "who": lease["who"]})
             _drop_all(st, evs, "租约交还")
-            st["lease"], st["line"], st["blind"] = None, "", UNKNOWN
+            st["lease"] = None
+            _forget_line(st)
             return {"released": True}
 
     def gate(self, token, kind, keys=(), text="", enter=False, secret=False, serial=None, port=None, human=None):
-        """-> None 直接发 (已标在发); 挂起时 -> 回给 Agent 的说明. secret 命中高危词抛 ToolError.
-        port / human: 要发的键鼠口和代理记的人工输入次数; 跟上次看到的不一样 = 人在车机 / 网页口动过, 这一行看不清."""
+        """-> 发送编号 (str, 直接发, 已标在发; 发完拿它 finish); 挂起时 -> 回给 Agent 的说明 (dict).
+        secret 命中高危词抛 ToolError. port / human: 要发的键鼠口和代理的 [启动 id, 人工输入次数];
+        跟上次看到的不一样 (或拿不到) = 人在车机 / 网页口动过, 这一行看不清; 换了一块键鼠也看不清."""
         with self._tx() as (st, now, evs):
-            who = self._need(st, token)["who"]
+            lease = self._need(st, token)
+            who = lease["who"]
             if st["pending"]:           # 键盘是一条流: 接着发的话, 人确认后顺序就乱了
                 raise mc.ToolError(f"有 {len(st['pending'])} 条在等确认, 处理完才能接着发; 一个键都没发. 用 kvm_status 看结果")
             if st["sending_until"] > now:   # 同一令牌并发两路: 键会交错
                 raise mc.ToolError("上一条还在发, 等它发完; 一个键都没发")
             sendable(kind, keys, text, secret)
             if port is not None:
-                if st["human_seen"].get(port, "?") != human:
+                cur = list(human) if isinstance(human, (list, tuple)) else None
+                if cur is None or st["human_seen"].get(port) != cur or st["line_port"] not in (None, port):
                     st["line"], st["blind"] = "", UNKNOWN
-                st["human_seen"][port] = human
+                st["human_seen"][port], st["line_port"] = cur, port
             shown = "+".join(keys) if kind == "key" else _shown(text, secret)
             line, blind = st["line"], st["blind"]
             if kind == "key":
@@ -315,21 +322,25 @@ class LeaseStore:
                 return {"status": "pending", "id": item["id"], "reason": why, "danger": hits,
                         "hint": "已挂起, 一个键都没发. 要人在推车上确认才发; 用 kvm_status 看结果. 等的时候继续 "
                                 "kvm_lease_renew, 租约过期这条就作废."}
-            st["before"] = [line, st["blind"]]
+            sid = _start_send(st, now, text, lease["token"], line, st["blind"])
             st["line"], st["blind"] = after, after_blind
-            st["sending_until"] = _sending_until(now, text)
-            return None
+            return sid
 
-    def finish(self, who, kind, shown, ok, why=None, started=True):
-        """发完 (清"在发"标志). 失败: 进了发送就可能发了一半, 这一行看不清; 一个键都没发出去就退回发之前."""
+    def finish(self, who, kind, shown, ok, why=None, started=True, send=None):
+        """发完 (send = gate / take 给的发送编号). 失败: 进了发送就可能发了一半, 这一行看不清;
+        一个键都没发出去, 且租约和发送编号都没换过, 才退回发之前. 编号对不上 (过时的回报) 按看不清, 也不清别人的"在发"."""
         with self._tx() as (st, _now, evs):
-            st["sending_until"] = 0
-            before = st.pop("before", None)
-            if not ok and not started and isinstance(before, list) and len(before) == 2 and \
-                    isinstance(before[0], str) and before[1] in _RANK:
-                st["line"], st["blind"] = before
+            mine = isinstance(send, str) and send == st["sending_id"]
+            before = st.pop("before", None) if mine else None
+            if mine:
+                st["sending_until"], st["sending_id"] = 0, None
+            token = st["lease"]["token"] if st["lease"] else None
+            if not mine:
+                _forget_line(st, keep_before=True)
+            elif not ok and not started and before and token and before["send"] == send and before["token"] == token:
+                st["line"], st["blind"] = before["line"], before["blind"]
             elif not ok:
-                st["line"], st["blind"] = "", UNKNOWN
+                _forget_line(st)
             evs.append({"ev": "send", "src": "agent", "who": who, "kind": kind, "text": shown, "ok": ok, "why": why})
 
     def take(self, iid, by):
@@ -343,15 +354,15 @@ class LeaseStore:
             if item is None:
                 raise ValueError(f"#{iid} 不在等确认 (租约过期或急停时作废)")
             st["pending"].remove(item)
-            st["before"] = [st["line"], st["blind"]]
-            st["sending_until"] = _sending_until(_now, item.get("text") or "")
+            token = st["lease"]["token"] if st["lease"] else None
+            sid = _start_send(st, _now, item.get("text") or "", token, st["line"], st["blind"])
             if isinstance(item.get("after"), str) and item.get("after_blind") in ("", PARTIAL, UNKNOWN):
                 st["line"], st["blind"] = item["after"], item["after_blind"]
             else:                       # 旧版本挂起的条目: 没有 after, 推不出这一行, 按看不见算
                 st["line"], st["blind"] = "", ("" if item.get("enter") else UNKNOWN)
             evs.append({"ev": "confirm", "src": "human", "who": by, "id": iid, "text": _item_text(item)})
             _remember(st, item, "confirmed", by)
-            return item
+            return dict(item, send=sid)
 
     def reject(self, iid, by, why="人拒绝"):
         with self._tx() as (st, _now, evs):
@@ -367,9 +378,19 @@ class LeaseStore:
             return public_view(st, now, self.stopped())
 
 
-def _sending_until(now, text):
-    """"在发"标志由 finish 清; 这个时刻只是进程死了没 finish 时的兜底, 往宽了给 (每字符按 0.2 秒)."""
-    return now + SEND_GRACE_S + len(text) * 0.2
+def _start_send(st, now, text, token, line, blind):
+    """标"在发" -> 发送编号. "在发"由 finish 清; sending_until 只是进程死了没 finish 时的兜底, 往宽了给 (每字符 0.2 秒).
+    before 记发之前的行, 连同租约令牌和编号, finish 两样都对得上才回滚."""
+    sid = secrets.token_hex(8)
+    st["sending_until"], st["sending_id"] = now + SEND_GRACE_S + len(text) * 0.2, sid
+    st["before"] = {"token": token, "send": sid, "line": line, "blind": blind}
+    return sid
+
+
+def _forget_line(st, keep_before=False):
+    st["line"], st["blind"] = "", UNKNOWN
+    if not keep_before:
+        st.pop("before", None)
 
 
 def _item_text(item):
@@ -400,11 +421,24 @@ def read_state(path):
     return {"next": doc["next"] if isinstance(doc.get("next"), int) else 1, "lease": lease,
             "pending": [p for p in doc.get("pending") or () if isinstance(p, dict)] if isinstance(doc.get("pending"), list) else [],
             "line": doc["line"] if isinstance(doc.get("line"), str) else "",
-            "blind": doc.get("blind", UNKNOWN if lease else "") if doc.get("blind", "") in _RANK else UNKNOWN,
+            "blind": _blind(doc.get("blind", UNKNOWN if lease else "")),
             "human_seen": doc["human_seen"] if isinstance(doc.get("human_seen"), dict) else {},
-            **({"before": doc["before"]} if "before" in doc else {}),
+            "sending_id": doc["sending_id"] if isinstance(doc.get("sending_id"), str) else None,
+            "line_port": doc["line_port"] if isinstance(doc.get("line_port"), str) else None,
+            **({"before": _before(doc.get("before"))} if _before(doc.get("before")) else {}),
             "sending_until": doc["sending_until"] if isinstance(doc.get("sending_until"), (int, float)) else 0,
             "history": doc["history"] if isinstance(doc.get("history"), list) else []}
+
+
+def _blind(v):
+    """读不懂 (类型不对 / 不认识) 按看不清."""
+    return v if isinstance(v, str) and v in _RANK else UNKNOWN
+
+
+def _before(v):
+    ok = isinstance(v, dict) and all(isinstance(v.get(k), str) for k in ("send", "line", "blind")) and \
+        isinstance(v.get("token"), (str, type(None))) and v["blind"] in _RANK
+    return v if ok else None
 
 
 def settle(st, now, stopped):
@@ -414,11 +448,13 @@ def settle(st, now, stopped):
     if lease and stopped:
         evs.append({"ev": "revoked", "src": "system", "who": lease.get("who"), "why": "全部急停"})
         _drop_all(st, evs, "全部急停")
-        st["lease"], st["line"], st["blind"] = None, "", UNKNOWN
+        st["lease"] = None
+        _forget_line(st)
     elif lease and lease["until"] <= now:
         evs.append({"ev": "lease_expired", "src": "system", "who": lease.get("who")})
         _drop_all(st, evs, "租约过期")
-        st["lease"], st["line"], st["blind"] = None, "", UNKNOWN
+        st["lease"] = None
+        _forget_line(st)
     elif not lease and st["pending"]:
         _drop_all(st, evs, "没有租约")
     st["_evs"] = evs
@@ -457,7 +493,7 @@ def human_action(store, op, arg, by, opener=None, ports=None):
     port = online.get(item.get("serial")) if item.get("serial") else next(iter(online.values()), None)
     shown = _item_text(item)
     if not port:
-        store.finish(item["who"], item["kind"], shown, False, "键鼠不在线", started=False)
+        store.finish(item["who"], item["kind"], shown, False, "键鼠不在线", started=False, send=item["send"])
         raise ValueError("键鼠不在线, 没发")
     started = False
     try:
@@ -473,12 +509,12 @@ def human_action(store, op, arg, by, opener=None, ports=None):
         finally:
             ch.close()
     except (OSError, ValueError) as e:
-        store.finish(item["who"], item["kind"], shown, False, str(e), started=started)
+        store.finish(item["who"], item["kind"], shown, False, str(e), started=started, send=item["send"])
         raise ValueError(f"发键失败: {e}") from None
     except Exception as e:              # 兜底: 不留"在发"标志
-        store.finish(item["who"], item["kind"], shown, False, type(e).__name__, started=started)
+        store.finish(item["who"], item["kind"], shown, False, type(e).__name__, started=started, send=item["send"])
         raise
-    store.finish(item["who"], item["kind"], shown, True)
+    store.finish(item["who"], item["kind"], shown, True, send=item["send"])
     return f"已发键鼠 #{arg}: {shown}"
 
 
@@ -521,12 +557,12 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who, h
 
     def _send(a, kind, fn, keys=(), text="", enter=False, secret=False):
         port = _port(a.get("serial"))           # 先挑口: 挑不出一个键都不动, 闸门状态也不动
-        held = store.gate(a["lease"], kind, keys=keys, text=text, enter=enter, secret=secret, serial=a.get("serial"),
-                          port=port, human=human_seq(port))
-        if held:
-            return [mc.json_content(held)]
         shown = "+".join(keys) if kind == "key" else _shown(text, secret) + (" + 回车" if enter else "")
-        me = who()
+        me = who()                              # 过闸门之前算好: 之后出任何错都要 finish
+        sid = store.gate(a["lease"], kind, keys=keys, text=text, enter=enter, secret=secret, serial=a.get("serial"),
+                         port=port, human=human_seq(port))
+        if isinstance(sid, dict):
+            return [mc.json_content(sid)]
         started = False
         try:
             try:
@@ -544,12 +580,12 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who, h
                 ch.close()
         except mc.ToolError as e:
             store.finish(me, kind, shown, False, "secret 发送失败 (原因不记, 可能带内容)" if secret else str(e),
-                         started=started)
+                         started=started, send=sid)
             raise
         except Exception as e:                  # 兜底: 不留"在发"标志, 不把半截状态当真
-            store.finish(me, kind, shown, False, type(e).__name__, started=started)
+            store.finish(me, kind, shown, False, type(e).__name__, started=started, send=sid)
             raise
-        store.finish(me, kind, shown, True)
+        store.finish(me, kind, shown, True, send=sid)
         return [mc.json_content({"sent": True, "hint": "发完等几秒, 用 screen_ocr 看结果"})]
 
     def kvm_status(_a):
@@ -658,18 +694,20 @@ def broker_up(port):
 
 
 def human_seq(port):
-    """代理记的这块键鼠人工输入次数 (车机 / 网页口; 实体 USB 键盘看不到). 代理不在 -> None."""
+    """代理的 [启动 id, 这块键鼠人工输入次数] (车机 / 网页口; 实体 USB 键盘看不到). 代理不在 / 不报启动 id -> None."""
     try:
         ch = kvm_broker.BrokerCh(port, src="agent", who="status")
     except OSError:
         return None
     try:
-        st = ch.status()
+        boot, st = ch.boot_status()
     except (OSError, ValueError):
         return None
     finally:
         ch.close()
-    return (st.get(os.path.realpath(port)) or {}).get("human_n", 0)
+    if not isinstance(boot, str):
+        return None
+    return [boot, (st.get(os.path.realpath(port)) or {}).get("human_n", 0)]
 
 
 def real_ocr(dev, lang):

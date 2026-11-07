@@ -152,6 +152,14 @@ def test_status_shows_who(env):
     assert st[PORT]["last"] == "claude" and st[PORT]["stopped"] is False
 
 
+def test_status_has_boot_id(env):
+    """#64: 键鼠闸门比 (启动 id, 人工输入次数), 代理重启后次数从 0 重数也撞不上旧值."""
+    a = client(env, who="claude")
+    boot, st = a.boot_status()
+    assert isinstance(boot, str) and len(boot) >= 8 and boot == client(env).boot_status()[0]
+    assert isinstance(st, dict)
+
+
 def test_busy_on_open_raises_busy(env):
     env["state"]["busy"] = True
     with pytest.raises(ch9329.Ch9329Busy):
