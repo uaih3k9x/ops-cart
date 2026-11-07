@@ -5,7 +5,8 @@
 只给整键和整行, 不给原始报告 / 鼠标 (同 kvm_broker_core.AGENT_OPS).
 闸门 (#42, #64): 打字按"从上次回车起的整行"查高危词, text 里每个换行切出的整行都查 (第一行跟缓冲拼起来), kvm_key 的
 可打印单键也计入这一行; 高危组合键也算, 命中就挂起等车机上的人确认; Agent 没有确认工具. 推车看不全这一行时
-(挪了光标 / 补全 / 调出历史 / 前面是 secret) 接着打的字要人确认, 推不出这一行时回车也要 (见 press / advance).
+(新租约 / 发键失败 / 挪了光标 / 补全 / 调出历史 / 前面是 secret) 接着打的字要人确认, 推不出这一行或带历史展开时
+回车也要 (见 press / advance). 发前对着芯片键表预检 (sendable), 不行就拒绝、状态不动.
 secret=true 的内容照样计入行检查, 但不进审计、日志和状态文件 (行缓冲里只记 <secret>), 命中高危词或看不全时直接拒绝. 这只是减速带: 推车看不懂屏幕, 鼠标 / 图形界面 / 脚本 / 编码都拦不住,
 真正的兜底是人盯和急停.
 日志 (#43): /var/log/ops-cart/kvm-thread.log, JSONL; 确认 / 拒绝 / 急停收回另在 events.log 记摘要.
@@ -17,12 +18,14 @@ import fcntl
 import hmac
 import json
 import os
+import re
 import secrets
 import subprocess
 import time
 
 import atomicfile
 import cart_ocr
+import ch9329
 import cartlog
 import cart_snap
 import kvm_broker
@@ -48,13 +51,18 @@ DANGER_SUB = ("diskpart", "bcdedit", "mkfs", "wipefs", "fdisk", "sgdisk", "parte
               "format-volume", "clear-disk", "remove-item", "reg delete")
 # 高危组合键: 按下的键里包含其中一组就算 (多带 shift 等也算). SysRq 在 HID 上就是 alt+printscreen (+字母, Linux 魔术键).
 DANGER_KEYS = {frozenset(k) for k in (("ctrl", "alt", "delete"), ("ctrl", "alt", "del"), ("alt", "f4"),
-                                      ("alt", "printscreen"))}
+                                      ("alt", "printscreen"), ("ctrl", "alt", "backspace"))}
+_PATH_SEP = re.compile(r"[\\/]")
+_EXE = re.compile(r"\.(?:exe|com|bat|cmd|ps1|sh)\b")
 
 
 def danger_of(text):
-    """这行里的高危词. 往多拦的方向错: 比如普通文字里带 write 也挂起."""
+    """这行里的高危词. 往多拦的方向错: 比如普通文字里带 write 也挂起.
+    命令名带路径 / 扩展名 (/sbin/reboot、C:\\...\\shutdown.exe) 时把路径分隔符换成空格、去掉扩展名再查一遍."""
     low = (text or "").lower()
-    return sw.danger_words(text) + [w for w in DANGER_SUB if w in low]
+    out = sw.danger_words(text) + sw.danger_words(_EXE.sub("", _PATH_SEP.sub(" ", low))) + \
+        [w for w in DANGER_SUB if w in low]
+    return list(dict.fromkeys(out))
 
 
 def danger_keys(keys):
@@ -64,14 +72,42 @@ def danger_keys(keys):
 
 # ---- 行缓冲 (#64): 推车对"当前这一行"知道多少
 # blind = ""       整行都看得见 (缓冲 line 就是这一行)
-#         PARTIAL  这一行前头有看不见的内容 (secret 只记成 SECRET_MARK, 或空行上调出了历史): 接着打字要人确认, 回车照发
-#         UNKNOWN  这一行变成什么推不出来 (挪了光标、补全、组合键、空行退格...): 接着打字和回车都要人确认
+#         PARTIAL  这一行前头有看不见的内容 (secret 只记成 SECRET_MARK): 接着打字要人确认, 回车照发
+#         UNKNOWN  这一行变成什么推不出来 (新租约、发键失败、挪了光标、补全、调历史、组合键、空行退格...):
+#                  接着打字和回车都要人确认, 直到人确认过的回车
+# 行里有 bash 历史展开 (! 或行首 ^) 时回车也要人确认: 真正执行的不是这一行.
 # 回车 (含 text 里的换行) 之后新的一行重新可知. 往多拦的方向错.
 PARTIAL, UNKNOWN = "partial", "unknown"
 SECRET_MARK = "<secret>"
 NEUTRAL_KEYS = {"capslock", "numlock", "scrolllock", "printscreen", "pause"}
-RECALL_KEYS = {"up", "down", "pgup", "pgdn", "esc"} | {f"f{i}" for i in range(1, 25)}
-BLIND_WHY = "推车看不全这一行 (前面有 secret / 挪过光标 / 调出过历史), 接着打字或回车要人确认"
+NEUTRAL_KEYS |= {f"f{i}" for i in range(10, 25)}               # BIOS 启动菜单常用; 不碰 shell 的这一行
+RECALL_KEYS = {"up", "down", "pgup", "pgdn", "esc"} | {f"f{i}" for i in range(1, 10)}    # cmd.exe 的历史键是 F1–F9
+BLIND_WHY = ("推车看不全这一行 (新租约 / 发键失败过 / 前面有 secret / 挪过光标 / 调出过历史 / 历史展开), "
+             "接着打字或回车要人确认")
+
+
+def _opaque(s):
+    """bash 历史展开 (!!、!-1、!foo、^a^b): 回车后真正执行的不是推车看到的这一行. 往多拦的方向错."""
+    return "!" in s or s.lstrip().startswith("^")
+
+
+def sendable(kind, keys=(), text="", secret=False):
+    """发之前对着芯片键表预检, 不行抛 ToolError, 闸门状态一点不动. 键名大小写要跟键表一致."""
+    if kind == "key":
+        try:
+            _report, unknown = ch9329.key_report(list(keys))
+        except ValueError as e:
+            raise mc.ToolError(f"发不出这组键: {e}; 一个键都没发") from None
+        if unknown or not keys:
+            raise mc.ToolError(f"不认识的键 {unknown or '(空)'} (键名小写, 如 enter / ctrl+alt+delete); 一个键都没发")
+        return
+    if "\t" in text:
+        raise mc.ToolError("text 里不许 Tab (补全后推车推不出这一行); 要补全用 kvm_key tab; 一个键都没发")
+    if secret and "\n" in text:
+        raise mc.ToolError("secret 里不许换行 (多行命令会无痕执行); 要回车给 enter=true 或另按 kvm_key enter; 一个键都没发")
+    bad = ch9329.untypable(text)
+    if bad:
+        raise mc.ToolError("有打不出的字符 (只能 ASCII)" + ("" if secret else f": {''.join(bad)!r}") + "; 一个键都没发")
 
 
 def key_effect(keys):
@@ -104,14 +140,17 @@ def advance(line, blind, text, secret=False):
     """打一段字 -> (高危词, 是否因看不全要人确认, 新 line, 新 blind). text 里每个换行切出的整行都查,
     第一行跟缓冲拼起来查. secret 的内容照样查, 但新 line 里只留 SECRET_MARK."""
     segs = text.split("\n")
-    blocked = bool(blind) and bool(segs[0]) or (blind == UNKNOWN and len(segs) > 1)
+    done = [line + segs[0]] + segs[1:-1]           # 打了换行的整行
+    blocked = bool(blind) and bool(segs[0]) or (blind == UNKNOWN and len(segs) > 1) or \
+        (len(segs) > 1 and any(_opaque(s) for s in done))
     hits = _hits([line + segs[0]] + segs[1:])
+    if secret:                                      # 不带换行 (sendable 保证)
+        if not text:
+            return hits, blocked, line, blind
+        mark = UNKNOWN if _opaque(line + text) or blind == UNKNOWN else PARTIAL
+        return hits, blocked, (line + SECRET_MARK)[-TEXT_MAX:], mark
     tail = segs[-1] if len(segs) > 1 else line + segs[0]
-    if secret:
-        tail = (SECRET_MARK if segs[-1] else "") if len(segs) > 1 else (line + SECRET_MARK if segs[0] else line)
-    new_blind = (PARTIAL if secret and segs[-1] else "") if len(segs) > 1 else \
-        (PARTIAL if secret and segs[0] else blind)
-    return hits, blocked, tail[-TEXT_MAX:], new_blind
+    return hits, blocked, tail[-TEXT_MAX:], ("" if len(segs) > 1 else blind)
 
 
 def press(line, blind, keys):
@@ -122,11 +161,9 @@ def press(line, blind, keys):
     if eff[0] == "char":
         return advance(line, blind, eff[1])
     if eff[0] == "enter":
-        return [], blind == UNKNOWN, "", ""
+        return [], blind == UNKNOWN or _opaque(line), "", ""
     if eff[0] == "backspace":
         return ([], False, line[:-1], blind) if line and not blind else ([], False, "", UNKNOWN)
-    if eff[0] == "recall":
-        return ([], False, "", PARTIAL) if not line and blind != UNKNOWN else ([], False, "", UNKNOWN)
     if eff[0] == "neutral":
         return [], False, line, blind
     return [], False, "", UNKNOWN
@@ -192,7 +229,7 @@ class LeaseStore:
             if st["lease"]:             # 认令牌不认名字: stdio 下两个 Agent 可能是同一个用户
                 raise mc.ToolError(f"键鼠写租约在 {st['lease']['who']} 手里, 还剩 {int(st['lease']['until'] - now)} 秒")
             st["lease"] = {"token": secrets.token_urlsafe(16), "who": who, "until": now + ttl, "ttl": ttl}
-            st["line"], st["blind"] = "", ""
+            st["line"], st["blind"] = "", UNKNOWN       # 租约之间人可能留了半截命令: 第一个回车要人确认
             evs.append({"ev": "lease_acquire", "src": "agent", "who": who, "ttl": ttl})
             return {"lease": st["lease"]["token"], "ttl_s": ttl, "hint": "用完 kvm_lease_release; 令牌别给别人."}
 
@@ -207,7 +244,7 @@ class LeaseStore:
             lease = self._need(st, token)
             evs.append({"ev": "lease_release", "src": "agent", "who": lease["who"]})
             _drop_all(st, evs, "租约交还")
-            st["lease"], st["line"], st["blind"] = None, "", ""
+            st["lease"], st["line"], st["blind"] = None, "", UNKNOWN
             return {"released": True}
 
     def gate(self, token, kind, keys=(), text="", enter=False, secret=False, serial=None):
@@ -216,6 +253,9 @@ class LeaseStore:
             who = self._need(st, token)["who"]
             if st["pending"]:           # 键盘是一条流: 接着发的话, 人确认后顺序就乱了
                 raise mc.ToolError(f"有 {len(st['pending'])} 条在等确认, 处理完才能接着发; 一个键都没发. 用 kvm_status 看结果")
+            if st["sending_until"] > now:   # 同一令牌并发两路: 键会交错
+                raise mc.ToolError("上一条还在发, 等它发完; 一个键都没发")
+            sendable(kind, keys, text, secret)
             shown = "+".join(keys) if kind == "key" else _shown(text, secret)
             line, blind = st["line"], st["blind"]
             if kind == "key":
@@ -224,7 +264,7 @@ class LeaseStore:
             else:
                 hits, blocked, after, after_blind = advance(line, blind, text, secret)
                 if enter:
-                    blocked = blocked or after_blind == UNKNOWN
+                    blocked = blocked or after_blind == UNKNOWN or _opaque(after)
                     after, after_blind = "", ""
                 full = line + ("" if secret else text)
             if hits and kind == "key" and danger_keys(keys):
@@ -237,8 +277,9 @@ class LeaseStore:
                 evs.append({"ev": "refused", "src": "agent", "who": who, "text": shown})   # 命中哪个词也不记, 算泄露
                 if hits:
                     raise mc.ToolError("secret 内容带高危词, 不能挂起给人看, 已拒绝; 一个键都没发")
-                raise mc.ToolError("这一行推车看不全 (前面有 secret / 挪过光标), secret 不能挂起给人看, 已拒绝; "
-                                   "一个键都没发. 先回车换到新的一行再打")
+                raise mc.ToolError("这一行推车看不全 (新租约 / 前面有 secret / 挪过光标 / 带 ! 等历史展开), secret 不能挂起"
+                                   "给人看, 已拒绝; 一个键都没发. 先回车换到新的一行再打; 密码带 ! 的不给 enter, "
+                                   "打完另按 kvm_key enter (回车要人确认)")
             if why:
                 item = {"id": st["next"], "kind": kind, "keys": list(keys), "text": text, "enter": bool(enter),
                         "who": who, "t": now, "reason": why, "danger": hits, "line": full[-TEXT_MAX:],
@@ -257,6 +298,8 @@ class LeaseStore:
     def finish(self, who, kind, shown, ok, why=None):
         with self._tx() as (st, _now, evs):
             st["sending_until"] = 0
+            if not ok:                  # 可能发了一半: 推不出屏幕上这一行
+                st["line"], st["blind"] = "", UNKNOWN
             evs.append({"ev": "send", "src": "agent", "who": who, "kind": kind, "text": shown, "ok": ok, "why": why})
 
     def take(self, iid, by):
@@ -264,10 +307,13 @@ class LeaseStore:
         with self._tx() as (st, _now, evs):
             if self.stopped():
                 raise ValueError("全部急停中, 先解除")
+            if st["sending_until"] > _now:
+                raise ValueError("Agent 那边还在发, 等它发完再确认")
             item = next((p for p in st["pending"] if p["id"] == iid), None)
             if item is None:
                 raise ValueError(f"#{iid} 不在等确认 (租约过期或急停时作废)")
             st["pending"].remove(item)
+            st["sending_until"] = _now + max(2.0, len(item.get("text") or "") / 20)
             if isinstance(item.get("after"), str) and item.get("after_blind") in ("", PARTIAL, UNKNOWN):
                 st["line"], st["blind"] = item["after"], item["after_blind"]
             else:                       # 旧版本挂起的条目: 没有 after, 推不出这一行, 按看不见算
@@ -330,11 +376,11 @@ def settle(st, now, stopped):
     if lease and stopped:
         evs.append({"ev": "revoked", "src": "system", "who": lease.get("who"), "why": "全部急停"})
         _drop_all(st, evs, "全部急停")
-        st["lease"], st["line"], st["blind"] = None, "", ""
+        st["lease"], st["line"], st["blind"] = None, "", UNKNOWN
     elif lease and lease["until"] <= now:
         evs.append({"ev": "lease_expired", "src": "system", "who": lease.get("who")})
         _drop_all(st, evs, "租约过期")
-        st["lease"], st["line"], st["blind"] = None, "", ""
+        st["lease"], st["line"], st["blind"] = None, "", UNKNOWN
     elif not lease and st["pending"]:
         _drop_all(st, evs, "没有租约")
     st["_evs"] = evs
@@ -450,7 +496,7 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
             finally:
                 ch.close()
         except mc.ToolError as e:
-            store.finish(me, kind, shown, False, str(e))
+            store.finish(me, kind, shown, False, "secret 发送失败 (原因不记, 可能带内容)" if secret else str(e))
             raise
         store.finish(me, kind, shown, True)
         return [mc.json_content({"sent": True, "hint": "发完等几秒, 用 screen_ocr 看结果"})]
@@ -509,7 +555,8 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
                      "description": "期限秒"}}, kvm_lease_acquire),
         T("kvm_lease_renew", "续键鼠写租约. 过期了要重新申请.", {"lease": LEASE}, kvm_lease_renew),
         T("kvm_lease_release", "交还键鼠写租约.", {"lease": LEASE}, kvm_lease_release),
-        T("kvm_key", "往被测机按键或组合键, 如 enter / esc / f12. 高危组合键 (ctrl+alt+delete 等) 挂起等人确认. "
+        T("kvm_key", "往被测机按键或组合键, 如 enter / esc / f12 (键名小写). 高危组合键 (ctrl+alt+delete 等) 挂起等人确认; "
+          "新租约、调历史、补全、挪光标之后的回车也要人确认. "
           "人最近 3 秒动过键鼠会排队. 按之前先 screen_ocr 确认焦点对.",
           {"keys": {"type": "string", "required": True, "maxLength": 64, "pattern": r"[A-Za-z0-9_+-]+",
                     "description": "键名, 组合键用 + 连"}, "lease": LEASE, "serial": SERIAL},
@@ -518,7 +565,7 @@ def build_tools(store, ports, opener, ocr, wol, broker_up, who=ms.current_who):
           "可能误拦普通文字. 内容进审计日志, 密码给 secret=true. 敲之前先 screen_ocr 确认焦点对.",
           {"text": {"type": "string", "required": True, "maxLength": TEXT_MAX, "description": "要打的字"},
            "enter": {"type": "boolean", "description": "打完按回车"},
-           "secret": {"type": "boolean", "description": "密码等: 内容不进审计和日志; 带高危词直接拒绝"},
+           "secret": {"type": "boolean", "description": "密码等: 内容不进审计和日志; 不许换行; 带高危词直接拒绝"},
            "lease": LEASE, "serial": SERIAL},
           kvm_type, destructive=True, redact=redact_type),
         T("screen_ocr", "读被测机屏幕上的字 (OCR, 带坐标), 比 screenshot 省得多, 看画面先用这个. readable=false 时再用 "

@@ -66,10 +66,17 @@ class Rig:
             pass
         return r["isError"], text
 
-    def lease(self, **a):
+    def lease(self, known=True, **a):
+        """known: 假装人已在车机上确认过一次回车 (新租约的当前行本来是"看不清", #64)."""
         err, r = self.call("kvm_lease_acquire", **a)
         assert not err, r
+        if known:
+            self.known()
         return r["lease"]
+
+    def known(self):
+        with self.store._tx() as (st, _now, _evs):
+            st["line"], st["blind"] = "", ""
 
 
 @pytest.fixture
@@ -173,8 +180,10 @@ def test_port_choice(rig):
     err, msg = rig.call("kvm_key", keys="a", lease=tok)
     assert err and "键鼠" in msg
     rig.ports = {"S1": "/p1", "S2": "/p2"}
+    rig.known()                                 # 发失败后这一行算看不清 (见 test_failed_send_makes_line_unknown)
     err, msg = rig.call("kvm_key", keys="a", lease=tok)
     assert err and "S1" in msg
+    rig.known()
     assert not rig.call("kvm_key", keys="a", lease=tok, serial="S2")[0]
     assert rig.opened[-1][0] == "/p2"
 
@@ -562,11 +571,6 @@ def test_newline_on_unknown_line_needs_human(rig, text, enter):
     assert r["status"] == "pending"
 
 
-def test_menu_navigation_on_empty_line_still_flows(rig):
-    """BIOS / 启动菜单: 空行上 F 键、上下键、esc 后回车直接发 (残余: shell 里调出历史再回车拦不住)."""
-    tok = rig.lease()
-    out = _keys(rig, tok, "f12", "down", "down", "enter", "esc", "up", "enter")
-    assert all(r.get("sent") for r in out)
 
 
 def test_recall_then_typing_needs_human(rig):
@@ -590,12 +594,6 @@ def test_neutral_keys_keep_line(rig):
     assert rig.call("kvm_type", text="kpart", lease=tok)[1]["status"] == "pending"
 
 
-def test_lease_reacquire_resets_unknown(rig):
-    tok = rig.lease()
-    _keys(rig, tok, "left")
-    rig.call("kvm_lease_release", lease=tok)
-    tok = rig.lease()
-    assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]
 
 
 # ---- #64 追加: 组合键超集也算, SysRq 是 alt+printscreen
@@ -625,3 +623,174 @@ def test_superset_combo_held(rig, keys):
     tok = rig.lease()
     err, r = rig.call("kvm_key", keys=keys, lease=tok)
     assert r["status"] == "pending" and rig.sent == []
+
+
+# ---- #64 第二轮: 闸门看不清的一律"看不清", 下一个回车要人确认
+
+def _confirm(rig, r):
+    mk.human_action(rig.store, "confirm", r["id"], "human:kiosk", opener=rig.opener, ports=lambda: rig.ports)
+
+
+@pytest.mark.parametrize("how", ["fresh", "release", "expire", "stop"])
+def test_new_lease_line_is_unknown(rig, how):
+    """租约之间人可能在屏幕上留了半截命令: 新租约的第一个回车要人确认, 确认后才重新可知."""
+    if how != "fresh":
+        tok = rig.lease()
+        assert rig.call("kvm_type", text="ls", lease=tok)[1]["sent"]
+        if how == "release":
+            rig.call("kvm_lease_release", lease=tok)
+        elif how == "expire":
+            rig.t[0] += 3600
+        else:
+            rig.stopped = True
+            rig.call("kvm_status")
+            rig.stopped = False
+    tok = rig.lease(known=False)
+    err, r = rig.call("kvm_key", keys="enter", lease=tok)
+    assert not err and r["status"] == "pending" and rig.sent[-1:] != [("keys", ("enter",))]
+    _confirm(rig, r)
+    assert rig.call("kvm_type", text="ls", enter=True, lease=tok)[1]["sent"]
+
+
+def test_new_lease_typing_needs_human(rig):
+    tok = rig.lease(known=False)
+    err, r = rig.call("kvm_type", text=" /q", lease=tok)
+    assert r["status"] == "pending" and "看不全" in r["reason"]
+
+
+@pytest.mark.parametrize("keys", ["Enter", "CTRL+c", "foo", "a+b+c+d+e+f+g"])
+def test_unsendable_keys_refused_before_state_changes(rig, keys):
+    """键名跟芯片键表对不上 (大小写也算) 就当场拒绝, 行缓冲不动."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", lease=tok)[1]["sent"]
+    err, msg = rig.call("kvm_key", keys=keys, lease=tok)
+    assert err and "键" in msg
+    assert rig.call("kvm_type", text="kpart", lease=tok)[1]["status"] == "pending"
+
+
+def test_untypable_text_refused_before_state_changes(rig):
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="dis", lease=tok)[1]["sent"]
+    err, _ = rig.call("kvm_type", text="x\u00e9\nok", lease=tok)
+    assert err
+    assert rig.call("kvm_type", text="kpart", lease=tok)[1]["status"] == "pending"
+
+
+def test_untypable_secret_message_has_no_content(rig):
+    tok = rig.lease()
+    err, msg = rig.call("kvm_type", text="pw\u00e9", secret=True, lease=tok)
+    assert err and "\u00e9" not in msg and rig.sent == []
+
+
+@pytest.mark.parametrize("how", ["agent", "human"])
+def test_failed_send_makes_line_unknown(rig, how):
+    """发键失败可能发了一半: 推车不知道屏幕上剩了什么."""
+    tok = rig.lease()
+    if how == "agent":
+        rig.fail = OSError("gone")
+        err, _ = rig.call("kvm_type", text="ls", lease=tok)
+        assert err
+    else:
+        err, r = rig.call("kvm_type", text="diskpart", lease=tok)
+        rig.fail = OSError("gone")
+        with pytest.raises(ValueError):
+            _confirm(rig, r)
+    rig.fail = None
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_tab_in_text_refused(rig):
+    tok = rig.lease()
+    err, msg = rig.call("kvm_type", text="rm -rf /ho\t", lease=tok)
+    assert err and "tab" in msg.lower() and rig.sent == []
+
+
+@pytest.mark.parametrize("keys", ["up", "down", "pgup", "pgdn", "esc", "f3", "f7", "f9"])
+def test_recall_on_empty_line_then_enter_needs_human(rig, keys):
+    """空行调出历史再回车, 可能重放人确认过的危险命令."""
+    tok = rig.lease()
+    _keys(rig, tok, keys)
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+@pytest.mark.parametrize("keys", ["f10", "f11", "f12", "f13"])
+def test_high_f_keys_keep_line(rig, keys):
+    """cmd.exe 的历史键是 F1–F9; F10 以上 (BIOS 启动菜单常用) 不动这一行."""
+    tok = rig.lease()
+    out = _keys(rig, tok, keys, "enter")
+    assert all(r.get("sent") for r in out)
+    assert rig.call("kvm_type", text="dis", lease=tok)[1]["sent"]
+    _keys(rig, tok, keys)
+    assert rig.call("kvm_type", text="kpart", lease=tok)[1]["status"] == "pending"
+
+
+@pytest.mark.parametrize("text", ["!!", "sudo !!", "!-2", "!rm", "echo !$", "^ls^rm", " ^a^b"])
+def test_history_expansion_enter_needs_human(rig, text):
+    """bash 历史展开: 回车后真正执行的不是推车看到的这一行."""
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text=text, enter=True, lease=tok)
+    assert r["status"] == "pending" and rig.sent == []
+    mk.human_action(rig.store, "reject", r["id"], "human:kiosk")
+    assert rig.call("kvm_type", text=text, lease=tok)[1]["sent"]
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_history_expansion_in_middle_line_of_text(rig):
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text="ls\n!!\nls", lease=tok)
+    assert r["status"] == "pending" and rig.sent == []
+
+
+def test_secret_with_bang_makes_enter_need_human(rig):
+    """密码里常有 !: 推车看不见内容, 不知道是不是历史展开, 回车要人确认 (人看得见屏幕是不是密码提示)."""
+    tok = rig.lease()
+    assert rig.call("kvm_type", text="pw!1", secret=True, lease=tok)[1]["sent"]
+    assert rig.call("kvm_key", keys="enter", lease=tok)[1]["status"] == "pending"
+
+
+def test_secret_with_bang_and_enter_refused(rig):
+    tok = rig.lease()
+    err, msg = rig.call("kvm_type", text="pw!1", secret=True, enter=True, lease=tok)
+    assert err and "kvm_key" in msg and rig.sent == []
+
+
+@pytest.mark.parametrize("text", ["pw\nreboot", "pw\n", "\npw"])
+def test_secret_newline_refused(rig, text):
+    """secret 带换行就能在审计里无痕执行多行命令."""
+    tok = rig.lease()
+    err, msg = rig.call("kvm_type", text=text, secret=True, lease=tok)
+    assert err and "换行" in msg and rig.sent == []
+    assert "reboot" not in rig.log.read_text()
+
+
+@pytest.mark.parametrize("text", ["/sbin/reboot", "/usr/sbin/shutdown -h now", "sudo /bin/rm -rf /x",
+                                  "C:\\Windows\\System32\\shutdown.exe /s /t 0", '"shutdown.exe" -r',
+                                  "format.com c:", "& 'C:\\x\\diskpart.exe'", "reboot.exe"])
+def test_command_name_with_path_ext_quotes(text):
+    assert mk.danger_of(text)
+
+
+@pytest.mark.parametrize("text", ["ls -l", "uname -r", "cat /var/log/syslog", "cd C:\\Users\\x", "ping 192.0.2.1"])
+def test_plain_commands_not_danger(text):
+    assert not mk.danger_of(text)
+
+
+def test_ctrl_alt_backspace_is_danger():
+    assert mk.danger_keys(["ctrl", "alt", "backspace"])
+
+
+def test_secret_failure_reason_not_logged(rig):
+    tok = rig.lease()
+    rig.fail = OSError("boom-hunter2")
+    err, _ = rig.call("kvm_type", text="hunter2", secret=True, lease=tok)
+    assert err and "hunter2" not in rig.log.read_text()
+
+
+def test_same_token_concurrent_send_refused(rig):
+    """同一令牌两路并发: 上一条还在发就不放第二条, 免得键交错."""
+    tok = rig.lease()
+    assert rig.store.gate(tok, "type", text="ls") is None
+    with pytest.raises(mc.ToolError):
+        rig.store.gate(tok, "type", text="pwd")
+    rig.store.finish("agent-a", "type", "ls", True)
+    assert rig.store.gate(tok, "type", text="pwd") is None
