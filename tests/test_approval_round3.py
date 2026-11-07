@@ -338,3 +338,8 @@ def test_r7_combined_short_options_read_only(cmd):
                                  "strace -fo log kill 1"])
 def test_r8_glued_option_argument(cmd):
     assert serial(cmd)["tier"] == ac.L3, cmd
+
+
+def test_r9_double_dash_ends_prefix_options():
+    assert serial("sudo -nu root -- kill 1")["tier"] == ac.L3
+    assert serial("sudo -- ls")["tier"] == ac.L2

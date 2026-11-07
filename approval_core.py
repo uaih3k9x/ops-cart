@@ -207,6 +207,9 @@ def serial_danger(text, extra=()):
                         i, n = i + 1, n - 1
             elif _ASSIGN.match(toks[i]):
                 i += 1
+            elif toks[i] == "--" and cur:       # getopt: -- 之后不再是选项
+                i += 1
+                break
             elif toks[i].startswith("-") and cur:
                 i += 2 if _takes_arg(cur, raw[i]) else 1
             else:
