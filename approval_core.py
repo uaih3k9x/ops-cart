@@ -44,6 +44,9 @@ EXPIRES_S = {L2: 15 * 60, L3: 10 * 60, L4: 10 * 60}
 AUTH_TTL_S = 120            # 批准以后多久内没开始执行就作废 (执行器是下一阶段, 先定常量)
 KVM_L2_KEYS = frozenset({frozenset(("alt", "f4"))})
 
+ESTOP_SCOPES = ("all", "kvm", "slot:1", "slot:2", "slot:3", "slot:4")
+LABEL_BATCH_MAX = 200
+PXE_MACS_MAX = 64
 L3_GAP_S = 30               # 同一账号 30 秒内只能批一条 L3 或 L4
 REQ_MAX_AGE_S = 60
 REQ_FUTURE_S = 5
@@ -67,12 +70,36 @@ _BY_RE = re.compile(r"[\x21-\x7e]{1,64}")
 _CODE_RE = re.compile(r"[0-9]{6}")
 _TS_LOGIN_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}")
 _TS_NODE_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
-# 命中任一敏感词, 从第一个敏感词后面起整段打码 (往多打的方向错); 敏感词本身留着, 人能看出这条在设密码.
-# 两边只把字母数字下划线当词的一部分: encrypted-password / -secret / shared-key 这类复合词也认.
-_SENSITIVE = re.compile(
-    r"(?<![A-Za-z0-9_])(password|passwd|pwd|passphrase|secret|community|cipher|simple|psk|key|token"
-    r"|credential|md5|sha|sha1|sha256|sha384|sha512|auth|authentication|priv|privacy|encrypted|hash)"
-    r"(?![A-Za-z0-9_])", re.I)
+# 打码只打值, 不打后面的命令 (审查 H1: 整段打掉会把 "; iptables -F" 也藏起来).
+# 1) 关键词 + 空白 + 最多 4 个修饰词 (0/7/cipher/simple/md5/level 15 ...) + 一个值. 关键词前后只把字母数字下划线
+#    当词的一部分, 所以 encrypted-password / shared-key / --secret 也认.
+_KEYWORD = re.compile(
+    r"(?<![A-Za-z0-9_])(password|passwd|pwd|passphrase|secret|community|cipher|simple|psk|key|key-string|token"
+    r"|credential|md5|sha|sha1|sha256|sha384|sha512|auth|priv|authentication-mode|privacy-mode)(?=\s)", re.I)
+_MODIFIER = re.compile(
+    r"(?:\d{1,2}|cipher|simple|irreversible-cipher|hash|encrypted|plain|plaintext|md5|sha\d*|aes\d*|des|3des"
+    r"|hmac-\S+|level|read|write)", re.I)
+_NOT_VALUE = frozenset(("zeroize", "generate", "export", "import", "chain", "pubkey-chain", "rsa", "dsa", "ecdsa"))
+_TOKEN = re.compile(r"\s+(\"[^\"]*\"|'[^']*'|\S+)")
+# 2) 固定写法: 只打括号里最后一组
+_VALUE_RULES = [re.compile(r, re.I) for r in (
+    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]*(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*\s*[=:]\s*"
+    r"(\"[^\"]*\"|'[^']*'|\S+)",                                  # DB_PASSWORD=x / --password=x / pass:x
+    r"://[^/@\s:]+:([^@\s/]+)@",                                   # URL 里的 user:pass@
+    r"(?<!\S)-u\s*[^\s:]+:(\S+)",                                  # curl -u user:pass
+    r"(?<!\S)-U\s*[^\s%]+%(\S+)",                                  # smbclient -U user%pass
+    r"\bwpa_passphrase\s+\S+\s+(\S+)",
+    r"\bversion\s+(?:1|2c)\s+(\S+)",                               # snmp-server host H version 2c <community>
+)]
+_CTX_RULES = [(re.compile(c, re.I), re.compile(r, re.I)) for c, r in (
+    (r"\b(?:mysql\w*|mariadb\w*)\b", r"(?<!\S)-p(\S+)"),          # mysql -pX
+    (r"\bldap\w+", r"(?<!\S)-[wy]\s+(\S+)"),                       # ldapsearch -w X
+)]
+# 3) 这些工具整条命令都可能是口令: 只显示长度, 只能拒
+_OPAQUE = re.compile(r"(?<![A-Za-z0-9_-])(?:chpasswd|passwd|htpasswd|sshpass)(?![A-Za-z0-9_-])|\bnet\s+user\b", re.I)
+_UNSAFE_HIDDEN = re.compile(r"[\s;&|<>`]|\$\(")
+# 设备停在密码提示符时, 这条动作本身就是密码
+_PW_PROMPT = re.compile(r"(?i)(?:password|passwd|pass ?phrase|密码)\s*[:：]?\s*$")
 _BAD_CATS = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
 
 
@@ -124,9 +151,9 @@ _SCHEMA = {
     ("kvm", "key"): {"type": None, "keys": _is_list_of_str},
     ("kvm", "type"): {"type": None, "text": _is_str, "enter": lambda v: isinstance(v, bool),
                       "secret": lambda v: isinstance(v, bool), "prefix": lambda v: _is_str(v, empty=True)},
-    ("pxe", None): {"purpose": _is_str, "macs": _is_list_of_str},
-    ("estop_release", None): {"scope": _is_str},
-    ("label_batch", None): {"count": lambda v: type(v) is int and v >= 2, "kind": _is_str},
+    ("pxe", None): {"purpose": _is_str, "macs": lambda v: _is_list_of_str(v) and len(v) <= PXE_MACS_MAX},
+    ("estop_release", None): {"scope": lambda v: v in ESTOP_SCOPES},
+    ("label_batch", None): {"count": lambda v: type(v) is int and 2 <= v <= LABEL_BATCH_MAX, "kind": _is_str},
 }
 
 
@@ -188,21 +215,71 @@ def requirement(tier, channel, kind):
 
 # ------------------------------------------------------------ 打码 / 清洗
 
-def _split_mask(text):
-    m = _SENSITIVE.search(text)
-    if m and text[m.end():].strip():
-        return text[:m.end()], len(text[m.end():].strip())
-    return text, 0
+def _spans(text):
+    """要打码的 [start, end) 区间, 已合并."""
+    out = []
+    for m in _KEYWORD.finditer(text):
+        pos, skipped = m.end(), 0
+        while True:
+            t = _TOKEN.match(text, pos)
+            if not t:
+                break
+            tok = t.group(1)
+            if skipped < 4 and _MODIFIER.fullmatch(tok):
+                pos, skipped = t.end(), skipped + 1
+                continue
+            if tok.lower() not in _NOT_VALUE and tok[0] not in ";|&":
+                out.append((t.start(1), t.end(1)))
+            break
+    for rx in _VALUE_RULES:
+        out += [(m.start(1), m.end(1)) for m in rx.finditer(text)]
+    for ctx, rx in _CTX_RULES:
+        if ctx.search(text):
+            out += [(m.start(1), m.end(1)) for m in rx.finditer(text)]
+    merged = []
+    for a, b in sorted(out):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a, b))
+    return merged
 
 
 def _mark(n):
     return f"<已打码 {n} 字符>"
 
 
+def _opaque_mark(text):
+    return f"<可能含口令, 只显示长度: {len(text)} 字符>"
+
+
+def _masked_parts(text):
+    """-> [(片段, 是否打码)]."""
+    parts, pos = [], 0
+    for a, b in _spans(text):
+        if a > pos:
+            parts.append((text[pos:a], False))
+        parts.append((text[a:b], True))
+        pos = b
+    if pos < len(text):
+        parts.append((text[pos:], False))
+    return parts
+
+
 def mask_command(text):
-    """敏感词 (password / secret / community / cipher ...) 后面的内容整段换成长度. digest 仍按原文算."""
-    head, hidden = _split_mask(text)
-    return f"{head} {_mark(hidden)}" if hidden else head
+    """只把口令的值换成长度, 命令其余部分原样. chpasswd / passwd / sshpass 这类整条只显示长度. digest 仍按原文算."""
+    if _OPAQUE.search(text):
+        return _opaque_mark(text)
+    return "".join(_mark(len(p)) if hid else p for p, hid in _masked_parts(text))
+
+
+def _unclear(text):
+    """这段原文人在卡片上看不清: 太长被截断、含控制类字符、整条只显示长度、或打掉的部分里有空白或 shell 元字符."""
+    if len(text) > ACTION_MAX or _OPAQUE.search(text):
+        return True
+    if any(ch not in "\n\t" and unicodedata.category(ch) in _BAD_CATS for ch in text):
+        return True
+    return any(hid and _UNSAFE_HIDDEN.search(p) for p, hid in _masked_parts(text))
 
 
 def _escape(text):
@@ -220,23 +297,42 @@ def visible(text):
     return text.replace(" ", "␠").replace("\t", "⇥").replace("\r\n", "\n").replace("\n", "↵ 回车")
 
 
-def _action_shown(text, secret=False):
+def _shown_parts(text):
+    return "".join(_mark(len(p)) if hid else visible(_escape(p)) for p, hid in _masked_parts(text))
+
+
+def _action_shown(text, secret=False, opaque=False):
     if secret:
         return f"<secret {len(text)} 字符>"     # 同 mcp_kvm._shown: secret 只显示长度
-    head, hidden = _split_mask(text)
-    if len(head) > ACTION_MAX:
-        shown = f"{visible(_escape(head[:80]))} …(共 {len(text)} 字符, 去网页看全文)… {visible(_escape(head[-80:]))}"
-    else:
-        shown = visible(_escape(head))
-    return f"{shown} {_mark(hidden)}" if hidden else shown
+    if opaque or _OPAQUE.search(text):
+        return _opaque_mark(text)
+    if len(text) > ACTION_MAX:
+        return f"{_shown_parts(text[:80])} …(共 {len(text)} 字符, 去网页看全文)… {_shown_parts(text[-80:])}"
+    return _shown_parts(text)
+
+
+def at_password_prompt(item):
+    """串口挂起时设备最后一行输出是密码提示符."""
+    if item.get("kind") != "serial":
+        return False
+    lines = [_norm(str(ln)) for ln in item.get("evidence") or () if str(ln).strip()]
+    return bool(lines) and bool(_PW_PROMPT.search(lines[-1]))
 
 
 def truncated(item):
-    """动作原文有没有因为太长被截断显示. 截断了的条目不给批准, 只能拒 (人没看到全文)."""
+    """动作原文人在卡片上看不全或看不清 -> 不给批准, 只能拒. 键鼠 secret 的内容本来就不显示, 但 prefix 照查."""
     act = item.get("action") or {}
-    if item.get("kind") not in ("serial", "kvm") or act.get("secret"):
+    if item.get("kind") not in ("serial", "kvm"):
         return False
-    return any(len(_split_mask(str(act.get(k) or ""))[0]) > ACTION_MAX for k in ("text", "prefix"))
+    if at_password_prompt(item):
+        return True
+    fields = ["prefix"] + ([] if act.get("secret") else ["text"])
+    return any(_unclear(act[k]) for k in fields if isinstance(act.get(k), str) and act.get(k))
+
+
+def _norm(text):
+    """去掉 Cf (零宽、方向控制), 再 NFKC (全角 -> 半角): 打码前先做, 防 pass<零宽>word 这类躲过词表."""
+    return unicodedata.normalize("NFKC", "".join(ch for ch in text if unicodedata.category(ch) != "Cf"))
 
 
 def untrusted(text, limit=UNTRUSTED_MAX):
@@ -253,6 +349,8 @@ def untrusted(text, limit=UNTRUSTED_MAX):
             out.append("⇥")
         elif unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "Cn"):
             continue
+        elif ch in "<>":
+            out.append("＜" if ch == "<" else "＞")     # 防飞书 <at user_id="all"> 和 lark_md 标签
         else:
             out.append(ch)
     s = "".join(out)
@@ -260,8 +358,8 @@ def untrusted(text, limit=UNTRUSTED_MAX):
 
 
 def _untrusted_masked(text, limit=UNTRUSTED_MAX):
-    """设备输出这类: 可能回显密码, 先打码再清洗."""
-    return untrusted(mask_command(text) if isinstance(text, str) else text, limit)
+    """设备输出这类: 可能回显密码. 先归一化 (去零宽 + NFKC), 再打码, 再清洗."""
+    return untrusted(mask_command(_norm(text)) if isinstance(text, str) else text, limit)
 
 
 # ------------------------------------------------------------ 摘要 / 卡片
@@ -274,11 +372,11 @@ def _dur(s):
 def _title_action(item):
     kind, act, tgt = item["kind"], item["action"], untrusted(item["target"], 64)
     danger = [untrusted(w, 32) for w in item.get("danger") or ()]
-    tier = f"[L{item['tier']}]"
+    tier = f"[L{tier_of(item)}]"
     if kind == "serial":
         title = f"{tier} {tgt} 串口" + (f" · 高危词 {', '.join(danger)}" if danger else "")
         label = "按键" if act.get("type") == "key" else "动作"
-        return title, [f"{label}: {_action_shown(str(act.get('text', '')))}"]
+        return title, [f"{label}: {_action_shown(str(act.get('text', '')), opaque=at_password_prompt(item))}"]
     if kind == "kvm":
         title = f"{tier} 键鼠 {tgt}" + (f" · 高危词 {', '.join(danger)}" if danger else "")
         if act.get("type") == "key":
@@ -456,13 +554,43 @@ def prune(state, now):
 _OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,64}")
 
 
-def _identity_ok(channel, req, accounts, acct, ident):
-    """网页: by 是 web:..., 必须带 tailscale 登录名. 飞书: 账号必须绑了 open_id, by 必须正好是 feishu:<那个 open_id>."""
+_ACCOUNT_KEYS = {"feishu", "ts_login", "ts_nodes"}
+
+
+def valid_accounts(accounts):
+    """白名单 {账号: {"feishu": open_id, "ts_login": 登录名, "ts_nodes": [设备名]}}, 三项都可选.
+    open_id 和登录名在账号之间必须唯一 (否则一个人能冒另一个账号的 TOTP 和冷却)."""
+    if not isinstance(accounts, dict):
+        return False
+    seen_oid, seen_login = set(), set()
+    for acct, info in accounts.items():
+        if not tc.valid_account(acct) or not isinstance(info, dict) or not set(info) <= _ACCOUNT_KEYS:
+            return False
+        oid, login, nodes = info.get("feishu"), info.get("ts_login"), info.get("ts_nodes", [])
+        if oid is not None and (not isinstance(oid, str) or not _OPEN_ID_RE.fullmatch(oid) or oid in seen_oid):
+            return False
+        if login is not None:
+            if not isinstance(login, str) or not _TS_LOGIN_RE.fullmatch(login) or login.lower() in seen_login:
+                return False
+            seen_login.add(login.lower())
+        if not isinstance(nodes, list) or not all(isinstance(n, str) and _TS_NODE_RE.fullmatch(n) for n in nodes):
+            return False
+        if oid is not None:
+            seen_oid.add(oid)
+    return True
+
+
+def _identity_ok(channel, req, info, ident):
+    """网页: tailscale 登录名必须等于账号绑定的; 绑了设备列表时设备也要在里面.
+    飞书: 账号必须绑了 open_id, by 必须正好是 feishu:<那个 open_id> (由飞书回调服务按事件里的 open_id 填)."""
     if channel == "web":
-        return req["by"].startswith("web:") and ident["ts_login"] is not None
-    info = accounts.get(acct) if isinstance(accounts, dict) else None
-    bound = info.get("feishu") if isinstance(info, dict) else None
-    return isinstance(bound, str) and bool(_OPEN_ID_RE.fullmatch(bound)) and req["by"] == f"feishu:{bound}"
+        login = info.get("ts_login")
+        if not login or not ident["ts_login"] or ident["ts_login"].lower() != login.lower():
+            return False
+        nodes = info.get("ts_nodes") or []
+        return not nodes or ident["ts_node"] in nodes
+    bound = info.get("feishu")
+    return bool(bound) and req["by"] == f"feishu:{bound}"
 
 
 def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_node=None):
@@ -471,9 +599,10 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
     accounts 是白名单 {账号: {"feishu": open_id}}. 结果见 _EV 的键. 这里只登记 authorized, 真正执行由下一阶段的执行器在原生锁里比对 digest."""
     st = prune(state, now)
     ident = {"ts_login": None, "ts_node": None}
+    by = [None]                                     # 网页的 by 由服务端拼, 不用请求自报的
 
     def done(outcome, result=None, factor="none"):
-        rec = audit(_EV[outcome], item, channel, now, result or outcome, factor=factor, req=req, **ident)
+        rec = audit(_EV[outcome], item, channel, now, result or outcome, by=by[0], factor=factor, req=req, **ident)
         return outcome, st, rec
 
     try:
@@ -482,10 +611,14 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
         return done("forbidden", "identity")
     if channel not in CHANNELS:
         return done("forbidden", "channel")
+    if not valid_accounts(accounts):
+        return done("forbidden", "accounts")
     acct = req["account"]
     if acct not in accounts:
         return done("forbidden", "account")
-    if not _identity_ok(channel, req, accounts, acct, ident):
+    if channel == "web":
+        by[0] = "web:" + (ident["ts_login"] or "?") + (f"/{ident['ts_node']}" if ident["ts_node"] else "")
+    if not _identity_ok(channel, req, accounts[acct], ident):
         return done("forbidden", "identity")
     if req["nonce"] in st["nonces"]:
         return done("replay", "nonce")
@@ -496,17 +629,18 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
         return done("stale")
     if not now <= expires_of(item):                # 期限按 created 现算, NaN 也算过期
         return done("expired")
-    prev = st["decisions"].get(item["id"])
-    if prev:
-        return done("already" if prev["op"] == req["op"] else "conflict")
-
     def record(op):
         st["decisions"][item["id"]] = {"op": op, "account": acct, "channel": channel, "t": now,
                                        "digest": item["digest"]}
 
-    if req["op"] == "reject":                   # 拒绝是"停"的方向, 不要因素
-        record("reject")
-        return done("rejected")
+    prev = st["decisions"].get(item["id"])
+    if prev and prev["op"] == req["op"]:
+        return done("already")
+    if req["op"] == "reject":                   # 拒绝是"停"的方向, 不要因素; 执行前的拒绝覆盖批准
+        record("reject")                        # 执行器 (下一阶段) 在原生锁里查这条, 看到 reject 就不发
+        return done("rejected", "override" if prev else None)
+    if prev:
+        return done("conflict")                 # 先拒后批: 拒绝不能被翻
     tier = tier_of(item)                            # 不信条目里带的 tier, 现算
     if truncated(item):
         return done("forbidden", "truncated")
@@ -599,5 +733,12 @@ class ApprovalStore:
                 self._audit(rec)                    # 先记审计; 记不上就不提交 (没有审计的批准不算数)
             except OSError:
                 return "audit_fail"
-            atomicfile.write_json(self.path, st, mode=0o600)
+            try:
+                atomicfile.write_json(self.path, st, mode=0o600)
+            except OSError:
+                try:
+                    self._audit(audit("commit_fail", item, channel, now, "commit_fail", req=req))
+                except OSError:
+                    pass
+                return "commit_fail"                # 审计里那行 authorized 不算数, 以这行为准
             return out

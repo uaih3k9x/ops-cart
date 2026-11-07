@@ -12,7 +12,8 @@ import totp_core as tc
 FAKE = b"fake-seed-for-tests!"
 NOW = 1_700_000_010.0
 EPOCH = "1a2b3c4d"
-ACCOUNTS = {"alice": {"feishu": "ou_example"}, "bob": {"feishu": "ou_other"}}
+ACCOUNTS = {"alice": {"feishu": "ou_example", "ts_login": "alice@example.com"},
+            "bob": {"feishu": "ou_other", "ts_login": "bob@example.com"}}
 WEB_TS = ("alice@example.com", "laptop-1")
 
 
@@ -161,18 +162,17 @@ def test_digest_is_16_hex():
 
 # ------------------------------------------------------------ 打码和不可信文字
 
-@pytest.mark.parametrize("cmd,keep,hidden", [
-    ("local-user admin password irreversible-cipher Hunter2xx", "local-user admin password", "irreversible-cipher Hunter2xx"),
-    ("snmp-agent community read Pub1ic", "snmp-agent community", "read Pub1ic"),
-    ("username ops secret 0 abc", "username ops secret", "0 abc"),
-    ("set password=abc123", "set password", "=abc123"),
-    ("pre-shared-key cipher K3y", "pre-shared-key", "cipher K3y"),
+@pytest.mark.parametrize("cmd,secret,keep", [
+    ("local-user admin password irreversible-cipher Hunter2xx", "Hunter2xx", "password irreversible-cipher"),
+    ("snmp-agent community read Pub1ic", "Pub1ic", "community read"),
+    ("username ops secret 0 abc", "abc", "secret 0"),
+    ("set password=abc123", "abc123", "set password="),
+    ("pre-shared-key cipher K3y", "K3y", "pre-shared-key cipher"),
 ])
-def test_mask_command_hides_rest_after_sensitive_word(cmd, keep, hidden):
+def test_mask_command_hides_only_the_value(cmd, secret, keep):
     shown = ac.mask_command(cmd)
-    assert shown.startswith(keep)
-    assert hidden.split()[-1] not in shown
-    assert f"<已打码 {len(hidden.strip())} 字符>" in shown
+    assert secret not in shown and keep in shown
+    assert f"<已打码 {len(secret)} 字符>" in shown
 
 
 def test_mask_command_leaves_plain_commands():
@@ -454,7 +454,11 @@ def test_no_seed_refused():
 def test_already_and_conflict():
     out, st, _ = decide(serial(), req())
     assert decide(serial(), req(nonce="ab" * 8), state=st)[0] == "already"
-    assert decide(serial(), req(op="reject", nonce="cd" * 8), state=st)[0] == "conflict"
+    out, st, rec = decide(serial(), req(op="reject", nonce="cd" * 8), state=st)
+    assert out == "rejected" and rec["result"] == "override"          # 执行前的拒绝覆盖批准 (停的方向优先)
+    assert st["decisions"][serial()["id"]]["op"] == "reject"
+    assert decide(serial(), req(nonce="ef" * 8), state=st)[0] == "conflict"
+    assert decide(serial(), req(op="reject", nonce="0f" * 8), state=st)[0] == "already"
 
 
 def test_L3_rate_limit_30s_per_account():
@@ -602,7 +606,7 @@ def test_totp_code_used_on_feishu_cannot_be_reused_on_web():
     ("super password level 15 simple S1mple", "S1mple"),
     ("local-user a class manage password simple H3cPass", "H3cPass"),                 # H3C
     ("set system root-authentication encrypted-password \"$6$abc\"", "$6$abc"),          # Juniper
-    ("set system login user ops authentication plain-text-password-value Jun1per", "Jun1per"),
+    ("set system login user ops authentication encrypted-password Jun1per", "Jun1per"),
     ("set snmp community Pr1vate authorization read-only", "Pr1vate"),
     ("wpa-passphrase hunter2", "hunter2"),
     ("client-secret abc123", "abc123"),
@@ -654,6 +658,11 @@ def test_action_escapes_shown_visibly():
     ("estop_release", {"scope": ""}),
     ("label_batch", {"count": True, "kind": "cable"}),
     ("label_batch", {"count": 1, "kind": "cable"}),                       # 一张不算批量
+    ("label_batch", {"count": 201, "kind": "cable"}),
+    ("label_batch", {"count": 10 ** 9, "kind": "cable"}),
+    ("estop_release", {"scope": "slot:9"}),
+    ("estop_release", {"scope": "everything"}),
+    ("pxe", {"purpose": "rocky", "macs": ["02:00:00:00:00:01"] * 65}),
 ])
 def test_make_item_validates_action_schema(kind, action):
     with pytest.raises(ValueError):
@@ -747,9 +756,10 @@ def test_web_requires_tailscale_login():
     assert out == "forbidden" and rec["result"] == "identity"
 
 
-def test_web_by_must_be_web_form():
-    r = req(totp=tc.totp(FAKE, NOW))                    # by 是 feishu:...
-    assert decide(serial(), r, channel="web")[0] == "forbidden"
+def test_web_ignores_self_reported_by():
+    r = req(by="feishu:ou_example", totp=tc.totp(FAKE, NOW))     # 请求自报的 by 不算数
+    out, _, rec = decide(serial(), r, channel="web")
+    assert out == "authorized" and rec["by"] == "web:alice@example.com/laptop-1"
 
 
 def test_feishu_requires_bound_open_id():
@@ -791,7 +801,7 @@ r = {"op": "approve", "id": it["id"], "digest": it["digest"], "account": "alice"
      "totp": code, "oob": "", "retype": "", "nonce": nonce, "t": now}
 seed = b"fake-seed-for-tests!"
 print(ac.ApprovalStore(p).decide(it, ac.parse_request(json.dumps(r), now), "web", lambda a: seed,
-                                 {"alice": {}}, now, ts_login="alice@example.com"))
+                                 {"alice": {"ts_login": "alice@example.com"}}, now, ts_login="alice@example.com"))
 """
 
 
@@ -807,3 +817,165 @@ def test_concurrent_processes_same_totp_only_one_ok(tmp_path):
                                str(now)], stdout=subprocess.PIPE, text=True) for i in range(6)]
     outs = sorted(pr.communicate(timeout=30)[0].strip() for pr in procs)
     assert outs.count("authorized") == 1 and outs.count("replay") == 5, outs
+
+
+
+# ------------------------------------------------------------ 审查第二轮 (H1, M1-M3, L1-L7)
+
+@pytest.mark.parametrize("cmd,must_show", [
+    ("echo token; iptables -F; ip link set eth0 down", ["iptables␠-F", "eth0␠down"]),
+    ("crypto key zeroize rsa", ["zeroize␠rsa"]),
+    ("no aaa authentication login default", ["authentication␠login␠default"]),
+])
+def test_mask_never_hides_commands_after_keyword(cmd, must_show):
+    it = serial(cmd)
+    text = ac.render(it, NOW)["text"]
+    for w in must_show:
+        assert w in text
+    assert "已打码" not in ac.mask_command(cmd)
+
+
+@pytest.mark.parametrize("cmd", ["username a password abc;reboot", "set password \"a b\"",
+                                 "key x|y", "secret a&b", "password $(reboot)"])
+def test_hidden_part_with_shell_or_space_is_reject_only(cmd):
+    it = serial(cmd)
+    assert ac.truncated(it)
+    assert "approve" not in ac.card(it, "feishu", NOW)["buttons"]
+
+
+@pytest.mark.parametrize("cmd", [
+    "curl -u admin:S3cret http://192.0.2.1/api",
+    "curl http://admin:S3cret@192.0.2.1/",
+    "mysql -uroot -pS3cret",
+    "export DB_PASSWORD=S3cret",
+    "AWS_SECRET_ACCESS_KEY=S3cret aws s3 ls",
+    "wpa_passphrase MySSID S3cret",
+    "openssl enc -pass pass:S3cret",
+    "smbclient //h/s -U admin%S3cret",
+    "ldapsearch -w S3cret",
+    "snmp-server host 192.0.2.1 version 2c S3cret",
+    "ntp authentication-key 1 md5 S3cret",
+    "radius-server host 192.0.2.1 key S3cret",
+    "ppp pap sent-username u password 0 S3cret",
+    "local-user admin password irreversible-cipher S3cret",
+    "set system root-authentication encrypted-password \"S3cret\"",
+    "super password level 15 simple S3cret",
+])
+def test_mask_more_variants_still_approvable(cmd):
+    it = serial(cmd)
+    assert "S3cret" not in ac.render(it, NOW)["text"]
+    assert not ac.truncated(it)
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'root:S3cret' | chpasswd",
+    "echo S3cret | passwd --stdin root",
+    "net user admin S3cret /add",
+    "htpasswd -b /etc/h admin S3cret",
+    "sshpass -p S3cret ssh root@h",
+])
+def test_password_tools_shown_as_length_only_and_reject_only(cmd):
+    it = serial(cmd)
+    text = ac.render(it, NOW)["text"]
+    assert "S3cret" not in text and f"{len(cmd)} 字符" in text
+    assert ac.truncated(it) and "approve" not in ac.card(it, "feishu", NOW)["buttons"]
+
+
+@pytest.mark.parametrize("prompt", ["Password:", "password: ", "Enter passphrase:", "请输入密码：", "Pass phrase"])
+def test_at_password_prompt_action_hidden_and_reject_only(prompt):
+    it = serial("Hunter2xx", evidence=["login: admin", prompt])
+    text = ac.render(it, NOW)["text"]
+    assert "Hunter2xx" not in text and "9 字符" in text
+    assert ac.truncated(it) and "approve" not in ac.card(it, "feishu", NOW)["buttons"]
+    out, _, rec = decide(it, req(digest=it["digest"]))
+    assert out == "forbidden" and rec["result"] == "truncated" and "Hunter2xx" not in rec["summary"]
+
+
+def test_not_at_prompt_is_normal():
+    it = serial("display version", evidence=["Password:", "<sw>"])
+    assert not ac.truncated(it)
+
+
+def test_web_ts_login_must_be_bound_to_account():
+    r = req(by="web:anything", totp=tc.totp(FAKE, NOW))
+    out, _, rec = decide(serial(), r, channel="web", ts=("mallory@example.com", "agent-box"))
+    assert out == "forbidden" and rec["result"] == "identity"
+
+
+def test_web_ts_node_must_be_listed_when_configured():
+    accts = {"alice": {"ts_login": "alice@example.com", "ts_nodes": ["phone-1"]}}
+    r = ac.parse_request(raw(by="web:x", totp=tc.totp(FAKE, NOW)), NOW)
+    out, _, _ = ac.decide(ac.fresh_state(), serial(), r, "web", seeds, accts, NOW,
+                          ts_login="alice@example.com", ts_node="agent-box")
+    assert out == "forbidden"
+    out, _, rec = ac.decide(ac.fresh_state(), serial(), r, "web", seeds, accts, NOW,
+                            ts_login="alice@example.com", ts_node="phone-1")
+    assert out == "authorized"
+    assert rec["by"] == "web:alice@example.com/phone-1"              # by 由服务端拼, 不用请求自报的
+
+
+@pytest.mark.parametrize("accts", [
+    {"alice": {"feishu": "ou_x"}, "bob": {"feishu": "ou_x"}},
+    {"alice": {"ts_login": "a@example.com"}, "bob": {"ts_login": "A@example.com"}},
+    {"alice": {"feishu": "not-open-id"}},
+    {"alice": {"ts_login": "nope"}},
+    {"alice": {"ts_nodes": ["Bad Node"]}},
+    {"alice": {"extra": 1}},
+    {"Bad Name": {}},
+    ["alice"],
+])
+def test_bad_whitelist_refused(accts):
+    assert not ac.valid_accounts(accts)
+    st = ac.fresh_state()
+    out, _, rec = ac.decide(st, serial(), ac.parse_request(raw(account="alice", by="feishu:ou_x"), NOW),
+                            "feishu", seeds, accts, NOW)
+    assert out == "forbidden" and rec["result"] == "accounts"
+
+
+def test_evidence_zero_width_and_fullwidth_normalized_before_mask():
+    it = serial(evidence=["pass​word S3cret", "ｐａｓｓｗｏｒｄ Hunter2"])
+    text = ac.render(it, NOW)["text"]
+    assert "S3cret" not in text and "Hunter2" not in text
+
+
+def test_password_prompt_line_kept_readable():
+    it = serial(evidence=["Password:"])
+    assert "  | Password:" in ac.render(it, NOW)["text"]
+
+
+def test_untrusted_neutralizes_angle_brackets():
+    s = ac.untrusted('<at user_id="all">所有人</at>')
+    assert "<" not in s and ">" not in s
+    it = serial(intent='<at user_id="all">x</at>', evidence=['<at id="all"></at>'], target_label="<Core-SW>")
+    for ln in ac.render(it, NOW)["lines"]:
+        if "不可信" in ln or ln.startswith("  | "):
+            assert "<at" not in ln and "<Core" not in ln
+
+
+def test_store_commit_failure_reported_and_audited(tmp_path, monkeypatch):
+    p = str(tmp_path / "approvals.json")
+    log = tmp_path / "approval.log"
+    store = ac.ApprovalStore(p, audit_path=str(log))
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(ac.atomicfile, "write_json", boom)
+    assert store.decide(serial(), ac.parse_request(raw(), NOW), "feishu", seeds, ACCOUNTS, NOW) == "commit_fail"
+    evs = [json.loads(ln)["ev"] for ln in log.read_text().splitlines()]
+    assert evs == ["authorized", "commit_fail"]
+
+
+def test_kvm_secret_prefix_still_checked():
+    it = kvm(text="x", secret=True, prefix="a" * 300)
+    assert ac.truncated(it)
+    it2 = kvm(text="x", secret=True, prefix="username a password b;c ")
+    assert ac.truncated(it2)
+
+
+@pytest.mark.parametrize("scope", ["all", "kvm", "slot:1", "slot:4"])
+def test_estop_scope_whitelist_ok(scope):
+    assert estop_release(scope)["tier"] == ac.L3
+
+
+def test_label_batch_upper_bound_ok():
+    assert label_batch(200)["tier"] == ac.L2

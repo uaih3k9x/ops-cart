@@ -14,13 +14,21 @@
 
 | 级别 | 什么 | 飞书 | 网页 |
 |---|---|---|---|
-| L2 | 串口不带高危词、`send_key ctrl_c`、键鼠 `alt+f4`、`label_print` 批量 | 直接点批准 | TOTP |
-| L3 | 串口带高危词、键鼠挂起（默认）、远程解除急停 | TOTP；键鼠只能拒绝 | 带外码上线（A3）之前不开 |
+| L2 | 串口不带高危词、`send_key ctrl_c`、键鼠 `alt+f4`、`label_print` 批量（2–200 张） | 直接点批准 | TOTP |
+| L3 | 串口带高危词、键鼠挂起（默认）、远程解除急停（范围只收 `all`、`kvm`、`slot:1`–`slot:4`） | TOTP；键鼠只能拒绝 | 带外码上线（A3）之前不开 |
 | L4 | `pxe_request` 全部用途 | 不开放 | 不开放 |
 
 拒绝不要因素，但审批目录里的拒绝也要带 digest。同一账号 30 秒内只能批一条 L3 及以上。
 
-打码：命令里出现任一敏感词（`password`、`secret`、`key`、`passphrase`、`community`、`cipher`、`simple`、`md5`、`sha`、`auth`、`authentication`、`priv`、`encrypted` 等；`encrypted-password`、`shared-key`、`-secret` 这类复合词也认），从第一个敏感词后面起整段换成 `<已打码 N 字符>`（往多打的方向错）；键鼠 secret 只显示长度；设备输出和提示符上的名字也先打码再清洗。digest 仍按原文算。动作行里的控制字符、方向控制、零宽字符、行/段分隔符一律显示成 `\xNN` / `\u{..}`，不会另起一行。串口命令（最长 256 字符）永远完整显示；键鼠长文本超过 256 字符只显示头尾，这种条目只能拒绝、不能远程批准。
+打码（第二轮审查后改过）：**只打口令的值，不打后面的命令**。
+
+- 关键词写法：`password`、`secret`、`key`、`community`、`cipher`、`md5`、`auth`、`priv` 等，后面最多跳过 4 个修饰词（`0`/`7`/`cipher`/`simple`/`irreversible-cipher`/`md5`/`sha`/`aes`/`level 15` 等），只打紧跟的那一个值。`crypto key zeroize` 这类后面跟的是命令词的，不打。
+- 固定写法：`XX_PASSWORD=`、`--password=`、`pass:`，URL 里的 `user:pass@`，`curl -u u:p`，`smbclient -U u%p`，`mysql -pX`，`ldapsearch -w X`，`wpa_passphrase SSID X`，`snmp-server host H version 2c X`。
+- `chpasswd`、`passwd`、`htpasswd`、`net user`、`sshpass`：整条命令只显示长度，**只能拒**。
+- 设备最后一行输出是密码提示符（`Password:`、`密码：` 等）时，这条动作本身就是密码：只显示长度，**只能拒**。
+- **看不清就只能拒**：动作太长被截断、含控制类字符、整条只显示长度、打掉的值里有空白或 shell 元字符（`; & | < > \` $(`），这几种情况都没有批准按钮，`decide` 也会拒。
+- 设备输出和提示符上的名字先去掉零宽字符并做 NFKC 归一化，再打码、再清洗；`<` `>` 换成全角，防止飞书 `<at>` 标签和 lark_md 生效。
+- digest 仍按原文算。键鼠 secret 只显示长度，它的 prefix 照样检查。
 
 条目：`make_item` 按 kind 校验 action 的字段名和类型，多一个少一个都不收；`created` 必须是有限数。`decide` 不信条目里带的 `tier` 和 `expires`，按 `created` 现算。
 
@@ -28,10 +36,12 @@
 
 审批人身份：
 
-- 网页：`by` 必须是 `web:...`，并且必须带 tailscale 登录名，缺了就拒。
-- 飞书：白名单里这个账号必须绑了 open_id（`{"alice": {"feishu": "ou_..."}}`），`by` 必须正好是 `feishu:<那个 open_id>`。没绑或对不上就拒。
+- 白名单：`{"alice": {"feishu": "ou_…", "ts_login": "alice@example.com", "ts_nodes": ["phone-1"]}}`，三项都可选。open_id 和登录名在账号之间必须唯一，白名单不合格时一律拒。
+- 网页：tailscale 登录名必须等于账号绑定的登录名；`ts_nodes` 不为空时，设备名也要在列表里。`by` 由服务端拼成 `web:<登录名>/<设备>`，请求里自报的不算。
+- 飞书：账号必须绑了 open_id，`by` 必须正好是 `feishu:<那个 open_id>`。
+- 执行前的拒绝覆盖批准，停的方向优先：先批后拒时记 `rejected/override`，执行器（下一阶段）在原生锁里看到这条就不发；先拒后批记 `conflict`，拒绝不能被翻。
 
-决定记录先写审计、后提交：审计写不进去就返回 `audit_fail`，不登记批准。决定记录逐项校验，任何一项读不懂，整份就按读不懂处理。
+决定记录先写审计、后提交：审计写不进去就返回 `audit_fail`，不登记批准；审计写进去了但状态落盘失败，就补记一行 `commit_fail`，并返回失败。决定记录逐项校验，任何一项读不懂，整份就按读不懂处理。
 
 ## 残余风险
 
