@@ -996,7 +996,7 @@ class PinGate:
 
 
 # ---------------------------------------------------------------- 装机模式
-# 默认: tftp/grub.cfg 只有救援项 (inst.rescue, 不带 ks). 推车屏幕上输随机码解锁时,
+# 默认: tftp/grub.cfg 超时后从本地盘启动, 救援 (inst.rescue, 不带 ks) 只能手选 (#70). 推车屏幕上输随机码解锁时,
 # 只给选定 MAC 写 grub.cfg-01-<mac> (GRUB 先找按 MAC 命名的菜单); 30 分钟或该文件被取走即上锁.
 
 TFTP_ROOT = "/opt/pxe/tftp"
@@ -1006,7 +1006,7 @@ ARM_SECONDS = 30 * 60
 
 
 def grub_cfg_rescue(env_path=None):
-    return ("# 推车生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
+    return ("# 推车生成: 默认从本地盘启动, 救援 shell 要手选, 不装系统 (装机要在推车上解锁)\n" +
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 

@@ -18,7 +18,7 @@
 ## 能干什么
 
 - **装机**:自研 PXE 服务端(DHCP + proxyDHCP + TFTP),目标机器网线直插即全自动装 Rocky 9;
-  按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器只能进救援。
+  按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器超时后从本地硬盘启动,救援环境只能手选(带 sshd,见 [PUBLIC_SAFETY](docs/PUBLIC_SAFETY.md))。
   服务端自己也守规矩:租约到期回收、池满不发、不是自己的租约不吭声;装机口上看见别人的 DHCP 就转代理模式(不发地址、只给引导),
   网口上没有自己的地址就不回包;TFTP / HTTP 发装机菜单和 ks 前再核一遍装机模式和 MAC
 - **KVM**:HDMI 采集低延迟预览,CH9329 透传键鼠(绝对鼠标,VMware 式 Ctrl+Alt 释放);
@@ -174,7 +174,7 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 #   sudo systemctl enable --now cart-serial-req.path
 ```
 
-tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py --write-rescue`)。
+tftp 树由 `scripts/setup-cart.sh` 铺,它只写默认菜单(调 `kiosk_core.py --write-rescue`):超时后从本地盘启动,救援项要手选。
 装机菜单只在车机上解锁装机模式时按 MAC 生成,TFTP / HTTP 两头都会核对装机模式;
 所以 Windows 脚本和手工放进 tftp 的自动装机菜单都装不了机,这是故意的。
 

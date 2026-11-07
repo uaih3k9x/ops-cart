@@ -1071,7 +1071,13 @@ def test_pxe_mode_reader():
 def test_grub_menu_rescue_and_install():
     r, i = grub_menu("198.51.100.1"), grub_menu("198.51.100.1", install=True)
     assert "inst.ks" not in r and "inst.rescue" in r and "198.51.100.1" in r
+    assert r.split("menuentry ")[1] == f"'{_px_local_title()}' {{\n    exit\n}}\n\n"   # #70 默认本地盘
     assert "inst.ks=http://198.51.100.1:8000/ks.cfg" in i and "inst.ks.sendmac" in i
+
+
+def _px_local_title():
+    import pxeserver
+    return pxeserver.LOCAL_TITLE
 
 
 def test_parse_args_defaults_point_at_cart_state_files():
@@ -1113,14 +1119,15 @@ def test_grub_menu_rocky_and_rescue_have_no_winpe():
         assert not _winpe_entry(cfg) and _px.WINPE_CHAIN not in cfg
 
 
-def test_grub_menu_winpe_default_winpe_then_rescue_no_ks():
-    """解锁用途 winpe: 第 0 项 (默认) WinPE, 后面救援, 不带任何自动装机项, timeout 15."""
+def test_grub_menu_winpe_default_winpe_then_local_then_rescue_no_ks():
+    """解锁用途 winpe: 第 0 项 (默认) WinPE, 第 1 项本地盘, 后面救援, 不带任何自动装机项, timeout 15."""
     cfg = _px.grub_menu_winpe("192.0.2.1")
     entries = cfg.split("menuentry ")[1:]
     assert "set default=0" in cfg and "set timeout=15" in cfg
     assert entries[0].startswith("'WinPE (GRUB -> iPXE -> wimboot)'")
     assert "chainloader (http,192.0.2.1)/win/ipxe.efi" in entries[0]
-    assert "inst.rescue" in entries[1] and len(entries) == 3            # 救援 HTTP + TFTP
+    assert entries[1].startswith(f"'{_px.LOCAL_TITLE}'") and "exit" in entries[1]
+    assert all("inst.rescue" in e for e in entries[2:]) and len(entries) == 4   # 救援 HTTP + TFTP
     assert "inst.ks" not in cfg and "inst.repo" not in cfg
 
 
@@ -1176,11 +1183,11 @@ CLONE_PARAMS = ["boot=live", "noprompt", 'ocs_live_run="ocs-sr -batch restoredis
                 'ocs_repository="smb://192.0.2.1/clone-ro/"']
 
 
-def test_grub_menu_clone_restore_defaults_to_rescue():
-    """恢复会写盘, 默认落到救援 (第 1 项), 要人在屏幕前手选恢复项; 抓镜像只读, 仍默认克隆."""
+def test_grub_menu_clone_restore_defaults_to_local_disk():
+    """恢复会写盘, 默认落到本地盘 (第 1 项, #70 前是救援), 要人在屏幕前手选恢复项; 抓镜像只读, 仍默认克隆."""
     restore = _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS)
     assert "set default=1" in restore and "set default=0" not in restore
-    assert "inst.rescue" in restore.split("menuentry ")[1:][1]
+    assert restore.split("menuentry ")[1:][1].startswith(f"'{_px.LOCAL_TITLE}'")
     save = _px.grub_menu_clone("192.0.2.1", "clone-save", CLONE_PARAMS)
     assert "set default=0" in save and "set timeout=15" in save
 
@@ -1194,7 +1201,8 @@ def test_grub_menu_clone_entries_clone_then_rescue_no_ks():
     assert 'ocs_live_run=\\"ocs-sr -batch restoredisk lab-img SERIALNO=SN-EXAMPLE-1\\"' in entries[0]
     assert "fetch=http://192.0.2.1/clonezilla/filesystem.squashfs" in entries[0]
     assert "initrd (http,192.0.2.1)/clonezilla/initrd.img" in entries[0]
-    assert "inst.rescue" in entries[1] and len(entries) == 3
+    assert entries[1].startswith(f"'{_px.LOCAL_TITLE}'")
+    assert all("inst.rescue" in e for e in entries[2:]) and len(entries) == 4
     assert "inst.ks" not in cfg and _px.WINPE_CHAIN not in cfg
 
 

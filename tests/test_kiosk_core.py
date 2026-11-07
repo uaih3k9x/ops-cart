@@ -679,6 +679,7 @@ def test_mac_cfg_name_is_grub_per_mac_file():
 def test_rescue_menu_never_installs():
     cfg = kc.grub_cfg_rescue()
     assert "inst.rescue" in cfg and "inst.ks" not in cfg and "set default=0" in cfg
+    assert default_entry(cfg).strip().endswith("{\n    exit\n}")                 # #70 默认本地盘
 
 
 def test_install_menu_has_kickstart():
@@ -1449,7 +1450,7 @@ def test_arm_clone_restore_writes_each_batch_mac_menu(tmp_path, monkeypatch):
     for mac, serial in ((MAC, "SN-EXAMPLE-1"), (CMAC2, "SN-EXAMPLE-2")):
         cfg = _menu(env, mac)
         assert f"restoredisk lab-img SERIALNO={serial}" in cfg.split("menuentry ")[1]
-        assert "inst.rescue" in default_entry(cfg)                       # 恢复要人手选, 倒计时落救援
+        assert default_entry(cfg).strip().endswith("{\n    exit\n}")    # 恢复要人手选, 倒计时落本地盘 (#70)
         assert "inst.ks" not in cfg and "smb://192.0.2.1/clone-ro/" in cfg
         assert "clonesave" not in cfg                                     # 恢复不带可写账号
     rescue = (env["root"] / "grub.cfg").read_text()

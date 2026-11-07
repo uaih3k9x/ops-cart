@@ -1,7 +1,7 @@
 """被跟踪的 GRUB 菜单模板和脚本里的 heredoc: 默认项不许自动装机 (不许带 inst.ks).
 
 自动装机菜单只能由推车解锁时按 MAC 单独生成 (pxeserver.grub_menu(install=True)),
-仓库里任何模板、部署脚本写出来的菜单默认项都必须是救援."""
+仓库里任何模板、部署脚本写出来的菜单默认项都必须是本地盘 (#70 起; 之前是救援)."""
 
 import pathlib
 import re
@@ -65,9 +65,6 @@ def test_template_default_entry_is_not_install(name, cfg):
     assert "inst.ks" not in entry, name
 
 
-def test_generated_rescue_menu_default_is_rescue():
-    entry = default_entry(kc.grub_cfg_rescue())
-    assert "inst.rescue" in entry and "inst.ks" not in entry
 
 
 def test_default_entry_parser_catches_install_default():
@@ -119,3 +116,46 @@ def test_template_has_no_clone_entry(name, cfg):
 def test_generated_rescue_rocky_winpe_menus_have_no_clone():
     for cfg in (kc.grub_cfg_rescue(), kc.grub_cfg_install(), kc.grub_cfg_winpe()):
         assert "clonezilla" not in cfg and "ocs_live_run" not in cfg
+
+
+# ---- #70: 默认菜单超时后从本地盘启动; 救援 (inst.rescue + inst.sshd, root 可能无密码) 只能手动选
+
+def _is_local(entry):
+    return entry is not None and re.search(r"^\s*exit\b", entry, re.M) is not None \
+        and "linux" not in entry and "chainloader" not in entry
+
+
+def test_generated_default_menu_times_out_to_local_disk():
+    import pxeserver
+    for cfg in (kc.grub_cfg_rescue(), pxeserver.grub_menu("192.0.2.1")):
+        entry = default_entry(cfg)
+        assert _is_local(entry), entry
+        assert "inst.rescue" not in entry and "inst.sshd" not in entry
+        assert re.search(r"^set timeout=\d+$", cfg, re.M)            # 有超时, 不会停在菜单
+
+
+def test_generated_default_menu_still_offers_rescue_by_hand():
+    entries = _ENTRY.split(kc.grub_cfg_rescue())[1:]
+    rescue = [e for e in entries if "inst.rescue" in e]
+    assert len(rescue) == 2                                       # HTTP + TFTP 两条都还在
+    assert all("Rescue shell" in e for e in rescue)
+
+
+@pytest.mark.parametrize("name,cfg", grub_texts())
+def test_template_default_entry_is_local_not_rescue(name, cfg):
+    entry = default_entry(cfg)
+    assert "inst.rescue" not in entry and "inst.sshd" not in entry, name
+    assert _is_local(entry), name
+
+
+def test_unlocked_menus_never_default_to_rescue():
+    """解锁菜单: WinPE / 抓镜像默认是解锁用途本身; 恢复要写盘, 默认落到本地盘 (不是救援)."""
+    import pxeserver
+    params = ["boot=live", 'ocs_live_run="ocs-sr -batch restoredisk img"']
+    restore = pxeserver.grub_menu_clone("192.0.2.1", "clone-restore", params)
+    assert _is_local(default_entry(restore))
+    for cfg in (pxeserver.grub_menu_winpe("192.0.2.1"), restore,
+                pxeserver.grub_menu_clone("192.0.2.1", "clone-save", params)):
+        entry = default_entry(cfg)
+        assert "inst.rescue" not in entry and "inst.sshd" not in entry
+        assert any(_is_local(e) for e in _ENTRY.split(cfg)[1:])      # 都能手选回本地盘

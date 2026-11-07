@@ -43,6 +43,12 @@ python3 scripts/check_public_safe.py [仓库目录]
 
 `tests/test_public_safe.py` 测试规则本身，并对整个仓库跑一遍，要求零发现。
 
+## 救援环境 = root
+
+PXE 菜单里的 Rescue shell 带 `inst.sshd`：Anaconda 救援环境是 root，没设 `sshpw` 时 root 可能无需密码，
+同网段能直接 `ssh root@<该机>`。所以默认菜单超时后从本地盘启动，救援只能人在被测机屏幕前手选（#70）；
+解锁菜单（WinPE / 克隆）里救援也从不是默认项。
+
 ## 已知问题
 
 Git 历史里有过真实地址等信息，HEAD 已清理，但历史没有重写：重写会影响已有的 clone 和 fork，
