@@ -87,7 +87,7 @@ _TOKEN = re.compile(r"\s+(\"[^\"]*\"|'[^']*'|\S+)")
 # 2) 固定写法: 只打括号里最后一组
 _VALUE_RULES = [re.compile(r, re.I) for r in (
     r"(?<![A-Za-z0-9])[A-Za-z0-9_-]*(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*[=:]"
-    r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)",     # 值必须紧贴 = (KEY= cmd 是在执行 cmd)                                  # DB_PASSWORD=x / --password=x / pass:x
+    r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)",     # 紧贴: DB_PASSWORD=x / --password=x / pass:x
     r"://[^/@\s:]+:([^@\s/]+)@",                                   # URL 里的 user:pass@
     r"(?<!\S)-u\s*[^\s:]+:(\S+)",                                  # curl -u user:pass
     r"(?<!\S)-U\s*[^\s%]+%(\S+)",                                  # smbclient -U user%pass
@@ -95,6 +95,11 @@ _VALUE_RULES = [re.compile(r, re.I) for r in (
     r"\bversion\s+(?:1|2c)\s+(\S+)",                               # snmp-server host H version 2c <community>
     r"\bAuthorization:\s*(?:Bearer\s+|Basic\s+|Token\s+)?([^\s'\"]+)",  # curl -H 'Authorization: Bearer X'
 )]
+# 带空格的 KEY = x / key: x / key : x: 值后面再跟词就看不清. 不收 "KEY= x" (等号紧贴变量名、后面是空格:
+# shell 里是在 KEY 为空的环境下执行 x, x 是命令不是口令)
+_LOOSE_VALUE = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z0-9_-]*(?:password|passwd|secret|token|key|pwd|pass)[A-Za-z0-9_]*"
+    r"(?:\s+=\s*|\s*:\s+|\s+:)(\"[^\"]*\"|'[^']*'|[^\s;&|'\"]+)", re.I)
 _CTX_RULES = [(re.compile(c, re.I), re.compile(r, re.I)) for c, r in (
     (r"\b(?:mysql\w*|mariadb\w*)\b", r"(?<!\S)-p(\S+)"),          # mysql -pX
     (r"\bldap\w+", r"(?<!\S)-[wy]\s+(\S+)"),                       # ldapsearch -w X
@@ -107,7 +112,7 @@ _CTX_RULES = [(re.compile(c, re.I), re.compile(r, re.I)) for c, r in (
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9_-])(?:chpasswd|passwd|htpasswd|sshpass)(?![A-Za-z0-9_-])|\bnet\s+user\b", re.I)
 _UNSAFE_HIDDEN = re.compile(r"[\s;&|<>`]|\$\(")
 # 设备停在密码提示符时, 这条动作本身就是密码
-_PW_PROMPT = re.compile(r"(?i)(?:password|passwd|pass ?phrase|secret|密码|口令|\bPIN)\b[^\n]{0,80}[:：]\s*$"
+_PW_PROMPT = re.compile(r"(?i)(?:password|passwd|pass ?phrase|secret|密码|口令|\bPIN)\b[^\n?？\]]{0,80}[:：]\s*$"
                         r"|(?:password|passwd|pass ?phrase|密码|口令)\s*$")
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 _BAD_CATS = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
@@ -125,12 +130,12 @@ class StateUnreadable(Exception):
 # 黑名单补不完 (维护者 11-07 拍板: 飞书 L2 仍直点, 接受残余风险), 这里只把已知的变形写法往 L3 推, 往"多拦"错.
 # 首词 (去掉 sudo / env / VAR=x 这类前缀后) 是这些 -> L3
 _L3_LEAD = frozenset(("no", "undo", "do", "clear", "default", "rollback", "commit", "test", "debug", "crypto",
-                      "reset", "delete", "format", "erase", "kill", "pkill", "killall", "sysctl", "mount", "umount",
+                      "reset", "delete", "format", "erase", "kill", "pkill", "killall", "umount",
                       "chmod", "chown", "mv", "truncate", "tee", "exec", "eval", "source"))
 # 任意位置出现 (含带路径时的 basename) -> L3
 _L3_WORDS = frozenset(("blkdiscard", "wipefs", "shred", "telinit", "init", "kexec", "zeroize", "sysrq-trigger",
                        "ifdown", "parted", "sgdisk", "lvremove", "vgremove", "pvremove", "cryptsetup", "mdadm",
-                       "dd", "fdisk", "halt", "poweroff", "reboot", "shutdown", "rm", "rmdir", "find"))
+                       "dd", "fdisk", "halt", "poweroff", "reboot", "shutdown", "rm", "rmdir"))
 _PREFIX_CMDS = frozenset(("sudo", "env", "nohup", "time", "nice", "ionice", "command", "builtin", "xargs",
                           "strace", "ltrace", "timeout", "watch", "doas", "busybox", "chroot", "setsid", "stdbuf"))
 _SEG = re.compile(r"[;&|\n]+")
@@ -138,7 +143,7 @@ _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # 子命令组合: 第一个词 + 后面任一词 -> L3
 _L3_PAIRS = {"systemctl": {"isolate", "poweroff", "reboot", "halt", "kexec", "rescue", "emergency", "stop", "mask",
                            "disable", "kill"},
-             "iptables": {"-f", "--flush", "-x", "-p"}, "ip6tables": {"-f", "--flush", "-x", "-p"},
+             "sysctl": {"-w", "--write", "-p", "--load", "--system"},
              "nft": {"flush", "delete"}, "ip": {"down", "del", "delete", "flush"},
              "nmcli": {"down", "delete", "off"}, "ifconfig": {"down"}, "echo": {"/proc/sysrq-trigger"}}
 
@@ -153,26 +158,35 @@ def serial_danger(text, extra=()):
     low = (text or "").lower()
     if "$'" in low or "`" in low or "$(" in low:
         add("命令替换/转义")
-    if re.search(r">\s*/(?:proc|sys|dev)/", low):
+    if re.search(r">\s*/(?:proc|sys|dev)/(?!(?:null|stdout|stderr|tty|fd/\d+)(?:\s|$))", low):
         add("写 /proc /sys /dev")
-    for seg in _SEG.split(low):
-        toks = [t for t in re.split(r"\s+", seg.strip()) if t]
-        # 去掉前缀命令和它的选项 / 环境变量赋值, 找到真正的命令词
-        i = 0
-        while i < len(toks) and (toks[i] in _PREFIX_CMDS or _ASSIGN.match(toks[i]) or
-                                 (i > 0 and toks[i].startswith("-") and toks[i - 1] in _PREFIX_CMDS)):
-            i += 1
+    for seg_raw in _SEG.split(text or ""):
+        raw = [t for t in re.split(r"\s+", seg_raw.strip()) if t]
+        toks = [t.lower() for t in raw]
         base = [os.path.basename(t.strip("'\"\\")) or t for t in toks]
-        if i < len(toks) and base[i] in _L3_LEAD:
-            add(base[i])
+        # 去掉环境变量赋值和前缀命令; 前缀命令后面的选项和选项参数分不清, 往多拦错:
+        # 前缀之后的前 4 个词都当候选命令词
+        i, prefixed = 0, False
+        while i < len(toks) and (base[i] in _PREFIX_CMDS or _ASSIGN.match(toks[i])):
+            prefixed = prefixed or base[i] in _PREFIX_CMDS
+            i += 1
+        cands = range(i, min(len(toks), i + 4)) if prefixed else range(i, min(len(toks), i + 1))
+        for j in cands:
+            b = base[j]
+            if b in _L3_LEAD and not (b == "do" and j + 1 < len(toks) and toks[j + 1].startswith(("sh", "dis"))):
+                add(b)
+            if b == "mount" and len(toks) > j + 1:
+                add("mount")
+            if b in _L3_PAIRS and _L3_PAIRS[b] & set(toks[j + 1:]):
+                add(b)
+            if b in ("iptables", "ip6tables") and {"-F", "--flush", "-X", "-P", "-D", "-Z"} & set(raw[j + 1:]):
+                add(b)                          # 大小写敏感: -p 是协议, -P 是默认策略
+            if b == "sysctl" and any("=" in t for t in toks[j + 1:]):
+                add("sysctl")
         for t, b in zip(toks, base):
             for cand in {b, t.lstrip("-")}:
-                if cand in _L3_WORDS or cand in swc.DANGER:
+                if cand in _L3_WORDS or cand in swc.DANGER:      # 带路径的按 basename 精确匹配, 不按缩写
                     add(cand)
-            for w in swc.danger_words(b, extra) if "/" in t else ():
-                add(w)
-        if i < len(toks) and base[i] in _L3_PAIRS and _L3_PAIRS[base[i]] & set(toks[i + 1:]):
-            add(base[i])
     return out
 
 
@@ -298,37 +312,40 @@ def _keyword_hits(text):
     值后面还跟着不是尾词、也不是口令关键词的词 -> 这个"值"可能是命令, 标看不清."""
     out = []
     for m in _KEYWORD.finditer(text):
-        pos, last = m.end(), None
+        pos, last, t, gave_up = m.end(), None, None, False
         for _ in range(5):
             t = _TOKEN.match(text, pos)
             if not t:
                 break
             tok = t.group(1)
             if _MODIFIER.fullmatch(tok) and _TOKEN.match(text, t.end()):
-                pos, last = t.end(), t
+                pos, last, t = t.end(), t, None
                 continue
             if tok.lower() in _NOT_VALUE or tok[0] in ";|&":
                 t = None
             break
         else:
-            t = None
+            gave_up = True                      # 修饰词太多: 认不出哪个是值, 看不清
+        if gave_up:
+            out.append((m.start(), m.start(), True))
+            continue
         if t is None and last is not None and not _TOKEN.match(text, last.end()):
-            t = last
+            t = last                            # 跳完修饰词没有值了: password 12 里 12 就是值
         if t is None:
-            if last is not None and not _TOKEN.match(text, pos):
-                t = last
-            else:
-                continue
+            continue
         nxt = _TOKEN.match(text, t.end())
         unclear = bool(nxt) and not (_TAIL_OK.fullmatch(nxt.group(1)) or _is_keyword(nxt.group(1))
                                      or _MODIFIER.fullmatch(nxt.group(1)))
         out.append((t.start(1), t.end(1), unclear))
+    for m in _LOOSE_VALUE.finditer(text):
+        nxt = _TOKEN.match(text, m.end(1))
+        out.append((m.start(1), m.end(1), bool(nxt) and not _TAIL_OK.fullmatch(nxt.group(1).strip("'\""))))
     return out
 
 
 def _spans(text):
     """要打码的 [start, end) 区间, 已合并."""
-    out = [(a, b) for a, b, _ in _keyword_hits(text)]
+    out = [(a, b) for a, b, _ in _keyword_hits(text) if b > a]
     for rx in _VALUE_RULES:
         out += [(m.start(1), m.end(1)) for m in rx.finditer(text)]
     for ctx, rx in _CTX_RULES:
@@ -416,8 +433,8 @@ def at_password_prompt(item):
     if item.get("kind") != "serial":
         return False
     lines = []
-    for ln in item.get("evidence") or ():
-        s = _ANSI.sub("", str(ln))
+    for ln in (part for e in item.get("evidence") or () for part in re.split(r"\r?\n|\r", str(e))):
+        s = _ANSI.sub("", ln)
         s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc",) or ch == "\t")
         if s.strip():
             lines.append(_norm(s).rstrip())
@@ -838,7 +855,11 @@ class ApprovalStore:
                 self._audit(rec)                    # 先记审计; 记不上就不登记这次批准 / 拒绝 (没有审计的批准不算数)
             except OSError:
                 # 但输错计数、冷却、nonce 照样落盘: 否则能让审计写失败 (写满日志盘) 来绕过 TOTP 退避
-                st = dict(st, decisions=prune(state, now)["decisions"])
+                # 拒绝是"停"的方向, 照样落盘; 批准不登记
+                keep = prune(state, now)["decisions"]
+                if out == "rejected":
+                    keep[item["id"]] = st["decisions"][item["id"]]
+                st = dict(st, decisions=keep)
                 try:
                     atomicfile.write_json(self.path, st, mode=0o600)
                 except OSError:

@@ -176,9 +176,8 @@ def test_l2_audit_failure_never_registers_authorized(tmp_path, monkeypatch):
     it = serial("display version")
     monkeypatch.setattr(ac, "append_audit", lambda p, r: (_ for _ in ()).throw(OSError("x")))
     assert store.decide(it, req(it), "feishu", seeds, ACCOUNTS, now=NOW) == "audit_fail"
-    if os.path.exists(tmp_path / "a.json"):
-        import json
-        assert json.load(open(tmp_path / "a.json"))["decisions"] == {}
+    import json
+    assert json.load(open(tmp_path / "a.json"))["decisions"] == {}     # 文件必须写出来 (计数落盘), 但不登记批准
 
 
 def test_l3_longest_open_id_fits_by():
@@ -200,3 +199,66 @@ def test_snmpv3_auth_and_priv_both_masked_and_clear():
     assert not ac.truncated(it)               # 两个口令都打了, 其余看得清: L3 带 TOTP 能批
     c = ac.card(it, "feishu", NOW)
     assert "approve" in c["buttons"] and c["totp"]
+
+
+# ------------------------------------------------------------ 第四轮审查回归
+
+@pytest.mark.parametrize("cmd", ["password: S3cret", "DB_PASSWORD = S3cret", "echo \"api_key: S3cret\" >> app.yml",
+                                 "pass: S3cret", "token : S3cret"])
+def test_r4_m1_spaced_value_still_masked(cmd):
+    it = serial(cmd)
+    assert "S3cret" not in ac.card(it, "feishu", NOW)["text"], cmd
+    assert not feishu_one_click(it)
+
+
+def test_r4_m1_shell_assignment_then_command_not_masked():
+    assert "iptables" in ac.mask_command("KEY= iptables -F")
+
+
+@pytest.mark.parametrize("cmd", ["sudo -u root mount /dev/sda1 /mnt", "sudo -E -H chmod 777 /",
+                                 "nice -n 10 chmod 777 /", "sudo -u root systemctl stop sshd"])
+def test_r4_m2_prefix_options_with_args(cmd):
+    assert serial(cmd)["tier"] == ac.L3, cmd
+
+
+@pytest.mark.parametrize("cmd", ["ls -la 2>/dev/null", "grep foo /var/log/syslog 2>/dev/null", "do show run",
+                                 "mount", "sysctl -a", "find /etc -name '*.conf'", "cat /tmp/sa", "ls /home/de",
+                                 "iptables -L -n -v -x", "iptables -A INPUT -p tcp --dport 22 -j ACCEPT"])
+def test_r4_l1_read_only_not_l3(cmd):
+    assert serial(cmd)["tier"] == ac.L2, cmd
+
+
+@pytest.mark.parametrize("cmd", ["iptables -P INPUT DROP", "iptables -F", "sysctl -w net.ipv4.ip_forward=0",
+                                 "mount /dev/sdb1 /mnt", "find / -delete", "find / -exec rm {} ;"])
+def test_r4_l1_still_l3(cmd):
+    assert serial(cmd)["tier"] == ac.L3, cmd
+
+
+def test_r4_l2_too_many_modifiers_is_unclear():
+    assert ac.truncated(serial("password 7 7 7 7 7 Hunter2"))
+
+
+@pytest.mark.parametrize("last", ["Info: The password needs to be changed. Change now? [Y/N]:",
+                                  "Warning: The password will expire in 3 days. Continue? [Y/N]:",
+                                  "Configure the secret key of TACACS? [Y/N]:"])
+def test_r4_l3_yes_no_question_is_not_password_prompt(last):
+    assert not ac.at_password_prompt(serial("Y", evidence=[last]))
+
+
+def test_r4_l3_evidence_with_embedded_newlines_uses_last_line():
+    assert not ac.at_password_prompt(serial("display version", evidence=["Password:\r\n<HUAWEI>"]))
+
+
+def test_r4_l4_audit_failure_keeps_existing_decisions_and_persists_reject(tmp_path, monkeypatch):
+    import json
+    store = ac.ApprovalStore(str(tmp_path / "a.json"), audit_path=str(tmp_path / "audit.log"))
+    old = serial("display version")
+    assert store.decide(old, req(old, nonce="ab" * 8), "feishu", seeds, ACCOUNTS, now=NOW) == "authorized"
+    monkeypatch.setattr(ac, "append_audit", lambda p, r: (_ for _ in ()).throw(OSError("x")))
+    other = ac.make_item("serial", 18, "1a2b3c4d", target="slot:3", created=NOW - 60,
+                         action={"type": "line", "text": "display clock"})
+    assert store.decide(other, req(other, op="reject", nonce="cd" * 8), "feishu", seeds, ACCOUNTS,
+                        now=NOW + 1) == "audit_fail"
+    st = json.load(open(tmp_path / "a.json"))
+    assert st["decisions"][old["id"]]["op"] == "approve"         # 已有决定不被清掉
+    assert st["decisions"][other["id"]]["op"] == "reject"        # 拒绝是停的方向, 照样落盘
