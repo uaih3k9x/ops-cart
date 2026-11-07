@@ -313,6 +313,18 @@ def test_pxe_toggle_text_matches_toggle_texts():
     assert ui.pxe_toggle_text(False) == "PXE 装机服务:  关"
 
 
+def test_pxe_rows_set_patches_or_appends_and_keeps_others():
+    rows = [{"label": "OCR", "state": "OK"}, {"label": "PXE SERVER", "state": "OK", "detail": "RUNNING"}]
+    out = ui.pxe_rows_set(rows, False)
+    assert out[0] == rows[0] and out[1]["state"] == "--" and rows[1]["state"] == "OK"   # 不改原列表
+    assert ui.pxe_rows_set(None, True) == [{"label": "PXE SERVER", "state": "OK", "detail": "RUNNING"}]
+    assert ui.pxe_rows_set([rows[0]], True)[-1]["state"] == "OK"
+
+
+def test_preview_exit_note_is_neutral():
+    assert ui.preview_exit_note(1) == "UVC 预览已退出 (rc=1)"
+
+
 @pytest.mark.parametrize("pane, rc, gone", [("preview", None, False), ("preview", 1, True),
                                             ("preview", 0, True), ("serial", 1, False), (None, None, False)])
 def test_preview_died(pane, rc, gone):
@@ -335,12 +347,12 @@ def test_kiosk_syncs_toggle_texts_on_pane_change_and_check_result():
         if isinstance(fn, ast.FunctionDef):
             calls.setdefault(fn.name, set()).update(
                 ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call))
-    for name in ("_show_status", "_pane_open", "checks_done", "_build_menu"):
+    for name in ("_show_status", "_pane_open", "_checks_done", "_build_menu"):
         assert "self._sync_toggles" in calls[name], name
     assert "kui.toggle_texts" in calls["_sync_toggles"]
-    assert "kui.pxe_toggle_text" in calls["done"]               # 启停成功先写开/关, 再等自检校正
+    assert "self._pxe_toggle_done" in calls["asked"]           # 启停回来走具名方法 (test_kiosk_toggles 测它)
     assert "self._close_pane" in calls["_start_preview"]        # mpv 起不来就关面板
-    assert "kui.preview_died" in calls["refresh"] and "self._close_pane" in calls["refresh"]
+    assert "self._reap_preview" in calls["refresh"] and "self._checks_done" in calls["checks_done"]
 
 
 # ------------------------------------------------------------ B6 键鼠

@@ -385,7 +385,19 @@ def toggle_texts(pane, rows):
 
 def pxe_toggle_text(on):
     """PXE 启停成功后先按结果写按钮, 自检回来再校正."""
-    return toggle_texts(None, [{"label": "PXE SERVER", "state": "OK" if on else "--"}])["btn_pxe"]
+    return toggle_texts(None, pxe_rows_set([], on))["btn_pxe"]
+
+
+def pxe_rows_set(rows, on):
+    """启停成功后把自检结果里 PXE SERVER 那行改成 OK / "--" (没有就补一行), 别的行原样. 返回新列表."""
+    row = {"label": "PXE SERVER", "state": "OK" if on else "--", "detail": "RUNNING" if on else "OFF"}
+    out = [dict(r, state=row["state"], detail=row["detail"]) if r.get("label") == "PXE SERVER" else r
+           for r in rows or []]
+    return out if any(r.get("label") == "PXE SERVER" for r in out) else out + [row]
+
+
+def preview_exit_note(returncode):
+    return "UVC 预览已退出 (rc=%s)" % returncode
 
 
 def preview_died(pane, returncode):

@@ -71,6 +71,7 @@ class Kiosk(tk.Tk):
         self.passthrough = False
         self._ssd, self._ssd_ts = None, 0.0
         self._check_rows, self._check_ts, self._checking = None, 0.0, False
+        self._pxe_toggled_at = 0.0          # 最近一次车机上启停 PXE 成功的时间; 之前开跑的自检结果作废
         self._fans_seen = set()
         self._combo = kc.ReleaseCombo()
         self._kb = kc.HidKeyboard()
@@ -252,12 +253,10 @@ class Kiosk(tk.Tk):
             rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
             return kc.net_probe(), rows + [kui.font_row(self.ui_family)]
 
+        started = time.time()
+
         def checks_done(res):
-            self._checking = False
-            if not isinstance(res, Exception):
-                self._render_net(*res[0])
-                self._check_rows = res[1]
-                self._sync_toggles()
+            self._checks_done(started, res)
 
         rows = self._check_rows
 
@@ -279,11 +278,25 @@ class Kiosk(tk.Tk):
             self._checking, self._check_ts = True, time.time()
             self.ui.run_bg(checks, checks_done)
         self.ui.run_bg(board, self._render, key="board")
-        if kui.preview_died(self.pane.current, self.mpv.poll() if self.mpv else None):
-            self._close_pane()                  # mpv 自己退了 (采集卡拔了等): 关面板, 按钮回 "关"
-            self.banner.config(text="UVC 预览已退出 (采集设备断开?)")
+        self._reap_preview()
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
+
+    def _checks_done(self, started, res):
+        """自检结果回来. 在最近一次 PXE 启停之前开跑的那轮作废 (读到的是启停前的状态), 等下一轮."""
+        self._checking = False
+        if isinstance(res, Exception) or started < self._pxe_toggled_at:
+            return
+        self._render_net(*res[0])
+        self._check_rows = res[1]
+        self._sync_toggles()
+
+    def _reap_preview(self):
+        """mpv 自己退了 (起不来 / 采集卡拔了 / 设备还被占着): 关预览面板, 按钮回 "关"."""
+        rc = self.mpv.poll() if self.mpv else None
+        if kui.preview_died(self.pane.current, rc):
+            self._close_pane()
+            self.banner.config(text=kui.preview_exit_note(rc))
 
     # ------------------------------------------------------------ 执行器条 (issue #2)
 
@@ -1073,15 +1086,21 @@ class Kiosk(tk.Tk):
             if not messagebox.askyesno("确认", f"确定要{verb} PXE 装机服务?"):
                 return
             cmd = ["systemctl", "stop" if active else "start", *units]
-
-            def done(r):
-                self._check_ts = 0.0        # 下一轮 refresh 就重跑自检, 按钮上的开/关跟着校正
-                if not isinstance(r, Exception) and r[0] == 0:
-                    self.btn_pxe.config(text=kui.pxe_toggle_text(not active))
-                self.banner.config(text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
-                                   else f"PXE 装机服务{verb}失败, 详见 journalctl")
-            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30), done, f"正在{verb} PXE 装机服务…")
+            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30),
+                            lambda r: self._pxe_toggle_done(r, active), f"正在{verb} PXE 装机服务…")
         self._bg_action("toggle_pxe", lambda: kc.services_status(("pxe-server",)), asked, "读取服务状态…")
+
+    def _pxe_toggle_done(self, res, active):
+        """启停回来: 成功就先把自检结果里 PXE 那行改掉再刷按钮, 并作废之前开跑的自检; 都让下一轮立刻重跑校正."""
+        verb = "停止" if active else "启动"
+        self._check_ts = 0.0
+        if isinstance(res, Exception) or res[0] != 0:
+            self.banner.config(text=f"PXE 装机服务{verb}失败, 详见 journalctl")
+            return
+        self._pxe_toggled_at = time.time()
+        self._check_rows = kui.pxe_rows_set(self._check_rows, not active)
+        self._sync_toggles()
+        self.banner.config(text=f"PXE 装机服务已{verb}")
 
     def confirm_power(self, off):
         verb = "关机" if off else "重启"
