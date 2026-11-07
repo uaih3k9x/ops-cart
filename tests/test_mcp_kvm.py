@@ -993,7 +993,7 @@ def test_stale_rollback_across_leases_does_not_clear_new_lease(tmp_path):
     _known(s)
     sid = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
     s.release(a)
-    t[0] += mk.SEND_GRACE_S + 10                 # 兜底时长过了, B 才申请得到
+    t[0] += mk.SEND_GRACE_MAX + 10                 # 兜底时长过了, B 才申请得到
     b = s.acquire("B", 60, {"/p": ["b", 0]})["lease"]
     s.finish("A", "type", "ls", False, "no sock", started=False, send=sid)
     r = s.gate(b, "type", text="", enter=True, port="/p", human=["b", 0])
@@ -1018,7 +1018,7 @@ def test_stale_rollback_across_sends_does_not_clobber(tmp_path):
     a = s.acquire("A", 300, {"/p": ["b", 0]})["lease"]
     _known(s)
     old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
-    t[0] += mk.SEND_GRACE_S + 10
+    t[0] += mk.send_grace("ls", False) + 10
     new = s.gate(a, "type", text="dis", port="/p", human=["b", 0])
     assert new != old
     s.finish("A", "type", "ls", False, "no sock", started=False, send=old)
@@ -1033,7 +1033,7 @@ def test_stale_finish_does_not_clear_new_sending_flag(tmp_path):
     a = s.acquire("A", 300, {"/p": ["b", 0]})["lease"]
     _known(s)
     old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
-    t[0] += mk.SEND_GRACE_S + 10
+    t[0] += mk.send_grace("ls", False) + 10
     assert isinstance(s.gate(a, "type", text="pwd", port="/p", human=["b", 0]), str)
     s.finish("A", "type", "ls", True, send=old)
     assert s.view()["sending"]
@@ -1103,3 +1103,96 @@ def test_switching_keyboard_makes_line_unknown(rig):
     assert rig.call("kvm_type", text="dis", lease=tok, serial="S1")[1]["sent"]
     r = rig.call("kvm_type", text="ls", lease=tok, serial="S2")[1]
     assert r["status"] == "pending" and "看不全" in r["reason"]
+
+
+# ---- #64 第五轮
+
+def test_stale_half_sent_then_new_rollback(tmp_path):
+    """老的一条发了一半才回报, 新的一条一个没发: 不能用新的 before 把行洗干净."""
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 300, {"/p": ["b", 0]})["lease"]
+    _known(s)
+    old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
+    t[0] += mk.send_grace("ls", False) + 10
+    new = s.gate(a, "type", text="x", port="/p", human=["b", 0])
+    s.finish("A", "type", "ls", False, "timeout", started=True, send=old)
+    s.finish("A", "type", "x", False, "no sock", started=False, send=new)
+    r = s.gate(a, "type", text="", enter=True, port="/p", human=["b", 0])
+    assert isinstance(r, dict) and r["status"] == "pending"
+
+
+@pytest.mark.parametrize("text,enter,n", [("", False, 1), ("ls", False, 1), ("ls", True, 2), ("x" * 1000, True, 2)],
+                         ids=["空", "打字", "打字+回车", "满长+回车"])
+def test_send_grace_covers_broker_client_timeout(text, enter, n):
+    """兜底不能短于代理正常最长耗时 (人在操作时 agent 请求排队), 每个请求一份客户端超时."""
+    import kvm_broker
+    assert mk.send_grace(text, enter) >= n * kvm_broker.CLIENT_TIMEOUT_S + len(text) * 0.2
+    assert mk.send_grace(text, enter) <= mk.SEND_GRACE_MAX
+
+
+def test_gate_sending_lasts_past_broker_queue(tmp_path):
+    import kvm_broker
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 300, {"/p": ["b", 0]})["lease"]
+    _known(s)
+    s.gate(a, "type", text="ls", port="/p", human=["b", 0])
+    t[0] += kvm_broker.CLIENT_TIMEOUT_S - 1
+    assert s.view()["sending"]
+
+
+@pytest.mark.parametrize("val", [1e300, float("inf"), "nan"])
+def test_absurd_sending_until_is_clamped(tmp_path, val):
+    """极大值 / Infinity / 墙钟回拨: 截到 now + 最大兜底, 不会永远拒绝."""
+    t = [1000.0]
+    s = _store(tmp_path, t)
+    doc = {"sending_until": val}
+    raw = json.dumps(doc).replace('"nan"', "NaN")
+    open(s.path, "w").write(raw)
+    s.view()
+    t[0] += mk.SEND_GRACE_MAX + 1
+    s.acquire("A", 60, {})
+
+
+def test_estop_clears_sending(rig):
+    """人在车上按全部急停: "在发"标志清掉, 解除后能重新申请."""
+    tok = rig.lease()
+    sid = rig.store.gate(tok, "type", text="ls", port=PORT, human=[rig.boot, rig.human_n])
+    assert isinstance(sid, str)
+    rig.stopped = True
+    rig.store.view()
+    rig.stopped = False
+    assert not rig.store.view()["sending"]
+    rig.lease()
+
+
+def test_pending_remembers_port_and_confirm_fails_if_gone(rig):
+    """挂起时的口存进条目; 确认时那块键鼠不在了就算失败, 不重新挑口."""
+    rig.ports = {"S1": "/p1"}
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text="diskpart", lease=tok)
+    rig.ports = {"S2": "/p2"}
+    with pytest.raises(ValueError):
+        _confirm(rig, r)
+    assert not [o for o in rig.opened if o[0] == "/p2"]
+
+
+def test_confirm_uses_remembered_port(rig):
+    rig.ports = {"S1": "/p1"}
+    tok = rig.lease()
+    err, r = rig.call("kvm_type", text="diskpart", lease=tok)
+    rig.ports = {"S2": "/p2", "S1": "/p1"}
+    _confirm(rig, r)
+    assert rig.opened[-1][0] == "/p1"
+
+
+def test_store_switching_port_is_unknown(tmp_path):
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 60, {"/p1": ["b", 0], "/p2": ["b", 0]})["lease"]
+    _known(s)
+    sid = s.gate(a, "type", text="ls", port="/p1", human=["b", 0])
+    s.finish("A", "type", "ls", True, send=sid)
+    r = s.gate(a, "type", text="x", port="/p2", human=["b", 0])
+    assert isinstance(r, dict) and "看不全" in r["reason"]

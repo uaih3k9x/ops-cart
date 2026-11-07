@@ -17,6 +17,7 @@ import contextlib
 import fcntl
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -42,7 +43,6 @@ TTL_S, TTL_MIN_S, TTL_MAX_S = 60, 10, 300
 LAN1 = "eno1"                   # 魔术包只从装机口发: LAN2 / 无线上都是别人的机器
 TEXT_MAX = 1000
 HISTORY_MAX = 10
-SEND_GRACE_S = 30
 SUMMARY_EVS = {"confirm", "reject", "revoked"}
 OCR_MIN_LINE = 40.0             # 低于这个置信度的行当噪声扔掉
 OCR_MIN_MEAN = 60.0             # 平均低于这个: 明说读不出, 叫 Agent 看图
@@ -314,7 +314,7 @@ class LeaseStore:
             if why:
                 item = {"id": st["next"], "kind": kind, "keys": list(keys), "text": text, "enter": bool(enter),
                         "who": who, "t": now, "reason": why, "danger": hits, "line": full[-TEXT_MAX:],
-                        "serial": serial, "after": after, "after_blind": after_blind}
+                        "serial": serial, "port": port, "after": after, "after_blind": after_blind}
                 st["next"] += 1
                 st["pending"].append(item)
                 evs.append({"ev": "pending", "src": "agent", "who": who, "id": item["id"], "text": shown,
@@ -322,7 +322,8 @@ class LeaseStore:
                 return {"status": "pending", "id": item["id"], "reason": why, "danger": hits,
                         "hint": "已挂起, 一个键都没发. 要人在推车上确认才发; 用 kvm_status 看结果. 等的时候继续 "
                                 "kvm_lease_renew, 租约过期这条就作废."}
-            sid = _start_send(st, now, text, lease["token"], line, st["blind"])
+            sid = _start_send(st, now, send_grace(text if kind == "type" else "", enter, kind), lease["token"],
+                              line, st["blind"])
             st["line"], st["blind"] = after, after_blind
             return sid
 
@@ -335,8 +336,8 @@ class LeaseStore:
             if mine:
                 st["sending_until"], st["sending_id"] = 0, None
             token = st["lease"]["token"] if st["lease"] else None
-            if not mine:
-                _forget_line(st, keep_before=True)
+            if not mine:                # 过时的回报: 连 before 一起丢, 当前这条失败也只能按看不清
+                _forget_line(st)
             elif not ok and not started and before and token and before["send"] == send and before["token"] == token:
                 st["line"], st["blind"] = before["line"], before["blind"]
             elif not ok:
@@ -355,7 +356,10 @@ class LeaseStore:
                 raise ValueError(f"#{iid} 不在等确认 (租约过期或急停时作废)")
             st["pending"].remove(item)
             token = st["lease"]["token"] if st["lease"] else None
-            sid = _start_send(st, _now, item.get("text") or "", token, st["line"], st["blind"])
+            sid = _start_send(st, _now, send_grace(item.get("text") or "", bool(item.get("enter")), item.get("kind")),
+                              token, st["line"], st["blind"])
+            if isinstance(item.get("port"), str):
+                st["line_port"] = item["port"]
             if isinstance(item.get("after"), str) and item.get("after_blind") in ("", PARTIAL, UNKNOWN):
                 st["line"], st["blind"] = item["after"], item["after_blind"]
             else:                       # 旧版本挂起的条目: 没有 after, 推不出这一行, 按看不见算
@@ -378,19 +382,28 @@ class LeaseStore:
             return public_view(st, now, self.stopped())
 
 
-def _start_send(st, now, text, token, line, blind):
-    """标"在发" -> 发送编号. "在发"由 finish 清; sending_until 只是进程死了没 finish 时的兜底, 往宽了给 (每字符 0.2 秒).
+def send_grace(text, enter, kind="type"):
+    """"在发"的兜底时长: 不能短于代理正常最长耗时. 每个代理请求 (打字一次、回车一次) 一份客户端超时
+    (含人在操作时 agent 排队的时间), 再加每字符 0.2 秒."""
+    n = 1 if kind == "key" else max(1, bool(text) + bool(enter))
+    return n * kvm_broker.CLIENT_TIMEOUT_S + len(text) * 0.2
+
+
+SEND_GRACE_MAX = send_grace("x" * TEXT_MAX, True)
+
+
+def _start_send(st, now, grace, token, line, blind):
+    """标"在发" -> 发送编号. "在发"由 finish 清; sending_until 只是进程死了没 finish 时的兜底 (send_grace).
     before 记发之前的行, 连同租约令牌和编号, finish 两样都对得上才回滚."""
     sid = secrets.token_hex(8)
-    st["sending_until"], st["sending_id"] = now + SEND_GRACE_S + len(text) * 0.2, sid
+    st["sending_until"], st["sending_id"] = now + grace, sid
     st["before"] = {"token": token, "send": sid, "line": line, "blind": blind}
     return sid
 
 
-def _forget_line(st, keep_before=False):
+def _forget_line(st):
     st["line"], st["blind"] = "", UNKNOWN
-    if not keep_before:
-        st.pop("before", None)
+    st.pop("before", None)
 
 
 def _item_text(item):
@@ -426,7 +439,8 @@ def read_state(path):
             "sending_id": doc["sending_id"] if isinstance(doc.get("sending_id"), str) else None,
             "line_port": doc["line_port"] if isinstance(doc.get("line_port"), str) else None,
             **({"before": _before(doc.get("before"))} if _before(doc.get("before")) else {}),
-            "sending_until": doc["sending_until"] if isinstance(doc.get("sending_until"), (int, float)) else 0,
+            "sending_until": doc["sending_until"] if isinstance(doc.get("sending_until"), (int, float)) and
+            not isinstance(doc.get("sending_until"), bool) and math.isfinite(doc["sending_until"]) else 0,
             "history": doc["history"] if isinstance(doc.get("history"), list) else []}
 
 
@@ -445,6 +459,11 @@ def settle(st, now, stopped):
     """算掉过期和急停: 租约没了, 挂着的一起作废. 带 _evs 给调用方写日志."""
     evs = []
     lease = st["lease"]
+    if st["sending_until"] > now + SEND_GRACE_MAX:     # 极大值 / 墙钟回拨: 不能让 gate 和 acquire 一直拒绝
+        st["sending_until"] = now + SEND_GRACE_MAX
+    if stopped and st["sending_until"]:         # 人在车上按了全部急停: 代理那边排着的都丢了, "在发"清掉
+        st["sending_until"], st["sending_id"] = 0, None
+        _forget_line(st)
     if lease and stopped:
         evs.append({"ev": "revoked", "src": "system", "who": lease.get("who"), "why": "全部急停"})
         _drop_all(st, evs, "全部急停")
@@ -490,7 +509,10 @@ def human_action(store, op, arg, by, opener=None, ports=None):
         raise ValueError(f"不认识的动作 {op}")
     item = store.take(arg, by)
     online = (ports or kvm_core.ports)()
-    port = online.get(item.get("serial")) if item.get("serial") else next(iter(online.values()), None)
+    if isinstance(item.get("port"), str):        # 挂起时的那块键鼠; 不在了就算失败, 不重新挑口
+        port = item["port"] if item["port"] in online.values() else None
+    else:                                       # 旧版本挂起的条目
+        port = online.get(item.get("serial")) if item.get("serial") else next(iter(online.values()), None)
     shown = _item_text(item)
     if not port:
         store.finish(item["who"], item["kind"], shown, False, "键鼠不在线", started=False, send=item["send"])
