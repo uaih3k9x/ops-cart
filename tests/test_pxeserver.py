@@ -1071,7 +1071,13 @@ def test_pxe_mode_reader():
 def test_grub_menu_rescue_and_install():
     r, i = grub_menu("198.51.100.1"), grub_menu("198.51.100.1", install=True)
     assert "inst.ks" not in r and "inst.rescue" in r and "198.51.100.1" in r
+    assert r.split("menuentry ")[1] == f"'{_px_local_title()}' {{\n    exit\n}}\n\n"   # #70 默认本地盘
     assert "inst.ks=http://198.51.100.1:8000/ks.cfg" in i and "inst.ks.sendmac" in i
+
+
+def _px_local_title():
+    import pxeserver
+    return pxeserver.LOCAL_TITLE
 
 
 def test_parse_args_defaults_point_at_cart_state_files():
@@ -1113,14 +1119,15 @@ def test_grub_menu_rocky_and_rescue_have_no_winpe():
         assert not _winpe_entry(cfg) and _px.WINPE_CHAIN not in cfg
 
 
-def test_grub_menu_winpe_default_winpe_then_rescue_no_ks():
-    """解锁用途 winpe: 第 0 项 (默认) WinPE, 后面救援, 不带任何自动装机项, timeout 15."""
+def test_grub_menu_winpe_default_winpe_then_local_then_rescue_no_ks():
+    """解锁用途 winpe: 第 0 项 (默认) WinPE, 第 1 项本地盘, 后面救援, 不带任何自动装机项, timeout 15."""
     cfg = _px.grub_menu_winpe("192.0.2.1")
     entries = cfg.split("menuentry ")[1:]
     assert "set default=0" in cfg and "set timeout=15" in cfg
     assert entries[0].startswith("'WinPE (GRUB -> iPXE -> wimboot)'")
     assert "chainloader (http,192.0.2.1)/win/ipxe.efi" in entries[0]
-    assert "inst.rescue" in entries[1] and len(entries) == 3            # 救援 HTTP + TFTP
+    assert entries[1].startswith(f"'{_px.LOCAL_TITLE}'") and "exit" in entries[1]
+    assert all("inst.rescue" in e for e in entries[2:]) and len(entries) == 4   # 救援 HTTP + TFTP
     assert "inst.ks" not in cfg and "inst.repo" not in cfg
 
 
@@ -1176,11 +1183,11 @@ CLONE_PARAMS = ["boot=live", "noprompt", 'ocs_live_run="ocs-sr -batch restoredis
                 'ocs_repository="smb://192.0.2.1/clone-ro/"']
 
 
-def test_grub_menu_clone_restore_defaults_to_rescue():
-    """恢复会写盘, 默认落到救援 (第 1 项), 要人在屏幕前手选恢复项; 抓镜像只读, 仍默认克隆."""
+def test_grub_menu_clone_restore_defaults_to_local_disk():
+    """恢复会写盘, 默认落到本地盘 (第 1 项, #70 前是救援), 要人在屏幕前手选恢复项; 抓镜像只读, 仍默认克隆."""
     restore = _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS)
     assert "set default=1" in restore and "set default=0" not in restore
-    assert "inst.rescue" in restore.split("menuentry ")[1:][1]
+    assert restore.split("menuentry ")[1:][1].startswith(f"'{_px.LOCAL_TITLE}'")
     save = _px.grub_menu_clone("192.0.2.1", "clone-save", CLONE_PARAMS)
     assert "set default=0" in save and "set timeout=15" in save
 
@@ -1194,7 +1201,8 @@ def test_grub_menu_clone_entries_clone_then_rescue_no_ks():
     assert 'ocs_live_run=\\"ocs-sr -batch restoredisk lab-img SERIALNO=SN-EXAMPLE-1\\"' in entries[0]
     assert "fetch=http://192.0.2.1/clonezilla/filesystem.squashfs" in entries[0]
     assert "initrd (http,192.0.2.1)/clonezilla/initrd.img" in entries[0]
-    assert "inst.rescue" in entries[1] and len(entries) == 3
+    assert entries[1].startswith(f"'{_px.LOCAL_TITLE}'")
+    assert all("inst.rescue" in e for e in entries[2:]) and len(entries) == 4
     assert "inst.ks" not in cfg and _px.WINPE_CHAIN not in cfg
 
 
@@ -1582,3 +1590,79 @@ def test_client_log_write_failure_does_not_break_dhcp(tmp_path):
     d = dhcp_for_test()
     d.on_client = pxeserver_module.ClientLog(str(tmp_path / "no" / "such" / "dir" / "x.json"), clock=lambda: 1.0)
     assert d.handle(make_discover(), ("0.0.0.0", 68)) is not None
+
+
+# ---- #70 审查: #70 之前的老菜单 (默认/fallback 是救援 = root + sshd) 不能照发
+
+from test_grub_templates import _is_local, default_entry  # noqa: E402
+
+LEGACY_RESCUE = ("set default=0\nset timeout=10\n\n"
+                 "menuentry 'Rescue shell (HTTP fast)' {\n"
+                 "    linux (http,192.0.2.1)/vmlinuz ip=dhcp inst.stage2=http://192.0.2.1:8000/rocky "
+                 "inst.rescue inst.sshd inst.text\n    initrd (http,192.0.2.1)/initrd.img\n}\n")
+FALLBACK_RESCUE = ("set default=0\nset fallback=1\nset timeout=10\n\n" + _px.LOCAL_ENTRY + "\n" +
+                   LEGACY_RESCUE.split("\n\n", 1)[1])
+
+
+def test_rescue_default_menu_detects_default_and_fallback():
+    assert _px.rescue_default_menu(LEGACY_RESCUE)
+    assert _px.rescue_default_menu(FALLBACK_RESCUE)
+    assert _px.rescue_default_menu(LEGACY_RESCUE.replace("set default=0", "set default=saved"))
+    assert _px.rescue_default_menu(LEGACY_RESCUE.replace("inst.rescue ", ""))        # 只带 sshd 也算
+    for cfg in (grub_menu("192.0.2.1"), grub_menu("192.0.2.1", install=True), _px.grub_menu_winpe("192.0.2.1"),
+                _px.grub_menu_clone("192.0.2.1", "clone-restore", CLONE_PARAMS),
+                _px.grub_menu_clone("192.0.2.1", "clone-save", CLONE_PARAMS)):
+        assert not _px.rescue_default_menu(cfg)
+
+
+@pytest.mark.parametrize("name", ["grub.cfg-C0000201", "EFI/BOOT/grub.cfg", "grub.cfg-01-02-00-00-00-00-09"])
+@pytest.mark.parametrize("legacy", [LEGACY_RESCUE, FALLBACK_RESCUE])
+def test_tftp_legacy_rescue_default_menu_replaced_with_local(tmp_path, name, legacy):
+    root, mode = _tree(tmp_path)
+    (root / name).write_text(legacy)
+    got = _fetch(root, mode, name)
+    assert got == grub_menu("192.0.2.1") and _is_local(default_entry(got))
+
+
+def test_tftp_expired_mac_menu_falls_back_to_local_default(tmp_path):
+    root, mode = _tree(tmp_path, armed_until=50)
+    srv = TftpServer("192.0.2.1", str(root), FakeLog(), pxe_mode_path=str(mode), now=lambda: 51,
+                     event=lambda m: None)
+    f, size, tag = srv.open_file(ARMED_CFG, ("192.0.2.9", 1))
+    got = f.read().decode()
+    assert _is_local(default_entry(got)) and "inst.ks" not in got and "未解锁" in tag
+
+
+# ---- #70 第二轮审查: rescue_default_menu 从严 (白名单: 只有能确认默认项不是救援的才放过)
+
+_R = "menuentry 'Rescue' {\n linux /vmlinuz inst.stage2=x inst.rescue inst.sshd\n}\n"
+_L = "menuentry 'Local' {\n exit\n}\n"
+
+
+@pytest.mark.parametrize("cfg", [
+    "default=1\ntimeout=10\n" + _L + _R,                                        # 不带 set
+    "set default=7\nset timeout=10\n" + _R + _L,                                # 越界, GRUB 回落第 0 项
+    "set default=0\nset timeout=10\nset a=\"inst.rescue inst.sshd\"\nmenuentry 'R' {\n linux /vmlinuz $a\n}\n",
+    "set default=0\nset timeout=10\nif false; then\n" + _L + "fi\n" + _R,       # if 让下标错位
+    "set default=1\nset timeout=3\n" + _L + "submenu 'S' {\n set default=1\n" + _L + _R + "}\n",
+    ("set default=0\nset timeout=10\n" + _R).replace("\n", "\r\n"),             # CRLF
+    "set default=\"1\"\nset default=0\n" + _R + _L,                             # 设了两次
+    "set timeout=10\n" + _L.replace("exit", "linux /vmlinuz $x") + _R,         # 默认项引用变量
+])
+def test_rescue_default_menu_strict_cases(cfg):
+    assert _px.rescue_default_menu(cfg)
+
+
+def test_rescue_default_menu_plain_menus_without_rescue_pass():
+    assert not _px.rescue_default_menu("set default=0\nmenuentry 'x' {\n linux /vmlinuz inst.text\n}\n")
+    assert not _px.rescue_default_menu("set default=1\n" + _R + _L)            # 默认指向本地盘
+
+
+def test_tftp_armed_unlock_menu_with_rescue_default_is_replaced(tmp_path):
+    """已放行的解锁菜单也要查: 带 WinPE 项但默认是救援 -> 换默认菜单."""
+    root, mode = _tree(tmp_path, armed_until=1000)
+    winpe = _px.grub_menu_winpe("192.0.2.1").replace("set default=0", "set default=2")
+    (root / ARMED_CFG).write_text(winpe)
+    assert _fetch(root, mode, "/" + ARMED_CFG) == grub_menu("192.0.2.1")
+    (root / ARMED_CFG).write_text(_px.grub_menu_winpe("192.0.2.1"))
+    assert _fetch(root, mode, "/" + ARMED_CFG) == _px.grub_menu_winpe("192.0.2.1")

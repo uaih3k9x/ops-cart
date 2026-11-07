@@ -996,7 +996,7 @@ class PinGate:
 
 
 # ---------------------------------------------------------------- 装机模式
-# 默认: tftp/grub.cfg 只有救援项 (inst.rescue, 不带 ks). 推车屏幕上输随机码解锁时,
+# 默认: tftp/grub.cfg 超时后从本地盘启动, 救援 (inst.rescue, 不带 ks) 只能手选 (#70). 推车屏幕上输随机码解锁时,
 # 只给选定 MAC 写 grub.cfg-01-<mac> (GRUB 先找按 MAC 命名的菜单); 30 分钟或该文件被取走即上锁.
 
 TFTP_ROOT = "/opt/pxe/tftp"
@@ -1006,7 +1006,7 @@ ARM_SECONDS = 30 * 60
 
 
 def grub_cfg_rescue(env_path=None):
-    return ("# 推车生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
+    return ("# 推车生成: 默认从本地盘启动, 救援 shell 要手选, 不装系统 (装机要在推车上解锁)\n" +
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
@@ -1137,9 +1137,10 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, p
 
 
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
-    """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
+    """删掉所有按 MAC 的装机菜单, 主菜单写回默认 (超时本地盘). 开机时也调一次, 保证默认安全.
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
-    只要带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu) 也一并删掉. clonezilla/ 和 win/ 一样不删. grub.cfg.bak-* 这类
+    只要带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu), 或默认/fallback 项是救援
+    (pxeserver.rescue_default_menu, #70 之前的老菜单) 也一并删掉; EFI/BOOT/grub.cfg 一律删 (同 setup-cart.sh). clonezilla/ 和 win/ 一样不删. grub.cfg.bak-* 这类
     手工备份 GRUB 不会去取, 不动. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
     再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
@@ -1150,11 +1151,14 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
             fetched = name == "grub.cfg" or name.startswith("grub.cfg-")
             if not fetched or full == os.path.join(root, "grub.cfg"):
                 continue
-            if not (name.startswith("grub.cfg-01-") and d == root):
+            always = (name.startswith("grub.cfg-01-") and d == root) or \
+                full == os.path.join(root, "EFI", "BOOT", "grub.cfg")
+            if not always:
                 try:
                     with open(full, errors="replace") as f:
-                        if not pxeserver.unlock_only_menu(f.read()):
-                            continue
+                        text = f.read()
+                    if not (pxeserver.unlock_only_menu(text) or pxeserver.rescue_default_menu(text)):
+                        continue
                 except OSError:
                     continue
             os.remove(full)
@@ -1164,12 +1168,12 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
         os.remove(path)
     except FileNotFoundError:
         pass
-    _pxe_event("装机模式上锁, 只剩救援菜单" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else ""))
+    _pxe_event("装机模式上锁, 只剩默认菜单 (超时本地盘)" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else ""))
 
 
 def pxe_retire(macs, root=TFTP_ROOT):
     """一批里已经取走菜单的那几台: 先删它们的 MAC 菜单 (别的还在等, 不整体上锁).
-    做完关机后再 PXE 就只拿得到救援菜单, 不会再写一遍盘."""
+    做完关机后再 PXE 就只拿得到默认菜单 (超时本地盘), 不会再写一遍盘."""
     gone = []
     for mac in macs:
         try:
@@ -1380,10 +1384,10 @@ def video_size(dev):
 # ---------------------------------------------------------------- 命令行 (部署脚本用)
 
 def main(argv=None):
-    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留救援菜单 (setup-cart.sh 调).
+    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留默认菜单 (超时本地盘, 救援要手选; setup-cart.sh 调). 命令名沿用, 不改.
     菜单只从这里 (pxeserver.grub_menu) 生成, 部署脚本不再自己写 grub.cfg."""
     ap = argparse.ArgumentParser(prog="kiosk_core.py")
-    ap.add_argument("--write-rescue", action="store_true", help="写救援菜单并删掉所有自动装机菜单")
+    ap.add_argument("--write-rescue", action="store_true", help="写默认菜单 (超时本地盘, 救援要手选) 并删掉所有自动装机菜单和老的救援默认菜单")
     ap.add_argument("--root", default=TFTP_ROOT)
     ap.add_argument("--state", default=PXE_MODE)
     a = ap.parse_args(sys.argv[1:] if argv is None else argv)
@@ -1391,7 +1395,7 @@ def main(argv=None):
         ap.print_usage(sys.stderr)
         return 2
     pxe_disarm(root=a.root, path=a.state)
-    print(f"救援菜单已写入 {os.path.join(a.root, 'grub.cfg')}")
+    print(f"默认菜单 (超时本地盘) 已写入 {os.path.join(a.root, 'grub.cfg')}")
     return 0
 
 

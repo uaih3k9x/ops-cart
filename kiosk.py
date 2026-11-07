@@ -109,7 +109,7 @@ class Kiosk(tk.Tk):
         self._code = None
         self._boot_once = kui.Once(self._boot_finish)
         self._exit_once = kui.Once(self._disarm_quietly)
-        self._disarm_quietly()          # 开机即复位: PXE 默认只给救援菜单
+        self._disarm_quietly()          # 开机即复位: PXE 只给默认菜单 (超时本地盘)
         self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
         self.after(50, self._boot_selftest)
         self._last_input = time.time()

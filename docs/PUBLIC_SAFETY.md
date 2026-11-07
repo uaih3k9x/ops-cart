@@ -43,6 +43,21 @@ python3 scripts/check_public_safe.py [仓库目录]
 
 `tests/test_public_safe.py` 测试规则本身，并对整个仓库跑一遍，要求零发现。
 
+## 救援环境 = root
+
+PXE 菜单里的 Rescue shell 带 `inst.sshd`：Anaconda 救援环境是 root，没设 `sshpw` 时 root 可能无需密码，
+同网段能直接 `ssh root@<该机>`。所以默认菜单超时后从本地盘启动，救援不是默认 / 超时项，只能手动选择（#70）；
+解锁菜单（WinPE / 克隆）里救援也从不是默认项。这只防"没人碰就进了 root"，不是访问控制：
+所有菜单都没设 GRUB `superusers` / `password_pbkdf2`，倒计时内有键盘的人（在被测机前，或经推车键鼠直通）
+能按 `e` 编辑菜单，或按 `c` 进 GRUB 命令行手敲 `linux` / `initrd` / `boot` 进 root 救援，任何菜单项都挡不住；
+`vmlinuz`、`initrd.img`、stage2 不管解没解锁都照发。维护者决定不设 GRUB 密码，依靠人在场盯着，以及键鼠通道
+本身的访问控制（人经网页口直通靠登录 / PIN，agent 发键走键鼠闸门和远程审批），接受此残余风险。
+#70 之前留下的老菜单（默认项可能是救援的 `grub.cfg-*`、`EFI/BOOT/grub.cfg`）上锁扫树时会删掉，
+TFTP 发菜单时换成默认菜单，HTTP 直接 403。
+
+本地盘启动用 GRUB 的 `exit` 退回固件按启动顺序走：空盘 / 坏盘的机器 `exit` 后固件可能又回到 PXE，
+菜单会循环出现，这不是推车的问题；个别 UEFI 固件 `exit` 后会停在启动管理器或 setup 界面，要人选一下。只支持 UEFI（GRUB）；BIOS / pxelinux 菜单不支持，也不要手放进 tftp 树。
+
 ## 已知问题
 
 Git 历史里有过真实地址等信息，HEAD 已清理，但历史没有重写：重写会影响已有的 clone 和 fork，

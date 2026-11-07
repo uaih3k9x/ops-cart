@@ -64,7 +64,7 @@ class Cart:
         self.mode_path = str(tmp_path / "pxe-mode.json")
         self.clock = Clock()
         monkeypatch.setattr(kc, "_pxe_event", lambda msg: None)
-        kc.pxe_disarm(root=self.root, path=self.mode_path)        # 开机复位: 只有救援菜单
+        kc.pxe_disarm(root=self.root, path=self.mode_path)        # 开机复位: 只有默认菜单 (超时本地盘)
 
         # pxe_arm 换成记账的包装, 照样真写 tmp 里的菜单
         self.arms, real_arm = [], kc.pxe_arm
