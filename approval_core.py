@@ -152,6 +152,14 @@ _ARG_OPTS = {
     "chroot": {"--userspec", "--groups"}, "watch": {"-n", "-d", "--interval"},
 }
 _POSITIONAL = {"timeout": 1, "chroot": 1}
+
+
+def _takes_arg(cmd, opt):
+    """这个选项后面跟不跟一个参数. 合并短选项 (sudo -iu root) 看最后一个字母; --x=y 自带参数."""
+    table = _ARG_OPTS.get(cmd, ())
+    if opt in table:
+        return True
+    return bool(re.fullmatch(r"-[A-Za-z]{2,}", opt)) and f"-{opt[-1]}" in table
 _SEG = re.compile(r"[;&|\n]+")
 _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # 子命令组合: 第一个词 + 后面任一词 -> L3
@@ -179,32 +187,32 @@ def serial_danger(text, extra=()):
         toks = [t.lower() for t in raw]
         base = [os.path.basename(t.strip("'\"\\")) or t for t in toks]
         # 去掉环境变量赋值和前缀命令 (按各自的选项表剥选项参数), 剩下第一个词是真正的命令词
-        i, cur, first_prefix = 0, None, None    # cur: 正在剥的前缀命令
+        i, cur, starts = 0, None, []            # cur: 正在剥的前缀命令; starts: 每层前缀的位置
         while i < len(toks):                    # 前缀命令、它的选项和选项参数、位置参数、环境变量赋值, 可叠好几层
             if base[i] in _PREFIX_CMDS:
-                cur, first_prefix = base[i], i if first_prefix is None else first_prefix
+                cur = base[i]
+                starts.append(i)
                 i += 1
                 n = _POSITIONAL.get(cur, 0)
                 while n and i < len(toks):
                     if toks[i].startswith("-"):
-                        i += 2 if raw[i] in _ARG_OPTS.get(cur, ()) else 1
+                        i += 2 if _takes_arg(cur, raw[i]) else 1
                     else:
                         i, n = i + 1, n - 1
             elif _ASSIGN.match(toks[i]):
                 i += 1
             elif toks[i].startswith("-") and cur:
-                i += 2 if raw[i] in _ARG_OPTS.get(cur, ()) else 1
+                i += 2 if _takes_arg(cur, raw[i]) else 1
             else:
                 break
         # 子命令组合类判断 (systemctl stop / iptables -F / sysctl -w / mount 设备) 另外在前缀之后 4 个词的窗口里查,
         # 剥离判错时也不漏 (这几类要命令词和子命令同时出现, 误报少)
-        window = range(first_prefix + 1, min(len(toks), first_prefix + 5)) if first_prefix is not None else ()
-        for j in sorted(set(range(i, min(len(toks), i + 1))) | set(window)):
+        window = {j for p0 in starts for j in range(p0 + 1, min(len(toks), p0 + 5))}   # 每层前缀后 4 个词
+        for j in sorted(set(range(i, min(len(toks), i + 1))) | window):
             precise = j == i
             b = base[j]
             if precise and b in _L3_LEAD and not (b == "do" and j + 1 < len(toks) and toks[j + 1].startswith(("sh", "dis"))):
                 add(b)
-            b = base[j]
             if precise and b == "mount":        # 只有 -l / -t ext4 这类只列出; 带设备或挂载点才改东西
                 rest, k = toks[j + 1:], 0
                 while k < len(rest):

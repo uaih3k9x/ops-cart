@@ -315,3 +315,17 @@ def test_r6_prefix_flags_without_args_still_l3(cmd):
                                  "sudo iptables -nL", "sudo journalctl -u sshd", "timeout 5 ping -c 1 192.0.2.1"])
 def test_r6_read_only_with_prefix_flags_l2(cmd):
     assert serial(cmd)["tier"] == ac.L2, cmd
+
+
+# ------------------------------------------------------------ 第七轮审查回归
+
+@pytest.mark.parametrize("cmd", ["sudo -iu root kill 1", "sudo -nu root kill 1", "sudo -Eu root chmod 777 /",
+                                 "sudo -iu root umount /mnt", "doas -nu root kill 1", "env -iu FOO kill 1",
+                                 "sudo -u root nice -n 1 sudo -nu root systemctl stop sshd"])
+def test_r7_combined_short_options(cmd):
+    assert serial(cmd)["tier"] == ac.L3, cmd
+
+
+@pytest.mark.parametrize("cmd", ["sudo -iu root ls", "sudo -nu root cat /etc/hosts"])
+def test_r7_combined_short_options_read_only(cmd):
+    assert serial(cmd)["tier"] == ac.L2, cmd
