@@ -654,6 +654,7 @@ def test_new_lease_line_is_unknown(rig, how):
             rig.stopped = True
             rig.call("kvm_status")
             rig.stopped = False
+            rig.t[0] += mk.ESTOP_SETTLE_S
     tok = rig.lease(known=False)
     err, r = rig.call("kvm_key", keys="enter", lease=tok)
     assert not err and r["status"] == "pending" and rig.sent[-1:] != [("keys", ("enter",))]
@@ -1011,6 +1012,15 @@ def test_acquire_refused_while_sending(tmp_path):
         s.acquire("B", 60, {})
 
 
+def _after_expiry_send(s, a, text):
+    """兜底过期后这一行看不清 (第六轮): 先挂起; 人拒掉、假装确认过回车, 再放一条新的."""
+    r = s.gate(a, "type", text=text, port="/p", human=["b", 0])
+    assert isinstance(r, dict) and r["status"] == "pending"
+    s.reject(r["id"], "human:kiosk")
+    _known(s)
+    return s.gate(a, "type", text=text, port="/p", human=["b", 0])
+
+
 def test_stale_rollback_across_sends_does_not_clobber(tmp_path):
     """发送卡过兜底时长, 同一租约放了新的一条; 老的那条 finish 回滚不能盖掉新的状态."""
     t = [0.0]
@@ -1019,8 +1029,8 @@ def test_stale_rollback_across_sends_does_not_clobber(tmp_path):
     _known(s)
     old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
     t[0] += mk.send_grace("ls", False) + 10
-    new = s.gate(a, "type", text="dis", port="/p", human=["b", 0])
-    assert new != old
+    new = _after_expiry_send(s, a, "dis")
+    assert isinstance(new, str) and new != old
     s.finish("A", "type", "ls", False, "no sock", started=False, send=old)
     s.finish("A", "type", "dis", True, send=new)
     r = s.gate(a, "type", text="", enter=True, port="/p", human=["b", 0])     # 不一致按看不清
@@ -1034,7 +1044,7 @@ def test_stale_finish_does_not_clear_new_sending_flag(tmp_path):
     _known(s)
     old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
     t[0] += mk.send_grace("ls", False) + 10
-    assert isinstance(s.gate(a, "type", text="pwd", port="/p", human=["b", 0]), str)
+    assert isinstance(_after_expiry_send(s, a, "pwd"), str)
     s.finish("A", "type", "ls", True, send=old)
     assert s.view()["sending"]
 
@@ -1115,7 +1125,7 @@ def test_stale_half_sent_then_new_rollback(tmp_path):
     _known(s)
     old = s.gate(a, "type", text="ls", port="/p", human=["b", 0])
     t[0] += mk.send_grace("ls", False) + 10
-    new = s.gate(a, "type", text="x", port="/p", human=["b", 0])
+    new = _after_expiry_send(s, a, "x")
     s.finish("A", "type", "ls", False, "timeout", started=True, send=old)
     s.finish("A", "type", "x", False, "no sock", started=False, send=new)
     r = s.gate(a, "type", text="", enter=True, port="/p", human=["b", 0])
@@ -1151,6 +1161,8 @@ def test_absurd_sending_until_is_clamped(tmp_path, val):
     raw = json.dumps(doc).replace('"nan"', "NaN")
     open(s.path, "w").write(raw)
     s.view()
+    with pytest.raises(mc.ToolError):                # 截到 now + 最大兜底: 先拒
+        s.acquire("A", 60, {})
     t[0] += mk.SEND_GRACE_MAX + 1
     s.acquire("A", 60, {})
 
@@ -1164,6 +1176,7 @@ def test_estop_clears_sending(rig):
     rig.store.view()
     rig.stopped = False
     assert not rig.store.view()["sending"]
+    rig.t[0] += mk.ESTOP_SETTLE_S
     rig.lease()
 
 
@@ -1196,3 +1209,35 @@ def test_store_switching_port_is_unknown(tmp_path):
     s.finish("A", "type", "ls", True, send=sid)
     r = s.gate(a, "type", text="x", port="/p2", human=["b", 0])
     assert isinstance(r, dict) and "看不全" in r["reason"]
+
+
+
+# ---- #64 第六轮
+
+@pytest.mark.parametrize("how", ["gate", "take"])
+def test_expired_send_without_report_makes_line_unknown(tmp_path, how):
+    """进程在打字和回车之间死了, 没回报: 兜底过期后这一行看不清, 下一个回车要人确认."""
+    t = [0.0]
+    s = _store(tmp_path, t)
+    a = s.acquire("A", 300, {"/p": ["b", 0]})["lease"]
+    _known(s)
+    if how == "gate":
+        assert isinstance(s.gate(a, "type", text="ls", enter=True, port="/p", human=["b", 0]), str)
+    else:
+        r = s.gate(a, "type", text="diskpart", enter=True, port="/p", human=["b", 0])
+        s.take(r["id"], "human:kiosk")
+    t[0] += mk.send_grace("ls", True) + 1 if how == "gate" else mk.send_grace("diskpart", True) + 1
+    r = s.gate(a, "type", text="", enter=True, port="/p", human=["b", 0])
+    assert isinstance(r, dict) and r["status"] == "pending"
+
+
+def test_no_lease_right_after_estop_release(rig):
+    """急停清了"在发", 代理那边排着的请求要人停手 QUIET_S 才会丢完: 解除后这段时间不给租约."""
+    import kvm_broker_core as kbc
+    rig.stopped = True
+    rig.store.view()
+    rig.stopped = False
+    err, msg = rig.call("kvm_lease_acquire", ttl_s=60)
+    assert err and "急停" in msg
+    rig.t[0] += kbc.QUIET_S + 1.5
+    rig.lease()

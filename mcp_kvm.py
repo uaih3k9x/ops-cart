@@ -30,6 +30,7 @@ import ch9329
 import cartlog
 import cart_snap
 import kvm_broker
+import kvm_broker_core as kbc
 import kiosk_core as kc
 import kvm_core
 import mcp_core as mc
@@ -43,6 +44,7 @@ TTL_S, TTL_MIN_S, TTL_MAX_S = 60, 10, 300
 LAN1 = "eno1"                   # 魔术包只从装机口发: LAN2 / 无线上都是别人的机器
 TEXT_MAX = 1000
 HISTORY_MAX = 10
+ESTOP_SETTLE_S = kbc.QUIET_S + 1     # 急停解除后多久才给租约: 代理排着的请求要人停手 QUIET_S 才丢完
 SUMMARY_EVS = {"confirm", "reject", "revoked"}
 OCR_MIN_LINE = 40.0             # 低于这个置信度的行当噪声扔掉
 OCR_MIN_MEAN = 60.0             # 平均低于这个: 明说读不出, 叫 Agent 看图
@@ -246,6 +248,8 @@ class LeaseStore:
                 raise mc.ToolError(f"键鼠写租约在 {st['lease']['who']} 手里, 还剩 {int(st['lease']['until'] - now)} 秒")
             if st["sending_until"] > now:
                 raise mc.ToolError("上一个租约的键还在发, 等几秒再申请")
+            if st["estop_seen"] is not None and now - st["estop_seen"] < ESTOP_SETTLE_S:   # 代理排着的还没丢完
+                raise mc.ToolError(f"全部急停刚解除, {ESTOP_SETTLE_S:g} 秒后再申请")
             st["lease"] = {"token": secrets.token_urlsafe(16), "who": who, "until": now + ttl, "ttl": ttl}
             _forget_line(st)            # 租约之间人可能留了半截命令: 第一个回车要人确认
             st["sending_id"], st["line_port"] = None, None
@@ -439,9 +443,16 @@ def read_state(path):
             "sending_id": doc["sending_id"] if isinstance(doc.get("sending_id"), str) else None,
             "line_port": doc["line_port"] if isinstance(doc.get("line_port"), str) else None,
             **({"before": _before(doc.get("before"))} if _before(doc.get("before")) else {}),
-            "sending_until": doc["sending_until"] if isinstance(doc.get("sending_until"), (int, float)) and
-            not isinstance(doc.get("sending_until"), bool) and math.isfinite(doc["sending_until"]) else 0,
+            "sending_until": _until(doc.get("sending_until")),
+            "estop_seen": _until(doc.get("estop_seen")) if "estop_seen" in doc else None,
             "history": doc["history"] if isinstance(doc.get("history"), list) else []}
+
+
+def _until(v):
+    """时刻字段: 不是数 -> 0; NaN / Infinity -> 无穷大, 由 settle 跟极大值一样截到 now + 最大兜底."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return 0
+    return v if math.isfinite(v) else math.inf
 
 
 def _blind(v):
@@ -459,11 +470,18 @@ def settle(st, now, stopped):
     """算掉过期和急停: 租约没了, 挂着的一起作废. 带 _evs 给调用方写日志."""
     evs = []
     lease = st["lease"]
-    if st["sending_until"] > now + SEND_GRACE_MAX:     # 极大值 / 墙钟回拨: 不能让 gate 和 acquire 一直拒绝
+    if st["sending_until"] > now + SEND_GRACE_MAX:     # 极大值 / Infinity / 墙钟回拨: 不能让 gate 和 acquire 一直拒绝
         st["sending_until"] = now + SEND_GRACE_MAX
+    if st["sending_id"] and st["sending_until"] <= now:    # 兜底过期也没回报 (进程死在打字和回车之间): 推不出屏幕
+        st["sending_until"], st["sending_id"] = 0, None
+        _forget_line(st)
     if stopped and st["sending_until"]:         # 人在车上按了全部急停: 代理那边排着的都丢了, "在发"清掉
         st["sending_until"], st["sending_id"] = 0, None
         _forget_line(st)
+    if stopped:
+        st["estop_seen"] = now
+    elif st["estop_seen"] is not None and st["estop_seen"] > now:     # 墙钟回拨
+        st["estop_seen"] = now
     if lease and stopped:
         evs.append({"ev": "revoked", "src": "system", "who": lease.get("who"), "why": "全部急停"})
         _drop_all(st, evs, "全部急停")
