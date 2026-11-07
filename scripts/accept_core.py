@@ -255,7 +255,7 @@ REQUIRED_PY = (
     "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core", "lamps_core",
     "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
     "netmode_panel", "netprof_core", "notify_core", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
-    "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_core", "serial_gate_model",
+    "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_allowlist", "serial_core", "serial_gate_model",
     "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme", "tspl_preview",
     "udisp", "udisp_usb", "ups_core", "web_core", "webkiosk", "wifi_core",
     "wifi_panel", "wifi_prefer", "wol_core", "wol_panel",
@@ -544,6 +544,7 @@ MCP_TOOLS = {
     "#24": ("pxe_request", "pxe_requests", "pxe_retire"),
     "#41": ("kvm_status", "kvm_lease_acquire", "kvm_lease_renew", "kvm_lease_release", "kvm_key", "kvm_type",
             "screen_ocr", "wol_send", "pxe_clients"),
+    "#75": ("gate_allowlist",),
 }
 
 

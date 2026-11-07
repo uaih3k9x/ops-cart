@@ -2,7 +2,8 @@
 """mcp_serial: 串口写路径的 MCP 工具 + 车机确认 / 急停命令行 (#21). 规则全在 serial_write_core, 这里只管 IO.
 
 工具 (cart_mcp 注册): lease_acquire / lease_renew / lease_release / send_command (行级命令) /
-  send_key (回车 / 翻页空格 / Ctrl+C) / pending_list (只读) / estop (Agent 也能自停; 解除不给 Agent).
+  send_key (回车 / 翻页空格 / Ctrl+C) / pending_list (只读) / gate_allowlist (只读, #75 第 1 层白名单) /
+  estop (Agent 也能自停; 解除不给 Agent).
 发送一律走 conbroker send (以 serial.conf 的 user 身份; 人 3 秒内敲过键它自己排队), 不直开串口.
 
 状态: /run/ops-cart/serial-write.json (root 0600; 租约、挂起、在途、急停), 每次操作 flock 一把锁
@@ -44,6 +45,7 @@ import confirm_core as cc
 import kvm_broker
 import lamps_core
 import mcp_core as mc
+import serial_allowlist as sa
 import serial_core
 import serial_gate_model as gm
 import serial_write_core as sw
@@ -332,7 +334,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         r = rules()
         vendor, at = sw.slot_vendor(n, r, text)
         judge = gm.make_judge(r, lambda: tail(s["dev"], CONTEXT_LINES), intent, llm=llm)
-        gate = sw.classify(cmd, vendor, at, r, judge=judge)
+        gate = sw.classify(cmd, vendor, at, r, judge=judge, mode=_mode(vendor, at, text))
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
@@ -348,6 +350,30 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
             name = None
         k = sw.KEYS[key]
         return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"])
+
+    def _mode(vendor, at, text):
+        return sa.prompt_mode(vendor, sw.last_line(text)) if at else "config"
+
+    def gate_allowlist(a):
+        """只读: 这个槽位按登记 / 认出的厂商和当前提示符 mode, 第 1 层白名单里可用的条目. 不发任何字节."""
+        n = a["slot"]
+        s = _slot(n)
+        try:
+            text = tail(s["dev"], TAIL_LINES)
+        except mc.ToolError:
+            text = ""
+        r = rules()
+        vendor, at = sw.slot_vendor(n, r, text)
+        mode = _mode(vendor, at, text)
+        dis = r.get("allowlist_disable", [])
+        return [mc.json_content({
+            "slot": n, "vendor": vendor, "mode": mode, "phase": "shadow",
+            "entries": sa.catalog(vendor, mode, dis),
+            "types": sa.type_help(vendor) if vendor in sa.ALLOW else {},
+            "disabled": list(dis), "unknown_disable": list(r.get("allowlist_unknown", [])),
+            "note": "影子期: 第 1 层放行仍按旧规则 (display / show 全称小写), 这份清单是将来的放行口径, 先照抄写法. "
+                    "{类型} 是参数槽; src=待核 的条目还没在现场核过. 不在清单里的命令将来要模型或人确认. "
+                    + ("" if vendor in sa.ALLOW else "认不出厂商或该厂商不开第 1 层白名单 (如 linux), 清单为空.")})]
 
     def pending_list(a):
         return [mc.json_content(_run(lambda b, now: b.view(now, a.get("slot"))))]
@@ -373,7 +399,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              "过闸门: 认得出厂商、设备停在提示符上的只读命令 (华为 display… / 思科 show…, 全称小写) 直接发, "
              "返回设备输出; 其余的若推车开了决策模型, 由模型按命令、设备最近输出和你给的 intent 判, 判放行直接发, "
              "否则挂起 (status=pending) 等人在推车上确认; 带 save/reboot/reset/format/delete 等高危词的永远要人确认. "
-             "人 3 秒内敲过键会排队. 要先 lease_acquire.",
+             "人 3 秒内敲过键会排队. 要先 lease_acquire. 先用 gate_allowlist 查第 1 层白名单, 照抄写法.",
              {"slot": SLOT, "command": {"type": "string", "maxLength": sw.LINE_MAX, "required": True,
                                         "description": "一行命令, 不含换行"},
               "lease": LEASE,
@@ -391,6 +417,9 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
              "(人确认后发出的命令输出摘要在 history 里, 完整输出用 read_output). 只读.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "只看这个槽位, 不给 = 全部"}},
              pending_list, read_only=True),
+        Tool("gate_allowlist", "查某个槽位第 1 层命令白名单 (按厂商和设备当前提示符): 可直发的命令写法和参数类型. "
+             "只读, 不往设备发任何东西.",
+             {"slot": SLOT}, gate_allowlist, read_only=True),
         Tool("estop", "急停: 撤销写租约、丢弃挂起的命令, 之后谁都不能写这个槽位, 直到人在推车上解除. "
              "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位, 同时停键鼠、作废在等确认的 PXE 解锁申请. "
              "觉得自己要出错时就用它.",

@@ -11,6 +11,8 @@
     "linux": {"model": false}
   },
   "danger": ["license", "patch"],
+  "_allowlist": "#75 第 1 层命令前缀白名单 (serial_allowlist, 现在是影子期: 只记录进 gate.shadow, 放行仍按上面的只读规则). 只能按条目 id 禁用, 不能新增; id 写成 <厂商>:<条目原文>, 如 huawei:display interface {ifname} (禁用它的全部取值). 不认识的 id 忽略, gate_allowlist 里看得到. 条目清单: MCP 工具 gate_allowlist 或 serial_allowlist.py.",
+  "allowlist": {"disable": []},
   "_model": "第 2 层决策模型 (#22): 第 1 层不放行、又不带高危词的命令交模型判, 判放行直接发, 判拦 / 超时 / 报错 / 格式不对 / 预算超限一律人确认. 以 serial.conf 的 user 身份跑它 ~/.claude 配的线路 (同 cart_dream). enabled 默认 false = 第 1 层之外全人确认. timeout_s 5-120; budget_usd 单次花费上限 (美元, 最多 1); context_chars 给模型看的设备最近输出字数 (最多 8000); model 可选, 传给 claude --model.",
   "model": {"enabled": false, "timeout_s": 30, "budget_usd": "0.2", "context_chars": 3000}
 }
