@@ -20,9 +20,23 @@
 
 拒绝不要因素，但审批目录里的拒绝也要带 digest。同一账号 30 秒内只能批一条 L3 及以上。
 
-打码：命令里出现 `password`、`secret`、`community`、`cipher`、`simple`、`pre-shared-key` 等词时，这个词后面的内容整段换成 `<已打码 N 字符>`（往多打的方向错）；键鼠 secret 只显示长度。digest 仍按原文算。
+打码：命令里出现任一敏感词（`password`、`secret`、`key`、`passphrase`、`community`、`cipher`、`simple`、`md5`、`sha`、`auth`、`authentication`、`priv`、`encrypted` 等；`encrypted-password`、`shared-key`、`-secret` 这类复合词也认），从第一个敏感词后面起整段换成 `<已打码 N 字符>`（往多打的方向错）；键鼠 secret 只显示长度；设备输出和提示符上的名字也先打码再清洗。digest 仍按原文算。动作行里的控制字符、方向控制、零宽字符、行/段分隔符一律显示成 `\xNN` / `\u{..}`，不会另起一行。串口命令（最长 256 字符）永远完整显示；键鼠长文本超过 256 字符只显示头尾，这种条目只能拒绝、不能远程批准。
+
+条目：`make_item` 按 kind 校验 action 的字段名和类型，多一个少一个都不收；`created` 必须是有限数。`decide` 不信条目里带的 `tier` 和 `expires`，按 `created` 现算。
 
 审计行字段：`t ev id digest kind tier channel account by factor summary result ts_login ts_node nonce`。`ts_login` / `ts_node` 是 tailscale 登录名和设备名（拍板 8），这一阶段由调用方传入、只校验格式，格式不对按 `forbidden/identity` 拒。永远不记 TOTP 码和种子，nonce 只记前 4 位。
+
+审批人身份：
+
+- 网页：`by` 必须是 `web:...`，并且必须带 tailscale 登录名，缺了就拒。
+- 飞书：白名单里这个账号必须绑了 open_id（`{"alice": {"feishu": "ou_..."}}`），`by` 必须正好是 `feishu:<那个 open_id>`。没绑或对不上就拒。
+
+决定记录先写审计、后提交：审计写不进去就返回 `audit_fail`，不登记批准。决定记录逐项校验，任何一项读不懂，整份就按读不懂处理。
+
+## 残余风险
+
+- **TOTP 冷却可以被用来锁人**：冷却按账号算、跨通道共享。谁能往请求目录投件，谁就能故意输错，把这个账号锁住，最长 1 小时（设计稿 T11）。这一阶段不处理，缓解办法：车机确认不受影响；急停和拒绝不要 TOTP；以后每次进入冷却都推通知。
+- 飞书 L2 按拍板 2 不要 TOTP：飞书账号被盗就能直接批 L2（设计稿 T2 需要同步）。
 
 ## 待维护者对稿确认（拍板 9–11，按设计稿现有取值实现）
 

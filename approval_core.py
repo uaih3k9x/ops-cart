@@ -25,6 +25,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -48,7 +49,7 @@ REQ_MAX_AGE_S = 60
 REQ_FUTURE_S = 5
 REQ_MAX_BYTES = 4096
 KEEP_S = 24 * 3600          # nonce 和决定记录留 24 小时
-ACTION_MAX = 200            # 动作超过这么长: 头 80 + 尾 80 + 总长
+ACTION_MAX = 256            # >= serial_write_core.LINE_MAX: 串口命令永远完整显示; 超过的 (键鼠长文本) 只显示头尾, 只能拒
 UNTRUSTED_MAX = 200
 EVIDENCE_LINES = 20
 
@@ -66,10 +67,13 @@ _BY_RE = re.compile(r"[\x21-\x7e]{1,64}")
 _CODE_RE = re.compile(r"[0-9]{6}")
 _TS_LOGIN_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}")
 _TS_NODE_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
-# 敏感词后面的内容整段打码 (往多打的方向错); 敏感词本身留着, 人能看出这条在设密码
+# 命中任一敏感词, 从第一个敏感词后面起整段打码 (往多打的方向错); 敏感词本身留着, 人能看出这条在设密码.
+# 两边只把字母数字下划线当词的一部分: encrypted-password / -secret / shared-key 这类复合词也认.
 _SENSITIVE = re.compile(
-    r"(?<![A-Za-z0-9_-])(pre-shared-key|authentication-key|auth-key|key-string|password|passwd|pwd|secret"
-    r"|community|cipher|simple|psk|token|credential)(?![A-Za-z0-9_])", re.I)
+    r"(?<![A-Za-z0-9_])(password|passwd|pwd|passphrase|secret|community|cipher|simple|psk|key|token"
+    r"|credential|md5|sha|sha1|sha256|sha384|sha512|auth|authentication|priv|privacy|encrypted|hash)"
+    r"(?![A-Za-z0-9_])", re.I)
+_BAD_CATS = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
 
 
 class BadRequest(Exception):
@@ -105,6 +109,37 @@ def digest(item):
     return hashlib.sha256(blob.encode("ascii")).hexdigest()[:16]
 
 
+def _is_str(v, empty=False):
+    return isinstance(v, str) and (empty or bool(v))
+
+
+def _is_list_of_str(v):
+    return isinstance(v, list) and bool(v) and all(_is_str(x) for x in v)
+
+
+# 每种 kind 的 action 字段白名单: 多一个少一个、类型不对都不收 (卡片上看不见的字段不许夹带进 digest)
+_SCHEMA = {
+    ("serial", "line"): {"type": None, "text": _is_str},
+    ("serial", "key"): {"type": None, "text": _is_str},
+    ("kvm", "key"): {"type": None, "keys": _is_list_of_str},
+    ("kvm", "type"): {"type": None, "text": _is_str, "enter": lambda v: isinstance(v, bool),
+                      "secret": lambda v: isinstance(v, bool), "prefix": lambda v: _is_str(v, empty=True)},
+    ("pxe", None): {"purpose": _is_str, "macs": _is_list_of_str},
+    ("estop_release", None): {"scope": _is_str},
+    ("label_batch", None): {"count": lambda v: type(v) is int and v >= 2, "kind": _is_str},
+}
+
+
+def _check_action(kind, action):
+    key = (kind, action.get("type")) if kind in ("serial", "kvm") else (kind, None)
+    spec = _SCHEMA.get(key)
+    if spec is None or set(action) != set(spec):
+        raise ValueError(f"{kind} 的 action 字段不对")
+    for k, ok in spec.items():
+        if ok is not None and not ok(action[k]):
+            raise ValueError(f"{kind} 的 action.{k} 不合格")
+
+
 def make_item(kind, native_id, epoch, target, created, action, danger=(), ctx=None, agent=None, intent=None,
               model_reason=None, target_label=None, evidence=()):
     """规整成统一条目. target 为空的不收 (不许远程批准); id = kind:epoch:原生编号."""
@@ -118,14 +153,22 @@ def make_item(kind, native_id, epoch, target, created, action, danger=(), ctx=No
         raise ValueError("target 为空或太长: 不许远程批准")
     if not isinstance(action, dict):
         raise ValueError("action 要是 dict")
+    _check_action(kind, action)
+    created = float(created)
+    if not math.isfinite(created):
+        raise ValueError("created 要是有限的数")
     it = {"id": f"{kind}:{epoch}:{native_id}", "kind": kind, "target": target, "action": dict(action),
-          "danger": [str(w) for w in danger or ()], "created": float(created), "ctx": ctx,
+          "danger": [str(w) for w in danger or ()], "created": created, "ctx": ctx,
           "agent": agent, "intent": intent, "model_reason": model_reason, "target_label": target_label,
           "evidence": list(evidence or ())}
     it["tier"] = tier_of(it)
-    it["expires"] = it["created"] + EXPIRES_S.get(it["tier"], min(EXPIRES_S.values()))
+    it["expires"] = expires_of(it)
     it["digest"] = digest(it)
     return it
+
+
+def expires_of(item):
+    return item["created"] + EXPIRES_S.get(tier_of(item), min(EXPIRES_S.values()))
 
 
 def requirement(tier, channel, kind):
@@ -162,6 +205,17 @@ def mask_command(text):
     return f"{head} {_mark(hidden)}" if hidden else head
 
 
+def _escape(text):
+    """控制字符、方向控制、零宽、行/段分隔符显示成转义 (\\xNN / \\u{..}); 换行和 Tab 留给 visible."""
+    out = []
+    for ch in text.replace("\r\n", "\n"):
+        if ch not in "\n\t" and unicodedata.category(ch) in _BAD_CATS:
+            out.append(f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{{{ord(ch):04x}}}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def visible(text):
     return text.replace(" ", "␠").replace("\t", "⇥").replace("\r\n", "\n").replace("\n", "↵ 回车")
 
@@ -171,10 +225,18 @@ def _action_shown(text, secret=False):
         return f"<secret {len(text)} 字符>"     # 同 mcp_kvm._shown: secret 只显示长度
     head, hidden = _split_mask(text)
     if len(head) > ACTION_MAX:
-        shown = f"{visible(head[:80])} …(共 {len(text)} 字符, 去网页看全文)… {visible(head[-80:])}"
+        shown = f"{visible(_escape(head[:80]))} …(共 {len(text)} 字符, 去网页看全文)… {visible(_escape(head[-80:]))}"
     else:
-        shown = visible(head)
+        shown = visible(_escape(head))
     return f"{shown} {_mark(hidden)}" if hidden else shown
+
+
+def truncated(item):
+    """动作原文有没有因为太长被截断显示. 截断了的条目不给批准, 只能拒 (人没看到全文)."""
+    act = item.get("action") or {}
+    if item.get("kind") not in ("serial", "kvm") or act.get("secret"):
+        return False
+    return any(len(_split_mask(str(act.get(k) or ""))[0]) > ACTION_MAX for k in ("text", "prefix"))
 
 
 def untrusted(text, limit=UNTRUSTED_MAX):
@@ -195,6 +257,11 @@ def untrusted(text, limit=UNTRUSTED_MAX):
             out.append(ch)
     s = "".join(out)
     return s[:limit] + f"…(共 {len(s)} 字)" if len(s) > limit else s
+
+
+def _untrusted_masked(text, limit=UNTRUSTED_MAX):
+    """设备输出这类: 可能回显密码, 先打码再清洗."""
+    return untrusted(mask_command(text) if isinstance(text, str) else text, limit)
 
 
 # ------------------------------------------------------------ 摘要 / 卡片
@@ -239,12 +306,12 @@ def render(item, now):
     lines = [title] + action
     tgt = f"目标: {untrusted(item['target'], 64)}"
     if item.get("target_label"):
-        tgt += f" (提示符上的名字: {untrusted(item['target_label'], 64)}, 来自设备输出, 不可信)"
+        tgt += f" (提示符上的名字: {_untrusted_masked(item['target_label'], 64)}, 来自设备输出, 不可信)"
     lines.append(tgt)
     ev = list(item.get("evidence") or ())[-EVIDENCE_LINES:]
     if ev:
         lines.append("现场: 挂起时设备最近输出 (设备输出, 不可信):")
-        lines += [f"  | {untrusted(ln)}" for ln in ev]
+        lines += [f"  | {_untrusted_masked(ln)}" for ln in ev]
     lines.append(f"来源: Agent {untrusted(item.get('agent') or '?', 64)} · {_dur(now - item['created'])}前"
                  f" · 剩 {_dur(item['expires'] - now)}")
     if item.get("danger"):
@@ -261,7 +328,7 @@ def render(item, now):
 def card(item, channel, now):
     """通道无关的卡片内容. 按钮按 requirement 定: 禁止远程批准的没有批准按钮; 拒绝、急停、关远程审批常驻.
     文字要按纯文本发 (不当 markdown 渲染)."""
-    need = requirement(item["tier"], channel, item["kind"])
+    need = "forbid" if truncated(item) else requirement(tier_of(item), channel, item["kind"])
     r = render(item, now)
     buttons = (["approve"] if need != "forbid" else []) + ["reject", "estop", "lockdown"]
     return {"id": item["id"], "digest": item["digest"], "title": r["title"], "text": r["text"],
@@ -272,6 +339,17 @@ def card(item, channel, now):
 
 FIELDS = ("op", "id", "digest", "account", "by", "totp", "oob", "retype", "nonce", "t")
 OPS = ("approve", "reject")         # challenge (带外码) 和 elevate (审批会话) 是下一阶段
+
+
+def _no_dup(pairs):
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("重复的键")
+    return dict(pairs)
+
+
+def _no_const(name):
+    raise ValueError(f"不收 {name}")
 
 
 def parse_request(raw, now):
@@ -286,7 +364,7 @@ def parse_request(raw, now):
     if not isinstance(raw, str) or len(raw.encode("utf-8")) > REQ_MAX_BYTES:
         raise BadRequest("请求太大或不是文本")
     try:
-        r = json.loads(raw)
+        r = json.loads(raw, object_pairs_hook=_no_dup, parse_constant=_no_const)
     except ValueError:
         raise BadRequest("不是 JSON") from None
     if not isinstance(r, dict) or set(r) != set(FIELDS):
@@ -375,10 +453,22 @@ def prune(state, now):
     return st
 
 
+_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,64}")
+
+
+def _identity_ok(channel, req, accounts, acct, ident):
+    """网页: by 是 web:..., 必须带 tailscale 登录名. 飞书: 账号必须绑了 open_id, by 必须正好是 feishu:<那个 open_id>."""
+    if channel == "web":
+        return req["by"].startswith("web:") and ident["ts_login"] is not None
+    info = accounts.get(acct) if isinstance(accounts, dict) else None
+    bound = info.get("feishu") if isinstance(info, dict) else None
+    return isinstance(bound, str) and bool(_OPEN_ID_RE.fullmatch(bound)) and req["by"] == f"feishu:{bound}"
+
+
 def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_node=None):
     """一条已解析的请求 -> (结果, 新决定记录, 审计行). 不改输入.
     item 是取件时按原生状态现算的条目 (没了就 None); seed_of(账号) -> 种子字节或 None;
-    accounts 是白名单账号. 结果见 _EV 的键. 这里只登记 authorized, 真正执行由下一阶段的执行器在原生锁里比对 digest."""
+    accounts 是白名单 {账号: {"feishu": open_id}}. 结果见 _EV 的键. 这里只登记 authorized, 真正执行由下一阶段的执行器在原生锁里比对 digest."""
     st = prune(state, now)
     ident = {"ts_login": None, "ts_node": None}
 
@@ -395,6 +485,8 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
     acct = req["account"]
     if acct not in accounts:
         return done("forbidden", "account")
+    if not _identity_ok(channel, req, accounts, acct, ident):
+        return done("forbidden", "identity")
     if req["nonce"] in st["nonces"]:
         return done("replay", "nonce")
     st["nonces"][req["nonce"]] = now
@@ -402,7 +494,7 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
         return done("gone")
     if item["id"] != req["id"] or digest(item) != req["digest"]:
         return done("stale")
-    if now > item["expires"]:
+    if not now <= expires_of(item):                # 期限按 created 现算, NaN 也算过期
         return done("expired")
     prev = st["decisions"].get(item["id"])
     if prev:
@@ -415,11 +507,14 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
     if req["op"] == "reject":                   # 拒绝是"停"的方向, 不要因素
         record("reject")
         return done("rejected")
-    need = requirement(item["tier"], channel, item["kind"])
+    tier = tier_of(item)                            # 不信条目里带的 tier, 现算
+    if truncated(item):
+        return done("forbidden", "truncated")
+    need = requirement(tier, channel, item["kind"])
     if need == "forbid":
         return done("forbidden", "tier")
     a = st["accounts"].setdefault(acct, dict(tc.fresh_account(), last_hi=0.0))
-    if item["tier"] >= L3 and now - a.get("last_hi", 0.0) < L3_GAP_S:
+    if tier >= L3 and now - a.get("last_hi", 0.0) < L3_GAP_S:
         return done("too_soon")
     factor = "none"
     if need == "totp":
@@ -429,7 +524,7 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
         if res != "ok":
             return done(_TOTP_OUT[res], factor=f"totp:{res}")
         factor = "totp:ok"
-    if item["tier"] >= L3:
+    if tier >= L3:
         a["last_hi"] = now
     record("approve")
     return done("authorized", factor=factor)
@@ -437,8 +532,21 @@ def decide(state, item, req, channel, seed_of, accounts, now, ts_login=None, ts_
 
 # ------------------------------------------------------------ 决定记录落盘
 
+def _finite(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def _valid_state(doc):
-    return isinstance(doc, dict) and all(isinstance(doc.get(k), dict) for k in ("accounts", "nonces", "decisions"))
+    """逐项校验: 任何一项读不懂都当整份读不懂 (调用方一律拒, 不擅自重置)."""
+    if not isinstance(doc, dict) or not all(isinstance(doc.get(k), dict) for k in ("accounts", "nonces", "decisions")):
+        return False
+    for acct, a in doc["accounts"].items():
+        if not tc.valid_account(acct) or not tc.valid_state(a) or not _finite(a.get("last_hi", 0.0)):
+            return False
+    if not all(_NONCE_RE.fullmatch(k) and _finite(t) for k, t in doc["nonces"].items()):
+        return False
+    return all(_ID_RE.fullmatch(k) and isinstance(d, dict) and d.get("op") in OPS and _finite(d.get("t"))
+               for k, d in doc["decisions"].items())
 
 
 class ApprovalStore:
@@ -481,9 +589,15 @@ class ApprovalStore:
             try:
                 state = self._load()
             except StateUnreadable:
-                self._audit(audit("state_unreadable", item, channel, now, "state_unreadable", req=req))
+                try:
+                    self._audit(audit("state_unreadable", item, channel, now, "state_unreadable", req=req))
+                except OSError:
+                    pass
                 return "state_unreadable"
             out, st, rec = decide(state, item, req, channel, seed_of, accounts, now, ts_login, ts_node)
+            try:
+                self._audit(rec)                    # 先记审计; 记不上就不提交 (没有审计的批准不算数)
+            except OSError:
+                return "audit_fail"
             atomicfile.write_json(self.path, st, mode=0o600)
-            self._audit(rec)
             return out

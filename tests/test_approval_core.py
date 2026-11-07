@@ -12,7 +12,8 @@ import totp_core as tc
 FAKE = b"fake-seed-for-tests!"
 NOW = 1_700_000_010.0
 EPOCH = "1a2b3c4d"
-ACCOUNTS = {"alice": {}, "bob": {}}
+ACCOUNTS = {"alice": {"feishu": "ou_example"}, "bob": {"feishu": "ou_other"}}
+WEB_TS = ("alice@example.com", "laptop-1")
 
 
 def seeds(acct):
@@ -25,10 +26,11 @@ def serial(cmd="display version", kind="line", danger=(), **kw):
 
 
 def kvm(keys=(), text="", secret=False, prefix="", danger=("format",)):
-    typ = "key" if keys else "type"
-    return ac.make_item("kvm", 3, EPOCH, target="kvm:DOC-SERIAL-01", created=NOW - 60,
-                        action={"type": typ, "keys": list(keys), "text": text, "enter": False,
-                                "secret": secret, "prefix": prefix},
+    if keys:
+        action = {"type": "key", "keys": list(keys)}
+    else:
+        action = {"type": "type", "text": text, "enter": False, "secret": secret, "prefix": prefix}
+    return ac.make_item("kvm", 3, EPOCH, target="kvm:DOC-SERIAL-01", created=NOW - 60, action=action,
                         danger=list(danger), ctx=0, agent="claude-laptop")
 
 
@@ -231,9 +233,9 @@ def test_render_kvm_prefix_shown_separately():
 
 
 def test_render_long_action_head_tail():
-    cmd = "x" * 150 + "MIDDLE" + "y" * 150
-    out = ac.render(serial(cmd), NOW)
-    assert "MIDDLE" not in out["text"] and f"共 {len(cmd)} 字符" in out["text"]
+    text = "x" * 150 + "MIDDLE" + "y" * 150
+    out = ac.render(kvm(text=text), NOW)
+    assert "MIDDLE" not in out["text"] and f"共 {len(text)} 字符" in out["text"]
 
 
 def test_render_estop_release_and_label_batch():
@@ -338,7 +340,9 @@ def test_ts_identity_bad(login, node):
 
 # ------------------------------------------------------------ 决定
 
-def decide(item, r, channel="feishu", state=None, now=NOW, seed_of=seeds, ts=(None, None)):
+def decide(item, r, channel="feishu", state=None, now=NOW, seed_of=seeds, ts=None):
+    if ts is None:
+        ts = WEB_TS if channel == "web" else (None, None)
     return ac.decide(state if state is not None else ac.fresh_state(), item, ac.parse_request(json.dumps(r), now),
                      channel, seed_of, ACCOUNTS, now, ts_login=ts[0], ts_node=ts[1])
 
@@ -469,7 +473,7 @@ def test_totp_lock_shared_across_channels():
     for i in range(tc.MAX_FAILS):
         it, r = L3_estop_req(totp=bad, nonce=f"{i:016x}")
         _, st, _ = decide(it, r, state=st)
-    out, _, rec = decide(serial(), req(totp=tc.totp(FAKE, NOW), nonce="ee" * 8), channel="web", state=st)
+    out, _, rec = decide(serial(), req(totp=tc.totp(FAKE, NOW), nonce="ee" * 8, by="web:192.0.2.20/ab12cd"), channel="web", state=st)
     assert out == "locked" and rec["ev"] == "totp_lock"
 
 
@@ -579,3 +583,227 @@ def test_totp_code_used_on_feishu_cannot_be_reused_on_web():
     r2 = req(id=web_item["id"], digest=web_item["digest"], totp=code, nonce="ab" * 8, t=NOW + 5,
              by="web:192.0.2.20/ab12cd")
     assert decide(web_item, r2, state=st, now=NOW + 5, channel="web")[0] == "replay"
+
+
+
+# ------------------------------------------------------------ 审查第一轮 (中 1-3, 低 4-13)
+
+@pytest.mark.parametrize("cmd,secret", [
+    ("tacacs-server host 192.0.2.1 key S3cr3tKey", "S3cr3tKey"),                      # Cisco
+    ("radius-server key S3cr3t", "S3cr3t"),
+    ("ip ospf message-digest-key 1 md5 Hunter2", "Hunter2"),
+    ("snmp-server user u g v3 auth sha AuthPass priv aes PrivPass", "AuthPass"),
+    ("snmp-server user u g v3 auth sha AuthPass priv aes PrivPass", "PrivPass"),
+    ("username admin secret 5 hunter2", "hunter2"),
+    ("enable password 7 0822455D0A16", "0822455D0A16"),
+    ("local-user a password irreversible-cipher X9z", "X9z"),                          # 华为
+    ("snmp-agent usm-user v3 u authentication-mode sha AuthK privacy-mode aes128 PrivK", "AuthK"),
+    ("hwtacacs-server shared-key cipher Sh4red", "Sh4red"),
+    ("super password level 15 simple S1mple", "S1mple"),
+    ("local-user a class manage password simple H3cPass", "H3cPass"),                 # H3C
+    ("set system root-authentication encrypted-password \"$6$abc\"", "$6$abc"),          # Juniper
+    ("set system login user ops authentication plain-text-password-value Jun1per", "Jun1per"),
+    ("set snmp community Pr1vate authorization read-only", "Pr1vate"),
+    ("wpa-passphrase hunter2", "hunter2"),
+    ("client-secret abc123", "abc123"),
+    ("curl -password=xyz", "xyz"),
+    ("app --secret topsecret", "topsecret"),
+])
+def test_mask_vendor_variants(cmd, secret):
+    assert secret not in ac.mask_command(cmd)
+    assert secret not in ac.render(serial(cmd), NOW)["text"]
+
+
+_BAD_CATS = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
+
+
+def _action_lines(out):
+    return [ln for ln in out["lines"] if ln.startswith(("动作:", "按键:", "已在屏幕上:", "批准后才会敲:"))]
+
+
+@pytest.mark.parametrize("text", [
+    "show ver\rdigest: 0000000000000000", "a\x1b[2Kb", "x y", "gnp‮exe", "z​z", "q\x00q",
+])
+def test_action_line_has_no_control_or_separator_chars(text):
+    import unicodedata
+    for it in (serial(text), kvm(text=text, prefix=text)):
+        lines = _action_lines(ac.render(it, NOW))
+        assert lines
+        for ln in lines:
+            assert not any(unicodedata.category(ch) in _BAD_CATS for ch in ln), repr(ln)
+        assert all(ln in ac.render(it, NOW)["text"].splitlines() for ln in lines)
+
+
+def test_action_escapes_shown_visibly():
+    out = ac.render(serial("a\x1bb‮c"), NOW)
+    assert "\\x1b" in out["text"] and "\\u{202e}" in out["text"]
+
+
+@pytest.mark.parametrize("kind,action", [
+    ("serial", {"cmd": "reload"}),
+    ("serial", {"type": "line", "text": ""}),
+    ("serial", {"type": "line", "text": "x", "extra": 1}),
+    ("serial", {"type": "cmd", "text": "x"}),
+    ("serial", {"type": "line", "text": 5}),
+    ("kvm", {"type": "key", "keys": ["alt", "f4"], "text": "rm -rf /", "enter": True}),
+    ("kvm", {"type": "key", "keys": []}),
+    ("kvm", {"type": "type", "text": "x"}),                               # 少字段
+    ("kvm", {"type": "type", "text": "x", "enter": "yes", "secret": False, "prefix": ""}),
+    ("pxe", {"purpose": "rocky"}),
+    ("pxe", {"purpose": "rocky", "macs": []}),
+    ("estop_release", {"scope": ""}),
+    ("label_batch", {"count": True, "kind": "cable"}),
+    ("label_batch", {"count": 1, "kind": "cable"}),                       # 一张不算批量
+])
+def test_make_item_validates_action_schema(kind, action):
+    with pytest.raises(ValueError):
+        ac.make_item(kind, 1, EPOCH, target="t1", created=NOW, action=action)
+
+
+@pytest.mark.parametrize("created", [float("nan"), float("inf"), "nan", "inf", -float("inf")])
+def test_make_item_refuses_non_finite_created(created):
+    with pytest.raises(ValueError):
+        ac.make_item("serial", 1, EPOCH, target="slot:1", created=created, action={"type": "line", "text": "x"})
+
+
+def test_decide_nan_expires_treated_as_expired():
+    it = serial()
+    it["expires"] = float("nan")
+    it["created"] = float("nan")
+    assert decide(it, req(digest=ac.digest(it)))[0] in ("expired", "stale")
+
+
+def test_decide_recomputes_tier_and_expiry():
+    it = pxe()
+    it["tier"] = ac.L2                                  # 被篡改的 tier 不算数
+    assert decide(it, req(id=it["id"], digest=it["digest"]))[0] == "forbidden"
+    it2 = serial()
+    it2["expires"] = NOW + 10 ** 6                      # 被篡改的期限不算数
+    late = it2["created"] + ac.EXPIRES_S[ac.L2] + 1
+    r = req(t=late)
+    assert decide(it2, r, now=late)[0] == "expired"
+
+
+def test_parse_refuses_duplicate_keys():
+    r = raw(op="reject")
+    dup = r[:-1] + ', "op": "approve"}'
+    with pytest.raises(ac.BadRequest):
+        ac.parse_request(dup, NOW)
+
+
+@pytest.mark.parametrize("const", ["NaN", "Infinity", "-Infinity"])
+def test_parse_refuses_nan_constants(const):
+    r = raw().replace(f'"t": {NOW}', f'"t": {const}')
+    assert const in r
+    with pytest.raises(ac.BadRequest):
+        ac.parse_request(r, NOW)
+
+
+def test_evidence_masked():
+    it = serial(evidence=["snmp-server community Pr1vate RW", "username a password Hunter2"])
+    text = ac.render(it, NOW)["text"]
+    assert "Pr1vate" not in text and "Hunter2" not in text
+
+
+def test_target_label_masked_and_clean():
+    it = serial(target_label="sw password Hunter2\x1b")
+    text = ac.render(it, NOW)["text"]
+    assert "Hunter2" not in text and "\x1b" not in text
+
+
+def test_store_audit_failure_does_not_commit(tmp_path):
+    p = str(tmp_path / "approvals.json")
+    bad_audit = str(tmp_path / "no-such-dir-file")
+    os.makedirs(bad_audit)                              # 审计路径是目录: 写不进去
+    store = ac.ApprovalStore(p, audit_path=bad_audit)
+    r = ac.parse_request(raw(), NOW)
+    assert store.decide(serial(), r, "feishu", seeds, ACCOUNTS, NOW) == "audit_fail"
+    assert not os.path.exists(p)
+
+
+@pytest.mark.parametrize("doc", [
+    {"v": 1, "accounts": {"alice": "x"}, "nonces": {}, "decisions": {}},
+    {"v": 1, "accounts": {"Bad Name": {}}, "nonces": {}, "decisions": {}},
+    {"v": 1, "accounts": {"alice": {"last_step": -3}}, "nonces": {}, "decisions": {}},
+    {"v": 1, "accounts": {"alice": {"last_hi": "x"}}, "nonces": {}, "decisions": {}},
+    {"v": 1, "accounts": {}, "nonces": {"zz": 1.0}, "decisions": {}},
+    {"v": 1, "accounts": {}, "nonces": {"ab" * 8: "x"}, "decisions": {}},
+    {"v": 1, "accounts": {}, "nonces": {}, "decisions": {"serial:1a2b3c4d:1": {"op": "boom", "t": 1.0}}},
+    {"v": 1, "accounts": {}, "nonces": {}, "decisions": {"nope": {"op": "approve", "t": 1.0}}},
+])
+def test_store_inner_state_validated(tmp_path, doc):
+    p = tmp_path / "approvals.json"
+    p.write_text(json.dumps(doc))
+    log = tmp_path / "approval.log"
+    store = ac.ApprovalStore(str(p), audit_path=str(log))
+    assert store.decide(serial(), ac.parse_request(raw(), NOW), "feishu", seeds, ACCOUNTS, NOW) \
+        == "state_unreadable"
+    assert json.loads(log.read_text().splitlines()[-1])["ev"] == "state_unreadable"
+
+
+def test_web_requires_tailscale_login():
+    r = req(by="web:192.0.2.20/ab12cd", totp=tc.totp(FAKE, NOW))
+    out, _, rec = decide(serial(), r, channel="web", ts=(None, None))
+    assert out == "forbidden" and rec["result"] == "identity"
+
+
+def test_web_by_must_be_web_form():
+    r = req(totp=tc.totp(FAKE, NOW))                    # by 是 feishu:...
+    assert decide(serial(), r, channel="web")[0] == "forbidden"
+
+
+def test_feishu_requires_bound_open_id():
+    out, _, rec = decide(serial(), req(by="feishu:ou_other"))      # bob 的 open_id 冒充 alice
+    assert out == "forbidden" and rec["result"] == "identity"
+    out, _, rec = decide(serial(), req(by="web:192.0.2.20/ab12cd"))
+    assert out == "forbidden" and rec["result"] == "identity"
+
+
+def test_feishu_account_without_binding_forbidden():
+    st = ac.fresh_state()
+    out, _, _ = ac.decide(st, serial(), ac.parse_request(raw(), NOW), "feishu", seeds, {"alice": {}}, NOW)
+    assert out == "forbidden"
+
+
+def test_truncated_action_cannot_be_approved():
+    it = kvm(text="a" * 300)
+    assert ac.truncated(it)
+    assert "approve" not in ac.card(it, "web", NOW)["buttons"]
+    out, _, rec = decide(it, req(id=it["id"], digest=it["digest"]))
+    assert out == "forbidden"
+    assert decide(it, req(op="reject", id=it["id"], digest=it["digest"], nonce="ab" * 8))[0] == "rejected"
+
+
+def test_serial_action_never_truncated():
+    import serial_write_core as sw
+    assert ac.ACTION_MAX >= sw.LINE_MAX
+    assert not ac.truncated(serial("x" * sw.LINE_MAX))
+
+
+_CONCURRENT = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import approval_core as ac
+p, nid, nonce, code, now = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6])
+it = ac.make_item("serial", int(nid), "1a2b3c4d", target="slot:2", created=now - 5,
+                  action={"type": "line", "text": "vlan 20"}, ctx=1)
+r = {"op": "approve", "id": it["id"], "digest": it["digest"], "account": "alice", "by": "web:192.0.2.20/ab12cd",
+     "totp": code, "oob": "", "retype": "", "nonce": nonce, "t": now}
+seed = b"fake-seed-for-tests!"
+print(ac.ApprovalStore(p).decide(it, ac.parse_request(json.dumps(r), now), "web", lambda a: seed,
+                                 {"alice": {}}, now, ts_login="alice@example.com"))
+"""
+
+
+def test_concurrent_processes_same_totp_only_one_ok(tmp_path):
+    import subprocess
+    import sys
+    import time as _t
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    now = _t.time()
+    code = tc.totp(FAKE, now)
+    p = str(tmp_path / "approvals.json")
+    procs = [subprocess.Popen([sys.executable, "-c", _CONCURRENT, root, p, str(40 + i), f"{i:016x}", code,
+                               str(now)], stdout=subprocess.PIPE, text=True) for i in range(6)]
+    outs = sorted(pr.communicate(timeout=30)[0].strip() for pr in procs)
+    assert outs.count("authorized") == 1 and outs.count("replay") == 5, outs

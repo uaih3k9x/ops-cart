@@ -119,7 +119,7 @@ def fresh_account():
     return {"last_step": 0, "fails": 0, "locked_until": 0.0, "lockouts": 0}
 
 
-def _ok_state(st):
+def valid_state(st):
     if not isinstance(st, dict):
         return False
     for k, typ in (("last_step", int), ("fails", int), ("lockouts", int), ("locked_until", (int, float))):
@@ -132,7 +132,7 @@ def _ok_state(st):
 def verify(acct_state, key, code, now):
     """-> (结果, 新状态). 结果: ok / bad / replay / clock_back / locked / no_seed / bad_state.
     只有 bad 计入输错次数; 读不懂的账号状态不当成新账号 (否则 last_step 归零, 旧码能重放)."""
-    if not _ok_state(acct_state):
+    if not valid_state(acct_state):
         return "bad_state", acct_state
     st = dict(fresh_account(), **acct_state)
     if now < st["locked_until"]:
