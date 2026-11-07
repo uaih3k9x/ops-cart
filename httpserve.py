@@ -28,7 +28,7 @@ import sys
 import time
 
 from pxeserver import (PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
-                       unlock_only_menu)
+                       rescue_default_menu, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -82,11 +82,16 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
         elif base.startswith("grub.cfg") and os.path.isfile(path):
             try:
                 with open(path, "rb") as f:
-                    armed = unlock_only_menu(f.read(64 * 1024).decode("utf-8", "replace"))
+                    text = f.read(64 * 1024).decode("utf-8", "replace")
             except OSError:
-                armed = False
-            if armed and not install_allowed(menu_mac(base), pxe_mode(self.pxe_mode_path, self.now())):
+                text = ""
+            if unlock_only_menu(text) and not install_allowed(menu_mac(base),
+                                                              pxe_mode(self.pxe_mode_path, self.now())):
                 self.send_error(403, "Install mode is locked")
+                return None
+            if rescue_default_menu(text):                   # #70: 默认项可能是救援 (root + sshd), 同 TFTP 不发
+                log.warning("拒绝 %s 取 %s: 默认项是救援", self.client_address[0], base)
+                self.send_error(403, "Rescue default menu refused")
                 return None
         return super().send_head()
 

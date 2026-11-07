@@ -154,3 +154,22 @@ def test_clone_menu_gated_like_install_menu(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_http_rescue_default_menu_refused(tmp_path):
+    """#70: 跟 TFTP 对称, 默认/fallback 是救援的菜单 (含已放行的解锁菜单) HTTP 不发; 新默认菜单照发."""
+    import pxeserver
+    from test_pxeserver import LEGACY_RESCUE
+    srv = serve(tmp_path)
+    http = tmp_path / "http"
+    (http / "grub.cfg").write_text(pxeserver.grub_menu("192.0.2.1"))
+    (http / "grub.cfg-C0000201").write_text(LEGACY_RESCUE)
+    (http / "grub.cfg-01-02-00-00-00-00-01").write_text(
+        pxeserver.grub_menu_winpe("192.0.2.1").replace("set default=0", "set default=2"))
+    try:
+        assert get(srv, "grub.cfg") == 200
+        assert get(srv, "grub.cfg-C0000201") == 403
+        assert get(srv, "grub.cfg-01-02-00-00-00-00-01") == 403
+    finally:
+        srv.shutdown()
+        srv.server_close()

@@ -1631,3 +1631,38 @@ def test_tftp_expired_mac_menu_falls_back_to_local_default(tmp_path):
     f, size, tag = srv.open_file(ARMED_CFG, ("192.0.2.9", 1))
     got = f.read().decode()
     assert _is_local(default_entry(got)) and "inst.ks" not in got and "未解锁" in tag
+
+
+# ---- #70 第二轮审查: rescue_default_menu 从严 (白名单: 只有能确认默认项不是救援的才放过)
+
+_R = "menuentry 'Rescue' {\n linux /vmlinuz inst.stage2=x inst.rescue inst.sshd\n}\n"
+_L = "menuentry 'Local' {\n exit\n}\n"
+
+
+@pytest.mark.parametrize("cfg", [
+    "default=1\ntimeout=10\n" + _L + _R,                                        # 不带 set
+    "set default=7\nset timeout=10\n" + _R + _L,                                # 越界, GRUB 回落第 0 项
+    "set default=0\nset timeout=10\nset a=\"inst.rescue inst.sshd\"\nmenuentry 'R' {\n linux /vmlinuz $a\n}\n",
+    "set default=0\nset timeout=10\nif false; then\n" + _L + "fi\n" + _R,       # if 让下标错位
+    "set default=1\nset timeout=3\n" + _L + "submenu 'S' {\n set default=1\n" + _L + _R + "}\n",
+    ("set default=0\nset timeout=10\n" + _R).replace("\n", "\r\n"),             # CRLF
+    "set default=\"1\"\nset default=0\n" + _R + _L,                             # 设了两次
+    "set timeout=10\n" + _L.replace("exit", "linux /vmlinuz $x") + _R,         # 默认项引用变量
+])
+def test_rescue_default_menu_strict_cases(cfg):
+    assert _px.rescue_default_menu(cfg)
+
+
+def test_rescue_default_menu_plain_menus_without_rescue_pass():
+    assert not _px.rescue_default_menu("set default=0\nmenuentry 'x' {\n linux /vmlinuz inst.text\n}\n")
+    assert not _px.rescue_default_menu("set default=1\n" + _R + _L)            # 默认指向本地盘
+
+
+def test_tftp_armed_unlock_menu_with_rescue_default_is_replaced(tmp_path):
+    """已放行的解锁菜单也要查: 带 WinPE 项但默认是救援 -> 换默认菜单."""
+    root, mode = _tree(tmp_path, armed_until=1000)
+    winpe = _px.grub_menu_winpe("192.0.2.1").replace("set default=0", "set default=2")
+    (root / ARMED_CFG).write_text(winpe)
+    assert _fetch(root, mode, "/" + ARMED_CFG) == grub_menu("192.0.2.1")
+    (root / ARMED_CFG).write_text(_px.grub_menu_winpe("192.0.2.1"))
+    assert _fetch(root, mode, "/" + ARMED_CFG) == _px.grub_menu_winpe("192.0.2.1")
