@@ -48,10 +48,10 @@ python3 scripts/check_public_safe.py [仓库目录]
 PXE 菜单里的 Rescue shell 带 `inst.sshd`：Anaconda 救援环境是 root，没设 `sshpw` 时 root 可能无需密码，
 同网段能直接 `ssh root@<该机>`。所以默认菜单超时后从本地盘启动，救援不是默认 / 超时项，只能手动选择（#70）；
 解锁菜单（WinPE / 克隆）里救援也从不是默认项。这只防"没人碰就进了 root"，不是访问控制：
-所有菜单都没设 GRUB `superusers` / `password_pbkdf2`，倒计时内有键盘的人（在被测机前，或经推车键鼠直通，
-后者不受远程审批保护）能按 `e` 改任一项的参数，或按 `c` 进 GRUB 命令行手敲 `linux` / `initrd` / `boot`
-进 root 救援；`vmlinuz`、`initrd.img`、stage2 不管解没解锁都照发。所以光把救援纳入解锁也挡不住，
-要挡得给 GRUB 设 superusers + 密码，并且内核 / initrd / stage2 也按解锁才发（另议）。
+所有菜单都没设 GRUB `superusers` / `password_pbkdf2`，倒计时内有键盘的人（在被测机前，或经推车键鼠直通）
+能按 `e` 编辑菜单，或按 `c` 进 GRUB 命令行手敲 `linux` / `initrd` / `boot` 进 root 救援，任何菜单项都挡不住；
+`vmlinuz`、`initrd.img`、stage2 不管解没解锁都照发。维护者决定不设 GRUB 密码，依靠人在场盯着与键鼠通道的
+远程审批，接受此残余风险。
 #70 之前留下的老菜单（默认项可能是救援的 `grub.cfg-*`、`EFI/BOOT/grub.cfg`）上锁扫树时会删掉，
 TFTP 发菜单时换成默认菜单，HTTP 直接 403。
 
