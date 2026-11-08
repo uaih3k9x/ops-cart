@@ -86,6 +86,7 @@
 
 ```bash
 scripts/stamp-build.sh                                   # 生成 BUILD (提交数 + 短哈希)
+ssh cart mkdir -p ops-cart
 scp -r *.py VERSION BUILD web icons fonts deploy examples scripts cart:ops-cart/
 # 以下在推车上 cd ~/ops-cart 后执行
 sudo install -d -m 755 /opt/pxe && sudo cp -r *.py VERSION BUILD web icons fonts /opt/pxe/
@@ -93,14 +94,17 @@ sudo install -D -m 644 -t /usr/local/share/fonts/ops-cart/ /opt/pxe/fonts/unifon
 sudo install -D -m 644 deploy/pxe.env.example /etc/ops-cart/pxe.env      # 改成现场装机网段
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo cp deploy/sysctl.d/* /etc/sysctl.d/ && sudo sysctl --system
-sudo cp deploy/tmpfiles.d/ops-cart.conf /etc/tmpfiles.d/ && sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
+sudo cp deploy/tmpfiles.d/ops-cart.conf /etc/tmpfiles.d/ && sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf   # 没建 ops-web 用户时 serial-req 那行报错属预期, 其余照建
 sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/
 sudo install -D -m 644 -t /etc/systemd/journald.conf.d/ deploy/journald.conf.d/ops-cart.conf && sudo systemctl restart systemd-journald
 sudo install -m 755 deploy/bin/kiosk-launcher /usr/local/bin/kiosk
 sudo install -m 755 -t /usr/local/bin/ deploy/bin/kiosk-setpin deploy/bin/cart-fan-curve
 sudo kiosk-setpin
 sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload
-sudo firewall-cmd --permanent --zone=pxe --change-interface=<装机网卡> && sudo firewall-cmd --reload   # LAN1 要在 pxe 区
+# LAN1 (eno1) 的主地址必须就是 pxe.env 的 PXE_IP, 且在 pxe 区; 否则三件套 active 也装不了机. 二选一:
+#   车机「网口模式」把 LAN1 设成静态 PXE_IP (netmode 建的连接自带 pxe 区), 或者:
+sudo nmcli con add type ethernet ifname eno1 con-name lan1-pxe ipv4.method manual \
+    ipv4.addresses <PXE_IP>/<PXE_PREFIX> connection.zone pxe && sudo nmcli con up lan1-pxe
 sudo python3 -m venv /opt/pxe/venv && sudo /opt/pxe/venv/bin/pip install pillow pyusb   # cart-dash 用这个 venv
 sudo bash scripts/setup-cart.sh      # 先把 Rocky minimal ISO 放到脚本里写的路径; 校验后铺 tftp 和 HTTP 仓库, 只写默认菜单
 sudo install -m 644 examples/ks.cfg.example /opt/pxe/http/ks.cfg   # 改掉里面的密码 hash 和分区再用
@@ -122,6 +126,8 @@ sudo systemctl enable --now cart-fan-curve.service   # 认不出 it8625 时会�
 | `cart-ocr.service` | OCR 常驻服务；`sudo bash scripts/setup-ocr.sh deploy/ocr-requirements.txt` 建 `/opt/pxe/ocr-venv` | 可选 |
 | `cart-revtunnel.service` | 备用远程通道 | 可选，见 [`docs/REMOTE_TUNNEL.md`](docs/REMOTE_TUNNEL.md) |
 | `cart-ble-input.service` | 蓝牙隔空打字 | 可选，默认不开，见 [`docs/BLE_INPUT.md`](docs/BLE_INPUT.md) |
+
+网口名在代码和单元里写死：LAN1 装机口 `eno1`（`pxe-server.service`、`netmode_core`、自检），LAN2 管理口 `enp3s0`，无线 `wlp4s0`（`wifi_core`）。新机器的网口名不一样，就要改代码或单元文件。
 
 配置都在 `/etc/ops-cart/`（照 `examples/` 改），运行时状态在 `/run/ops-cart/`（重启清空），要跨重启的在 `/var/lib/ops-cart/`，日志在 `/var/log/ops-cart/`。
 
