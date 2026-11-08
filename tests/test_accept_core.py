@@ -135,7 +135,7 @@ def test_third_party_imports_are_only_venv_ones():
     if not hasattr(sys, "stdlib_module_names"):
         pytest.skip("要 3.10+ 才有标准库清单")
     d = ac.derive(ROOT)
-    assert d["third_party"] <= set(ac.THIRD_PARTY) | set(ac.OCR_THIRD_PARTY)
+    assert d["third_party"] <= set(ac.THIRD_PARTY) | set(ac.OCR_THIRD_PARTY) | set(ac.BLE_THIRD_PARTY)
 
 
 def test_system_files_cover_every_unit():

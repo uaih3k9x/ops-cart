@@ -114,6 +114,7 @@ def judge_build(text, expect=None):
 
 THIRD_PARTY = ("PIL", "usb")             # 只有副屏用, 装在 /opt/pxe/venv
 OCR_THIRD_PARTY = ("rapidocr_openvino",)        # 只有 ocr_rapid_worker 用, 装在 /opt/pxe/ocr-venv (#47)
+BLE_THIRD_PARTY = ("dbus", "gi")                # 只有 ble_input 用, 系统包 python3-dbus / python3-gobject, 可选 (#52)
 _PYREF = re.compile(r"\b(\w+)\.py\b")
 _OPTREF = re.compile(r"/opt/pxe/(\w+)\.py\b")
 
@@ -249,7 +250,7 @@ def _not_stdlib(names):
 
 # ---- 以下常量由 `python3 scripts/cart_accept.py --print-manifest` 生成, 测试比对仓库 ----
 REQUIRED_PY = (
-    "atomicfile", "cart_dream", "cart_label", "cart_mcp", "cart_ocr", "cart_snap",
+    "atomicfile", "ble_input", "ble_input_core", "cart_dream", "cart_label", "cart_mcp", "cart_ocr", "cart_snap",
     "cartlog", "ch9329", "clone_core", "confirm_core", "confirm_panel", "dash_core",
     "dash_render", "dash_service", "hidpdc", "httpserve", "ime_core", "ime_proc",
     "ime_rime", "ime_tk", "ime_worker", "kiosk", "kiosk_core", "kiosk_ui_core",
@@ -279,6 +280,7 @@ SYSTEM_FILES = {
     "/etc/systemd/journald.conf.d/ops-cart.conf": "deploy/journald.conf.d/ops-cart.conf",
     "/etc/systemd/system/campus-auth.service": "deploy/systemd/campus-auth.service",
     "/etc/systemd/system/campus-auth.timer": "deploy/systemd/campus-auth.timer",
+    "/etc/systemd/system/cart-ble-input.service": "deploy/systemd/cart-ble-input.service",
     "/etc/systemd/system/cart-boot-success.service": "deploy/systemd/cart-boot-success.service",
     "/etc/systemd/system/cart-boot-success.timer": "deploy/systemd/cart-boot-success.timer",
     "/etc/systemd/system/cart-dash.service": "deploy/systemd/cart-dash.service",
@@ -328,6 +330,7 @@ UNITS = {
     "cart-mcp.service": _u(None, None, "#19", note="MCP HTTP; 默认不开, 只用 stdio"),
     "cart-mcp-ro.service": _u(None, None, "#49", note="MCP HTTP 只读档; 默认不开"),
     "cart-ocr.service": _u(None, None, "#47", note="OCR 常驻服务; 不开退回 Tesseract"),
+    "cart-ble-input.service": _u(None, None, "#52", note="蓝牙隔空打字; 草稿, 默认不开"),
     "cart-serial-req.path": _u(None, None, "#23", note="网页急停 / 拒绝"),
     "cart-serial-req.service": _u(None, None, "#23", oneshot=True),
     "cart-notify.timer": _u(True, True, "#4", note="关键事件推手机 (UPS 预告也走它)"),
