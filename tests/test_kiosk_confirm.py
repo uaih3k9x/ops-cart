@@ -43,7 +43,6 @@ def _fake(view):
     fake._serial_say = lambda text, ok=True: calls["say"].append((text, ok))
     fake._open_pane = lambda name, sel=None: calls["pane"].append((name, sel))
     fake._open_confirm = lambda n: calls["confirm"].append(n)
-    fake._bigfish_ctl = lambda op, ok=True: None          # 大肥鱼急停 (#53) 另有 test_kiosk_bigfish
     for name in ("_serial_action", "_head_click", "_lamp_paint"):
         setattr(fake, name, getattr(kiosk.Kiosk, name).__get__(fake))
     return calls, fake
