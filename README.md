@@ -56,6 +56,7 @@
 | `mcp_pxe.py` · `pxe_req_core.py` · `pxe_req_panel.py` · `pxe_log_core.py` | Agent 申请 PXE 解锁（人照抄确认码才生效）、`pxe_clients`；网页 PXE 日志页 |
 | `mcp_label.py` · `cart_label.py` · `tspl_preview.py` | MCP 标签工具；TSPL 生成；开发机上预览 |
 | `confirm_core.py` · `confirm_panel.py` | 串口 / 键鼠写操作的确认框和急停 UI |
+| `bigfish_panel.py` · `bigfish_core.py` | 大肥鱼面板（#53）：只读看它在做什么，锁屏和副屏一行状态；确认 / 拒绝 / 急停走现有确认框和全部急停。接口约定见 [docs/BIGFISH_PANEL.md](docs/BIGFISH_PANEL.md) |
 | `approval_core.py` · `totp_core.py` · `approval_channel.py` | 远程审批第一阶段：分级、digest、TOTP、通道接口；还没接进推车 |
 | `ble_input.py` · `ble_input_core.py` | 蓝牙隔空打字：BlueZ GATT 服务，收文字排进 `/run/ops-cart/ble-input/in/` |
 | `webkiosk.py` · `web_core.py` · `web/` | 网页口（专用用户 `ops-web`，默认不自启） |

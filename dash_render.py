@@ -443,7 +443,7 @@ def _locked_lines(view, W, H):
     """锁屏公告排版: (字号, 行距, 各行, 第一行顶). 字框 (glyph_boxes) 和实际画字共用, 不能各算各的."""
     paras = paragraphs(view.get("notice")) or ["推车锁定中"]
     base = LOCKED_FRONT_Y + 2 * (FRONT_ROW + FRONT_GAP) + 20 if view.get("front") else 700   # 观察中: 让出前面板
-    room = H - 160 - base                   # 分隔线以下、底部提示以上
+    room = H - (190 if view.get("bigfish") else 160) - base   # 分隔线以下、底部提示 (和大肥鱼一行 #53) 以上
     for size in (96, 80, 64, 52, 44):       # 字号从大往下试, 整段放得进为止
         lh = int(size * 1.3)
         lines = [ln for p in paras for ln in wrap(p, _font(size), W - 2 * M, 5)]
@@ -460,6 +460,8 @@ def _locked_body(d, view, W, H):
     size, lh, lines, top = _locked_lines(view, W, H)
     for i, line in enumerate(lines):
         d.text((W // 2, top + i * lh + lh // 2), line, font=_font(size), fill=FG, anchor="mm")
+    if view.get("bigfish"):
+        d.text((W // 2, H - 150), view["bigfish"], font=_font(26), fill=DIM, anchor="mm")
     d.text((W // 2, H - 110), "推车已锁定 · 在车上解锁后显示状态", font=_font(26), fill=DIM,
            anchor="mm")
 

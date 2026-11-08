@@ -15,6 +15,7 @@ import tkinter as tk
 from subprocess import DEVNULL, Popen       # 只给 mpv 用
 from tkinter import messagebox, simpledialog
 
+import bigfish_core as bfc
 import cartlog
 import clone_core as cc
 import confirm_core as cfc
@@ -35,6 +36,7 @@ from ks_panel import KsPanel
 from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
+from bigfish_panel import BigfishPanel
 from confirm_panel import ConfirmDialog, KvmDialog
 from pxe_req_panel import PxeRequestDialog
 import theme as th
@@ -616,6 +618,29 @@ class Kiosk(tk.Tk):
             return
         self._kvm_say("处理中…")
 
+    # ------------------------------------------------------------ 大肥鱼面板 (#53): 不另起审批, 用现有确认框和急停
+
+    def _agent_states(self):
+        """(串口每槽位状态, 键鼠摘要); 还没采到串口按全部急停, 没采到键鼠 None."""
+        sw_view = self._sw_view if self._sw_view is not None else cfc.stopped_view()
+        return cfc.slot_states(sw_view), cfc.kvm_summary(self._kvm_view) if self._kvm_view is not None else None
+
+    def _bigfish_pending(self):
+        return bfc.pending_count(*self._agent_states())
+
+    def _bigfish_confirm(self):
+        target = bfc.pending_target(*self._agent_states())
+        if target is None:
+            self.banner.config(text="没有待确认的")
+        elif target[0] == "serial":
+            self._open_confirm(target[1])
+        else:
+            self._open_kvm()
+
+    def _bigfish_estop(self):
+        """就是执行器条上的"Agent 全部急停": 大肥鱼那边看 serial-estop.json 的 all 停手."""
+        self._serial_action("estop", None)
+
     # ------------------------------------------------------------ Agent PXE 解锁申请 (#24)
 
     def _pxe_req_update(self, view):
@@ -736,7 +761,10 @@ class Kiosk(tk.Tk):
             return
         try:
             # 串口面板: 打开时就指定要选的那一路, 列表回来后落位 (issue #5); 网口模式面板: 选中那个口 (#12)
-            if select and name in ("serial", "netmode"):
+            if name == "bigfish":           # #53: 确认 / 拒绝 / 急停都走现有入口
+                w = BigfishPanel(self.body, pending=self._bigfish_pending, on_confirm=self._bigfish_confirm,
+                                 on_estop=self._bigfish_estop)
+            elif select and name in ("serial", "netmode"):
                 w = PANE_CLASSES[name](self.body, want=select)
             else:
                 w = PANE_CLASSES[name](self.body)
@@ -1230,6 +1258,9 @@ class Kiosk(tk.Tk):
         self._lock_ups = tk.Label(w, text=uc.label(self._ups), font=FONT, bg=th.BG,
                                   fg=self._ups_fg(uc.health(self._ups)))
         self._lock_ups.place(relx=0.985, rely=0.065, anchor="ne")
+        # 右上角第三行: 大肥鱼一行 (#53), 只有枚举出来的字, 不显示它说的话
+        self._lock_bigfish = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.DIM)
+        self._lock_bigfish.place(relx=0.985, rely=0.11, anchor="ne")
         # 底部一行: 昨夜整理 (cart_dream.py) 的标题
         self._lock_dream = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.FAINT)
         self._lock_dream.place(relx=0.5, rely=0.97, anchor="s")
@@ -1272,6 +1303,7 @@ class Kiosk(tk.Tk):
         if text != self._lock_notice.cget("text"):     # 字号自适应: 时钟和 PIN 之间那块塞满
             px = kc.notice_font_px(text, self.winfo_screenwidth() * 0.9, self.winfo_screenheight() * 0.36)
             self._lock_notice.config(text=text, font=th.font(-px, bold=True))
+        self._lock_bigfish.config(text=bfc.lock_line(bfc.load(time.time())))
         dream = kc.dream_line()
         if dream != self._lock_dream.cget("text"):
             self._lock_dream.config(text=dream)
