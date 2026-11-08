@@ -23,7 +23,9 @@ import theme as th
 
 BG, CARD, FG, DIM, OFF = th.follow(globals(), BG="PANEL", CARD="BG", FG="FG", DIM="DIM", OFF="BOX")
 FONT, FONT_MONO = th.FONT_SMALL, th.FONT_MONO
-CELL, GAP, PAD = 40, 8, 16              # 口的格子 / 间隔 / 边距 (像素)
+CELL, GAP, PAD = 40, 8, 16              # 口的格子 / 间隔 / 边距 (像素); 列多了按画布宽度缩
+WIN_W, WIN_H = 1100, 440
+CANVAS_W = WIN_W - 2 * PAD              # 画布左右各让出 PAD
 FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
 SNAP_S = 5                              # 多久给副屏写一次快照
 
@@ -31,12 +33,19 @@ def _lit_color(state):
     return {"up": th.LAMP_OK, "admin": th.LAMP_WARN, "standby": th.DIM, "unknown": th.MARK}.get(state, OFF)
 
 
-def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD, stale=False):
-    """面板格子 + 当前端口状态 -> 要画的东西 [{name, box, fill, fg, shape, label}]. stale: 数据不可信, 全灰."""
+def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD, stale=False, width=None):
+    """面板格子 + 当前端口状态 -> 要画的东西 [{name, box, fill, fg, shape, label}]. stale: 数据不可信, 全灰.
+    width: 画布宽; 列多 (48 口 + 上行) 放不下就把格子等比缩小 (同 dash_render.front_boxes)."""
+    cols = max((c["x"] for c in panel), default=0) + 1
+    pitch = cell + gap
+    if width:
+        pitch = min(pitch, (width - 2 * pad) // cols)
+        gap = max(2, pitch // 6)
+        cell = pitch - gap
     out = []
     for c in panel:
         state, lit = ("unknown", False) if stale else oc.lamp(ports.get(c["name"]), now)
-        x0, y0 = pad + c["x"] * (cell + gap), pad + c["y"] * (cell + gap)
+        x0, y0 = pad + c["x"] * pitch, pad + c["y"] * pitch
         out.append({"name": c["name"], "box": (x0, y0, x0 + cell, y0 + cell), "shape": c.get("shape", "rj45"),
                     "label": c.get("label", ""), "fill": _lit_color(state) if lit else OFF,
                     "fg": th.LAMP_LIT_FG if lit and state != "down" else DIM})
@@ -69,15 +78,17 @@ def port_info(p):
 
 
 class ObserveWindow(tk.Toplevel):
-    def __init__(self, master, dev, name, vendor, ddir, token, head=None):
+    def __init__(self, master, dev, name, vendor, ddir, token, head=None, console=(None, None)):
         super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=th.PRIMARY, **th.DIALOG)
         self.dev, self.name, self.vendor, self.ddir, self.token = dev, name, vendor, ddir, token
         self.head = head or survey_core.safe_name(os.path.basename(dev))
         self.ui, self.stop_evt = queue.Queue(), threading.Event()
         self.obs, self.worker, self.hits, self._snap_at, self._hover = None, None, {}, 0, None
         self._closing = False
+        self._pause_console, self._resume_console = console      # 车机控制台本身是 attach 着的"人"
+        self._console_paused, self._snap_err = False, None
         self.overrideredirect(True)
-        W, H = 1100, 440
+        W, H = WIN_W, WIN_H
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
         self.attributes("-topmost", True)
         self._build()
@@ -126,10 +137,16 @@ class ObserveWindow(tk.Toplevel):
         self.status.config(text="看现场、登录中…", fg=DIM)
         self._snap_at = 0
         self.stop_evt.clear()
-        self.worker = threading.Thread(target=self._work, args=(self.obs, user, pw), daemon=True)
+        if self._pause_console:             # 登录阶段不许有人 attach (#85 第四轮); 车机控制台先断开, 登录完再接回
+            self._pause_console()
+            self._console_paused = True
+        box = [pw]                          # 一次性容器: 线程取出后清空, 不在 Thread._args 里一直挂着
+        del pw
+        self.worker = threading.Thread(target=self._work, args=(self.obs, user, box), daemon=True)
         self.worker.start()
 
-    def _work(self, obs, user, pw):
+    def _work(self, obs, user, box):
+        pw = box.pop() if box else ""
         ok = obs.start(user, pw, cancelled=self.stop_evt.is_set)
         del pw
         oc.record("start", head=self.head, device=obs.device, ok=ok, error=obs.error)
@@ -142,13 +159,23 @@ class ObserveWindow(tk.Toplevel):
         oc.record("stop", head=self.head, device=obs.device, state=obs.state, left=obs.left, error=obs.error)
         self.ui.put(self._ended)
 
+    def _console_back(self):
+        if self._console_paused and self._resume_console:
+            self._console_paused = False
+            try:
+                self._resume_console()
+            except Exception:
+                pass
+
     def _logged_in(self):
+        self._console_back()
         self.login_row.pack_forget()
         self.title_lbl.config(text=f"观察 {self.dev} · {self.obs.device}" + (f" · {self.obs.model}" if self.obs.model else ""))
 
     def _ended(self):
         """后台线程结束: 正常退出就关窗; 出了事 (失败 / 掉线 / 没敢 quit) 留着窗口说明, 登录行回来可以再登."""
         obs, self.worker = self.obs, None
+        self._console_back()
         if self._closing and obs.left != "skipped":
             return self.destroy()
         self._write_snap()
@@ -172,7 +199,9 @@ class ObserveWindow(tk.Toplevel):
         obs = self.obs
         if obs and obs.panel:
             stale = obs.state != "polling" or bool(obs.error)
-            self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time(), stale=stale))
+            width = self.canvas.winfo_width()
+            self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time(), stale=stale,
+                                                      width=width if width > 1 else CANVAS_W))
         if obs and self.worker and obs.state == "polling" and not self._closing:
             self._status(obs)
         if obs and time.monotonic() - self._snap_at > SNAP_S:
@@ -185,8 +214,9 @@ class ObserveWindow(tk.Toplevel):
         try:
             os.makedirs(oc.STATE_DIR, exist_ok=True)
             atomicfile.write_json(oc.snapshot_path(self.head), self.obs.snapshot(self.head, owner=self.token))
-        except OSError:
-            pass
+            self._snap_err = None
+        except OSError as e:                # 不静默吞: 状态栏提示副屏看不到
+            self._snap_err = f"副屏快照写不进去: {e.strerror or e}"
 
     def _status(self, obs):
         if self._hover and self._hover in obs.ports:
@@ -195,6 +225,8 @@ class ObserveWindow(tk.Toplevel):
             self.status.config(text=obs.error, fg=th.WARN)
         elif obs.warning:
             self.status.config(text=obs.warning, fg=th.WARN)
+        elif self._snap_err:
+            self.status.config(text=self._snap_err, fg=th.WARN)
         elif obs.pacer.paused(time.monotonic()):
             self.status.config(text="有人在用串口, 暂停", fg=DIM)
         else:
@@ -216,6 +248,7 @@ class ObserveWindow(tk.Toplevel):
 
     def destroy(self):
         self.stop_evt.set()
+        self._console_back()
         oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
         oc.release(self.name, self.token)
         super().destroy()
@@ -231,7 +264,9 @@ def open_for(master, dev, name, vendor, ddir):
                 return w
         return None
     try:
-        return ObserveWindow(master, dev, name, vendor, ddir, token)
+        pause = getattr(master, "_disconnect", None)
+        resume = (lambda: master._connect(wake=False)) if hasattr(master, "_connect") else None
+        return ObserveWindow(master, dev, name, vendor, ddir, token, console=(pause, resume))
     except Exception:
         oc.release(name, token)
         raise

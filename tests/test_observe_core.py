@@ -510,6 +510,9 @@ class FakeDev:
             return None
         return self.console[off:]
 
+    def humans(self):
+        return None if self.unreadable else oc.humans_attached(self.console)
+
     def sleep(self, s):
         self.naps.append(s)
         if self.on_nap:
@@ -1124,7 +1127,17 @@ def test_poll_skipped_and_paused_when_agent_takes_lease():
     assert ob.state == "polling" and "租约" in ob.error and ob.pacer.paused(101)
 
 
-@pytest.mark.parametrize("add", ["\nContinue? [Y/N]:", "\nPassword:", "\n<SW-TEST>dis"])
+def test_poll_sees_password_prompt_as_session_gone():
+    # 第四轮: 轮询中途 console 冒出 Password: = 有人登出又在登录, 会话不是我们的了
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    n = len(dev.polls)
+    dev.console += "\nPassword:"
+    assert ob.tick(100) is False and len(dev.polls) == n and ob.state == "lost"
+
+
+@pytest.mark.parametrize("add", ["\nContinue? [Y/N]:", "\n<SW-TEST>dis"])
 def test_poll_skipped_when_console_mid_operation(add):
     dev = FakeDev()
     ob = _obs(dev)
@@ -1296,7 +1309,8 @@ def test_password_interrupted_then_human_logs_in_no_quit():
     assert "quit" not in [t for _r, t in dev.sent]
 
 
-def test_pw_sent_set_only_after_pass_exchange_returns():
+def test_pw_sent_means_maybe_sent_once_exchange_starts():
+    # 第四轮: pw_sent = "密码可能已发出" (过了所有检查、交给 exchange 那一刻起); 发送出错也算, 但没见到提示符照样不 quit
     dev = FakeDev()
 
     def boom(d):
@@ -1304,7 +1318,7 @@ def test_pw_sent_set_only_after_pass_exchange_returns():
     dev.script["pass"] = boom
     ob = _obs(dev)
     assert ob.start("admin", "s3cret") is False
-    assert ob.login.pw_sent is False
+    assert ob.login.pw_sent is True
     dev.console += "\n<SW-TEST>"
     ob.stop(now=100)
     assert "quit" not in [t for _r, t in dev.sent] and "密码可能已发出" in ob.error
@@ -1352,11 +1366,13 @@ def test_new_content_detected_by_offset_not_window():
 
 def test_abort_after_username_tells_human_console_waits_at_password():
     dev = FakeDev()
-    dev.on_sleep = lambda d: setattr(d, "console", d.console + "x") if d.sent and d.sent[-1][0] == "user" else None
+    # 有人在 console 上重新敲了一遍用户名, 设备又停在 Password: -> 提示里写明停在 Password:
+    dev.on_sleep = (lambda d: setattr(d, "console", d.console + "\nUsername:other\nPassword:")
+                    if d.sent and d.sent[-1][0] == "user" and not d.console.endswith("other\nPassword:") else None)
     ob = _obs(dev)
     assert ob.start("admin", "s3cret") is False
     assert "pass" not in _roles(dev)
-    assert "用户名已发出" in ob.error and "Password:" in ob.error
+    assert "用户名是我们发的" in ob.error and "Password:" in ob.error
 
 
 def test_log_file_read_from_offset(tmp_path):
@@ -1455,3 +1471,145 @@ def test_unrecognised_phy_kept_as_unknown_with_warning():
     ob.start("admin", "s3cret")
     assert ob.tick(100) is True
     assert "GigabitEthernet0/0/2" in ob.warning
+
+
+
+# ============================================================ 第四轮复审
+
+RELOGIN = "quit\n" + IDLE + USER + "ops2\nPassword:\n" + LOGGED
+SVC = "\n[2026-11-07 09:00:00 服务启动 /dev/con-1 9600]\n"
+HUMAN_IN = "\n[2026-11-07 09:00:01 人 接入]\n"
+HUMAN_OUT = "\n[2026-11-07 09:00:02 人 断开]\n"
+
+
+# ---- 中1: 跳过的日志先扫一遍再丢
+
+def test_skipped_content_with_relogin_marks_lost_and_no_quit():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    dev.console += RELOGIN                  # 有人 quit 掉我们, 用自己的账号重新登录, 回到 <SW-TEST>
+    ob.tick(110)                            # 人在用 -> 暂停; 跳过的部分要扫
+    assert ob.state == "lost"
+    ob.stop(now=500)
+    assert "quit" not in [t for _r, t in dev.sent]
+
+
+def test_interjected_relogin_seen_by_scene_check_marks_lost():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    dev.console += RELOGIN
+    ob.tick(102)                            # 还在自己那轮的 settle 窗口里, 由轮询前的现场检查发现
+    assert ob.state == "lost"
+
+
+@pytest.mark.parametrize("text,changed", [
+    ("display clock\n2026-11-07 10:00:00\n<SW-TEST>", False),
+    (IDLE, True), (USER, True), ("\nPassword:", True), ("<SW-TEST>quit\n", True), ("quit\n", True),
+    ("\nLogin authentication\n", True), ("\nInfo: The max number of VTY users is 5.\n", True),
+    ("\nThe current login time is 2026-11-07 10:00:00.\n", True),
+])
+def test_session_changed(text, changed):
+    assert oc.session_changed(text) is changed
+
+
+# ---- 中2a: 登录全程有人 attach 着就不开始 / 中止
+
+def test_refuses_start_when_human_attached():
+    dev = FakeDev(console=SVC + HUMAN_IN + IDLE)
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False and dev.sent == []
+    assert "attach" in ob.error
+
+
+def test_starts_when_human_detached():
+    dev = FakeDev(console=SVC + HUMAN_IN + HUMAN_OUT + IDLE)
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is True, ob.error
+
+
+def test_aborts_when_human_attaches_mid_login():
+    dev = FakeDev()
+
+    def busy():
+        if dev.sent and dev.sent[-1][0] == "wake" and HUMAN_IN not in dev.console:
+            dev.console += HUMAN_IN
+    ob = _obs(dev, busy=busy)
+    assert ob.start("admin", "s3cret") is False and _roles(dev) == ["wake"]
+    assert "attach" in ob.error
+
+
+def test_humans_attached_counts():
+    assert oc.humans_attached(SVC + HUMAN_IN) == 1
+    assert oc.humans_attached(SVC + HUMAN_IN + HUMAN_OUT) == 0
+    assert oc.humans_attached(HUMAN_IN + SVC) == 0                  # 服务重启前的不算
+    assert oc.humans_attached(HUMAN_IN + "x" + HUMAN_IN.replace("人", "Claude")) == 1
+
+
+def test_humans_attached_unknown_when_log_too_big(tmp_path):
+    p = tmp_path / "con-1.log"
+    p.write_bytes(b"x" * 2048 + HUMAN_OUT.encode())
+    assert oc.LogFile(str(p)).humans(limit=1024) is None              # 没读到服务启动, 又不是从头读的
+    assert oc.LogFile(str(p)).humans(limit=1 << 20) == 0
+
+
+# ---- 低4 / 低5
+
+def test_cancel_during_password_quiet_window():
+    dev = FakeDev()
+    flag = {"c": False}
+
+    def nap(d):
+        if d.sent and d.sent[-1][0] == "user":
+            flag["c"] = True
+    dev.on_sleep = nap
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret", cancelled=lambda: flag["c"]) is False
+    assert "pass" not in _roles(dev)
+
+
+def test_auth_failure_reason_kept_by_stop():
+    dev = FakeDev()
+    dev.script["pass"] = "\nError: Local authentication is rejected.\n\nUsername:"
+    ob = _obs(dev)
+    assert ob.start("admin", "wrong") is False
+    ob.stop(now=100)
+    assert "认证失败" in ob.error and "quit" not in [t for _r, t in dev.sent]
+
+
+def test_username_straight_to_prompt_not_called_password_wait():
+    dev = FakeDev()
+    dev.script["user"] = "admin\n<SW-TEST>"
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert "可能停在 Password" not in ob.error
+
+
+# ---- 低6 / 低7
+
+@pytest.mark.parametrize("line", [
+    "Nov  7 2026 10:00:00 SW-TEST IFNET/4/LINK_STATE:The line protocol on the interface has entered the UP state.",
+    "#Nov 7 2026 10:00:00+08:00 SW-TEST SHELL/5/CMDRECORD: Recorded command information.",
+])
+def test_trap_lines_without_percent_are_async(line):
+    assert oc.classify("\n<SW-TEST>\n" + line + "\n") == "prompt"
+
+
+def test_please_press_enter_is_idle():
+    assert oc.classify("\n\nPlease Press ENTER.\n") == "idle"
+
+
+# ---- 存疑: sysname 一样的两台设备换了线
+
+def test_port_set_change_marks_lost():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    assert ob.tick(100) is True
+    dev.brief = BRIEF_AR.replace("<AR-TEST>", "<SW-TEST>")
+    assert ob.tick(200) is False and ob.state == "lost"
+    ob.stop(now=300)
+    assert "quit" not in [t for _r, t in dev.sent]

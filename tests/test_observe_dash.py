@@ -174,3 +174,59 @@ def test_default_ctx_reads_per_port_snapshots(tmp_path, monkeypatch):
     monkeypatch.setattr(oc, "STATE_DIR", str(tmp_path))
     (tmp_path / "con-3.json").write_text('{"ts": 1, "head": "con-3"}')
     assert [d["head"] for d in oc.read_snapshots()] == ["con-3"]
+
+
+
+@pytest.mark.parametrize("names", [
+    [f"GigabitEthernet0/0/{i}" for i in range(1, 49)] + [f"XGigabitEthernet0/0/{i}" for i in range(1, 5)],
+    [f"GigabitEthernet0/0/{i}" for i in range(1, 25)] + [f"XGigabitEthernet0/0/{i}" for i in range(1, 5)],
+    [f"GigabitEthernet0/0/{i}" for i in range(1, 9)],
+])
+def test_panel_fits_canvas_width(names):
+    panel = oc.auto_layout(names)
+    cells = op.panel_cells(panel, {}, now=0, width=op.CANVAS_W)
+    assert len(cells) == len(names)
+    assert max(c["box"][2] for c in cells) <= op.CANVAS_W
+    assert min(c["box"][2] - c["box"][0] for c in cells) >= 16
+
+
+class _FakeWin:
+    def __init__(self):
+        import queue
+        import threading
+        self.ui, self.stop_evt, self.head = queue.Queue(), threading.Event(), "con-1"
+        self._logged_in = self._ended = None
+
+
+def test_password_box_emptied_when_taken(monkeypatch):
+    monkeypatch.setattr(oc, "record", lambda *a, **k: None)
+    box = ["s3cret"]
+    seen = {}
+
+    class Obs:
+        device = error = None
+        state, left = "failed", "none"
+
+        def start(self, user, pw, cancelled=None):
+            seen["pw"], seen["box"] = pw, list(box)
+            return False
+
+        def stop(self, now=None):
+            pass
+    op.ObserveWindow._work(_FakeWin(), Obs(), "admin", box)
+    assert seen == {"pw": "s3cret", "box": []} and box == []
+
+
+def test_snapshot_write_failure_reported(tmp_path, monkeypatch):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setattr(oc, "STATE_DIR", str(blocker / "observe"))
+    w = _FakeWin()
+    w.obs, w.token, w._snap_at, w._snap_err = None, "t", 0, None
+
+    class Obs:
+        def snapshot(self, head, owner=None):
+            return {"ts": 1}
+    w.obs = Obs()
+    op.ObserveWindow._write_snap(w)
+    assert w._snap_err
