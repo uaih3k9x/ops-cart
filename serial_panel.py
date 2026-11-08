@@ -394,9 +394,15 @@ class SerialPanel(tk.Frame):
                 self.port_var.set((free or ports)[0])
             shown = [f"{os.path.basename(n)} @ {b}" for n, b in self._serves.items()]
             self.serve_label.config(text=f"服务: {', '.join(shown) or '未开'}")
-            if not self.sock and self._auto_connect_ok() and match_service(self.port_var.get(), self._serves):
-                self._connect(wake=wake)
+            self._after_refresh(wake)
         self._async(fetch, done)
+
+    def _after_refresh(self, wake):
+        """列表回来以后: 选中的口有服务就连上; 这一路正在观察 (#85) 就不连, 标题显示"观察中"."""
+        if not self.sock and self._auto_connect_ok() and match_service(self.port_var.get(), self._serves):
+            self._connect(wake=wake)
+        elif self._held_here():
+            self._show_held()
 
     def start_serve(self):
         """开服务: 防连点; 进程提前退出时把它的报错显示出来, 不再静默失败."""

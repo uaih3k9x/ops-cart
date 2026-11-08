@@ -411,13 +411,12 @@ def test_work_always_finishes_life_and_posts_ended(monkeypatch):
     monkeypatch.setattr(oc, "record", lambda *a, **k: None)
     w = _FakeWin()
     w.life = op.Life("con-1", "t")
-    oc._CLAIMS.clear()
     oc.claim("con-1", "t")
     w.life.worker_started()
     w.life.window_gone()
 
     class Obs:
-        device = error = note = None
+        device = error = None
         state = "polling"
 
         def start(self, name, cancelled=None):
@@ -426,13 +425,13 @@ def test_work_always_finishes_life_and_posts_ended(monkeypatch):
         def tick(self, now):
             raise RuntimeError("炸了")
 
-        def stop(self, now=None):
+        def stop(self):
             pass
-    with pytest.raises(RuntimeError):
-        op.ObserveWindow._work(w, Obs(), "SW-TEST")
+    obs = Obs()
+    op.ObserveWindow._work(w, obs, "SW-TEST")      # 意外异常: 不再往外抛, 观察置成 failed
+    assert obs.state == "failed" and "炸了" in obs.error
     assert oc.holder("con-1") is None
     assert not w.ui.empty()
-    oc._CLAIMS.clear()
 
 
 def test_serial_panel_connect_refused_while_observing():
@@ -491,44 +490,104 @@ class _Lbl:
 
 
 class _BeginWin:
-    """ObserveWindow.begin 用到的那些属性的替身."""
+    """ObserveWindow.begin / confirm / cancel_confirm 用到的那些属性的替身. probes: 依次返回的现场."""
 
-    def __init__(self, probe, answer=True):
-        self.worker, self.obs, self._closing, self.asked, self.spawned = None, None, True, [], []
+    def __init__(self, *probes):
+        self.worker, self.obs, self._closing, self._confirming, self.spawned = None, None, True, None, []
         self.status, self.close_btn, self.start_btn = _Lbl(), _Lbl(), _Lbl()
         self.stop_evt = __import__("threading").Event()
         self.hold = op.ConsoleHold("/dev/con-1", panels=lambda: [None])
-        self._probe, self._answer, self.close = probe, answer, None
+        self.close, self.shown = None, []
+        self._probes = list(probes)
 
     def _new_observer(self):
         win = self
 
         class O:
             def probe(self):
-                return win._probe
+                return win._probes.pop(0) if len(win._probes) > 1 else win._probes[0]
         return O()
 
-    def ask(self, title, msg):
-        self.asked.append(msg)
-        return self._answer
+    def _show_confirm(self, text):
+        self.shown.append(text)
+
+    def _hide_confirm(self):
+        self.shown.append(None)
 
     def _spawn(self, obs, name):
         self.spawned.append(name)
+        self.worker = object()
 
 
-def test_begin_refuses_with_reason_without_asking():
+def test_begin_refuses_with_reason_without_confirming():
     w = _BeginWin((None, "console 还没登录 (停在 Username:), 请先在 console 上登录"))
     op.ObserveWindow.begin(w)
-    assert "还没登录" in w.status.kw["text"] and w.asked == [] and w.spawned == []
+    assert "还没登录" in w.status.kw["text"] and w.shown == [] and w.spawned == [] and w._confirming is None
 
 
-def test_begin_asks_to_confirm_device_name():
-    w = _BeginWin(("SW-TEST", None), answer=False)
+def test_begin_shows_inline_confirm_not_modal():
+    import inspect
+    w = _BeginWin(("SW-TEST", None))
     op.ObserveWindow.begin(w)
-    assert w.asked == [op.confirm_text("SW-TEST")] and "<SW-TEST>" in w.asked[0] and w.spawned == []
-    w = _BeginWin(("SW-TEST", None), answer=True)
+    assert w.shown == [op.confirm_text("SW-TEST")] and w.spawned == [] and w._confirming
+    assert w.start_btn.kw["state"] == "disabled"
+    assert "messagebox" not in inspect.getsource(op)                 # 不用模态框 (嵌套事件循环可重入)
+
+
+def test_begin_reentry_during_confirm_does_nothing():
+    w = _BeginWin(("SW-TEST", None))
     op.ObserveWindow.begin(w)
+    op.ObserveWindow.begin(w)                    # 确认期间又点一次
+    assert len([x for x in w.shown if x]) == 1 and w.spawned == []
+    op.ObserveWindow.confirm(w)
+    op.ObserveWindow.confirm(w)                  # 再点确认也只起一个线程
     assert w.spawned == ["SW-TEST"] and w._closing is False and w.close_btn.kw["text"] == "退出观察"
+
+
+def test_confirm_rechecks_scene():
+    w = _BeginWin(("SW-TEST", None), ("OTHER-SW", None))
+    op.ObserveWindow.begin(w)
+    op.ObserveWindow.confirm(w)
+    assert w.spawned == [] and "变" in w.status.kw["text"] and w.start_btn.kw["state"] == "normal"
+    w = _BeginWin(("SW-TEST", None), (None, "console 停在系统视图里"))
+    op.ObserveWindow.begin(w)
+    op.ObserveWindow.confirm(w)
+    assert w.spawned == [] and "系统视图" in w.status.kw["text"]
+
+
+def test_confirm_refused_if_worker_already_running():
+    w = _BeginWin(("SW-TEST", None))
+    op.ObserveWindow.begin(w)
+    w.worker = object()
+    op.ObserveWindow.confirm(w)
+    assert w.spawned == []
+
+
+def test_cancel_confirm():
+    w = _BeginWin(("SW-TEST", None))
+    op.ObserveWindow.begin(w)
+    op.ObserveWindow.cancel_confirm(w, "锁屏了")
+    assert w._confirming is None and w.shown[-1] is None and "锁屏" in w.status.kw["text"]
+    assert w.start_btn.kw["state"] == "normal"
+    op.ObserveWindow.confirm(w)
+    assert w.spawned == []
+
+
+def test_lock_cancels_pending_confirm():
+    op._WINDOWS.clear()
+    calls = []
+
+    class W(_Win):
+        _confirming = ("obs", "SW-TEST")
+
+        def cancel_confirm(self, why=None):
+            calls.append(why)
+            self._confirming = None
+    w = W()
+    op._WINDOWS.add(w)
+    op.hide_all()
+    assert calls and "锁屏" in calls[0] and "withdraw" in w.calls
+    op._WINDOWS.clear()
 
 
 def test_begin_holds_panel_console_for_whole_observation():
@@ -536,6 +595,8 @@ def test_begin_holds_panel_console_for_whole_observation():
     w = _BeginWin(("SW-TEST", None))
     w.hold = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     op.ObserveWindow.begin(w)
+    assert p.calls == []                         # 等确认的时候还不动面板
+    op.ObserveWindow.confirm(w)
     assert p.calls == ["disconnect"] and oc.is_observing("/dev/con-1")   # 人用面板登录的: 观察期间借走
 
 
@@ -635,3 +696,88 @@ def test_kiosk_lock_and_unlock_call_observe_hide_show():
     tree = ast.parse(src)
     fns = {n.name: ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
     assert "hide_all" in fns["lock"] and "show_all" in fns["_try_unlock"]
+
+
+
+# ============================================================ 第九轮
+
+def test_life_counts_workers():
+    oc.claim("con-1", "t")
+    life = op.Life("con-1", "t")
+    life.worker_started()
+    life.worker_started()                        # 万一起了两个
+    life.window_gone()
+    life.worker_done()
+    assert oc.holder("con-1") == "t"             # 先结束的那个不能把占用放掉
+    life.worker_done()
+    assert oc.holder("con-1") is None
+
+
+def test_console_hold_drop_does_not_reconnect():
+    p = _Panel()
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
+    h.pause()
+    h.drop()
+    assert p.calls == ["disconnect"] and not oc.is_observing("/dev/con-1")
+
+
+def test_release_console_on_kiosk_exit_drops_without_reconnect():
+    p = _Panel()
+
+    class W:
+        hold = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
+    w = W()
+    w.hold.pause()
+    op.ObserveWindow._release_console(w, interrupted=True)
+    assert p.calls == ["disconnect"]
+    w.hold.pause()
+    op.ObserveWindow._release_console(w, interrupted=False)
+    assert p.calls[-1] == ("connect", False)
+
+
+def test_shutdown_reports_whether_it_interrupted(monkeypatch):
+    import threading
+    monkeypatch.setattr(oc, "record", lambda *a, **k: None)
+    w = _FakeWin()
+    w.worker = None
+    assert op.ObserveWindow._shutdown(w) is False
+    w.stop_evt.clear()
+    w.worker = threading.Thread(target=lambda: w.stop_evt.wait(5), daemon=True)
+    w.worker.start()
+    assert op.ObserveWindow._shutdown(w, timeout=2) is True
+
+
+def test_new_panel_shows_observing_after_refresh():
+    import serial_panel as sp
+
+    class V:
+        def get(self):
+            return "/dev/con-1"
+
+    class P:
+        _serves = {"/dev/con-1": "9600"}
+        port_var = V()
+        sock = None
+
+        def __init__(self):
+            self.shown, self.connected = 0, []
+
+        def _show_held(self):
+            self.shown += 1
+
+        def _connect(self, wake=True):
+            self.connected.append(wake)
+
+        def _auto_connect_ok(self):
+            return sp.SerialPanel._auto_connect_ok(self)
+
+        def _held_here(self):
+            return sp.SerialPanel._held_here(self)
+    oc.observing_add("/dev/con-1")
+    p = P()
+    sp.SerialPanel._after_refresh(p, True)
+    assert p.shown == 1 and p.connected == []
+    oc.observing_discard("/dev/con-1")
+    p = P()
+    sp.SerialPanel._after_refresh(p, True)
+    assert p.shown == 0 and p.connected == [True]

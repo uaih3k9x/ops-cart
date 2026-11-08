@@ -15,7 +15,6 @@ import time
 import weakref
 
 import tkinter as tk
-from tkinter import messagebox
 
 import atomicfile
 import lamps_core
@@ -36,8 +35,11 @@ _WINDOWS = weakref.WeakSet()            # 开着的观察窗口: 锁屏时隐藏
 
 
 def hide_all():
+    """锁屏: 等待中的设备确认作废 (解锁后让人重新点), 窗口藏起来."""
     for w in list(_WINDOWS):
         if _alive(w):
+            if getattr(w, "_confirming", None):
+                w.cancel_confirm("锁屏了, 确认已取消; 解锁后请重新点 开始观察")
             w.withdraw()
 
 
@@ -88,6 +90,12 @@ class ConsoleHold:
                     pass
         return cut
 
+    def drop(self):
+        """只撤销登记, 不接回 (kiosk 退出的时候不必再去连面板)."""
+        if self.active:
+            self.active = False
+            oc.observing_discard(self.name)
+
     def resume(self):
         """撤销登记; 选着这一路又没连上的面板接回 (标题跟着刷新). 接不回返回给人看的一句."""
         if not self.active:
@@ -108,26 +116,27 @@ class ConsoleHold:
 
 
 class Life:
-    """观察窗口和它的后台线程谁后结束, 谁放 claim: 线程还在跑 (可能还在一条 conbroker 交互里) 时, 同一路不许开新的观察或巡检."""
+    """观察窗口和它的后台线程都结束了才放 claim: 线程还在跑 (可能还在一条 conbroker 交互里) 时,
+    同一路不许开新的观察或巡检. 按线程计数, 先结束的那个不会把占用放掉."""
 
     def __init__(self, name, token):
         self.name, self.token, self._lock = name, token, threading.Lock()
-        self._worker, self._window = False, True
+        self._workers, self._window = 0, True
 
     def worker_started(self):
         with self._lock:
-            self._worker = True
+            self._workers += 1
 
     def worker_done(self):
         with self._lock:
-            self._worker = False
-            if not self._window:
+            self._workers = max(0, self._workers - 1)
+            if not self._window and not self._workers:
                 oc.release(self.name, self.token)
 
     def window_gone(self):
         with self._lock:
             self._window = False
-            if not self._worker:
+            if not self._workers:
                 oc.release(self.name, self.token)
 
 
@@ -190,7 +199,7 @@ class ObserveWindow(tk.Toplevel):
         self.hold = ConsoleHold(name)             # 车机控制台本身是 attach 着的"人"
         self.life = Life(name, token)
         self._snap_err = None
-        self.ask = lambda title, msg: messagebox.askyesno(title, msg, parent=self)   # 人确认设备名
+        self._confirming = None             # (obs, 设备名): 等人在窗口里点 确认 / 取消
         self.overrideredirect(True)
         W, H = WIN_W, WIN_H
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
@@ -210,6 +219,13 @@ class ObserveWindow(tk.Toplevel):
         self.start_btn = tk.Button(bar, text="开始观察", font=FONT, command=self.begin, bg=th.PRIMARY, fg=FG,
                                    **th.RAISED, cursor="hand2", padx=12)
         self.start_btn.pack(side="right", padx=6, pady=4)
+        self.confirm_row = tk.Frame(self, bg=BG)         # 不用模态框: 嵌套事件循环里能重入 begin
+        self.confirm_lbl = tk.Label(self.confirm_row, text="", font=FONT, bg=BG, fg=FG)
+        self.confirm_lbl.pack(side="left")
+        tk.Button(self.confirm_row, text="取消", font=FONT, command=self.cancel_confirm, bg=th.BTN2, fg=FG,
+                  **th.RAISED, cursor="hand2", padx=12).pack(side="right", padx=6)
+        tk.Button(self.confirm_row, text="确认", font=FONT, command=self.confirm, bg=th.PRIMARY, fg=FG,
+                  **th.RAISED, cursor="hand2", padx=12).pack(side="right", padx=6)
         self.canvas = tk.Canvas(self, bg=CARD, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=PAD)
         self.canvas.bind("<Motion>", self._on_hover)
@@ -226,25 +242,57 @@ class ObserveWindow(tk.Toplevel):
                            log=log, busy=lambda: oc.agent_busy(self.dev))
 
     def begin(self):
-        """开始观察: 看现场 (只认用户视图提示符) -> 人确认设备名 -> 后台线程开始轮询. 这一步不往 console 发任何字节."""
-        if self.worker:
+        """开始观察第一步: 看现场 (只认用户视图提示符), 在窗口里请人确认设备名. 这一步不往 console 发任何字节.
+        确认期间 (_confirming) 再点直接返回; 不用模态确认框: 它的嵌套事件循环里能重入, 锁屏解锁后还会被盖住."""
+        if self.worker or self._confirming:
             return
         obs = self._new_observer()
         name, why = obs.probe()
         if why:
             self.status.config(text=f"没开始: {why}", fg=th.WARN)
             return
-        if not self.ask("开始观察", confirm_text(name)):
+        self._confirming = (obs, name)
+        self.start_btn.config(state="disabled")
+        self._show_confirm(confirm_text(name))
+
+    def confirm(self):
+        """人点了 确认: 再看一次现场 (还得是同一个 <设备名>), 后台线程开始轮询."""
+        pending, self._confirming = self._confirming, None
+        if not pending:
+            return
+        self._hide_confirm()
+        obs, name = pending
+        if self.worker:
+            return
+        got, why = obs.probe()
+        if why or got != name:
+            self.status.config(text=f"没开始: {why or f'现场变了 (<{name}> 变成了 <{got}>), 请重新点 开始观察'}",
+                               fg=th.WARN)
+            self.start_btn.config(state="normal")
             return
         self.obs = obs
         self._closing = False               # 上次点过退出观察、留着窗口再开始: 按钮恢复
         self.close_btn.config(state="normal", text="退出观察", command=self.close)
-        self.start_btn.config(state="disabled")
         self.status.config(text=f"观察 <{name}>…", fg=DIM)
         self._snap_at = 0
         self.stop_evt.clear()
         self.hold.pause()                   # 观察全程占着车机控制台对这一路的连接 (有人 attach 就不轮询); 结束时接回
         self._spawn(obs, name)
+
+    def cancel_confirm(self, why=None):
+        if not self._confirming:
+            return
+        self._confirming = None
+        self._hide_confirm()
+        self.start_btn.config(state="normal")
+        self.status.config(text=why or "已取消", fg=th.WARN if why else DIM)
+
+    def _show_confirm(self, text):
+        self.confirm_lbl.config(text=text)
+        self.confirm_row.pack(fill="x", padx=PAD, pady=(8, 0), before=self.canvas)
+
+    def _hide_confirm(self):
+        self.confirm_row.pack_forget()
 
     def _spawn(self, obs, name):
         self.worker = threading.Thread(target=self._work, args=(obs, name), daemon=True)
@@ -260,6 +308,9 @@ class ObserveWindow(tk.Toplevel):
                 self.stop_evt.wait(0.5)
             obs.stop()
             oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error)
+        except Exception as e:              # 意外出错: 别停在 polling (副屏会把旧数据当实时的画)
+            obs.state, obs.error = "failed", f"观察出错, 已停止: {e or type(e).__name__}"
+            oc.record("stop", head=self.head, device=getattr(obs, "device", None), state="failed", error=obs.error)
         finally:                            # 不管怎么结束: 放占用 (窗口已关的话) 并通知界面 (接回控制台在 _ended 里)
             life = getattr(self, "life", None)
             if life:
@@ -351,13 +402,17 @@ class ObserveWindow(tk.Toplevel):
         self.stop_evt.set()
         worker = self.worker
         if worker is None or not worker.is_alive():
-            return
+            return False
         oc.record("interrupted", head=self.head, note="观察被 kiosk 退出打断")
         worker.join(timeout)
+        return True
+
+    def _release_console(self, interrupted):
+        """kiosk 退出打断的: 只撤销"观察中"登记, 不在退出过程中接回面板; 否则正常接回."""
+        (self.hold.drop if interrupted else self.hold.resume)()
 
     def destroy(self):
-        self._shutdown()
-        self.hold.resume()
+        self._release_console(self._shutdown())
         oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
         self.life.window_gone()             # 后台线程还在跑就等它结束再放 claim
         _WINDOWS.discard(self)
