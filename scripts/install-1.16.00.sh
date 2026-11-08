@@ -121,6 +121,8 @@ cat <<EOF
   [ ] 手选 Rescue shell 还能进救援 (#76)
   [ ] 串口发一条命令后 serial-slot<N>.log 里有 gate.shadow (#78)
   [ ] 车机确认框里挂起项带设备上下文, 字号不挤掉"确认发送"按钮 (#67 #68)
+  [ ] 串口确认框里有"设备最后一行（不可信）"这一块, "确认发送"按钮没被挤掉 (#74)
+  [ ] 车机真屏跑确认框 Tk 测试 (命令见 docs/DEPLOY_1.16.00.md 第 8 步, skip 不算过)
 没开的 (要用再手工开, 见 docs/DEPLOY_1.16.00.md 第 6 步):
   cart-mcp-ro.service (要先在 mcp.json 加 readonly 段), cart-ble-input.service (要先配对 + trust)
 EOF

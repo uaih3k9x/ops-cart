@@ -31,6 +31,7 @@ sudo bash /tmp/deploy-1.16.00/install.sh
 | #63 | 蓝牙隔空打字·安卓 App | 只有 `android/`，推车上不用 |
 | #78 | 串口写闸门第 1 层白名单·影子期：只记录 `gate.shadow`，放行不变 | 新 `serial_allowlist.py`；`serial-gate.json` 可选 `allowlist.disable` |
 | #91 | 测试数据避开禁用词 | 只改测试 |
+| #74 | 串口按键闸门：设备停在确认类提示（`[Y/N]`、`Are you sure`、以问号收尾……）上、或读不到最后一行时，Agent 发回车 / 空格要人确认 | 换 `serial_write_core.py`、`mcp_serial.py`、`confirm_core.py`、`confirm_panel.py`、`kiosk.py`；确认框多一块"设备最后一行（不可信）"。**没有新单元、新配置，也不用迁移**；靠重启 kiosk 生效（MCP stdio 每次新起进程，cart-mcp 开着也会重启） |
 
 **单元 / 系统件改动**（`git diff f6541fd -- deploy/`）：
 
@@ -97,10 +98,11 @@ cp *.py VERSION BUILD $P/opt/ && cp -r web icons $P/opt/
 cp deploy/systemd/cart-mcp.service deploy/systemd/cart-mcp-ro.service deploy/systemd/cart-ble-input.service $P/systemd/
 cp scripts/cart_accept.py scripts/accept_core.py scripts/accept-manifest.json $P/accept/
 cp scripts/install-1.16.00.sh $P/install.sh
+mkdir -p $P/tk-test && cp tests/conftest.py tests/test_confirm_panel.py $P/tk-test/   # 第 8 步车机真屏跑
 tar -C $(dirname $P) -cf - deploy-1.16.00 | ssh <推车> 'rm -rf /tmp/deploy-1.16.00 && tar -C /tmp -xf -'
 ```
 
-包的布局：`opt/`（落到 `/opt/pxe`）、`systemd/`、`accept/`（单放，别混进 `/opt/pxe`）、`install.sh`。
+包的布局：`opt/`（落到 `/opt/pxe`）、`systemd/`、`accept/`（单放，别混进 `/opt/pxe`）、`tk-test/`、`install.sh`。
 
 ## 4. 落位（脚本第 2–4 段）
 
@@ -170,6 +172,19 @@ journalctl -u kiosk -u cart-dash -u webkiosk -u kvm-broker -u pxe-server -u cart
 - [ ] 串口发一条命令后，`serial-slot<N>.log` 里有 `gate.shadow`（#78）。
 - [ ] 车机确认框里挂起项带设备上下文、带 `<secret>` 的行显示正常，不挤掉"确认发送"按钮（#67 #68）。
 - [ ] 键鼠经 MCP 操作 BIOS 启动菜单（F12 + 上下键 + 回车）不会被挂起（#67）。
+- [ ] 串口确认框里有"设备最后一行（不可信）"这一块（灰字），"确认发送"按钮没被挤掉（#74）。
+- [ ] 串口设备停在 `[Y/N]` / `Destination filename [...]?` 这类提示上时，Agent 发回车被挂起；停在 `---- More ----` 上时空格照常翻页（#74）。
+
+确认框的 Tk 测试（#74 / #65）在车机真屏上跑一次。包里 `tk-test/` 带了 `test_confirm_panel.py` 和 `conftest.py`。会在车机屏幕上短暂开关几个窗口，没人用车机时跑：
+
+```bash
+cd /tmp/deploy-1.16.00/tk-test
+sudo env DISPLAY=:0 XAUTHORITY=/root/.Xauthority PYTHONPATH=/opt/pxe python3 -m pytest -q -p no:cacheprovider test_confirm_panel.py
+```
+
+- `OPS_TK_TESTS=1` 只是 macOS 上的开关（`tests/conftest.py`），推车是 Linux，不用设，有 `DISPLAY` 就真跑；没有显示会全部 skip，**skip 不算过**。
+- 推车的 pytest 是 6.2.2，不认 `pytest.ini` 的 `pythonpath`，所以用 `PYTHONPATH=/opt/pxe` 测装好的代码。
+- 待核对：kiosk 是 root 用 `xinit` 起的 X，授权文件在不在 `/root/.Xauthority`。连不上显示就 `sudo ls -a /root` 找 `.serverauth.*`，或者 `sudo xauth list` 看看。
 
 ## 9. 回滚
 
