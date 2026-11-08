@@ -43,27 +43,42 @@ def cart(tmp_path):
         (pkg / "systemd" / u).write_text("new " + u + "\n")
     shutil.copy(SCRIPT, pkg / "install.sh")
 
+    (opt / "tftp" / "EFI" / "BOOT").mkdir(parents=True)
+    (opt / "tftp" / "EFI" / "BOOT" / "grub.cfg").write_text("old efi menu\n")
+    (opt / "pxe-mode.json").write_text('{"old": 1}\n')
+    for f in ("cart_accept.py", "accept_core.py", "accept-manifest.json"):
+        (pkg / "accept" / f).write_text("x\n")
+
     calls = tmp_path / "calls.log"
-    fail = tmp_path / "fail-restart"
+    fail = tmp_path / "fail-restart"      # 列在这里的服务: restart 返回非 0
+    brk = tmp_path / "break-on-restart"   # 列在这里的服务: restart 返回 0, 之后 is-active 为假 (新代码起不来)
+    active = tmp_path / "active"          # 当前 active 的服务 (同时当作 enabled)
+    active.write_text("kiosk\ncart-dash\ncart-mcp\n")
     _exe(bin_ / "id", 'echo 0\n')
-    # 假 systemctl: kiosk / cart-dash / cart-mcp 开着; fail-restart 文件里写的服务重启失败
-    _exe(bin_ / "systemctl", f'''echo "$*" >> {calls}
+    _exe(bin_ / "systemctl", f"""echo "$*" >> {calls}
+svc="${{@: -1}}"
 case "$1" in
-  is-active|is-enabled) for a; do case "$a" in kiosk|cart-dash|cart-mcp) exit 0;; esac; done; exit 3;;
-  restart) [ -f {fail} ] && grep -qx "$2" {fail} && exit 1; exit 0;;
+  is-active|is-enabled) grep -qx "$svc" {active} && exit 0; exit 3;;
+  restart)
+    [ -f {fail} ] && grep -qx "$2" {fail} && exit 1
+    if [ -f {brk} ] && grep -qx "$2" {brk}; then grep -vx "$2" {active} > {active}.n || true; mv {active}.n {active}
+    else grep -qx "$2" {active} || echo "$2" >> {active}; fi
+    exit 0;;
 esac
 exit 0
-''')
-    # 假 python3: kiosk_core --write-rescue 写新菜单; 验收只记一笔
-    _exe(bin_ / "python3", f'''echo "python3 $*" >> {calls}
+""")
+    # 假 python3: kiosk_core --write-rescue 像 pxe_disarm 那样写新菜单、删 EFI/BOOT 菜单、写 pxe-mode.json; 验收只记一笔
+    _exe(bin_ / "python3", f"""echo "python3 $*" >> {calls}
 case "$1" in
-  */kiosk_core.py) printf "menuentry 'Boot from local disk' {{ exit }}\\n" > "$4/grub.cfg";;
+  */kiosk_core.py) printf "menuentry 'Boot from local disk' {{ exit }}\\n" > "$4/grub.cfg"
+                   rm -f "$4/EFI/BOOT/grub.cfg"; echo '{{"new": 1}}' > "$4/../pxe-mode.json";;
 esac
 exit 0
-''')
+""")
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", OPT=str(opt), SYS=str(sysd),
                ETC=str(etc), LOG=str(log), SETTLE="0")
-    return dict(tmp=tmp_path, opt=opt, sys=sysd, etc=etc, pkg=pkg, env=env, calls=calls, fail=fail)
+    return dict(tmp=tmp_path, opt=opt, sys=sysd, etc=etc, pkg=pkg, env=env, calls=calls, fail=fail,
+                brk=brk, active=active)
 
 
 def run(cart, extra_env=None):
@@ -146,3 +161,88 @@ def test_failure_stops_and_rollback_restores(cart):
     assert (cart["sys"] / "cart-mcp.service").read_text() == "old unit\n"
     assert not (cart["sys"] / "cart-mcp-ro.service").exists()
     assert not (cart["sys"] / "cart-ble-input.service").exists()
+
+
+def _rollback(cart, b):
+    return subprocess.run(["bash", str(b / "rollback.sh")], env=cart["env"], capture_output=True, text=True)
+
+
+def test_die_after_backup_prints_rollback(cart):
+    """restart 返回 0 但随后没起来: 走 die 而不是 ERR, 也要打印回滚命令."""
+    cart["brk"].write_text("kiosk\n")
+    r = run(cart)
+    assert r.returncode != 0
+    (b,) = backups(cart)
+    assert "kiosk" in r.stderr
+    assert f"sudo bash {b}/rollback.sh" in r.stderr
+
+
+def test_rollback_restarts_services_active_before_deploy_even_if_down_now(cart):
+    cart["brk"].write_text("kiosk\n")
+    run(cart)
+    (b,) = backups(cart)
+    assert "kiosk" not in cart["active"].read_text().split()     # 新代码把 kiosk 弄停了
+    cart["brk"].unlink()
+    before = len(cart["calls"].read_text())
+    rr = _rollback(cart, b)
+    assert rr.returncode == 0, rr.stderr
+    after = cart["calls"].read_text()[before:].splitlines()
+    for s in ("kiosk", "cart-dash", "cart-mcp"):
+        assert f"restart {s}" in after
+    assert "restart pxe-server" not in after                     # 部署前没开的不拉
+    assert "kiosk" in cart["active"].read_text().split()
+
+
+def test_rollback_reports_services_that_fail_to_restart(cart):
+    cart["fail"].write_text("cart-mcp\n")
+    run(cart)
+    (b,) = backups(cart)
+    rr = _rollback(cart, b)
+    assert rr.returncode != 0 and "cart-mcp" in rr.stderr
+    assert (cart["opt"] / "VERSION").read_text() == "1.15.01\n"   # 文件照样换回去了
+
+
+def test_menus_and_pxe_mode_backed_up_and_restored_as_a_set(cart):
+    cart["fail"].write_text("cart-mcp\n")
+    run(cart)
+    (b,) = backups(cart)
+    assert (b / "tftp" / "EFI" / "BOOT" / "grub.cfg").read_text() == "old efi menu\n"
+    assert (b / "pxe-mode.json").exists()
+    cart["fail"].unlink()
+    assert _rollback(cart, b).returncode == 0
+    opt = cart["opt"]
+    assert (opt / "tftp" / "grub.cfg").read_text() == "Rescue default\n"
+    assert (opt / "tftp" / "EFI" / "BOOT" / "grub.cfg").read_text() == "old efi menu\n"
+    assert (opt / "pxe-mode.json").read_text() == '{"old": 1}\n'
+
+
+def test_rollback_removes_pxe_mode_that_did_not_exist_before(cart):
+    (cart["opt"] / "pxe-mode.json").unlink()
+    cart["fail"].write_text("cart-mcp\n")
+    run(cart)
+    (b,) = backups(cart)
+    cart["fail"].unlink()
+    assert _rollback(cart, b).returncode == 0
+    assert not (cart["opt"] / "pxe-mode.json").exists()
+
+
+@pytest.mark.parametrize("missing", ["systemd/cart-mcp-ro.service", "systemd/cart-ble-input.service",
+                                     "systemd/cart-mcp.service", "accept/cart_accept.py"])
+def test_refuses_incomplete_package(cart, missing):
+    (cart["pkg"] / missing).unlink()
+    r = run(cart)
+    assert r.returncode != 0 and missing in r.stderr
+    assert backups(cart) == []
+
+
+def test_refuses_package_with_wrong_target_version(cart):
+    (cart["pkg"] / "opt" / "VERSION").write_text("1.16.01\n")
+    r = run(cart)
+    assert r.returncode != 0 and "1.16.01" in r.stderr
+    assert backups(cart) == []
+
+
+def test_force_hint_does_not_use_sudo_E(cart):
+    (cart["opt"] / "VERSION").write_text("1.14.00\n")
+    r = run(cart)
+    assert "sudo FORCE=1 bash" in r.stderr and "sudo -E" not in r.stderr

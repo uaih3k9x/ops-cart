@@ -11,32 +11,37 @@ SYS=${SYS:-/etc/systemd/system}
 ETC=${ETC:-/etc/ops-cart}
 LOG=${LOG:-/var/log/ops-cart}
 FROM=1.15.01
-TO=$(cat "$PKG/opt/VERSION")
+EXPECT_TO=1.16.00
+TO=$(cat "$PKG/opt/VERSION" 2>/dev/null || true)
 NEW_UNITS="cart-mcp-ro.service cart-ble-input.service"
 CHANGED_UNITS="cart-mcp.service"
-# 改过代码、要重启的常驻服务 (开着才重启); kiosk 会回到锁屏
+# 改过代码、要重启的常驻服务 (部署前开着的才重启); kiosk 会回到锁屏
 RESTART="cart-dash kiosk webkiosk kvm-broker pxe-server pxe-http-boot pxe-http-repo cart-mcp"
 B=""
 
-die() { echo "!! $*" >&2; exit 1; }
-
-on_err() {
-    echo >&2
-    echo "!! 第 $1 行出错, 已停下." >&2
+hint_rollback() {
     if [ -n "$B" ] && [ -x "$B/rollback.sh" ]; then
-        echo "!! 回滚: sudo bash $B/rollback.sh" >&2
+        echo "!! 已经装了一半. 回滚: sudo bash $B/rollback.sh" >&2
     else
         echo "!! 备份前就停了, 推车上什么都没改." >&2
     fi
 }
+# die 是 exit 1, 不走 ERR trap: 自己打回滚提示
+die() { echo "!! $*" >&2; hint_rollback; exit 1; }
+on_err() { echo >&2; echo "!! 第 $1 行出错, 已停下." >&2; hint_rollback; }
 trap 'on_err $LINENO' ERR
 
 [ "$(id -u)" = 0 ] || die "要 root: sudo bash $0"
 [ -f "$PKG/opt/BUILD" ] || die "包里缺 BUILD"
 grep -q -- '-dirty' "$PKG/opt/BUILD" && die "BUILD 带 -dirty, 包不是从干净提交打的"
+[ "$TO" = "$EXPECT_TO" ] || die "包里 VERSION 是 '$TO', 不是 $EXPECT_TO"
+for f in $(for u in $CHANGED_UNITS $NEW_UNITS; do echo "systemd/$u"; done) accept/cart_accept.py accept/accept_core.py \
+         accept/accept-manifest.json opt/kiosk_core.py; do
+    [ -f "$PKG/$f" ] || die "包不全: 缺 $f"
+done
 CUR=$(cat "$OPT/VERSION" 2>/dev/null || echo "?")
 if [ "$CUR" != "$FROM" ] && [ "${FORCE:-}" != 1 ]; then
-    die "推车现在是 $CUR, 本包只从 $FROM 升 (确认无误再 FORCE=1 sudo -E bash $0)"
+    die "推车现在是 $CUR, 本包只从 $FROM 升 (确认无误再 sudo FORCE=1 bash $0)"
 fi
 # 有机器正解锁着: 重写默认菜单会把它的装机菜单一并删掉, 先等装完或在车机上上锁
 if ls "$OPT"/tftp/grub.cfg-* >/dev/null 2>&1; then
@@ -45,12 +50,20 @@ fi
 
 echo "==> $CUR ($(cat "$OPT/BUILD" 2>/dev/null)) -> $TO ($(cat "$PKG/opt/BUILD"))"
 
+# 现在开着的服务: 装完重启它们, 回滚时也无条件重启它们 (新代码起不来停掉的也要拉回来)
+ACTIVE=""
+for s in $RESTART; do if systemctl is-active --quiet "$s"; then ACTIVE="$ACTIVE $s"; fi; done
+
 # ---- 1. 备份
 TS=$(date +%Y%m%d-%H%M%S)
 B=$OPT/.bak-$TS
 mkdir -p "$B/etc/systemd" "$B/tftp"
 cp -a "$OPT"/*.py "$OPT/VERSION" "$OPT/BUILD" "$OPT/web" "$OPT/icons" "$B/"
-cp -a "$OPT/tftp/grub.cfg" "$B/tftp/"
+# PXE 菜单整批备份: tftp 树里所有 grub.cfg* (含 EFI/BOOT 下的), 保留相对路径
+(cd "$OPT/tftp" && find . -name 'grub.cfg*' -type f) | while IFS= read -r f; do
+    mkdir -p "$B/tftp/$(dirname "$f")"; cp -a "$OPT/tftp/$f" "$B/tftp/$f"
+done
+if [ -f "$OPT/pxe-mode.json" ]; then cp -a "$OPT/pxe-mode.json" "$B/"; fi
 for u in $CHANGED_UNITS; do cp -a "$SYS/$u" "$B/etc/systemd/"; done
 cp -a "$ETC" "$B/etc/ops-cart"
 cat > "$B/rollback.sh" <<EOF
@@ -60,12 +73,20 @@ set -eu
 B=$B
 cp -a \$B/*.py \$B/VERSION \$B/BUILD $OPT/
 rm -rf $OPT/web $OPT/icons && cp -a \$B/web \$B/icons $OPT/
-cp -a \$B/tftp/grub.cfg $OPT/tftp/grub.cfg
+# PXE 菜单整批换回备份时那一套; pxe-mode.json 备份时没有就删
+find $OPT/tftp -name 'grub.cfg*' -type f -delete
+(cd \$B/tftp && find . -type f) | while IFS= read -r f; do   # 逐个文件拷回, 不动 tftp 目录本身的属性 / SELinux 标签
+    mkdir -p "$OPT/tftp/\$(dirname "\$f")"; cp -a "\$B/tftp/\$f" "$OPT/tftp/\$f"
+done
+if [ -f \$B/pxe-mode.json ]; then cp -a \$B/pxe-mode.json $OPT/; else rm -f $OPT/pxe-mode.json; fi
 for u in $NEW_UNITS; do systemctl disable --now \$u 2>/dev/null || true; rm -f $SYS/\$u; done
 for u in $CHANGED_UNITS; do install -m 644 \$B/etc/systemd/\$u $SYS/\$u; done
 systemctl daemon-reload
-for s in $RESTART; do if systemctl is-active --quiet \$s; then systemctl restart \$s; fi; done
+# 部署前开着的这几个: 不看现在状态, 直接重启
+BAD=""
+for s in $ACTIVE; do systemctl restart \$s || BAD="\$BAD \$s"; done
 echo "回滚完: \$(cat $OPT/VERSION) \$(cat $OPT/BUILD)"
+if [ -n "\$BAD" ]; then echo "!! 这些没重启成功:\$BAD (journalctl -u <名字> -n 50)" >&2; exit 1; fi
 EOF
 chmod 700 "$B/rollback.sh"
 echo "==> 备份: $B"
@@ -89,13 +110,14 @@ python3 "$OPT/kiosk_core.py" --write-rescue --root "$OPT/tftp"
 grep -q "Boot from local disk" "$OPT/tftp/grub.cfg" || die "新 grub.cfg 里没有本地盘项"
 
 # ---- 6. 重启 (开着的才重启)
-for s in $RESTART; do
-    if systemctl is-active --quiet "$s"; then systemctl restart "$s"; echo "    重启 $s"; fi
-done
+for s in $ACTIVE; do systemctl restart "$s"; echo "    重启 $s"; done
 sleep "${SETTLE:-3}"
 FAILED=""
 for s in $RESTART; do
-    if systemctl is-enabled --quiet "$s" 2>/dev/null && ! systemctl is-active --quiet "$s"; then FAILED="$FAILED $s"; fi
+    if ! systemctl is-active --quiet "$s"; then
+        case " $ACTIVE " in *" $s "*) FAILED="$FAILED $s";; esac
+        if systemctl is-enabled --quiet "$s" 2>/dev/null; then case "$FAILED " in *" $s "*) ;; *) FAILED="$FAILED $s";; esac; fi
+    fi
 done
 [ -z "$FAILED" ] || die "重启后没起来:$FAILED (journalctl -u <名字> -n 50)"
 trap - ERR

@@ -80,12 +80,17 @@ TS=$(date +%Y%m%d-%H%M%S)
 B=/opt/pxe/.bak-$TS
 sudo mkdir -p $B/etc/systemd $B/tftp
 sudo cp -a /opt/pxe/*.py /opt/pxe/VERSION /opt/pxe/BUILD /opt/pxe/web /opt/pxe/icons $B/
-sudo cp -a /opt/pxe/tftp/grub.cfg $B/tftp/
+( cd /opt/pxe/tftp && sudo find . -name 'grub.cfg*' -type f ) | while read -r f; do   # 菜单整批, 含 EFI/BOOT 下的
+    sudo mkdir -p "$B/tftp/$(dirname "$f")" && sudo cp -a "/opt/pxe/tftp/$f" "$B/tftp/$f"
+done
+[ -f /opt/pxe/pxe-mode.json ] && sudo cp -a /opt/pxe/pxe-mode.json $B/
 sudo cp -a /etc/systemd/system/cart-mcp.service $B/etc/systemd/
 sudo cp -a /etc/ops-cart $B/etc/ops-cart          # 配置原样留一份 (含 0600 的)
 ```
 
-脚本同时在 `$B/rollback.sh` 写好回滚脚本（第 9 步），出错时直接打印这条回滚命令。
+脚本在备份前先记下第 7 步那几个服务里**当时开着的**，写进 `$B/rollback.sh`（第 9 步）。出错停下时（不管是命令失败还是脚本自己判的失败），都会打印这条回滚命令。
+
+备份前脚本还会检查部署包齐不齐：3 个单元、`accept/cart_accept.py` 等都要在，包里 `VERSION` 必须是 1.16.00。缺了就停，什么都不动。版本检查要跳过，用 `sudo FORCE=1 bash install.sh`。别用 `sudo -E`，它会把开发机上测试用的 `OPT` / `SYS` / `ETC` / `LOG` 变量带进 root 环境。
 
 ## 3. 部署包（开发机上打，传到推车 `/tmp`）
 
@@ -113,6 +118,8 @@ sudo cp -r $D/opt/web/. /opt/pxe/web/ && sudo cp -r $D/opt/icons/. /opt/pxe/icon
 sudo install -m 644 $D/systemd/cart-mcp.service $D/systemd/cart-mcp-ro.service $D/systemd/cart-ble-input.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
+
+`install -m 644` 装出来是 root:root 0644，和推车上原来一致（2026-11-08 用非 root 账号 `stat` 过，`/opt/pxe` 下 68 个文件都是 root:root 644，`web` / `icons` 目录是 root:root 755）。
 
 `/etc/ops-cart` **一个文件都不写**：pxe.env、pet-skin.json、serial.conf、kvm.json、mcp.json、serial-gate.json 都保留原样，这一版也没有必需的新配置。
 
@@ -198,12 +205,14 @@ sudo bash /opt/pxe/.bak-<时间戳>/rollback.sh
 B=/opt/pxe/.bak-<时间戳>
 sudo cp -a $B/*.py $B/VERSION $B/BUILD /opt/pxe/
 sudo rm -rf /opt/pxe/web /opt/pxe/icons && sudo cp -a $B/web $B/icons /opt/pxe/
-sudo cp -a $B/tftp/grub.cfg /opt/pxe/tftp/grub.cfg                     # 回到默认救援菜单
+sudo find /opt/pxe/tftp -name 'grub.cfg*' -type f -delete              # 菜单整批换回备份那一套
+( cd $B/tftp && find . -type f ) | while read -r f; do sudo cp -a "$B/tftp/$f" "/opt/pxe/tftp/$f"; done
+[ -f $B/pxe-mode.json ] && sudo cp -a $B/pxe-mode.json /opt/pxe/ || sudo rm -f /opt/pxe/pxe-mode.json
 sudo systemctl disable --now cart-mcp-ro cart-ble-input 2>/dev/null
 sudo rm -f /etc/systemd/system/cart-mcp-ro.service /etc/systemd/system/cart-ble-input.service
 sudo install -m 644 $B/etc/systemd/cart-mcp.service /etc/systemd/system/cart-mcp.service
 sudo systemctl daemon-reload
-# 重启第 7 步那几个开着的服务
+# 重启部署前开着的那几个 (名单在 rollback.sh 里写死, 不看现在状态: 新代码起不来停掉的也要拉回来)
 cat /opt/pxe/VERSION    # 回到 1.15.01
 ```
 
