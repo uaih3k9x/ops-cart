@@ -16,7 +16,7 @@ ACT_NAMES = {"lease_acquire", "lease_renew", "lease_release", "send_command", "s
              "kvm_key", "kvm_type", "wol_send", "label_print"}
 READONLY_NAMES = {"list_threads", "read_output", "screenshot", "cart_status", "pxe_status", "pending_list",
                   "pxe_clients", "pxe_requests", "kvm_status", "screen_ocr", "label_preview",
-                  "label_printer_status", "label_abbrev_propose"}
+                  "label_printer_status", "label_abbrev_propose", "gate_allowlist"}
 
 
 def _listed(server):

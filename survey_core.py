@@ -21,6 +21,7 @@ import sys
 import time
 
 import cartlog
+import serial_allowlist
 from serial_core import _conbroker_cmd, _run, match_service, parse_list, serve_error
 
 SURVEY_DIR = "/var/log/ops-cart/survey"
@@ -28,6 +29,8 @@ PROFILES_PATH = "/opt/pxe/survey_profiles.json"    # 可选: 覆盖下面的命�
 DEFAULT_TIMEOUT = 30                                # 单条命令等提示符的秒数
 
 # ------------------------------------------------------------ 只读规则 (写死在代码里, JSON 改不了)
+# #75 拍板: 冻结黑名单补丁. 新发现的绕过类别只进测试反例集, 不再往这里加 deny / 禁用字符;
+# 第 1 层往 serial_allowlist (按厂商的命令前缀白名单) 迁, 影子期见 docs/DESIGN_layer1_allowlist.md.
 # verbs: 第一个词; pipes: "|" 后允许的过滤词 (True=要带参数); deny: 动词后第二个词黑名单 (只读命令里会写文件的)
 # session: 整句精确匹配放行的会话级命令 (只有关分页, 只对当前终端生效、不进配置); 不是动词, 不带任何变形
 _RULES = {
@@ -461,7 +464,7 @@ def _show_family(out):
 
 def _result(**kw):
     r = {"ok": False, "head": None, "vendor": None, "device": None, "path": None, "sections": [], "diff": None,
-         "previous": None, "refused": [], "error": None, "summary": ""}
+         "previous": None, "refused": [], "allowlist_miss": [], "error": None, "summary": ""}
     r.update(kw)
     return r
 
@@ -522,8 +525,35 @@ def _compare(res, survey_dir, prof):
     return out
 
 
-def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None):
+def _shadow_precheck(cmds, vendor, disabled, event):
+    """#75 影子期: 清单里不在第 1 层白名单的命令记 cartlog [survey] allowlist-miss, 巡检照常跑. -> 不命中的命令."""
+    miss = []
+    for c in cmds:
+        m = serial_allowlist.match(c, vendor, mode="exec", scope="survey", disabled=disabled)
+        if not m["entry"]:
+            miss.append(c)
+            (event or cartlog.event)("survey", "allowlist-miss " + cartlog.fields(vendor=vendor, cmd=c, why=m["why"]))
+    return miss
+
+
+def gate_disabled(event=None):
+    """写闸门规则文件里的 allowlist.disable (#75), 命令行和面板巡检共用; 不认识的 id 记 cartlog. 不抛异常."""
+    import serial_write_core                          # 晚 import 避免循环
+    try:
+        rules = serial_write_core.load_rules(serial_write_core.RULES_PATH)
+    except Exception:                                 # noqa: BLE001  影子统计拿不到就当没禁用, 不挡巡检
+        return []
+    for u in rules["allowlist_unknown"]:
+        (event or cartlog.event)("survey", "allowlist-disable-unknown " + cartlog.fields(id=u))
+    return rules["allowlist_disable"]
+
+
+def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None,
+               disabled=(), event=None):
     """跑一次巡检: 白名单预检 -> 逐条 send -> 存档 -> 和同设备上一份比. 不抛异常, 结果全在返回的 dict 里.
+
+    disabled: 规则文件 allowlist.disable 的条目 id; event: cartlog.event 那样的 (测试换成假的).
+    预检同时算 #75 的命令前缀白名单, 只记录 (allowlist_miss), 不影响跑不跑.
 
     send(port, cmd, timeout) -> conbroker send 的输出 (回显 + 正文 + 提示符); 出错可以抛异常.
     tail(port) -> 串口最近几行 (必填, 真机用 conbroker_tail): 最后一行不是设备提示符就一条都不发.
@@ -555,6 +585,7 @@ def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir
         return _result(head=head, refused=bad,
                        summary="巡检拒绝执行, 一条都没发: 清单里有白名单不放的命令: " + "; ".join(map(str, bad)))
 
+    miss = _shadow_precheck([c["cmd"] for c in cmds], vendor, disabled, event)
     t = time.localtime(now())
     sections, device, stop = [], None, None
     paging = prof.get("paging")
@@ -573,7 +604,7 @@ def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir
     done = sum(s["status"] == "ok" for s in sections)
     invalid = [s["cmd"] for s in sections if s["status"] == "invalid"]
     res = _result(ok=stop is None and not invalid, head=head, vendor=vendor, device=device, sections=sections,
-                  error=stop)
+                  error=stop, allowlist_miss=miss)
     if stop:
         result = f"中止, 已跑 {done}/{len(cmds)}; {stop}"
     elif invalid:
@@ -698,7 +729,7 @@ def main(argv=None):
         print(f"{port} 上没有在跑的 conbroker 服务, 先在串口面板开服务")
         return 2
     r = run_survey(name, a.vendor, send=conbroker_send, tail=conbroker_tail, head=safe_name(os.path.basename(port)),
-                   survey_dir=a.dir, profiles=load_profiles(a.profiles))
+                   survey_dir=a.dir, profiles=load_profiles(a.profiles), disabled=gate_disabled())
     print(r["summary"])
     record(r)
     return 0 if r["ok"] else 1

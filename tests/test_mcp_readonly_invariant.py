@@ -84,7 +84,7 @@ def _readonly_tools(d, events):
     return tools
 
 
-ARGS = {"read_output": {"slot": 1}, "label_preview": {"kind": "text", "labels": [{"big": "A", "small": "B"}]},
+ARGS = {"read_output": {"slot": 1}, "gate_allowlist": {"slot": 1}, "label_preview": {"kind": "text", "labels": [{"big": "A", "small": "B"}]},
         "label_abbrev_propose": {"category": "vendor", "entries": {"x": "X"}}}
 
 
@@ -99,7 +99,7 @@ def test_readonly_tools_never_lock_or_write(tmp_path, monkeypatch, scenario):
     tools = _readonly_tools(d, events)
     assert {t.name for t in tools} == {
         "list_threads", "read_output", "screenshot", "cart_status", "pxe_status", "pending_list", "pxe_clients",
-        "pxe_requests", "kvm_status", "screen_ocr", "label_preview", "label_printer_status", "label_abbrev_propose"}
+        "pxe_requests", "kvm_status", "screen_ocr", "label_preview", "label_printer_status", "label_abbrev_propose", "gate_allowlist"}
     server = ms.Server(tools, profile=mc.READONLY)
     for t in tools:
         r = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -328,7 +328,7 @@ def test_real_tools_readonly_end_to_end(tmp_path, monkeypatch, scenario):
     server = cm.make_server("readonly", None)
     assert set(server.tools) == {
         "list_threads", "read_output", "screenshot", "cart_status", "pxe_status", "pending_list", "pxe_clients",
-        "pxe_requests", "kvm_status", "screen_ocr", "label_preview", "label_printer_status", "label_abbrev_propose"}
+        "pxe_requests", "kvm_status", "screen_ocr", "label_preview", "label_printer_status", "label_abbrev_propose", "gate_allowlist"}
 
     def call(name, args=None):
         return server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",

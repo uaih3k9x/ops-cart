@@ -7,7 +7,7 @@
 - 只收行级命令: 一行可打印 ASCII, 不许控制字符 / 换行 / 制表符 / 全角 / 零宽; 原始字节能拆碎、退格拼出 save, 不给.
   特殊键只给三个固定的: 回车、翻页空格 (直接放行), Ctrl+C (打断键, 要人确认).
 - 闸门第 1 层: 认得出厂商、设备停在提示符上、命令过只读白名单 (survey_core.is_readonly, 规则文件只能加动词)
-  才直接发; 带高危词 (save / reboot / reset / format / delete ...) 的永远要人确认, 不送模型.
+  才直接发. #75 影子期: 同时算按厂商的命令前缀白名单 (serial_allowlist), 结论写进 gate.shadow, 不改放行结果; 带高危词 (save / reboot / reset / format / delete ...) 的永远要人确认, 不送模型.
 - 闸门第 2 层 (#22): 认得出厂商、停在提示符上、不在白名单里、不带高危词的, 交调用方注入的 judge (决策模型,
   serial_gate_model) 判; 判放行才直发 (layer=2), 判拦 / 出错 / 超时 / 结果不对 / 没开一律挂起等人确认.
 - 挂起期间 (#65): 槽位有挂起项时, 这个槽位的任何直发 (第 1/2 层放行的命令和键) 都拒 (pending), 和键鼠一致 ——
@@ -35,6 +35,7 @@ import secrets
 import time
 import unicodedata
 
+import serial_allowlist
 import survey_core
 
 SLOTS = (1, 2, 3, 4)
@@ -168,7 +169,11 @@ def _model_conf(doc):
 
 def load_rules(path=RULES_PATH):
     """规则文件 -> {slots: {槽位: 厂商}, auto_huawei, vendors: {厂商: {extra_verbs, model, notes}},
-    danger: [...], model: {enabled, timeout_s, budget_usd, context_chars, model}}.
+    danger: [...], model: {enabled, timeout_s, budget_usd, context_chars, model},
+    allowlist_disable: [条目 id], allowlist_unknown: [不认识的 id]}.
+
+    allowlist.disable (#75): 只能按条目 id 禁用 serial_allowlist 的条目, 不能新增 (写别的键一律无效);
+    不认识的 id 忽略, 放进 allowlist_unknown (gate_allowlist 里看得到).
 
     只能收紧或加只读动词: 只读动词只能加给内置有只读规则的厂商 (survey_core: huawei / h3c / cisco / ruijie);
     写闸门里 H3C 按华为处理 (槽位登记、vendors 配置都写进 huawei; 写 h3c 会被忽略);
@@ -179,7 +184,7 @@ def load_rules(path=RULES_PATH):
     vendors = sorted(_PROMPT)
     out = {"slots": {}, "auto_huawei": True,
            "vendors": {v: {"extra_verbs": [], "model": True, "notes": ""} for v in vendors},
-           "danger": list(DANGER), "model": dict(MODEL_DEFAULT)}
+           "danger": list(DANGER), "model": dict(MODEL_DEFAULT), "allowlist_disable": [], "allowlist_unknown": []}
     doc = {}
     if path:
         try:
@@ -209,6 +214,9 @@ def load_rules(path=RULES_PATH):
         extra_danger += [w for w in spec.get("danger") or () if isinstance(w, str) and _VERB.fullmatch(w)]
     out["danger"] += sorted(set(extra_danger) - set(DANGER))
     out["model"] = _model_conf(doc.get("model"))
+    al = doc.get("allowlist")
+    if isinstance(al, dict) and "disable" in al:
+        out["allowlist_disable"], out["allowlist_unknown"] = serial_allowlist.parse_disable(al["disable"])
     return out
 
 
@@ -278,11 +286,13 @@ def user_view(vendor, text):
                 and not survey_core._CONFIRM.fullmatch(ln))
 
 
-def classify(cmd, vendor, at_prompt, rules, judge=None, user_view=False):
-    """一行命令 -> 闸门结果 {verdict: pass|confirm, layer, reason, danger, vendor[, model]}. 调用方先 check_line.
+def classify(cmd, vendor, at_prompt, rules, judge=None, user_view=False, mode=None):
+    """一行命令 -> 闸门结果 {verdict: pass|confirm, layer, reason, danger, vendor[, model][, shadow]}. 调用方先 check_line.
 
     judge(cmd, vendor) -> {allow: bool, reason: 非空字符串, model: {...}}: 第 2 层决策模型 (serial_gate_model);
-    None = 没开. 只有认得出厂商、停在提示符上、不在只读白名单里、不带高危词的才问它."""
+    None = 没开. 只有认得出厂商、停在提示符上、不在只读白名单里、不带高危词的才问它.
+    mode: 提示符 "exec" / "config" (serial_allowlist.prompt_mode), 不给按 config. 只用于影子 (#75):
+    轮到第 1 层判的命令, gate.shadow = {allowlist, src, readonly, pass[, why]}, 放行结果仍按 is_readonly."""
     d = danger_words(cmd, rules.get("danger", ()))
     if d:
         return _gate("confirm", f"带高危词 {', '.join(d)}, 永远要人确认", d, vendor)
@@ -294,9 +304,13 @@ def classify(cmd, vendor, at_prompt, rules, judge=None, user_view=False):
         return _gate("confirm", "带 [ ] { } (思科 tclsh 等环境里是 Tcl 命令替换), 不送模型, 要人确认", vendor=vendor)
     # 规则文件加的动词 (ping 之类) 只在用户视图放: 配置视图里同名的词可能是配置命令
     extra = rules.get("vendors", {}).get(vendor, {}).get("extra_verbs", ()) if user_view else ()
-    if survey_core.is_readonly(cmd, vendor, extra_verbs=extra):
-        return _gate("pass", f"{vendor} 只读命令 (第 1 层放行)", vendor=vendor)
-    return _layer2(cmd, vendor, rules, judge)
+    ro = survey_core.is_readonly(cmd, vendor, extra_verbs=extra)
+    g = _gate("pass", f"{vendor} 只读命令 (第 1 层放行)", vendor=vendor) if ro else _layer2(cmd, vendor, rules, judge)
+    try:                                # 影子只记录: 它出错也不能让闸门出错或改结论
+        g["shadow"] = serial_allowlist.shadow(cmd, vendor, mode, ro, rules.get("allowlist_disable", ()))
+    except Exception as e:              # noqa: BLE001
+        g["shadow"] = {"error": repr(e)[:200]}
+    return g
 
 
 def _layer2(cmd, vendor, rules, judge):
