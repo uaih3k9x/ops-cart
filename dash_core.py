@@ -18,6 +18,7 @@ import atomicfile
 import confirm_core
 import lamps_core
 import lldp_core
+import observe_core
 import pxeserver
 import sun_core
 import ups_core
@@ -33,7 +34,7 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
            "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2, "pxe": 1,
-           "svcs": 5, "version": 300, "theme": 5}
+           "svcs": 5, "version": 300, "theme": 5, "observe": 1}
 # LLDP 监听哪些口 (#14): 跟下排 LAN1 / LAN2 灯同一份配置, 网口名不另写
 LLDP_IFACES = [(name, key[4:]) for name, _label, key in lamps_core.LOWER
                if name in ("LAN1", "LAN2") and key.startswith("net:")]
@@ -79,6 +80,7 @@ def collect(ctx):
         "kvm_agent": _pull(ctx, "kvm_agent", None),  # 键鼠 Agent 状态 {stopped, pending, writer, sending} (#43)
         "agent": _pull(ctx, "agent", None),         # Agent 写串口每槽位 [{estop, pending, writer, sending}] #23
         "theme": _pull(ctx, "theme", dict(THEME_DARK)),  # 深浅模式 {mode, setting, next_switch} #31
+        "observe": _pull(ctx, "observe", None),     # 串口观察模式的端口快照 (#85), 车机写 observe.json
     }
     return snap
 
@@ -342,6 +344,7 @@ def layout_view(snap, locked=False, active=(), now=None):
         "peers": [] if locked else peers(snap),      # 锁屏是教室引导牌, 不露交换机名
         "serve": _serve(snap.get("pxe"), now),       # 锁屏也显示: 发地址影响整个网段
         "stale": stale(snap, now),
+        "front": None if locked else observe_core.front_view(snap.get("observe"), now),   # 观察中的设备前面板 (#85)
     }
     return view
 
@@ -598,6 +601,7 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "agent": lambda: agent_sample(),
         "kvm_agent": lambda: kvm_sample(),
         "theme": theme_sampler(),
+        "observe": lambda: observe_core.read_snapshot(),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)

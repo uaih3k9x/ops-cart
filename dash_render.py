@@ -336,9 +336,12 @@ def _work_body(d, view, W, H):
     if len(problems) > 2:
         d.text((M + 40, y), "还有 %d 项" % (len(problems) - 2), font=_font(24), fill=DIM)
 
-    # 温度: 三列, 每列一条 0–100°C 的条
+    # 温度: 三列, 每列一条 0–100°C 的条; 观察模式 (#85) 开着时这块换成设备前面板
     y = 892
     temps = [t for t in (view.get("temps") or []) if len(t) > 1][:3]
+    if view.get("front"):
+        _front(d, view["front"], W)
+        temps = []
     if temps:
         cw = (W - 2 * M) // 3
         for i, (name, c) in enumerate(temps):
@@ -350,7 +353,7 @@ def _work_body(d, view, W, H):
             d.rounded_rectangle([x0, y + 46, x0 + max(10, int(bw * min(c, 100) / 100)), y + 56], 5,
                                 fill=_temp_color(c))
     rpms = [str(f[1]) for f in (view.get("fans") or [])
-            if isinstance(f, (list, tuple)) and len(f) > 1 and f[1]]
+            if isinstance(f, (list, tuple)) and len(f) > 1 and f[1] and not view.get("front")]
     if rpms:
         d.text((M, y + 72), "风扇 " + " · ".join(rpms[:3]) + " rpm", font=_font(26), fill=DIM)
     d.line([M, 1000, W - M, 1000], fill=LINE, width=2)
@@ -370,6 +373,35 @@ def _work_body(d, view, W, H):
     lines = wrap(view.get("dream") or "", _font(26), W - 2 * M, 2)
     for i, line in enumerate(lines):
         d.text((M, H - 60 - 38 * (len(lines) - i)), line, font=_font(26), fill=DIM)
+
+
+FRONT_Y, FRONT_ROW, FRONT_GAP = 926, 30, 6       # 前面板: 两排口, 标题在 892 那行
+
+
+def front_boxes(front, W=PANEL_W):
+    """前面板每个口的框 [(框, 口)]; 列宽按最右一列平分, 最宽 48."""
+    ports = front.get("ports") or []
+    cols = max((p["x"] for p in ports), default=0) + 1
+    pitch = min(48, (W - 2 * M) // cols)
+    out = []
+    for p in ports:
+        x0, y0 = M + p["x"] * pitch, FRONT_Y + p["y"] * (FRONT_ROW + FRONT_GAP)
+        out.append(([x0, y0, x0 + pitch - 4, y0 + FRONT_ROW], p))
+    return out
+
+
+def _front(d, front, W):
+    d.text((M, 892), front.get("title") or "", font=_font(24), fill=DIM)
+    color = {"up": ACCENT, "admin": WARN, "standby": DIM}
+    for box, p in front_boxes(front, W):
+        lit = p.get("lit") and p.get("state") in color
+        fill = color[p["state"]] if lit else LINE
+        if p.get("shape") == "rj45":
+            d.rectangle(box, fill=fill)
+        else:
+            d.rounded_rectangle(box, 8, fill=fill)
+        d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), str(p.get("label", "")), font=_font(16),
+               fill=lc.LIT_FG if lit else DIM, anchor="mm")
 
 
 def _locked_lines(view, W, H):

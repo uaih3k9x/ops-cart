@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""串口观察模式的车机窗口 (#85): 输一次密码, 画设备前面板, 灯跟着真机亮灭闪. 逻辑在 observe_core.py.
+
+串口面板选中一路点"观察"打开. 线程纪律同 serial_panel: 后台线程 (登录 / 轮询 / quit) 只往 self.ui 放东西,
+界面只在 _tick 里改. 密码框读完立刻清空, 密码只经 Observer.start 传给登录状态机, 不落盘不进日志.
+"""
+
+import functools
+import os
+import queue
+import threading
+import time
+
+import tkinter as tk
+
+import atomicfile
+import lamps_core
+import observe_core as oc
+import survey_core
+import theme as th
+
+BG, CARD, FG, DIM, OFF = th.follow(globals(), BG="PANEL", CARD="BG", FG="FG", DIM="DIM", OFF="BOX")
+FONT, FONT_MONO = th.FONT_SMALL, th.FONT_MONO
+CELL, GAP, PAD = 40, 8, 16              # 口的格子 / 间隔 / 边距 (像素)
+FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
+SNAP_S = 5                              # 多久给副屏写一次快照
+
+
+def _lit_color(state):
+    return {"up": th.LAMP_OK, "admin": th.LAMP_WARN, "standby": th.DIM}.get(state, OFF)
+
+
+def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD):
+    """面板格子 + 当前端口状态 -> 要画的东西 [{name, box, fill, fg, shape, label}]."""
+    out = []
+    for c in panel:
+        state, lit = oc.lamp(ports.get(c["name"]), now)
+        x0, y0 = pad + c["x"] * (cell + gap), pad + c["y"] * (cell + gap)
+        out.append({"name": c["name"], "box": (x0, y0, x0 + cell, y0 + cell), "shape": c.get("shape", "rj45"),
+                    "label": c.get("label", ""), "fill": _lit_color(state) if lit else OFF,
+                    "fg": th.LAMP_LIT_FG if lit and state != "down" else DIM})
+    return out
+
+
+def draw(canvas, cells):
+    """画到画布上, 返回 {图元 id: 接口名} 给悬停 / 点击查. rj45 画成带卡口的方块, 光口画成长方块."""
+    canvas.delete("all")
+    hits = {}
+    for c in cells:
+        x0, y0, x1, y1 = c["box"]
+        if c["shape"] == "rj45":
+            w = (x1 - x0) // 4
+            pts = (x0, y0, x1, y0, x1, y1 - 8, x1 - w, y1 - 8, x1 - w, y1, x0 + w, y1, x0 + w, y1 - 8, x0, y1 - 8)
+            i = canvas.create_polygon(*pts, fill=c["fill"], outline=DIM)
+        else:
+            i = canvas.create_rectangle(x0, y0 + 6, x1, y1 - 6, fill=c["fill"], outline=DIM)
+        hits[i] = c["name"]
+        hits[canvas.create_text((x0 + x1) // 2, (y0 + y1) // 2 - 2, text=c["label"], fill=c["fg"], font=FONT)] = c["name"]
+    return hits
+
+
+def _pct(u):
+    return "--" if u is None else f"{u:g}%"
+
+
+def port_info(p):
+    return f"{p['name']}   {p.get('phy', '?')} / {p.get('proto', '?')}   入 {_pct(p.get('in_uti'))}   出 {_pct(p.get('out_uti'))}"
+
+
+class ObserveWindow(tk.Toplevel):
+    def __init__(self, master, dev, name, vendor, ddir, head=None):
+        super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=th.PRIMARY, **th.DIALOG)
+        self.dev, self.name, self.vendor, self.ddir = dev, name, vendor, ddir
+        self.head = head or survey_core.safe_name(os.path.basename(dev))
+        self.ui, self.stop_evt = queue.Queue(), threading.Event()
+        self.obs, self.hits, self._snap_at, self._hover = None, {}, 0, None
+        self.overrideredirect(True)
+        W, H = 1100, 440
+        self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
+        self.attributes("-topmost", True)
+        self._build()
+        self.after(FRAME_MS, self._tick)
+
+    def _build(self):
+        bar = tk.Frame(self, bg=th.TITLE)
+        bar.pack(fill="x")
+        self.title_lbl = tk.Label(bar, text=f"观察 {self.dev}", font=th.FONT_BIG, bg=th.TITLE, fg=th.WHITE, padx=12)
+        self.title_lbl.pack(side="left")
+        tk.Button(bar, text="退出观察", font=FONT, command=self.close, bg=th.BTN2, fg=FG, **th.RAISED,
+                  cursor="hand2", padx=10).pack(side="right", padx=6, pady=4)
+        self.login_row = tk.Frame(self, bg=BG)
+        self.login_row.pack(fill="x", padx=PAD, pady=8)
+        self.user_var, self.pass_var = tk.StringVar(), tk.StringVar()
+        for label, var, show in (("用户名", self.user_var, ""), ("密码", self.pass_var, "•")):
+            tk.Label(self.login_row, text=label, font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(0, 4))
+            e = tk.Entry(self.login_row, textvariable=var, show=show, font=FONT, width=16, bg=CARD, fg=FG,
+                         insertbackground=FG, **th.SUNKEN)
+            e.pack(side="left", padx=(0, 12), ipady=4)
+            e.bind("<Return>", lambda _e: self.login())
+        self.login_btn = tk.Button(self.login_row, text="登录", font=FONT, command=self.login, bg=th.PRIMARY, fg=FG,
+                                   **th.RAISED, cursor="hand2", padx=12)
+        self.login_btn.pack(side="left")
+        self.canvas = tk.Canvas(self, bg=CARD, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=PAD)
+        self.canvas.bind("<Motion>", self._on_hover)
+        self.canvas.bind("<Button-1>", self._on_hover)
+        self.status = tk.Label(self, text="", font=FONT_MONO, bg=BG, fg=DIM, anchor="w")
+        self.status.pack(fill="x", padx=PAD, pady=8)
+
+    # ------------------------------------------------------------ 后台
+
+    def login(self):
+        user, pw = self.user_var.get().strip(), self.pass_var.get()
+        self.pass_var.set("")                       # 读完就清
+        if self.obs or not user or not pw:
+            return
+        self.login_btn.config(state="disabled")
+        log = os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log")
+        self.obs = oc.Observer(self.name, self.vendor,
+                               exchange=functools.partial(oc.broker_exchange, self.ddir, self.name, vendor=self.vendor),
+                               send=survey_core.conbroker_send, log_size=lambda: lamps_core.file_size(log))
+        self.status.config(text="登录中…", fg=DIM)
+        threading.Thread(target=self._work, args=(self.obs, user, pw), daemon=True).start()
+
+    def _work(self, obs, user, pw):
+        ok = obs.start(user, pw)
+        del pw
+        oc.record("start", head=self.head, device=obs.device, ok=ok, error=obs.error)
+        self.ui.put(self._logged_in if ok else self._failed)
+        while ok and not self.stop_evt.is_set() and obs.state == "polling":
+            obs.tick(time.monotonic())
+            self.stop_evt.wait(0.5)
+        obs.stop()
+        oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error)
+
+    def _logged_in(self):
+        self.login_row.pack_forget()
+        self.title_lbl.config(text=f"观察 {self.dev} · {self.obs.device}" + (f" · {self.obs.model}" if self.obs.model else ""))
+
+    def _failed(self):
+        self.status.config(text=self.obs.error or "登录失败", fg=th.BAD)
+        self.obs = None
+        self.login_btn.config(state="normal")
+
+    # ------------------------------------------------------------ 界面
+
+    def _tick(self):
+        try:
+            while True:
+                self.ui.get_nowait()()
+        except queue.Empty:
+            pass
+        obs = self.obs
+        if obs and obs.panel:
+            self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time()))
+        if obs and obs.state in ("polling", "lost"):
+            self._status(obs)
+            if time.monotonic() - self._snap_at > SNAP_S:
+                self._snap_at = time.monotonic()
+                try:
+                    atomicfile.write_json(oc.STATE_PATH, obs.snapshot(self.head))
+                except OSError:
+                    pass
+        if self.winfo_exists():
+            self.after(FRAME_MS, self._tick)
+
+    def _status(self, obs):
+        if self._hover and self._hover in obs.ports:
+            self.status.config(text=port_info(obs.ports[self._hover]), fg=FG)
+        elif obs.error:
+            self.status.config(text=obs.error, fg=th.BAD if obs.state == "lost" else th.WARN)
+        elif obs.pacer.paused(time.monotonic()):
+            self.status.config(text="有人在用串口, 暂停", fg=DIM)
+        else:
+            self.status.config(text="", fg=DIM)
+
+    def _on_hover(self, ev):
+        items = self.canvas.find_overlapping(ev.x, ev.y, ev.x, ev.y)
+        self._hover = next((self.hits[i] for i in reversed(items) if i in self.hits), None)
+
+    def close(self):
+        self.stop_evt.set()                         # 后台线程发 quit 退出登录
+        try:
+            os.remove(oc.STATE_PATH)
+        except OSError:
+            pass
+        self.destroy()
+
+
+def open_for(master, dev, name, vendor, ddir):
+    return ObserveWindow(master, dev, name, vendor, ddir)

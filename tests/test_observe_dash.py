@@ -1,0 +1,118 @@
+"""#85 观察模式的副屏区块 / 车机前面板: 用快照和假画布测, 不起 Tk、不碰串口."""
+
+import pytest
+
+import dash_core as dc
+import observe_core as oc
+import observe_panel as op
+import theme as th
+
+
+def _snap(now, ports=None):
+    ports = ports if ports is not None else [
+        {"name": "GigabitEthernet0/0/1", "label": "1", "x": 0, "y": 0, "shape": "rj45", "state": "up",
+         "in_uti": 0, "out_uti": 0},
+        {"name": "GigabitEthernet0/0/2", "label": "2", "x": 0, "y": 1, "shape": "rj45", "state": "admin",
+         "in_uti": 0, "out_uti": 0},
+        {"name": "XGigabitEthernet0/0/1", "label": "1", "x": 2, "y": 0, "shape": "sfp", "state": "down",
+         "in_uti": 0, "out_uti": 0}]
+    return {"ts": now, "head": "con-1", "device": "SW-TEST", "model": None, "state": "polling", "error": None,
+            "ports": ports}
+
+
+def test_layout_view_has_front_when_observing():
+    v = dc.layout_view({"ts": 100, "observe": _snap(100)}, now=101)
+    assert v["front"]["title"] == "con-1 · SW-TEST"
+    assert [p["state"] for p in v["front"]["ports"]] == ["up", "admin", "down"]
+
+
+def test_layout_view_no_front_when_locked_stale_or_missing():
+    assert dc.layout_view({"ts": 100, "observe": _snap(100)}, locked=True, now=101)["front"] is None
+    assert dc.layout_view({"ts": 100, "observe": _snap(0)}, now=oc.FRONT_STALE_S + 1)["front"] is None
+    assert dc.layout_view({"ts": 100}, now=101)["front"] is None
+
+
+def test_collect_pulls_observe():
+    snap = dc.collect({"observe": lambda: _snap(5), "now": lambda: 5})
+    assert snap["observe"]["device"] == "SW-TEST"
+    assert dc.collect({"now": lambda: 5})["observe"] is None
+
+
+def test_render_draws_front_lamps():
+    PIL = pytest.importorskip("PIL")  # noqa: F841
+    import dash_render as r
+    v = dc.layout_view({"ts": 100, "observe": _snap(100)}, now=101)
+    img = r.render(v)
+    boxes = r.front_boxes(v["front"])
+    (x0, y0, x1, y1), port = boxes[0]
+    assert port["state"] == "up"
+    assert img.getpixel(((x0 + x1) // 2, y0 + 3)) == _rgb(th.LAMP_OK)
+    (x0, y0, x1, y1), port = boxes[1]
+    assert img.getpixel(((x0 + x1) // 2, y0 + 3)) == _rgb(th.LAMP_WARN)
+    assert all(r.M <= b[0][0] and b[0][2] <= r.PANEL_W - r.M for b in boxes)
+
+
+def test_render_front_many_ports_fit_width():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    names = [f"GigabitEthernet0/0/{i}" for i in range(1, 49)] + [f"XGigabitEthernet0/0/{i}" for i in range(1, 5)]
+    ports = [dict(p, state="up") for p in oc.auto_layout(names)]
+    v = dc.layout_view({"ts": 100, "observe": _snap(100, ports)}, now=101)
+    boxes = r.front_boxes(v["front"])
+    assert len(boxes) == 52
+    assert max(b[0][2] for b in boxes) <= r.PANEL_W - r.M
+    r.render(v)
+
+
+def _rgb(hexcolor):
+    h = hexcolor.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+# ------------------------------------------------------------ 车机前面板: 纯计算 + 假画布
+
+def test_panel_cells_colors_and_shapes():
+    ports = _snap(0)["ports"]
+    cells = op.panel_cells(ports, {p["name"]: p for p in ports}, now=0)
+    by = {c["name"]: c for c in cells}
+    assert by["GigabitEthernet0/0/1"]["fill"] == th.LAMP_OK
+    assert by["GigabitEthernet0/0/2"]["fill"] == th.LAMP_WARN
+    assert by["XGigabitEthernet0/0/1"]["fill"] == op.OFF
+    assert by["GigabitEthernet0/0/1"]["box"][1] < by["GigabitEthernet0/0/2"]["box"][1]     # 奇数口在上
+    assert by["XGigabitEthernet0/0/1"]["shape"] == "sfp"
+
+
+def test_port_info_line():
+    p = {"name": "GigabitEthernet0/0/6", "phy": "up", "proto": "up", "state": "up", "in_uti": 12.5, "out_uti": 3.2}
+    s = op.port_info(p)
+    assert "GigabitEthernet0/0/6" in s and "12.5%" in s and "3.2%" in s
+    assert "--" in op.port_info({"name": "Vlanif1", "phy": "up", "proto": "up", "in_uti": None, "out_uti": None})
+
+
+class FakeCanvas:
+    def __init__(self):
+        self.calls = []
+
+    def delete(self, *a):
+        self.calls.append(("delete",) + a)
+
+    def create_rectangle(self, *a, **k):
+        self.calls.append(("rect", a, k))
+        return len(self.calls)
+
+    def create_polygon(self, *a, **k):
+        self.calls.append(("poly", a, k))
+        return len(self.calls)
+
+    def create_text(self, *a, **k):
+        self.calls.append(("text", a, k))
+        return len(self.calls)
+
+
+def test_draw_on_fake_canvas():
+    ports = _snap(0)["ports"]
+    c = FakeCanvas()
+    hits = op.draw(c, op.panel_cells(ports, {p["name"]: p for p in ports}, now=0))
+    texts = [c_[2]["text"] for c_ in c.calls if c_[0] == "text"]
+    assert texts.count("1") == 2 and "2" in texts
+    assert len(set(hits.values())) == 3 and all(isinstance(i, int) for i in hits)

@@ -254,7 +254,7 @@ REQUIRED_PY = (
     "dash_render", "dash_service", "ocr_rapid_worker", "pet_core", "pet_render", "pet_sprites", "hidpdc", "httpserve", "kiosk", "kiosk_core",
     "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core", "lamps_core",
     "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
-    "netmode_panel", "netprof_core", "notify_core", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
+    "netmode_panel", "netprof_core", "notify_core", "observe_core", "observe_panel", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
     "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_core", "serial_gate_model",
     "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme", "tspl_preview",
     "udisp", "udisp_usb", "ups_core", "web_core", "webkiosk", "wifi_core",

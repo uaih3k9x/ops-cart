@@ -85,7 +85,8 @@ class SerialPanel(tk.Frame):
         self.baud_menu.pack(side="left", padx=6)
         for text, cmd in (("刷新", self.refresh_ports), ("开服务", self.start_serve),
                           ("停服务", self.stop_serve), ("唤醒(回车)", lambda: self._tx(b"\r")),
-                          ("Ctrl+C", lambda: self._tx(b"\x03")), ("巡检", self.survey)):
+                          ("Ctrl+C", lambda: self._tx(b"\x03")), ("巡检", self.survey),
+                          ("观察", self.observe)):
             _btn(bar, text, cmd).pack(side="left", padx=4)
         self.serve_label = tk.Label(bar, text="服务: 未知", font=FONT, bg=BG, fg=DIM)
         self.serve_label.pack(side="right")
@@ -440,6 +441,16 @@ class SerialPanel(tk.Frame):
             self._surveying = False
             self._con_write([("text", "\n[巡检] " + r["summary"].replace("\n", "\n       ") + "\n")], "mark")
         self._async(work, done)
+
+    def observe(self):
+        """#85 观察模式: 选中的口有在跑的服务才开窗 (登录、轮询都在 observe_panel 里)."""
+        dev = self.port_var.get()
+        name = match_service(dev, self._serves)
+        if not name:
+            self._con_write([("text", f"\n[观察] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
+            return
+        import observe_panel
+        observe_panel.open_for(self, dev, name, self.cfg.get("survey_vendor", "huawei"), self.ddir)
 
     def destroy(self):
         self._disconnect()
