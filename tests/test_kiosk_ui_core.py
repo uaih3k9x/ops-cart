@@ -533,7 +533,7 @@ def test_net_view_colors_and_unknown_state():
 def test_lock_screen_shows_net_indicator():
     """#1: 锁屏右上角也有网络标, 和顶栏用同一份状态刷新."""
     src = open(os.path.join(ROOT, "kiosk.py"), encoding="utf-8").read()
-    lock = src[src.index("    def lock(self):"):src.index("    def lock_now(self):")]
+    lock = src[src.index("    def lock(self"):src.index("    def lock_now(self):")]
     assert "_lock_net" in lock
     render = src[src.index("    def _render_net(self"):src.index("    def _render(self, res)")]
     assert "_lock_net" in render and "kui.net_view" in render

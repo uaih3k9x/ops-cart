@@ -34,14 +34,16 @@ SNAP_S = 5                              # 多久给副屏写一次快照
 _WINDOWS = weakref.WeakSet()            # 开着的观察窗口: 锁屏时隐藏 (置顶窗口别浮在锁屏上), 解锁后恢复
 
 
-def hide_all():
-    """锁屏: 等待中的设备确认作废; 正在跑的观察停掉 (轮询会替人给 console 保活); 窗口藏起来. 解锁后不自动恢复."""
+def hide_all(stop=False):
+    """锁屏: 窗口藏起来, 等待中的设备确认作废 (解锁后让人重新点).
+    stop: 人主动锁屏 -> 正在跑的观察也停掉, 解锁后不自动恢复. 闲置自动锁屏 (9x 定) 不停: 轮询照跑,
+    副屏照常显示, 靠观察总时长上限兜底 (轮询会替人给 console 保活)."""
     for w in list(_WINDOWS):
         if _alive(w):
             if getattr(w, "_confirming", None):
                 w.cancel_confirm("锁屏了, 确认已取消; 解锁后请重新点 开始观察")
             worker = getattr(w, "worker", None)
-            if worker is not None and worker.is_alive():
+            if stop and worker is not None and worker.is_alive():
                 w.stop_for_lock()
             w.withdraw()
 

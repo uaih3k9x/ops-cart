@@ -1105,3 +1105,44 @@ def test_profile_can_override_max_duration(tmp_path):
     assert oc.load_profile("huawei", str(p))["max_s"] == 600
     p.write_text(json.dumps({"huawei": {"max_s": "lots"}}))
     assert oc.load_profile("huawei", str(p))["max_s"] == 1800
+
+
+
+# ============================================================ 第十一轮
+
+@pytest.mark.parametrize("raw", ["Infinity", "1e308", "-5", "0", "true", "14401", "NaN"])
+def test_max_duration_must_be_finite_and_at_most_4_hours(tmp_path, raw):
+    p = tmp_path / "prof.json"
+    p.write_text('{"huawei": {"max_s": %s}}' % raw)
+    assert oc.load_profile("huawei", str(p))["max_s"] == 1800
+
+
+def test_max_duration_4_hours_ok(tmp_path):
+    p = tmp_path / "prof.json"
+    p.write_text('{"huawei": {"max_s": 14400}}')
+    assert oc.load_profile("huawei", str(p))["max_s"] == 14400
+
+
+def test_short_max_duration_shown_in_seconds():
+    dev, ob = _started(profile={"max_s": 45})
+    ob.tick(100)
+    ob.tick(146)
+    assert ob.state == "stopped" and "45 秒" in ob.reason
+
+
+def test_reason_in_snapshot_and_front_view():
+    dev, ob = _started(profile={"max_s": 300}, wall=lambda: 1000)
+    ob.tick(100)
+    ob.tick(500)
+    ob.stop()
+    snap = ob.snapshot("con-1", now=1000)
+    assert "时长上限" in snap["reason"]
+    assert "时长上限" in oc.front_view(snap, now=1001)["note"]
+
+
+def test_idle_lock_keeps_polling_until_max_duration():
+    # 闲置锁屏不停观察 (窗口这边不叫停), 轮询照常, 到时长上限才停
+    dev, ob = _started(profile={"max_s": 300})
+    assert ob.tick(100) is True
+    assert ob.tick(200) is True
+    assert ob.tick(401) is False and ob.state == "stopped"

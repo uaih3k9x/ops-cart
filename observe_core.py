@@ -524,6 +524,7 @@ class Pacer:
 DEFAULT_PROFILES = {"huawei": {"poll": ["display interface brief"], "version": "display version",
                                "timeout": 20,
                                "max_s": 1800}}   # 观察总时长上限: 轮询会让 console 一直不空闲超时, 不能无限保活
+MAX_S_CAP = 4 * 3600    # 观察总时长上限最多配到 4 小时
 POLL_GRACE_S = 10       # conbroker send 子进程在 -t 之外多给的秒数 (巡检是 60); 退出观察最多等一轮 = 20 + 10 秒
 
 
@@ -542,8 +543,9 @@ def load_profile(vendor, path=PROFILES_PATH):
             prof["version"] = over["version"]
         if isinstance(over.get("timeout"), (int, float)):
             prof["timeout"] = over["timeout"]
-        if isinstance(over.get("max_s"), (int, float)) and not isinstance(over["max_s"], bool) and over["max_s"] > 0:
-            prof["max_s"] = over["max_s"]
+        m = over.get("max_s")
+        if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and 0 < m <= MAX_S_CAP:
+            prof["max_s"] = m
     return prof
 
 
@@ -686,7 +688,8 @@ class Observer:
         limit = self.profile.get("max_s") or 1800
         if now - self._t0 >= limit:         # 轮询会替人给 console 保活: 到点就停, 要继续请人重新开始
             self.state = "stopped"
-            self.reason = f"已到时长上限 ({int(limit // 60)} 分钟), 需要继续请重新开始观察"
+            span = f"{limit:g} 秒" if limit < 60 else f"{int(limit // 60)} 分钟"
+            self.reason = f"已到时长上限 ({span}), 需要继续请重新开始观察"
             return False
         self.pacer.note_log(self.log.size(), now)
         if self.pacer.paused(now) and not self._advance(self.log.size()):  # 人在用: 他敲的先扫一遍, 再从这里接着看
@@ -819,7 +822,7 @@ class Observer:
             ports.append(dict(cell, state=p.get("state", "unknown"), in_uti=p.get("in_uti"), out_uti=p.get("out_uti")))
         return {"ts": self.wall() if now is None else now, "polled_at": self.polled_at, "owner": owner,
                 "head": head, "device": self.device, "model": self.model, "state": self.state, "error": self.error,
-                "ports": ports}
+                "reason": self.reason, "ports": ports}
 
 
 WRITE_STALE_S = 30      # 车机每 5 秒写一次快照; 这么久没写 = 车机窗口没了, 副屏不画
@@ -832,7 +835,7 @@ def front_view(doc, now, stale_s=FRONT_STALE_S):
     if not isinstance(doc, dict) or not isinstance(doc.get("ts"), (int, float)) or now - doc["ts"] > WRITE_STALE_S:
         return None
     ports, state, polled = doc.get("ports") or [], doc.get("state"), doc.get("polled_at")
-    note = doc.get("error") or _STATE_NOTE.get(state)
+    note = doc.get("error") or doc.get("reason") or _STATE_NOTE.get(state)     # 停止原因和车机显示的一致
     if not note and (not isinstance(polled, (int, float)) or now - polled > stale_s):
         note = "旧数据" if polled else "等第一轮轮询"
     out = []

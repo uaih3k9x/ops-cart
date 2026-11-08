@@ -694,8 +694,21 @@ def test_kiosk_lock_and_unlock_call_observe_hide_show():
     import ast
     src = open(os.path.join(os.path.dirname(op.__file__), "kiosk.py"), encoding="utf-8").read()
     tree = ast.parse(src)
-    fns = {n.name: ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    assert "hide_all" in fns["lock"] and "show_all" in fns["_try_unlock"]
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    lock = ast.unparse(fns["lock"])
+    assert "hide_all" in lock and "manual" in lock and "show_all" in ast.unparse(fns["_try_unlock"])
+    assert [a.arg for a in fns["lock"].args.args] == ["self", "reason"]
+    # 每个入口传的锁屏原因: 只有菜单里的"锁屏" (lock_now) 是人主动锁的
+    calls = {}
+    for name, fn in fns.items():
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "lock" \
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "self":
+                calls.setdefault(name, []).append(n.args[0].value if n.args else None)
+    assert calls["lock_now"] == ["manual"]
+    assert calls["_idle_tick"] == ["idle"]
+    assert all(v != "manual" for k, lst in calls.items() if k != "lock_now" for v in lst)
+    assert set(calls) == {"lock_now", "_idle_tick", "_boot_finish", "_rebuild_ui"}
 
 
 
@@ -785,34 +798,50 @@ def test_new_panel_shows_observing_after_refresh():
 
 # ============================================================ 第十轮
 
-def test_lock_stops_running_observation_without_auto_resume(monkeypatch):
-    import threading
+class _RunningWin(_Win):
+    """开着观察的窗口替身 (hide_all 用到的那些)."""
+    _confirming = None
+
+    def __init__(self):
+        import threading
+        super().__init__()
+        self.stop_evt, self.head, self._stop_reason, self.cancelled = threading.Event(), "con-1", None, []
+        self.worker = threading.Thread(target=lambda: self.stop_evt.wait(5), daemon=True)
+        self.worker.start()
+
+    def stop_for_lock(self):
+        op.ObserveWindow.stop_for_lock(self)
+
+    def cancel_confirm(self, why=None):
+        self.cancelled.append(why)
+        self._confirming = None
+
+
+def test_manual_lock_stops_running_observation_without_auto_resume(monkeypatch):
     got = []
     monkeypatch.setattr(oc, "record", lambda action, **kw: got.append((action, kw)))
     op._WINDOWS.clear()
-
-    class W(_Win):
-        _confirming = None
-
-        def __init__(self):
-            super().__init__()
-            self.stop_evt, self.head, self._stop_reason = threading.Event(), "con-1", None
-            self.worker = threading.Thread(target=lambda: None)
-            self.worker.start()
-            self.worker.join()
-            self.worker = threading.Thread(target=lambda: self.stop_evt.wait(5), daemon=True)
-            self.worker.start()
-
-        def stop_for_lock(self):
-            op.ObserveWindow.stop_for_lock(self)
-    w = W()
+    w = _RunningWin()
     op._WINDOWS.add(w)
-    op.hide_all()
-    assert w.stop_evt.is_set() and "锁屏" in w._stop_reason
+    op.hide_all(stop=True)
+    assert w.stop_evt.is_set() and "锁屏" in w._stop_reason and "withdraw" in w.calls
     assert got and "锁屏" in got[0][1]["note"]
     w.worker.join(2)
     op.show_all()
     assert w.stop_evt.is_set()                      # 解锁不会自动恢复
+    op._WINDOWS.clear()
+
+
+def test_idle_lock_hides_and_cancels_confirm_but_keeps_polling(monkeypatch):
+    monkeypatch.setattr(oc, "record", lambda *a, **k: None)
+    op._WINDOWS.clear()
+    w = _RunningWin()
+    w._confirming = ("obs", "SW-TEST")
+    op._WINDOWS.add(w)
+    op.hide_all()                                   # 默认是闲置锁屏
+    assert not w.stop_evt.is_set() and w._stop_reason is None
+    assert "withdraw" in w.calls and w.cancelled and "锁屏" in w.cancelled[0]
+    w.stop_evt.set()
     op._WINDOWS.clear()
 
 
@@ -864,3 +893,73 @@ def test_begin_clears_old_failure_text():
     w.status.kw["text"] = "没开始: console 还没登录"
     op.ObserveWindow.begin(w)
     assert "没开始" not in w.status.kw["text"]
+
+
+
+# ============================================================ 第十一轮: 真实 _work 的集成用例
+
+def test_manual_lock_during_first_command_integration(monkeypatch):
+    """真的 ObserveWindow._work + Observer, 假 send / 假日志: 第一条命令发送时人主动锁屏 ->
+    最多再发一条命令、线程结束后接回面板恰好一次 (不发唤醒回车)、窗口关掉后占用放掉."""
+    import queue
+    import threading
+    import test_observe_core as t
+    monkeypatch.setattr(oc, "record", lambda *a, **k: None)
+    op._WINDOWS.clear()
+    dev = t.FakeDev()
+    obs = t._obs(dev)
+    name, why = obs.probe()
+    assert why is None
+    panel = _Panel(sock=False)
+
+    class W:
+        _confirming, _closing, _stop_reason = None, False, None
+
+        def __init__(self):
+            self.ui, self.stop_evt, self.head, self.name, self.token = queue.Queue(), threading.Event(), "con-1", "/dev/con-1", "tk"
+            self.life, self.hold, self.obs = op.Life("/dev/con-1", "tk"), op.ConsoleHold("/dev/con-1", panels=lambda: [panel]), obs
+            self.status, self.start_btn, self.close_btn = _Lbl(), _Lbl(), _Lbl()
+            self.worker, self.close, self.destroy = None, None, None
+
+        def withdraw(self):
+            pass
+
+        def winfo_exists(self):
+            return True
+
+        def stop_for_lock(self):
+            op.ObserveWindow.stop_for_lock(self)
+
+        def _console_back(self):
+            op.ObserveWindow._console_back(self)
+
+        def _ended(self):
+            op.ObserveWindow._ended(self)
+
+        def _write_snap(self):
+            pass
+
+        def _work(self, o, n):
+            op.ObserveWindow._work(self, o, n)
+    w = W()
+    oc.claim(w.name, w.token)
+    op._WINDOWS.add(w)
+    w.hold.pause()
+    orig = dev.send
+
+    def send(port, cmd, timeout):
+        if len(dev.polls) == 0:
+            op.hide_all(stop=True)                   # 第一条命令发送期间: 人点了锁屏
+        return orig(port, cmd, timeout)
+    obs.send = send
+    op.ObserveWindow._spawn(w, obs, name)
+    w.worker.join(5)
+    assert not w.worker.is_alive() and len(dev.polls) <= 2
+    while not w.ui.empty():
+        w.ui.get()()
+    assert panel.calls.count(("connect", False)) == 1 and ("connect", True) not in panel.calls
+    assert "锁屏" in w.status.kw["text"]
+    assert oc.holder(w.name) == w.token          # 窗口还开着: 占用跟着窗口
+    w.life.window_gone()
+    assert oc.holder(w.name) is None
+    op._WINDOWS.clear()
