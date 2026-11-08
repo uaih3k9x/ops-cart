@@ -72,6 +72,7 @@ class Kiosk(tk.Tk):
         self.passthrough = False
         self._ssd, self._ssd_ts = None, 0.0
         self._check_rows, self._check_ts, self._checking = None, 0.0, False
+        self._pxe_toggled_at = 0.0          # 最近一次车机上启停 PXE 成功的时间; 之前开跑的自检结果作废
         self._fans_seen = set()
         self._combo = kc.ReleaseCombo()
         self._kb = kc.HidKeyboard()
@@ -110,11 +111,11 @@ class Kiosk(tk.Tk):
         self._code = None
         self._boot_once = kui.Once(self._boot_finish)
         self._exit_once = kui.Once(self._disarm_quietly)
-        self._disarm_quietly()          # 开机即复位: PXE 默认只给救援菜单
+        self._disarm_quietly()          # 开机即复位: PXE 只给默认菜单 (超时本地盘)
         self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
         self.after(50, self._boot_selftest)
         self._last_input = time.time()
-        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
+        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>", "<<OpsCartImeInput>>"):   # 最后一个: 中文输入吃掉的键 (#54)
             self.bind_all(seq, self._note_input, add="+")
         # 透传的键盘走全局: Tk 把按键投给有焦点的窗口, 不是嵌着 mpv 的那个 Frame
         self.bind_all("<KeyPress>", lambda e: self.passthrough and self._on_key(e, True), add="+")
@@ -224,6 +225,12 @@ class Kiosk(tk.Tk):
                 if "do" in it and "arg" not in it:
                     self._menu_btns[it["do"]] = b
         self.show_page("main")
+        self._sync_toggles()
+
+    def _sync_toggles(self):
+        """UVC 预览 / 串口会话 / PXE 装机服务三颗按钮写当前状态: 面板开关时、自检出结果时刷新."""
+        for attr, text in kui.toggle_texts(self.pane.current, self._check_rows).items():
+            getattr(self, attr).config(text=text)
 
     def show_page(self, name):
         for page in self.pages.values():
@@ -247,11 +254,10 @@ class Kiosk(tk.Tk):
             rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
             return kc.net_probe(), rows + [kui.font_row(self.ui_family)]
 
+        started = time.time()
+
         def checks_done(res):
-            self._checking = False
-            if not isinstance(res, Exception):
-                self._render_net(*res[0])
-                self._check_rows = res[1]
+            self._checks_done(started, res)
 
         rows = self._check_rows
 
@@ -273,8 +279,25 @@ class Kiosk(tk.Tk):
             self._checking, self._check_ts = True, time.time()
             self.ui.run_bg(checks, checks_done)
         self.ui.run_bg(board, self._render, key="board")
+        self._reap_preview()
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
+
+    def _checks_done(self, started, res):
+        """自检结果回来. 在最近一次 PXE 启停之前开跑的那轮作废 (读到的是启停前的状态), 等下一轮."""
+        self._checking = False
+        if isinstance(res, Exception) or started < self._pxe_toggled_at:
+            return
+        self._render_net(*res[0])
+        self._check_rows = res[1]
+        self._sync_toggles()
+
+    def _reap_preview(self):
+        """mpv 自己退了 (起不来 / 采集卡拔了 / 设备还被占着): 关预览面板, 按钮回 "关"."""
+        rc = self.mpv.poll() if self.mpv else None
+        if kui.preview_died(self.pane.current, rc):
+            self._close_pane()
+            self.banner.config(text=kui.preview_exit_note(rc))
 
     # ------------------------------------------------------------ 执行器条 (issue #2)
 
@@ -519,7 +542,8 @@ class Kiosk(tk.Tk):
         def serial():
             self._close_confirm()
             self._open_pane("serial", lc.slot_for_lamp(f"con-{n}"))
-        self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial)
+        self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial,
+                                          live=lambda k: mcp_serial.log_last_line(lc.SLOTS[k - 1]))
 
     def _close_confirm(self):
         if self._confirm_win is not None and self._confirm_win.winfo_exists():
@@ -705,6 +729,7 @@ class Kiosk(tk.Tk):
                 w.destroy()
 
     def _pane_open(self, name, select=None):
+        self._sync_toggles()
         self.status_wrap.pack_forget()
         if name == "preview":
             self._start_preview()
@@ -726,6 +751,7 @@ class Kiosk(tk.Tk):
         self.banner.config(text=kui.PANES[name])
 
     def _show_status(self):
+        self._sync_toggles()
         self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.banner.config(text="")
 
@@ -766,6 +792,7 @@ class Kiosk(tk.Tk):
             os.makedirs("/run/ops-cart", exist_ok=True)    # mpv 的 IPC socket 放这 (cart_snap.py 用)
             self.mpv = Popen(kc.mpv_cmd(wid, dev), stdout=DEVNULL, stderr=DEVNULL)
         except OSError as ex:
+            self._close_pane()                  # 不留开着的黑面板, 按钮回 "关"
             self.banner.config(text=f"mpv 起不来: {ex}")
             return
         self._banner_idle()
@@ -1061,10 +1088,21 @@ class Kiosk(tk.Tk):
             if not messagebox.askyesno("确认", f"确定要{verb} PXE 装机服务?"):
                 return
             cmd = ["systemctl", "stop" if active else "start", *units]
-            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30), lambda r: self.banner.config(
-                text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
-                else f"PXE 装机服务{verb}失败, 详见 journalctl"), f"正在{verb} PXE 装机服务…")
+            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30),
+                            lambda r: self._pxe_toggle_done(r, active), f"正在{verb} PXE 装机服务…")
         self._bg_action("toggle_pxe", lambda: kc.services_status(("pxe-server",)), asked, "读取服务状态…")
+
+    def _pxe_toggle_done(self, res, active):
+        """启停回来: 成功就先把自检结果里 PXE 那行改掉再刷按钮, 并作废之前开跑的自检; 都让下一轮立刻重跑校正."""
+        verb = "停止" if active else "启动"
+        self._check_ts = 0.0
+        if isinstance(res, Exception) or res[0] != 0:
+            self.banner.config(text=f"PXE 装机服务{verb}失败, 详见 journalctl")
+            return
+        self._pxe_toggled_at = time.time()
+        self._check_rows = kui.pxe_rows_set(self._check_rows, not active)
+        self._sync_toggles()
+        self.banner.config(text=f"PXE 装机服务已{verb}")
 
     def confirm_power(self, off):
         verb = "关机" if off else "重启"
@@ -1205,6 +1243,7 @@ class Kiosk(tk.Tk):
         e = tk.Entry(box, textvariable=self._pin_var, show="*", font=th.font(22, mono=True),
                      width=14, justify="center", bg=th.BG, fg=th.FG,
                      insertbackground=th.FG, **th.SUNKEN)
+        e.no_ime = True                     # 要人亲手敲, 不接中文输入 (中文输入的 NO_IME 约定)
         e.pack(ipady=8)
         e.bind("<Return>", lambda _e: self._try_unlock())
         self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg=th.BG, fg=th.DIM)
@@ -1401,8 +1440,10 @@ class Kiosk(tk.Tk):
             lb.selection_set(0)
         lb.pack(fill="x", padx=24)
         mac_var = tk.StringVar()
-        tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg=th.BG, fg=th.FG,
-                 insertbackground=th.FG, **th.SUNKEN).pack(fill="x", padx=24, pady=(6, 6), ipady=4)
+        mac_e = tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg=th.BG, fg=th.FG,
+                         insertbackground=th.FG, **th.SUNKEN)
+        mac_e.no_ime = True
+        mac_e.pack(fill="x", padx=24, pady=(6, 6), ipady=4)
         # 克隆用途: 这一批放不放行的清单 (#18). 人看的就是要写的: 解锁时 pxe_arm 重算, digest 不同就拒绝
         plan_lb = tk.Listbox(w, font=FONT_MONO, height=4, bg=th.BG, fg=th.WARN, **th.SUNKEN,
                              exportselection=False)
@@ -1433,6 +1474,7 @@ class Kiosk(tk.Tk):
         code_var = tk.StringVar()
         e = tk.Entry(w, textvariable=code_var, font=th.font(22, mono=True), width=10,
                      justify="center", bg=th.BG, fg=th.FG, insertbackground=th.FG, **th.SUNKEN)
+        e.no_ime = True
         e.pack(pady=8, ipady=6)
         msg = tk.Label(w, text="", font=FONT, bg=th.PANEL, fg=th.BAD)
         msg.pack()

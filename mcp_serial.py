@@ -2,7 +2,8 @@
 """mcp_serial: 串口写路径的 MCP 工具 + 车机确认 / 急停命令行 (#21). 规则全在 serial_write_core, 这里只管 IO.
 
 工具 (cart_mcp 注册): lease_acquire / lease_renew / lease_release / send_command (行级命令) /
-  send_key (回车 / 翻页空格 / Ctrl+C) / pending_list (只读) / estop (Agent 也能自停; 解除不给 Agent).
+  send_key (回车 / 翻页空格 / Ctrl+C) / pending_list (只读) / gate_allowlist (只读, #75 第 1 层白名单) /
+  estop (Agent 也能自停; 解除不给 Agent).
 发送一律走 conbroker send (以 serial.conf 的 user 身份; 人 3 秒内敲过键它自己排队), 不直开串口.
 
 状态: /run/ops-cart/serial-write.json (root 0600; 租约、挂起、在途、急停), 每次操作 flock 一把锁
@@ -44,6 +45,7 @@ import confirm_core as cc
 import kvm_broker
 import lamps_core
 import mcp_core as mc
+import serial_allowlist as sa
 import serial_core
 import serial_gate_model as gm
 import serial_write_core as sw
@@ -55,10 +57,11 @@ REQ_POLL_S = 0.2                # 半截请求文件隔多久再看
 REQ_ROUNDS = 10                 # 最多看几轮 (= 等半截文件写完最多 2 秒)
 LOG_DIR = cartlog.LOG_DIR
 OUTPUT_MAX = 64 * 1024          # 回给 Agent 的设备输出上限
-TAIL_LINES = 8                  # 发前看几行认厂商 / 提示符 / 名字
+TAIL_LINES = 24                 # 发前看几行认厂商 / 提示符 / 名字; 挂起 / 确认的指纹再从里面滤掉标记行取最后 8 行
 CONTEXT_LINES = 40              # 第 2 层: 给决策模型看几行最近输出 (再按规则文件 context_chars 掐尾)
 INTENT_MAX = 500                # Agent 声明的意图
 SEND_TIMEOUT = 30
+TAIL_TIMEOUT = 10
 SEND_TIMEOUT_MAX = 300
 KEY_TIMEOUT = 10
 SUMMARY_EVS = ("estop", "resume", "confirm", "reject")
@@ -161,8 +164,12 @@ class Store:
     def view(self, slot=None):
         return self.run(lambda b, now: b.view(now, slot))
 
+    def peek(self, slot=None):
+        """只读档用 (#49): 不加锁不写盘不写日志; 过期 / 读不懂只在视图里算."""
+        return peek(self.path, self.clock, slot)
 
-def peek(path=STATE_PATH, clock=time.time):
+
+def peek(path=STATE_PATH, clock=time.time, slot=None):
     """只读看一眼 (车机 / 网页 / 副屏): 不加锁不写盘, 过期的在内存里算掉. 读不了 / 读不懂 = 全部急停.
     写状态的一方都是原子改名, 不加锁也读不到半个文件."""
     now = clock()
@@ -173,18 +180,30 @@ def peek(path=STATE_PATH, clock=time.time):
         text = None
     except (OSError, UnicodeDecodeError):
         return cc.stopped_view("读不到状态文件")
-    return sw.Book.from_text(text, now).view(now)
+    return sw.Book.from_text(text, now).view(now, slot)
 
 
-def writers(store):
-    """{槽位: 写入者 或 None} 给 list_threads; 读不到状态就全是 None, 不抛."""
+def writers(store, readonly=False):
+    """{槽位: 写入者 或 None} 给 list_threads; 读不到状态就全是 None, 不抛. readonly: 走 peek, 不碰状态文件."""
     try:
-        return {s["slot"]: s["writer"] for s in store.view()["slots"]}
+        return {s["slot"]: s["writer"] for s in (store.peek() if readonly else store.view())["slots"]}
     except Exception:                   # noqa: BLE001  列执行绪不能因为这个挂
         return {n: None for n in sw.SLOTS}
 
 
 # ------------------------------------------------------------ conbroker send
+
+def conbroker_tail(dev, n):
+    """conbroker tail <口> -n N (以 serial.conf 的 user 身份); 失败抛 ToolError. cart_mcp 也用这个."""
+    try:
+        r = subprocess.run(serial_core._conbroker_cmd() + ["tail", dev, "-n", str(n)], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=TAIL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise mc.ToolError(f"conbroker tail 跑不起来: {e}") from None
+    if r.returncode != 0:
+        raise mc.ToolError(f"conbroker tail 失败: {serial_core.serve_error(r.returncode, r.stderr)}")
+    return r.stdout.rstrip("\n")
+
 
 def conbroker_send(dev, text, timeout, raw=False, run=subprocess.run):
     """-> (status, 输出, 说明). status: sent / refused (conbroker 发前把关没发) / timeout (发了没等到提示符) / error.
@@ -233,14 +252,22 @@ class Server(mc.Server):
 
 
 class Tool(mc.Tool):
-    def __init__(self, name, description, params, fn, read_only=False, destructive=False, redact=None):
-        super().__init__(name, description, params, fn)
-        self.read_only, self.destructive, self.redact = read_only, destructive, redact
+    """kind 必填 (mc.READONLY / mc.ACT, #49): 只读档按它决定注册不注册."""
+
+    def __init__(self, name, description, params, fn, *, kind, destructive=None, redact=None):
+        super().__init__(name, description, params, fn, kind=kind)
+        self.destructive, self.redact = destructive, redact
+
+    @property
+    def read_only(self):
+        return self.kind == mc.READONLY
 
     def spec(self):
         d = super().spec()
-        d["annotations"] = {"readOnlyHint": self.read_only, "destructiveHint": self.destructive,
-                            "openWorldHint": False}
+        d["annotations"] = {"readOnlyHint": self.read_only, "openWorldHint": False}
+        dh = False if self.read_only else self.destructive      # 动手工具没写 = 不写, 客户端按可能有破坏处理 (#49)
+        if dh is not None:
+            d["annotations"]["destructiveHint"] = dh
         return d
 
 
@@ -248,10 +275,11 @@ SLOT = {"type": "integer", "minimum": 1, "maximum": 4, "required": True, "descri
 LEASE = {"type": "string", "maxLength": 64, "required": True, "description": "lease_acquire 给的令牌"}
 
 
-def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, llm=None):
+def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, llm=None, readonly=False):
     """slots() -> lamps_core.slot_status 那样的 4 项; tail(dev, n) -> 文本 (出错抛 mc.ToolError);
     send(dev, text, timeout, raw) -> (status, 输出, 说明); rules() -> load_rules 的结果;
-    llm(指令, 数据, model 配置) -> claude 输出 (第 2 层决策模型, None = serial_gate_model.claude_llm). 测试里全换成假的."""
+    llm(指令, 数据, model 配置) -> claude 输出 (第 2 层决策模型, None = serial_gate_model.claude_llm). 测试里全换成假的.
+    readonly (#49): 只回只读工具, pending_list 走 store.peek (不加锁不写盘); 动手档照旧走 store.run."""
 
     def _slot(n):
         s = slots()[n - 1]
@@ -277,16 +305,18 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         except OSError as e:
             raise mc.ToolError(f"写状态文件失败, 不发: {e}") from None
 
-    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw):
+    def _dispatch(n, dev, kind, cmd, gate, lease, timeout, name, text, raw, context, mark, snap=None):
         me = who()
         if gate["verdict"] != "pass":
-            it = _run(lambda b, now: b.submit(n, lease, me, kind, cmd, gate, now, timeout, name), n, kind, cmd)
+            it = _run(lambda b, now: b.submit(n, lease, me, kind, cmd, gate, now, timeout, name, context=context,
+                                              mark=mark), n, kind, cmd)
             return [mc.json_content({
                 "status": "pending", "id": it["id"], "slot": n, "cmd": cmd, "reason": gate["reason"],
                 "danger": gate["danger"],
                 "hint": "已挂起, 一个字节都没发. 要人在推车上确认才发; 用 pending_list 看结果. "
                         "等的时候继续 lease_renew, 租约过期这条就作废."})]
-        it = _run(lambda b, now: b.begin(n, lease, me, kind, cmd, gate, now, timeout, name), n, kind, cmd)
+        it = _run(lambda b, now: b.begin(n, lease, me, kind, cmd, gate, now, timeout, name, snap=snap, mark=mark),
+                  n, kind, cmd)
         t0 = time.monotonic()
         try:
             status, out, note = send(dev, text, timeout, raw)
@@ -315,6 +345,21 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         _run(lambda b, now: b.release(a["slot"], a["lease"], now))
         return [mc.json_content({"slot": a["slot"], "released": True})]
 
+    def _settled(n, s, text, gate):
+        """第 2 层放行后再看一次设备 -> 原 gate 或转挂起的 gate. 最后一行变了 / 读不到 / 日志 HUMAN_QUIET_S 内动过 -> 挂起."""
+        try:
+            now_text = tail(s["dev"], TAIL_LINES)
+        except mc.ToolError:
+            now_text = None
+        mtime = slots()[n - 1].get("mtime")
+        quiet = store.clock() - mtime if mtime else None
+        before, now_line = sw.last_line(text), sw.last_line(now_text)
+        if now_text is not None and now_line == before and quiet is not None and quiet >= sw.HUMAN_QUIET_S:
+            return gate
+        why = ("模型判的时候设备变了 (最后一行: " + (now_line[-80:] or "看不到") + ")" if now_line != before or now_text is None
+               else "模型判的时候设备日志还有动静, 可能有人正在敲")
+        return dict(gate, verdict="confirm", layer=3, reason=f"{why}; 模型原本放行 ({gate.get('reason')}), 改为要人确认")
+
     def send_command(a):
         n, cmd = a["slot"], a["command"]
         intent = (a.get("intent") or "").strip() or None
@@ -324,7 +369,9 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         except sw.Refused as e:
             _run(lambda b, now: b.log_refused(n, who(), "line", cmd, e.code, str(e), now))
             raise mc.ToolError(str(e)) from None
-        _run(lambda b, now: b.writer(n, a["lease"], now), n, "line", cmd)    # 没租约 / 急停的不问模型, 不白花钱
+        # 没租约 / 急停的不问模型, 不白花钱; 发送序号在读输出之前取, 挂起时变了就不挂 (#65)
+        mark = _run(lambda b, now: b.send_mark(n, a["lease"], now), n, "line", cmd)
+        snap = store.run(lambda b, now: b.touched(n))     # 先判后占 (#74 第四轮): 模型判的几十秒里有人确认过就不直发
         try:
             text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
@@ -332,24 +379,64 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         r = rules()
         vendor, at = sw.slot_vendor(n, r, text)
         judge = gm.make_judge(r, lambda: tail(s["dev"], CONTEXT_LINES), intent, llm=llm)
-        gate = sw.classify(cmd, vendor, at, r, judge=judge)
+        gate = sw.classify(cmd, vendor, at, r, judge=judge, user_view=sw.user_view(vendor, text),
+                           mode=_mode(vendor, at, text))
+        gate["vendor_registered"] = bool(r.get("slots", {}).get(n))    # 自动认出来的华为不算 (#65 第四轮)
+        if gate["verdict"] == "pass" and gate.get("layer") == 2:
+            gate = _settled(n, s, text, gate)         # 模型判了几十秒: 设备还停在原处、日志也安静才直发 (#74 第五轮)
+        if text:
+            gate["line"] = sw.last_line(text)[-sw.LINE_SHOWN:]     # 挂起时设备停在哪: 确认时比对 (#74 第三轮)
+        if s.get("count") is not None:
+            gate["log_size"] = s["count"]             # 挂起时 conbroker 日志多大: 例外 (同一确认行) 要求没新字节
         if intent:
             gate["intent"] = intent     # 随闸门结果进日志和挂起列表, 人确认时看得到
         return _dispatch(n, s["dev"], "line", cmd, gate, a["lease"], a["timeout_s"], mc.thread_name(text),
-                         cmd, False)
+                         cmd, False, text, mark, snap=snap)
 
     def send_key(a):
         n, key = a["slot"], a["key"]
         s = _slot(n)
-        gate = sw.classify_key(key)
+        mark = _run(lambda b, now: b.send_mark(n, a["lease"], now), n, "key", key)    # #65: 读输出之前取序号
+        snap = store.run(lambda b, now: b.touched(n))     # #74: 先记下, 看完设备再占: 中间有人确认过就不直发
         try:
-            name = mc.thread_name(tail(s["dev"], TAIL_LINES))
+            text = tail(s["dev"], TAIL_LINES)
         except mc.ToolError:
-            name = None
+            text = None                 # 看不到设备停在哪: 闸门按未知挂起, submit 读不到上下文再拒 (#73, #65)
+        mtime = s.get("mtime")            # conbroker 日志的修改时间: 人敲键有回显, 几秒内动过 = 可能有人在用
+        quiet = store.clock() - mtime if mtime else None
+        gate = sw.classify_key(key, text, quiet, vendor=(rules().get("slots") or {}).get(n))
+        name = mc.thread_name(text) if text is not None else None
         k = sw.KEYS[key]
-        return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"])
+        return _dispatch(n, s["dev"], "key", key, gate, a["lease"], KEY_TIMEOUT, name, k["text"], k["raw"], text, mark,
+                         snap=snap)
+
+    def _mode(vendor, at, text):
+        return sa.prompt_mode(vendor, sw.last_line(text)) if at else "config"
+
+    def gate_allowlist(a):
+        """只读: 这个槽位按登记 / 认出的厂商和当前提示符 mode, 第 1 层白名单里可用的条目. 不发任何字节."""
+        n = a["slot"]
+        s = _slot(n)
+        try:
+            text = tail(s["dev"], TAIL_LINES)
+        except mc.ToolError:
+            text = ""
+        r = rules()
+        vendor, at = sw.slot_vendor(n, r, text)
+        mode = _mode(vendor, at, text)
+        dis = r.get("allowlist_disable", [])
+        return [mc.json_content({
+            "slot": n, "vendor": vendor, "mode": mode, "phase": "shadow",
+            "entries": sa.catalog(vendor, mode, dis),
+            "types": sa.type_help(vendor) if vendor in sa.ALLOW else {},
+            "disabled": list(dis), "unknown_disable": list(r.get("allowlist_unknown", [])),
+            "note": "影子期: 第 1 层放行仍按旧规则 (display / show 全称小写), 这份清单是将来的放行口径, 先照抄写法. "
+                    "{类型} 是参数槽; src=待核 的条目还没在现场核过. 不在清单里的命令将来要模型或人确认. "
+                    + ("" if vendor in sa.ALLOW else "认不出厂商或该厂商不开第 1 层白名单 (如 linux), 清单为空.")})]
 
     def pending_list(a):
+        if readonly:
+            return [mc.json_content(store.peek(a.get("slot")))]
         return [mc.json_content(_run(lambda b, now: b.view(now, a.get("slot"))))]
 
     def estop(a):
@@ -359,21 +446,23 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                                  "dropped": [d["id"] for d in dropped],
                                  "note": "已撤销写租约、丢弃挂起的命令, 没往设备发任何东西. 解除要人在推车本机上操作."})]
 
-    return [
+    tools = [
         Tool("lease_acquire", "申请某个槽位的写租约 (一条执行绪同时只有一个写入者). 返回令牌, 发命令时带上. "
              "租约有期限要续期, 过期自动释放, 挂着的命令一起作废. 急停中拿不到.",
              {"slot": SLOT, "ttl_s": {"type": "integer", "minimum": sw.LEASE_TTL_MIN_S,
                                       "maximum": sw.LEASE_TTL_MAX_S, "default": sw.LEASE_TTL_S,
-                                      "description": "期限秒数"}}, lease_acquire),
+                                      "description": "期限秒数"}}, lease_acquire, kind=mc.ACT, destructive=False),
         Tool("lease_renew", "续写租约 (从现在起再给一个期限). 过期了不能续, 要重新申请.",
-             {"slot": SLOT, "lease": LEASE}, lease_renew),
+             {"slot": SLOT, "lease": LEASE}, lease_renew, kind=mc.ACT, destructive=False),
         Tool("lease_release", "用完交还写租约; 自己还挂着等确认的命令一起作废.",
-             {"slot": SLOT, "lease": LEASE}, lease_release),
+             {"slot": SLOT, "lease": LEASE}, lease_release, kind=mc.ACT, destructive=False),
         Tool("send_command", "往某个槽位的串口发一行命令 (自动补回车, 只收一行可打印 ASCII, 不给原始字节). "
              "过闸门: 认得出厂商、设备停在提示符上的只读命令 (华为 display… / 思科 show…, 全称小写) 直接发, "
              "返回设备输出; 其余的若推车开了决策模型, 由模型按命令、设备最近输出和你给的 intent 判, 判放行直接发, "
              "否则挂起 (status=pending) 等人在推车上确认; 带 save/reboot/reset/format/delete 等高危词的永远要人确认. "
-             "人 3 秒内敲过键会排队. 要先 lease_acquire.",
+             "槽位有挂起项时这个槽位不许再直发任何命令或按键, 也不收新的挂起 (只收打断键 ctrl_c; 先等人确认 / 拒绝, "
+             "或 lease_release 撤回); 挂起后槽位又发过别的, 那条批准作废要重新提交. 人 3 秒内敲过键会排队. "
+             "要先 lease_acquire. 先用 gate_allowlist 查第 1 层白名单, 照抄写法.",
              {"slot": SLOT, "command": {"type": "string", "maxLength": sw.LINE_MAX, "required": True,
                                         "description": "一行命令, 不含换行"},
               "lease": LEASE,
@@ -381,49 +470,121 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                          "description": "这条命令要干什么、为什么 (一两句). 给决策模型和确认的人看, 进日志"},
               "timeout_s": {"type": "integer", "minimum": 1, "maximum": SEND_TIMEOUT_MAX, "default": SEND_TIMEOUT,
                             "description": "等提示符的秒数"}},
-             send_command, destructive=True),
-        Tool("send_key", "发一个固定特殊键: enter (回车) / space (翻页空格) 直接发; ctrl_c (打断) 要人确认. "
+             send_command, kind=mc.ACT, destructive=True),
+        Tool("send_key", "发一个固定特殊键: enter (回车) / space (翻页空格) 只有设备最后一行是命令提示符或 --More-- 翻页、且 5 秒内没动静时"
+             "才直接发 (--More-- 上的空格不用等 5 秒); 停在确认提示 ([confirm]、[Y/N] 等)、半截输出、刚刷过日志时挂起等人确认 (读不到设备输出就不挂起, 直接拒) "
+             "(要直发就等 5 秒再试); 同槽位前面还有挂起项时除了 ctrl_c 什么都不收 (也不直发); 人确认时推车会重看设备, 停在确认提示上就不发; "
+             "ctrl_c (打断) 要人确认. "
              "需要别的按键 (BootROM 菜单、按任意键) 请人在推车屏幕上操作.",
              {"slot": SLOT, "key": {"type": "string", "enum": sorted(sw.KEYS), "required": True,
                                     "description": "哪个键"},
-              "lease": LEASE}, send_key, destructive=True),
+              "lease": LEASE}, send_key, kind=mc.ACT, destructive=True),
         Tool("pending_list", "看各槽位的写入者 / 急停 / 在途, 挂起等人确认的命令, 和最近的结果 "
              "(人确认后发出的命令输出摘要在 history 里, 完整输出用 read_output). 只读.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "只看这个槽位, 不给 = 全部"}},
-             pending_list, read_only=True),
+             pending_list, kind=mc.READONLY),
+        Tool("gate_allowlist", "查某个槽位第 1 层命令白名单 (按厂商和设备当前提示符): 可直发的命令写法和参数类型. "
+             "只读, 不往设备发任何东西.",
+             {"slot": SLOT}, gate_allowlist, kind=mc.READONLY),
         Tool("estop", "急停: 撤销写租约、丢弃挂起的命令, 之后谁都不能写这个槽位, 直到人在推车上解除. "
              "只停发送, 不往设备发任何东西. 不给 slot = 全部槽位, 同时停键鼠、作废在等确认的 PXE 解锁申请. "
              "觉得自己要出错时就用它.",
              {"slot": {"type": "integer", "minimum": 1, "maximum": 4, "description": "槽位; 不给 = 全部"}},
-             estop),
+             estop, kind=mc.ACT, destructive=False),   # 只停不动设备; 标成破坏性客户端会先问人, 急停不能等
     ]
+    return [t for t in tools if t.kind == mc.READONLY] if readonly else tools
 
 
 def real_slots():
     return lamps_core.slot_status(serial_core.data_dir(serial_core.serial_conf_read()))
 
 
-def real_tools(tail, store=None):
+LIVE_BYTES = 4096
+
+
+def log_last_line(dev, ddir=None):
+    """车机确认框用 (#74 第三轮): 直接读 conbroker 日志末尾, 取设备当前最后一行; 读不到 None. 不起子进程, 主线程能调."""
+    try:
+        ddir = ddir or serial_core.data_dir(serial_core.serial_conf_read())
+        with open(os.path.join(ddir, "logs", f"{lamps_core._safe(dev)}.log"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - LIVE_BYTES))
+            return sw.last_line(f.read().decode("utf-8", "replace")) or None
+    except (OSError, ValueError):
+        return None
+
+
+def real_tools(tail, store=None, readonly=False):
     """cart_mcp 用: tail 用它的 conbroker_tail."""
-    return build_tools(store or Store(), slots=real_slots, tail=tail, send=conbroker_send)
+    return build_tools(store or Store(), slots=real_slots, tail=tail, send=conbroker_send, readonly=readonly)
 
 
 # ------------------------------------------------------------ 人确认后发送 / 网页请求
 
-def send_confirmed(store, iid, by, slots, send):
-    """人确认 #iid -> 标在途 -> 经 conbroker 发 -> finish. -> (条目, status, 输出, 说明).
-    Book 不让 (急停 / 租约没了 / 在途 / 不在挂起) 抛 sw.Refused, 一个字节都不发. 会阻塞到发完, 车机放后台线程调."""
-    it = store.run(lambda b, now: b.confirm(iid, by, now))
+def _current(store, iid, slots, tail):
+    """确认前重读那个槽位设备的最近输出; 读不到 / 没这条 -> None (Book 会说不行)."""
+    item = next((p for p in store.view()["pending"] if p["id"] == iid), None)
+    if item is None:
+        return None
+    try:
+        return tail(slots()[item["slot"] - 1]["dev"], TAIL_LINES)
+    except Exception:                   # noqa: BLE001  读不到就是读不到, 不发
+        return None
+
+
+def recheck(it, dev, tail, rules, size=None):
+    """人确认时重看设备 -> 不发的说明; 能发 -> None.
+    回车 / 空格 (#74 第二轮): 停在确认提示 / 不在白名单 / 看不到就不发; 确认的人在场, 不再看 5 秒窗口.
+    命令 (#74 第三、四轮): 当前最后一行要是本槽位厂商的提示符才发; 挂起时就停在确认提示上的 (回答它), 要还是同一行.
+    打断键 (ctrl_c) 不重看."""
+    if it["kind"] == "key" and it["cmd"] not in sw.KEY_ANSWERS:
+        return None
+    try:
+        text = tail(dev, TAIL_LINES)
+    except Exception:                   # noqa: BLE001  看不到 = 不知道会回答什么
+        text = None
+    now_line = sw.last_line(text)
+    shown = now_line[-sw.LINE_SHOWN:] or "(看不到)"
+    vendor = (rules().get("slots") or {}).get(it["slot"])
+    if it["kind"] == "key":
+        g = sw.classify_key(it["cmd"], text, float("inf"), vendor=vendor)
+        if g["verdict"] == "pass":
+            return None
+        why = g["reason"]
+    else:                               # 白名单 (#74 第四轮), 同按键
+        was = (it.get("gate") or {}).get("line")
+        if sw.at_any_prompt(now_line, vendor):
+            return None
+        was_size = (it.get("gate") or {}).get("log_size")
+        if (was and sw.is_confirm_prompt(was) and now_line == sw.last_line(was)
+                and was_size is not None and size == was_size):
+            return None                 # 挂起时就停在这个确认提示上: 人看过、明确要回答它; 还是同一行、日志没新字节才发
+        why = ("看不到设备现在停在哪" if not now_line else
+               f"设备现在不在提示符上 (挂起时最后一行: {was or '(没记)'}), 这条发出去可能替人回答")
+    return f"确认时重看设备, 没发: {why}; 设备现在最后一行: {shown}. 要发请让 Agent 重新挂起"
+
+
+def send_confirmed(store, iid, by, slots, send, tail=None, rules=sw.load_rules):
+    """人确认 #iid -> 标在途 -> (按键先重看设备) -> 经 conbroker 发 -> finish. -> (条目, status, 输出, 说明).
+    Book 不让 (急停 / 租约没了 / 在途 / 不在挂起) 抛 sw.Refused, 一个字节都不发. 会阻塞到发完, 车机放后台线程调.
+    tail(dev, n) 默认 conbroker_tail. 两道重看: Book.confirm 拿确认前重读的输出和挂起时整体比 (#65, 有新输出就作废),
+    recheck 再按 #74 的白名单看最后一行 (停在确认提示 / 不在提示符上就不发)."""
+    current = _current(store, iid, slots, tail or conbroker_tail)
+    it = store.run(lambda b, now: b.confirm(iid, by, now, current))
+    held = None
     try:
         dev = slots()[it["slot"] - 1]["dev"]
         if it["kind"] == "key":
             text, raw = sw.KEYS[it["cmd"]]["text"], sw.KEYS[it["cmd"]]["raw"]
         else:
             text, raw = it["cmd"], False
+        held = recheck(it, dev, tail or conbroker_tail, rules, size=slots()[it["slot"] - 1].get("count"))
     except Exception as e:              # noqa: BLE001  在途标记一定要收掉
         dev, err = None, f"{type(e).__name__}: {e}"
     t0 = time.monotonic()
-    if dev is None:
+    if held:
+        status, output, note = "refused", "", held
+    elif dev is None:
         status, output, note = "error", "", err
     else:
         try:
@@ -435,14 +596,14 @@ def send_confirmed(store, iid, by, slots, send):
     return it, status, output, note
 
 
-def human_action(store, op, arg, by, slots, send):
+def human_action(store, op, arg, by, slots, send, tail=None, rules=sw.load_rules):
     """车机上人的按钮 (#23) -> 一句结果: confirm (arg = 编号, 会阻塞到发完) / reject (编号) / estop / resume
     (槽位, None = 全部). Book 不让抛 sw.Refused. 调用方保证是本机人 (车机进程), 放后台线程调."""
     if op == "confirm":
-        it, status, output, note = send_confirmed(store, arg, by, slots, send)
-        tail = sw.echo_summary(output).strip().splitlines()[-1:] if output else []
+        it, status, output, note = send_confirmed(store, arg, by, slots, send, tail=tail, rules=rules)
+        last = [ln for ln in sw.device_lines(sw.echo_summary(output)) if ln.strip()][-1:] if output else []
         return f"#{it['id']} {it['cmd']} -> {status}" + (f" ({note})" if note else "") + \
-            (f": {tail[0]}" if tail and not note else "")
+            (f"; 设备回显（不可信）：{last[0][:sw.CONTEXT_LINE_MAX]}" if last and not note else "")
     where = "全部槽位" if arg is None else f"槽位 {arg}"
     if op == "reject":
         store.run(lambda b, now: b.reject(arg, by, now, why="车机上拒绝"))
@@ -587,12 +748,25 @@ def local_human(env, pid, stat=read_stat, tty=False):
 CLI_CMDS = ("pending", "confirm", "reject", "estop", "resume", "requests")
 
 
-def _intent(item):
-    it = (item.get("gate") or {}).get("intent")
-    return f"\n      意图: {it}" if it else ""
+def _untrusted_tail(shown):
+    """一条挂起项在设备输出之前要显示的几行, 三处显示面同一个顺序 (#65 第七 / 八轮):
+    闸门理由 -> 高危词 -> 提示 -> 模型理由 -> Agent 自述 (后面是设备最后一行 (#74)、设备输出、设备自报名)."""
+    return shown["reason"], shown["danger"], shown.get("note"), shown["model"], shown["intent"]
 
 
-def _print_view(v, out):
+def _device_lines(text):
+    """设备输出 -> 每行先清洗打码 (sw.device_lines: 删转义 / 控制字符) 再加 "| " (命令行上和推车自己的话分开)."""
+    return "\n".join("| " + ln for ln in sw.device_lines(text))
+
+
+def _live_line(tail, dev):
+    try:
+        return sw.last_line(tail(dev, TAIL_LINES)) or None
+    except Exception:                   # noqa: BLE001  读不到就不显示当前行
+        return None
+
+
+def _print_view(v, out, live=lambda slot: None, rules=lambda: {}):
     for s in v["slots"]:
         bits = [f"槽位 {s['slot']}:"]
         bits.append(f"急停 (by {s['estop']['by']} {s['estop']['t']})" if s["estop"] else "正常")
@@ -601,16 +775,22 @@ def _print_view(v, out):
             bits.append(f"在途 #{s['inflight']['id']} {s['inflight']['cmd']!r}")
         print(" ".join(bits), file=out)
     print("挂起等确认:" if v["pending"] else "挂起等确认: 无", file=out)
-    for p in v["pending"]:
-        warn = f" [高危: {', '.join(p['danger'])}]" if p.get("danger") else ""
-        print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前){warn}"
-              f"\n      {p.get('reason')}{_intent(p)}", file=out)
+    for s in v["slots"]:
+        if any(p["slot"] == s["slot"] for p in v["pending"]):
+            print(f"  槽位 {s['slot']} " + cc.card(v, s["slot"])["trusted"].replace("\n", "\n    "), file=out)
+    for p in v["pending"]:              # 可信记录已在上面; 顺序同车机 / 网页: 理由 -> 高危词 -> 提示 -> 模型 -> 自述 -> 设备
+        shown = next(x for x in cc.card(v, p["slot"], live(p["slot"]), (rules().get("slots") or {}).get(p["slot"]))["items"] if x["id"] == p["id"])
+        extra = "".join("\n      " + x.replace("\n", "\n        ")
+                        for x in (*_untrusted_tail(shown), shown["line"], shown["context"], shown["name"]) if x)
+        print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前)"
+              f"{extra}", file=out)
     for h in v["history"][-5:]:
         print(f"  最近 #{h['id']} 槽位 {h['slot']} {h['cmd']!r} -> {h['status']}"
               f"{' (' + h['why'] + ')' if h.get('why') else ''}", file=out)
 
 
-def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None):
+def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=None, env=None, tail=None,
+        rules=sw.load_rules):
     store = store or Store()
     send = send or conbroker_send
     slots = slots or real_slots
@@ -642,8 +822,9 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
             print(f"不行: {e}", file=out)
             return None
 
+    live = lambda slot: _live_line(tail or conbroker_tail, slots()[slot - 1]["dev"])  # noqa: E731
     if a.cmd == "pending":
-        _print_view(store.view(), out)
+        _print_view(store.view(), out, live, rules)
         return 0
     if a.cmd == "estop":
         dropped = store.run(lambda b, now: b.estop(a.slot, by.replace("@local", ""), "human", now))
@@ -672,19 +853,27 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
     if item is None:
         print(f"没有挂起的 #{a.id}", file=out)
         return 1
-    warn = f"\n  !!! 高危词: {', '.join(item['danger'])}" if item.get("danger") else ""
-    print(f"槽位 {item['slot']} ({item.get('name') or '名字未知'}) 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
-          f"\n  {item.get('reason')}{_intent(item).replace('      ', '  ')}{warn}\n确认发送? 输入 yes: ", end="", file=out)
+    warn = ""
+    card = cc.card(store.view(), item["slot"], live(item["slot"]), (rules().get("slots") or {}).get(item["slot"]))
+    shown = next(x for x in card["items"] if x["id"] == a.id)
+    ctx = shown.get("context")          # 卡片里设备输出每行已带 "| " (#65 第八轮, 三处一致)
+    # 顺序 (#65 第六轮): 推车自己的 (可信记录、提示、闸门理由) 在前, Agent / 模型 / 设备给的 (都不可信) 在后
+    for extra in (card["trusted"], *_untrusted_tail(shown), shown["line"], ctx, shown["name"]):
+        if extra:
+            warn += "\n  " + ("!!! " if extra == shown["danger"] else "") + extra.replace("\n", "\n    ")
+    print(f"槽位 {item['slot']} 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"
+          f"{warn}\n确认发送? 输入 yes: ", end="", file=out)
     out.flush()
     if stdin.readline().strip() != "yes":
         print("没输 yes, 不发 (还挂着)", file=out)
         return 1
     try:
-        it, status, output, note = send_confirmed(store, a.id, by, slots, send)
+        it, status, output, note = send_confirmed(store, a.id, by, slots, send, tail=tail, rules=rules)
     except sw.Refused as e:
         print(f"不行: {e}", file=out)
         return 1
-    print(f"#{it['id']} -> {status}{' (' + note + ')' if note else ''}\n{sw.echo_summary(output)}", file=out)
+    print(f"#{it['id']} -> {status}{' (' + note + ')' if note else ''}\n{_device_lines(sw.echo_summary(output))}",
+          file=out)
     return 0 if status == "sent" else 1
 
 

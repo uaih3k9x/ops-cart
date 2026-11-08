@@ -105,14 +105,16 @@ def test_survey_runs_in_background_and_reports_in_drain(monkeypatch):
                 "path": "/x/con-1_SW-A_20261030-1403.txt", "sections": [], "diff": None}
     monkeypatch.setattr(survey_core, "run_survey", fake_run)
     monkeypatch.setattr(survey_core, "record", lambda r: logged.append(r))
+    monkeypatch.setattr(survey_core, "gate_disabled", lambda: ["huawei:display arp"])
     p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
     sp.SerialPanel.survey(p)
     assert p._surveying
     sp.SerialPanel.survey(p)                     # 跑着时再点不起第二个
     _join_bg()
     n = len(p.written)
-    assert p.after_calls == [] and seen["port"] == "/dev/con-1" and seen["vendor"] == "huawei"
-    assert seen["head"] == "con-1" and seen["send"] is survey_core.conbroker_send
+    assert p.after_calls == [] and seen["port"] == "/dev/con-1" and seen["vendor"] == "auto"
+    assert seen["head"] == "con-1" and seen["send"] is survey_core.conbroker_send and seen["tail"] is survey_core.conbroker_tail
+    assert seen["disabled"] == ["huawei:display arp"]          # 和命令行同一个口径 (#75)
     assert len(logged) == 1
     sp.SerialPanel._run_ui(p)
     assert not p._surveying and len(p.written) == n + 1
@@ -229,3 +231,11 @@ def test_observe_refused_while_surveying():
     sp.SerialPanel.observe(p)
     assert "巡检" in p.written[-1]
     observe_core._CLAIMS.clear()
+
+
+def test_observe_vendor_falls_back_to_huawei_for_auto():
+    # #56 之后 survey_vendor 默认 auto; 观察只有华为的 brief 解析器
+    assert sp.observe_vendor({"survey_vendor": "auto"}) == "huawei"
+    assert sp.observe_vendor({}) == "huawei"
+    assert sp.observe_vendor({"survey_vendor": "h3c"}) == "huawei"
+    assert sp.observe_vendor({"survey_vendor": "huawei"}) == "huawei"

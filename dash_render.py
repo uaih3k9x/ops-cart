@@ -358,21 +358,49 @@ def _work_body(d, view, W, H):
         d.text((M, y + 72), "风扇 " + " · ".join(rpms[:3]) + " rpm", font=_font(26), fill=DIM)
     d.line([M, 1000, W - M, 1000], fill=LINE, width=2)
 
-    # 待办: 最多两条
+    # 待办 / 昨夜整理: 排版见 work_tail (底部红条出现时整块往上让)
     y = 1016
     todo = view.get("todo") or []
     d.text((M, y), "待办", font=_font(30), fill=ACCENT if todo else DIM)
     if not todo:
         d.text((M + 80, y + 2), "没有", font=_font(28), fill=DIM)
-    for item in todo[:2]:
-        y += 44
-        d.text((M + 10, y), "· " + wrap(item, _font(28), W - 2 * M - 40, 1)[0], font=_font(28),
-               fill=FG)
+    for kind, top, _, text in work_tail(view, W, H):
+        if kind == "todo":
+            d.text((M + 10, top), text, font=_font(28), fill=FG)
+        else:
+            d.text((M, top), text, font=_font(26), fill=DIM)
 
-    # 昨夜整理: 固定贴底, 最多两行
-    lines = wrap(view.get("dream") or "", _font(26), W - 2 * M, 2)
+
+TAIL_Y0, TAIL_GAP, DREAM_LH = 1016, 10, 38     # 待办抬头 / 跟底栏的间隔 / 昨夜整理行距
+
+
+def footer_top(view, H=PANEL_H):
+    """底栏顶边: 数据源停了是 70 高的红条, 平时一道 8 高的绿线."""
+    return H - (70 if view.get("stale") else 8)
+
+
+def work_tail(view, W=PANEL_W, H=PANEL_H):
+    """待办 (最多两条) + 昨夜整理 (贴底, 最多两行) 逐行排版: [(kind, 顶, 底, 文字)].
+
+    下限取底栏顶边再留 TAIL_GAP; 红条出现时放不下就先砍昨夜整理的行数, 末行收省略号.
+    """
+    limit = min(H - 60, footer_top(view, H) - TAIL_GAP)
+    tf, df = _font(28), _font(26)
+    rows, y = [], TAIL_Y0
+    bottom = TAIL_Y0 + _font(30).getbbox("待办")[3]
+    for item in (view.get("todo") or [])[:2]:
+        y += 44
+        text = "· " + wrap(item, tf, W - 2 * M - 40, 1)[0]
+        if y + tf.getbbox(text)[3] > limit:
+            break
+        bottom = y + tf.getbbox(text)[3]
+        rows.append(("todo", y, bottom, text))
+    n = min(2, (limit - bottom) // DREAM_LH)
+    lines = wrap(view.get("dream") or "", df, W - 2 * M, n) if n > 0 else []
     for i, line in enumerate(lines):
-        d.text((M, H - 60 - 38 * (len(lines) - i)), line, font=_font(26), fill=DIM)
+        top = limit - DREAM_LH * (len(lines) - i)
+        rows.append(("dream", top, top + df.getbbox(line)[3], line))
+    return rows
 
 
 FRONT_Y, FRONT_ROW, FRONT_GAP = 926, 30, 6       # 前面板: 两排口, 标题在 892 那行

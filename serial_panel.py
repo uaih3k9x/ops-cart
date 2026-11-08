@@ -48,6 +48,12 @@ def _btn(parent, text, cmd, bg=None):
                      activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=10)
 
 
+def observe_vendor(cfg):
+    """观察用哪个厂商的解析器: survey_vendor 是 auto (#56 起的默认) 或没有解析器的厂商时按华为."""
+    v = cfg.get("survey_vendor")
+    return v if observe_core.parser_for(v) else "huawei"
+
+
 def _held_here(panel):
     """面板当前选中的这一路是不是正在被观察 (#85; 登记在模块级, kiosk 切页新建的面板也看得到)."""
     name = match_service(panel.port_var.get(), panel._serves)
@@ -147,6 +153,7 @@ class SerialPanel(tk.Frame):
         self.chat_entry = tk.Entry(row, textvariable=self.chat_var, font=FONT, bg=BG2, fg=FG,
                                    insertbackground=FG, **th.SUNKEN, highlightthickness=2,
                                    highlightbackground=BG2, highlightcolor=th.PRIMARY)
+        self.chat_entry.no_ime = True       # 发往串口的命令, 不接中文输入 (中文输入的 NO_IME 约定)
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())
         _btn(row, "发送", self.chat_send, bg=th.PRIMARY).pack(side="left", padx=(6, 0))
@@ -449,7 +456,9 @@ class SerialPanel(tk.Frame):
     def survey(self):
         """#15 一键只读巡检: 后台跑 survey_core (走 conbroker send), 摘要经 self.ui 回主线程写进控制台.
 
-        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor, 默认 huawei.
+        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor
+        (huawei / h3c / cisco / ruijie), 默认 auto (#56 先 show version 再 display version 自动认).
+        发第一条前先 conbroker tail 看最后一行, 不在提示符上 (Username / Password / [Y/N] ...) 就不跑.
         """
         if self._surveying:
             return
@@ -463,14 +472,15 @@ class SerialPanel(tk.Frame):
             self._con_write([("text", f"\n[巡检] {dev} 正在观察, 先退出观察再巡检\n")], "mark")
             return
         self._surveying = True
-        vendor = self.cfg.get("survey_vendor", "huawei")
+        vendor = self.cfg.get("survey_vendor", "auto")
         head = survey_core.safe_name(os.path.basename(dev))
         self._con_write([("text", f"\n[巡检] {dev} ({vendor}): 逐条发只读命令, 跑完前先别敲键\n")], "mark")
 
         def work():
             try:
                 try:
-                    r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head)
+                    r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head,
+                                               tail=survey_core.conbroker_tail, disabled=survey_core.gate_disabled())
                 except Exception as e:             # run_survey 本不抛; 兜住, 免得按钮一直锁着
                     r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
                 survey_core.record(r)
@@ -484,7 +494,8 @@ class SerialPanel(tk.Frame):
         self._async(work, done)
 
     def observe(self):
-        """#85 观察模式: 选中的口有在跑的服务才开窗 (登录、轮询都在 observe_panel 里)."""
+        """#85 观察模式: 选中的口有在跑的服务才开窗 (看现场、确认设备、轮询都在 observe_panel 里).
+        厂商: serial.conf 的 survey_vendor 有 brief 解析器就用它, 否则 (auto / cisco ...) 按华为."""
         dev = self.port_var.get()
         name = match_service(dev, self._serves)
         if not name:
@@ -494,7 +505,7 @@ class SerialPanel(tk.Frame):
             self._con_write([("text", f"\n[观察] {dev} 正在巡检, 等巡检跑完再观察\n")], "mark")
             return
         import observe_panel
-        observe_panel.open_for(self, dev, name, self.cfg.get("survey_vendor", "huawei"), self.ddir)
+        observe_panel.open_for(self, dev, name, observe_vendor(self.cfg), self.ddir)
 
     def destroy(self):
         self._disconnect()

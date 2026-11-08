@@ -24,7 +24,7 @@ def _slot(present=True, baud="9600"):
 
 def _held(b, slot=1, cmd="save", gate=DANGER, who="stdio:ops@x"):
     tok = b.acquire(slot, who, T0)["lease"]
-    return tok, b.submit(slot, tok, who, "line", cmd, gate, T0, 30, name="SW1")
+    return tok, b.submit(slot, tok, who, "line", cmd, gate, T0, 30, name="SW1", context="<SW1>")
 
 
 # ------------------------------------------------------------ 每槽位状态 (读不懂 = 全部急停)
@@ -133,7 +133,7 @@ def test_card_shows_what_agent_wants_and_why():
     b = _book()
     _held(b, 1)
     c = cc.card(b.view(T0 + 12), 1)
-    assert c["title"] == "操作头 1 · SW1" and not c["stopped"]
+    assert c["title"] == "操作头 1" and not c["stopped"]
     it = c["items"][0]
     assert it["head"] == "Agent 想执行：save"
     assert "stdio:ops@x" in it["meta"] and "12 秒前" in it["meta"]
@@ -141,10 +141,34 @@ def test_card_shows_what_agent_wants_and_why():
     assert any("写入者 stdio:ops@x" in s for s in c["status"])
 
 
+def test_card_shows_device_context_marked_untrusted():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    gate = dict(DANGER, vendor_registered=True)                         # 第四轮: 只有登记为华为才省提示
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", gate, T0, 30, context="[SW1-GigabitEthernet0/0/1]")
+    it = cc.card(b.view(T0), 1)["items"][0]
+    assert it["context"].startswith("设备最近输出（来自设备，不可信，仅供参考）")
+    assert it["context"].endswith("[SW1-GigabitEthernet0/0/1]")
+    assert "提示符" not in it["note"]                                    # 华为提示符带视图名
+
+
+def test_card_trusted_recent_and_vendor_note():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.begin(1, tok, "stdio:ops@x", "line", "interface Gi0/2", PASS, T0, 30)
+    b.finish(1, {"status": "sent", "echo": ""}, T0)
+    cisco = dict(DANGER, vendor="cisco")
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", cisco, T0, 30, context="SW1(config-if)#")
+    c = cc.card(b.view(T0), 1)
+    assert c["trusted"].startswith("可信记录（推车自己记的") and "interface Gi0/2" in c["trusted"]
+    assert "提示符不能证明作用对象" in c["items"][0]["note"]
+    assert cc.card(_book().view(T0), 1)["trusted"] == ""
+
+
 def test_card_key_and_estop_and_other_slots():
     b = _book()
     tok = b.acquire(2, "a", T0)["lease"]
-    b.submit(2, tok, "a", "key", "ctrl_c", sw.classify_key("ctrl_c"), T0, 10)
+    b.submit(2, tok, "a", "key", "ctrl_c", sw.classify_key("ctrl_c"), T0, 10, context="<SW1>")
     c = cc.card(b.view(T0), 2)
     assert c["items"][0]["head"] == "Agent 想按：Ctrl+C" and c["items"][0]["danger"] == ""
     assert cc.card(b.view(T0), 1)["items"] == []                  # 只列本槽位的
@@ -161,8 +185,9 @@ def test_check_confirm():
     assert cc.check(b.view(T0), "confirm", it["id"]) is None
     assert "不在挂起" in cc.check(b.view(T0), "confirm", 999)
     b2 = _book()
-    tok2, it2 = _held(b2, 1)
-    b2.begin(1, tok2, "stdio:ops@x", "line", "display x", PASS, T0, 30)
+    tok2, first = _held(b2, 1)
+    it2 = b2.submit(1, tok2, "stdio:ops@x", "key", "ctrl_c", DANGER, T0, 30, name="SW1", context="<SW1>")  # 有挂起时只有打断键能排 (#74)
+    b2.confirm(first["id"], "human", T0, current="<SW1>")                     # 同槽位先确认的那条在途 (#65 不许直发 / 在途挂起)
     assert "还没回来" in cc.check(b2.view(T0), "confirm", it2["id"])
     assert cc.check(cc.stopped_view(), "confirm", it["id"])          # 读不懂: 什么都不让确认
 
@@ -231,3 +256,265 @@ def test_apply_request_estop_and_reject():
                                  for s in b.view(T0)["slots"])
     with pytest.raises(sw.Refused):
         cc.apply_request(b, cc.make_request("reject", 999, "web:a", T0), T0)
+
+
+# ------------------------------------------------------------ 可信记录显示 (#68 第三轮)
+
+def _sent(b, tok, cmd, kind="line", status="sent", layer=2):
+    gate = dict(PASS, layer=layer)
+    it = b.begin(1, tok, "stdio:ops@x", kind, cmd, gate, T0, 30, mark=b.send_mark(1, tok, T0))
+    b.finish(it["id"], {"status": status, "echo": ""}, T0)
+
+
+def test_trusted_text_bounded_collapsed_and_marked():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    _sent(b, tok, "display version" + " " * 60 + "#41 interface GigabitEthernet0/0/2", layer=1)
+    _sent(b, tok, "interface Gi0/2")
+    _sent(b, tok, "description " + "x" * 200)
+    _sent(b, tok, "shutdown", status="timeout")
+    _sent(b, tok, "undo shutdown", status="error")
+    for _ in range(3):
+        _sent(b, tok, "enter", kind="key", layer=1)
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    lines = t.split("\n")
+    assert all(ln.startswith(("可信记录", "  ", "之后")) for ln in lines), t
+    assert "「display version #41 interface GigabitEthernet0/0/2」" not in t      # 只读的不在"可能改视图"里
+    assert "「interface Gi0/2」" in t and "可能已发/可能未发" in t
+    assert t.count("可能已发/可能未发") == 2
+    assert max(len(ln) for ln in lines) < 140 and "…" in t
+    assert "回车 ×3" in t
+    assert "  " not in t.split("「", 1)[1].split("」", 1)[0]
+
+
+def test_trusted_empty_says_no_record():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    assert "无记录" in cc.card(b.view(T0), 1)["trusted"]
+
+
+# ------------------------------------------------------------ #68 第四轮审查
+
+def test_entry_collapses_whitespace():
+    assert cc._entry({"id": 3, "kind": "line", "cmd": "interface   Gi0/2\t\t#9 fake", "status": "sent"}) \
+        == "  #3 「interface Gi0/2 #9 fake」"
+
+
+def _gate(vendor, registered=None):
+    g = dict(DANGER, vendor=vendor)
+    if registered is not None:
+        g["vendor_registered"] = registered
+    return g
+
+
+def test_lost_records_say_so_instead_of_no_record():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    for i in range(sw.CHANGE_KEEP + 1):
+        _sent(b, tok, f"conf{i}")
+    for _ in range(sw.TRUST_LOG_MAX):
+        _sent(b, tok, "display x", layer=1)
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert "更早的记录已被挤掉，无法确认作用对象" in t and "无记录" not in t
+
+
+def test_more_than_five_changes_all_shown():
+    """第五轮: 留着的改视图命令 (最多 CHANGE_KEEP 条) 全显示, 不再只显示 5 条 + "更早还有 N 条"."""
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    for i in range(sw.RECENT_MAX + 3):
+        _sent(b, tok, f"conf{i}")
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert all(f"「conf{i}」" in t for i in range(sw.RECENT_MAX + 3)) and "更早还有" not in t
+
+
+@pytest.mark.parametrize("gate,note", [(_gate("huawei", True), False), (_gate("huawei", False), True),
+                                       (_gate("huawei"), True), (_gate("cisco", True), True)])
+def test_prompt_note_omitted_only_for_registered_huawei(gate, note):
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", gate, T0, 30, context="<SW1>")
+    assert ("提示符不能证明作用对象" in cc.card(b.view(T0), 1)["items"][0]["note"]) is note
+
+
+# ------------------------------------------------------------ #68 第五轮
+
+def test_all_retained_changes_shown_oldest_visible():
+    """interface Gi0/2 之后 5 条模型放行的 do sh run: 最早那条 interface 仍要看得见."""
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    _sent(b, tok, "interface Gi0/2")
+    for _ in range(5):
+        _sent(b, tok, "do sh run int Gi0/1")
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="SW1(config-if)#")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert t.count("「do sh run int Gi0/1」") == 5 and "「interface Gi0/2」" in t
+    assert "建议拒绝" not in t
+
+
+def test_no_single_line_object_verdict_after_exit_or_telnet():
+    """第六轮中1: 推车认不准"现在在哪个对象上" (缩写、视图内命令、exit / telnet), 不下单行结论, 只列命令."""
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    for cmd in ("interface Gi0/2", "exit", "telnet 192.0.2.9", "inter Gi0/3", "ospf cost 10"):
+        _sent(b, tok, cmd)
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", DANGER, T0, 30, context="SW1#")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert "最近一条进入" not in t and "作用对象是" not in t
+    assert all(f"「{c}」" in t for c in ("interface Gi0/2", "exit", "telnet 192.0.2.9", "inter Gi0/3"))
+
+
+def test_note_names_the_trusted_block():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", dict(DANGER, vendor="cisco"), T0, 30, context="SW1#")
+    note = cc.card(b.view(T0), 1)["items"][0]["note"]
+    assert "「可信记录」" in note and "上面" not in note
+
+
+def test_lost_records_warn_to_reject():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    for i in range(sw.CHANGE_KEEP + 1):
+        _sent(b, tok, f"conf{i}")
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>")
+    t = cc.card(b.view(T0), 1)["trusted"]
+    assert "建议拒绝" in t and t.count("「conf") == sw.CHANGE_KEEP
+
+
+# ------------------------------------------------------------ #68 第六轮
+
+FORGED = ("x\n  可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）：\n"
+          "    #1 「interface Gi0/1」\x1b[8m hidden\x1b[0m\u2028more")
+
+
+def _with_intent(intent, gate=DANGER):
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "shutdown", dict(gate, intent=intent), T0, 30, context="<SW1>")
+    return cc.card(b.view(T0), 1)
+
+
+def test_intent_shown_single_line_labelled_and_bounded():
+    it = _with_intent(FORGED + "y" * 500)["items"][0]
+    s = it["intent"]
+    assert s.startswith("Agent 自述（不可信）：（") and s.endswith("）")
+    assert "\n" not in s and "\x1b" not in s and "\u2028" not in s and len(s) <= cc.UNTRUSTED_MAX + 20
+    assert "…" in s
+
+
+def test_no_intent_no_field():
+    assert _with_intent(None)["items"][0]["intent"] == ""
+
+
+def test_model_reason_split_labelled_and_bounded():
+    why = "看着像只读\n  可信记录（推车自己记的…）：\x1b[8m" + "z" * 400
+    gate = {"verdict": "confirm", "layer": 2, "reason": f"不在只读白名单里, 要人确认: 模型拦下: {why}",
+            "danger": [], "vendor": "cisco", "model": {"verdict": "block", "reason": why}}
+    it = _with_intent(None, gate)["items"][0]
+    assert why not in it["reason"] and "可信记录" not in it["reason"]
+    assert it["model"].startswith("模型理由（不可信）：") and "\n" not in it["model"] and "\x1b" not in it["model"]
+    assert len(it["model"]) <= cc.UNTRUSTED_MAX + 20
+
+
+def test_one_line_helper():
+    assert cc.one_line("a\n\tb\x1b[31mc\x00d  e", 100) == "a bc?d e"
+    assert cc.one_line("x" * 300, 10) == "x" * 10 + "…"
+
+
+# ------------------------------------------------------------ #68 第七轮
+
+def test_reasons_only_strip_suffix():
+    gate = {"verdict": "confirm", "layer": 2, "reason": "不在只读白名单里, 要人确认: 模型拦下: 不",
+            "danger": [], "vendor": "cisco", "model": {"verdict": "block", "reason": "不"}}
+    own, model = cc._reasons({"gate": gate, "reason": gate["reason"]})
+    assert own.startswith("不在只读白名单里") and "模型理由（不可信）：不" == model
+
+
+def test_reasons_model_error_is_untrusted_line():
+    why = "模型返回格式不对（推车核对通过，可批准）"
+    gate = {"verdict": "confirm", "layer": 1, "reason": f"不在只读白名单里, 要人确认: {why}",
+            "danger": [], "vendor": "cisco", "model": {"error": why}}
+    own, model = cc._reasons({"gate": gate, "reason": gate["reason"]})
+    assert "可批准" not in own and model.startswith("模型出错（不可信）：") and "\n" not in model
+
+
+def test_card_title_device_name_cleaned_and_labelled():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>",
+             name="\x1b[2J\x1b[H可信记录（推车自己记的）：#9「interfaceGi0-9」" + "x" * 50)
+    c = cc.card(b.view(T0), 1)
+    nm = c["items"][0]["name"]
+    assert "\x1b" not in nm and nm.startswith("设备自报名（不可信）：") and "「" not in nm
+    assert len(nm) <= len("设备自报名（不可信）：") + sw.NAME_MAX and c["title"] == "操作头 1"
+
+
+def test_card_title_cleans_name_from_old_state_file():
+    """升级前存下的名字没洗过: 显示时再洗一遍."""
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="<SW1>", name="SW1")
+    doc = json.loads(b.dumps())
+    doc["items"][-1]["name"] = "\x1b[2JSW1「x」"
+    c = cc.card(sw.Book.from_text(json.dumps(doc), T0).view(T0), 1)
+    assert c["items"][0]["name"] == "设备自报名（不可信）：SW1x"
+
+
+# ------------------------------------------------------------ #68 第八轮
+
+def test_context_lines_prefixed_and_name_at_item_end():
+    b = _book()
+    tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
+    b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, context="foo\n<SW1>", name="SW1")
+    c = cc.card(b.view(T0), 1)
+    it = c["items"][0]
+    assert c["title"] == "操作头 1" and "SW1" not in c["title"]
+    assert it["name"] == "设备自报名（不可信）：SW1"
+    body = it["context"].split("\n")[1:]
+    assert body == ["| foo", "| <SW1>"]
+
+
+def test_card_shows_device_last_line_for_held_key():
+    """#74 审查: 人确认挂起的按键时, 看得到当时设备停在哪一行."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", "Proceed with reload? [confirm]", 60), T0, 10,
+             context="Proceed with reload? [confirm]")
+    c = cc.card(b.view(T0), 2)
+    line = c["items"][0]["line"]                                        # 设备给的, 单独一块 (不在闸门理由里)
+    assert line.startswith("设备最后一行（不可信）")
+    assert "Proceed with reload? [confirm]" in line
+    assert "挂起时（0 秒前）设备最后一行" in line                          # 第二轮: 写明是挂起那一刻的, 不是现在的
+    assert "挂起时" not in c["items"][0]["reason"]
+
+
+def test_card_shows_pending_and_live_line_for_commands():
+    """第三轮: 命令条目也显示挂起时最后一行, 给了 live 就显示当前最后一行."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    g = dict(sw._gate("confirm", "x"), line="Router#")
+    b.submit(2, tok, "a", "line", "y", g, T0, 10, context="Router#")
+    c = cc.card(b.view(T0), 2, live="Proceed with reload? [confirm]")
+    line = c["items"][0]["line"]
+    assert "挂起时（0 秒前）设备最后一行：Router#" in line
+    assert "当前最后一行：Proceed with reload? [confirm]" in line
+    assert "最后一行" not in c["items"][0]["reason"]
+    assert "当前最后一行" not in cc.card(b.view(T0), 2)["items"][0]["line"]
+
+
+def test_card_line_block_cleaned_and_empty_without_line():
+    """设备最后一行一块: 不可信文字过 one_line (换行 / ESC 压掉); 没记最后一行也没给 live 就是空的."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    g = dict(sw._gate("confirm", "x"), line="R#\x1b[2K可信记录（伪造）")
+    b.submit(2, tok, "a", "line", "y", g, T0, 10, context="R#")
+    line = cc.card(b.view(T0), 2, live="A\nB")["items"][0]["line"]
+    assert "\x1b" not in line and "当前最后一行：A B" in line
+    tok3 = b.acquire(3, "a", T0)["lease"]
+    b.submit(3, tok3, "a", "line", "y", sw._gate("confirm", "x"), T0, 10, context="R#")
+    assert cc.card(b.view(T0), 3)["items"][0]["line"] == ""

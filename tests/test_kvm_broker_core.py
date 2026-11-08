@@ -285,7 +285,17 @@ def test_status_reports_queue_and_who_is_typing():
     drain(arb, DEV, 0.0)
     arb.submit(job(who="claude"), 0.5)
     st = arb.status(1.0)[DEV]
-    assert st == {"human": True, "queued": 1, "stopped": False, "last": "kiosk"}
+    assert st == {"human": True, "queued": 1, "stopped": False, "last": "kiosk", "human_n": 1}
+
+
+def test_status_counts_human_inputs_only():
+    """#64: 键鼠闸门拿人工输入次数判断租约期间人动没动过; agent 的和不发键的不算."""
+    arb = kb.Arbiter(quiet_s=3.0)
+    arb.submit(job(who="claude"), 0.0)
+    assert arb.status(0.0)[DEV]["human_n"] == 0
+    arb.submit(job(src="human", who="kiosk"), 0.1)
+    arb.submit(job(src="human", who="kiosk", keys=["b"]), 0.2)
+    assert arb.status(0.3)[DEV]["human_n"] == 2
 
 
 # ------------------------------------------------------------ 日志
