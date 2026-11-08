@@ -354,7 +354,7 @@ send_command(cmd)
 4. **规则文件**：`allowlist.disable` 只认已有条目 id；不认识的进 `allowlist_unknown`（每条截断到 80 字符、最多 20 条，超出给计数；`gate_allowlist` 返回，巡检命令行和面板巡检都经 `survey_core.gate_disabled` 读、记 `[survey] allowlist-disable-unknown`）；`allowlist` 里别的键、`vendors.<厂商>.allowlist` 一律无效。影子期禁用只影响影子结论。
 5. **巡检预检影子**：整份清单在 `is_readonly` 预检通过后再按白名单（`mode="exec"`, `scope="survey"`）算一遍，不命中的每条记 `[survey] allowlist-miss vendor=… cmd=… why=…`，结果里 `allowlist_miss` 列出，巡检照常跑。
 6. **`conbroker_send` / `probe_vendor` 不动**：影子期它们仍按 `is_readonly`；main 上还没有 `probe_vendor`（#57）。阶段 3 再改。
-7. **和 `is_readonly` 的差异（3.7）**：main 上 `is_readonly` 只有 huawei / cisco，关分页还不放，所以 `KNOWN_DIFF` 暂时登记 `huawei:screen-length 0 temporary`、`cisco:terminal length 0`，#57 合并后删掉；H3C / 锐捷的一致性测试等 #57。
+7. **和 `is_readonly` 的差异（3.7）**：main 上 `is_readonly` 只有 huawei / cisco，关分页还不放，所以 `KNOWN_DIFF` 暂时登记 `huawei:screen-length 0 temporary`、`cisco:terminal length 0`，#57 合并后删掉；H3C / 锐捷的一致性测试等 #57。（合并 main 后：这两条已删；H3C / 锐捷一致性测试生效，`ruijie:show aggregatePort summary` 因大小写和 `is_readonly` 不一致，登记进 `KNOWN_DIFF`，待核，切换前要定。）
 8. **字面量大小写例外**：`ruijie:show aggregatePort summary` 照手册原样（`CASE_EXCEPTIONS`），待核。
 9. **没做的**：影子报告脚本 `scripts/gate_shadow_report.py`（阶段 2 用，另起 PR）；确认框里的"最接近的条目"；反例数据文件 `tests/data/layer1_bypass.json`（反例现在写在测试里，等 #57 合并后把四轮反例汇总进去）。
 

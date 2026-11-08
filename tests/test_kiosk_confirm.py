@@ -18,7 +18,7 @@ def _view(pending_slot=1, writer_slot=None, stop=None):
     b = sw.Book.from_text(None, T0)
     if pending_slot:
         tok = b.acquire(pending_slot, "a", T0)["lease"]
-        b.submit(pending_slot, tok, "a", "line", "save", DANGER, T0, 30)
+        b.submit(pending_slot, tok, "a", "line", "save", DANGER, T0, 30, context="<SW1>")
     if writer_slot:
         b.acquire(writer_slot, "b", T0)
     if stop:

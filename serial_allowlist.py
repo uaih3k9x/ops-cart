@@ -117,8 +117,9 @@ ALLOW = {
 }
 # 字面量照手册原样、不是全小写的条目 (待核; 设备照认小写与否不猜, 只放这一种写法)
 CASE_EXCEPTIONS = {("ruijie", "show aggregatePort summary")}
-# 白名单命中但 is_readonly 不过、并且是有意的 (设计稿 3.7). 关分页要等 #57 给 is_readonly 加上 session 规则.
-KNOWN_DIFF = frozenset({"huawei:screen-length 0 temporary", "cisco:terminal length 0"})
+# 白名单命中但 is_readonly 不过、并且是有意的 (设计稿 3.7). #57 合并后关分页两条已一致, 删掉;
+# 锐捷 aggregatePort 照手册大小写 (CASE_EXCEPTIONS), #57 的 is_readonly 只放全小写, 待核, 切到白名单前要定.
+KNOWN_DIFF = frozenset({"ruijie:show aggregatePort summary"})
 
 # ------------------------------------------------------------ 参数类型 (封闭集合)
 

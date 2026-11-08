@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """串口一键只读巡检 (#15): 按厂商发一套只读命令, 存档, 和同设备上一份比对. 纯逻辑, 不碰 Tk.
 
+厂商: 华为 VRP / H3C Comware (display 系), 思科 IOS·NX-OS / 锐捷 RGOS (show 系) (#56).
+vendor=auto 时先发 show version, 认不出再发 display version, 按输出里的软件名认厂商.
+
 执行走 conbroker send (等提示符、自动翻页、人最近敲过键时它自己排队), 不直接开串口.
 每条命令发出前都过只读白名单 (#3 三层闸门的第 1 层); 清单里有一条不合格, 整次巡检不跑.
-界面在 serial_panel.py 的"巡检"按钮; 命令行: python3 survey_core.py <操作头> [--vendor huawei]
+界面在 serial_panel.py 的"巡检"按钮; 命令行: python3 survey_core.py <操作头> [--vendor auto|huawei|h3c|cisco|ruijie]
+存档转成拓扑脚本读的 "######## <命令>" 分段格式: python3 survey_core.py --export-topo <存档> [-o 输出]
+存档里正文行以 ===== 或 ######## 开头的, 写入时前面加一个空格 (不当段头, 读和导出都不还原);
+同一条命令跑了多次, 读出来第 n 次记成 "命令 (第n次)". 发第一条前要先 tail 一眼, 设备不在提示符上就不跑.
 """
 
 import difflib
@@ -26,17 +32,36 @@ DEFAULT_TIMEOUT = 30                                # 单条命令等提示符�
 # #75 拍板: 冻结黑名单补丁. 新发现的绕过类别只进测试反例集, 不再往这里加 deny / 禁用字符;
 # 第 1 层往 serial_allowlist (按厂商的命令前缀白名单) 迁, 影子期见 docs/DESIGN_layer1_allowlist.md.
 # verbs: 第一个词; pipes: "|" 后允许的过滤词 (True=要带参数); deny: 动词后第二个词黑名单 (只读命令里会写文件的)
+# session: 整句精确匹配放行的会话级命令 (只有关分页, 只对当前终端生效、不进配置); 不是动词, 不带任何变形
 _RULES = {
     "huawei": {"verbs": {"display"},
                "pipes": {"include": True, "exclude": True, "begin": True, "section": True,
                          "count": False, "no-more": False},
-               "deny": {"diagnostic-information"}},       # 带文件名时把输出存进 flash
+               "deny": {"diagnostic-information"},        # 带文件名时把输出存进 flash
+               "session": {"screen-length 0 temporary"}},  # 不带 temporary 的 screen-length 0 是 user-interface 配置
+    "h3c": {"verbs": {"display"},
+            "pipes": {"include": True, "exclude": True, "begin": True},
+            "deny": {"diagnostic-information"},            # 同华为, 能把输出存成文件
+            "session": {"screen-length disable"}},         # 用户视图下只对当前会话
     "cisco": {"verbs": {"show"},
               "pipes": {"include": True, "exclude": True, "begin": True, "section": True, "count": False},
-              "deny": set()},
+              "deny": {"tech-support"},                    # 能 redirect / 打包写文件
+              "session": {"terminal length 0"}},
+    "ruijie": {"verbs": {"show"},
+               "pipes": {"include": True, "exclude": True, "begin": True},
+               "deny": {"tech-support"},                   # 同思科
+               "session": {"terminal length 0"}},
 }
 _TOKEN = re.compile(r"[\x21-\x7e]+")          # 一个词: 可打印 ASCII, 不含空白
-_FORBIDDEN = set(";&<>`$#!")                     # 拼接/重定向/命令替换/注释, 出现就拒
+_FORBIDDEN = set(";&<>`$#!?[]{}")                # 拼接/重定向/命令替换/注释/在线帮助/Tcl 替换, 出现就拒
+# 写文件的参数: 出现在任何位置都拒 (IOS-XE show logging ... to-file bootflash:x 这类); 加上任何带 ":" 的词
+# (flash: bootflash: disk0: usbflash0: nvram: cfa0: tftp:// scp: ...), 宁可多拦, 过滤词参数里也算
+_FILE_WORDS = {"to-file", "file", "filename", "tftp", "ftp", "sftp", "scp", "http", "https",
+               "clear", "reset"}                 # 有的 show 末尾带 clear 会顺手清计数器 (show platform ... drop clear)
+# 主动发包 / 巨量输出的只读命令: 不放 (连续几个词出现就拒), 要看走人确认
+_DENY_PHRASES = (("ntp-service", "trace"), ("ntp", "trace"), ("memory",), ("running-config", "all"), ("platform", "software", "trace"))
+_KEYWORD = re.compile(r"[a-z0-9][a-z0-9-]*")     # 内置动词后紧跟的关键词
+_QUOTES = set("\"'")
 MAX_LEN = 200
 
 
@@ -46,12 +71,26 @@ def is_readonly(cmd, vendor, extra_verbs=()):
     extra_verbs: #21 写闸门的规则文件给内置厂商追加的只读动词 (如 ping); 只加动词, 别的规则照旧.
 
     规则 (只认规范写法, 不替设备猜):
-      - 厂商得有内置规则 (huawei / cisco); 第一个词必须原样是 display (华为) / show (思科), 全小写.
+      - 厂商得有内置规则 (huawei / h3c / cisco / ruijie); 第一个词必须原样是 display (华为 / H3C) /
+        show (思科 / 锐捷), 全小写. 例外只有该厂商的关分页命令 (session), 整句逐字相等才放.
       - 整条只许可打印 ASCII, 词之间恰好一个空格, 不许前后空白、制表符、换行、控制字符、全角/零宽字符.
-      - 不许 ; & < > ` $ # ! —— 多命令拼接、重定向、命令替换、注释.
+      - 不许 ; & < > ` $ # ! ? [ ] { } —— 多命令拼接、重定向、命令替换、注释; ? 让设备显示帮助并把残留
+        放回输入行, 发出去的字面和执行的字面就不一样了; [ ] { } 在思科 tclsh 等环境里是 Tcl 命令替换
+        (show version [exec reload]). include 正则要字符类的, 走人确认.
+      - 任何位置 (含过滤词参数) 都不许出现写文件参数: to-file / file / filename / tftp / ftp / sftp / scp /
+        http / https, 以及任何带 ":" 的词 (文件系统或 URL 目标). IPv6 地址也因此不放, 走人确认.
+      - clear / reset 在任何位置都拒 (有的 show 末尾带 clear 会清计数器).
+      - 小黑名单 (连续出现就拒): ntp-service trace (主动发包)、memory、running-config all、
+        platform software trace (巨量输出, 会把串口占很久). 别的会触发 DNS 解析或输出很大的 show 照样可能放行,
+        见 docs/DESIGN_agent_mcp.md.
+      - 规则文件加的动词 (extra_verbs, 如 ping) 后面的参数不受关键词字符集约束, 只受上面这些通用规则.
+      - 引号 (" ') 只许出现在管道过滤词之后的参数里; 别处 (尤其关键词) 设备会去掉引号照样执行.
       - "|" 必须单独成词, 后面只许接过滤词 include/exclude/begin/section (要带参数)、count/no-more (不带);
         save/append/redirect/tee 这类写文件的管道全拒. 过滤词同样不许缩写、不许大写.
-      - display 后面紧跟的子命令不许在 deny 里 (diagnostic-information 能把输出写进 flash).
+      - 内置动词后紧跟的关键词必须完整匹配 [a-z0-9][a-z0-9-]* (后面的接口名等参数不限; 规则文件加的
+        动词如 ping 只要求全小写), 且不许是 deny 里任何一个词的前缀
+        (含全称): 设备按"唯一前缀、不分大小写"解析, diag / diagnostic-info 照样落到
+        diagnostic-information (能把输出写进 flash), 所以黑名单按前缀拦, 宁可多拦.
       - 动词后至少要有一个词.
 
     缩写 (dis / disp / sh) 不放, 理由:
@@ -63,12 +102,24 @@ def is_readonly(cmd, vendor, extra_verbs=()):
     rules = _RULES.get(vendor) if isinstance(vendor, str) else None
     if not rules or not isinstance(cmd, str) or not cmd or len(cmd) > MAX_LEN:
         return False
+    if cmd in rules["session"]:                        # 关分页: 整句逐字相等才放
+        return True
     if any(ch in _FORBIDDEN for ch in cmd):
         return False
     words = cmd.split(" ")
     if not all(_TOKEN.fullmatch(w) for w in words):       # 空词 = 前后空白或连续空格
         return False
-    if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2 or words[1] in rules["deny"]:
+    if any(w in _FILE_WORDS or ":" in w for w in words):
+        return False
+    for ph in _DENY_PHRASES:
+        if any(tuple(words[i:i + len(ph)]) == ph for i in range(1, len(words))):
+            return False
+    if (words[0] not in rules["verbs"] and words[0] not in extra_verbs) or len(words) < 2:
+        return False
+    kw = words[1]
+    if words[0] in rules["verbs"] and not _KEYWORD.fullmatch(kw):
+        return False
+    if kw != kw.lower() or any(d.startswith(kw) for d in rules["deny"]):
         return False
     segs, cur = [], []
     for w in words[1:]:
@@ -80,10 +131,10 @@ def is_readonly(cmd, vendor, extra_verbs=()):
         else:
             cur.append(w)
     segs.append(cur)
-    if not segs[0]:
+    if not segs[0] or any(ch in _QUOTES for w in segs[0] for ch in w):
         return False
     for seg in segs[1:]:
-        if not seg or seg[0] not in rules["pipes"]:
+        if not seg or seg[0] not in rules["pipes"] or any(ch in _QUOTES for ch in seg[0]):
             return False
         if rules["pipes"][seg[0]] != (len(seg) > 1):
             return False
@@ -97,8 +148,13 @@ def check_commands(cmds, vendor):
 
 # ------------------------------------------------------------ 命令清单 (数据, 可经 JSON 覆盖)
 
+_VOLATILE_DISPLAY = [r"uptime is", r"\bup ?time\b", r"\d{4}[-/]\d\d[-/]\d\d[ T]\d\d:\d\d:\d\d"]
+_VOLATILE_SHOW = _VOLATILE_DISPLAY + [r"^\s*Current configuration :", r"^\s*Building configuration"]
+
+# paging: 巡检开头先发的关分页命令 (会话级, 不进存档); 写死在代码里, JSON 改不了
 _DEFAULT_PROFILES = {
     "huawei": {
+        "paging": "screen-length 0 temporary",
         "commands": ["display version", "display clock", "display ip interface brief",
                      "display interface brief", "display lldp neighbor brief", "display mac-address",
                      "display arp", {"cmd": "display current-configuration", "timeout": 120}],
@@ -106,14 +162,31 @@ _DEFAULT_PROFILES = {
         "volatile": [r"uptime is", r"\bup ?time\b", r"\d{4}[-/]\d\d[-/]\d\d[ T]\d\d:\d\d:\d\d",
                      r"^\s*!?\s*Last configuration was", r"^\s*!Time:"],
     },
+    "h3c": {
+        "paging": "screen-length disable",
+        "commands": ["display version", "display clock", "display ip interface brief",
+                     "display interface brief", "display lldp neighbor-information list", "display mac-address",
+                     "display arp", {"cmd": "display current-configuration", "timeout": 120}],
+        "volatile_commands": ["display clock"],
+        "volatile": _VOLATILE_DISPLAY,
+    },
     "cisco": {
+        "paging": "terminal length 0",
         "commands": ["show version", "show clock", "show ip interface brief", "show interfaces status",
-                     "show cdp neighbors", "show mac address-table", "show arp",
+                     "show cdp neighbors", "show lldp neighbors", "show mac address-table", "show arp",
                      {"cmd": "show running-config", "timeout": 120}],
         "volatile_commands": ["show clock"],
         "volatile": [r"uptime is", r"\bup ?time\b", r"\d{4}[-/]\d\d[-/]\d\d[ T]\d\d:\d\d:\d\d",
                      r"^\s*! Last configuration change", r"^\s*! NVRAM config last updated",
                      r"^\s*Current configuration :", r"^\s*Building configuration"],
+    },
+    "ruijie": {
+        "paging": "terminal length 0",
+        "commands": ["show version", "show clock", "show ip interface brief", "show interfaces status",
+                     "show lldp neighbors", "show mac-address-table", "show arp",
+                     {"cmd": "show running-config", "timeout": 120}],
+        "volatile_commands": ["show clock"],
+        "volatile": _VOLATILE_SHOW,
     },
 }
 _OVERRIDABLE = ("commands", "volatile_commands", "volatile")
@@ -126,7 +199,7 @@ def _norm_cmd(c):
 
 
 def load_profiles(path=None):
-    """{厂商: {commands: [{cmd, timeout}], volatile_commands, volatile}}.
+    """{厂商: {commands: [{cmd, timeout}], volatile_commands, volatile[, paging]}}.
 
     JSON 只能覆盖 commands / volatile_commands / volatile; 只读规则在 _RULES 里, 文件改不动.
     JSON 新加的厂商没有内置规则, is_readonly 一律 False, 巡检会被拒. 文件坏了/不存在就用内置.
@@ -150,15 +223,47 @@ def load_profiles(path=None):
 
 # ------------------------------------------------------------ 提示符 / 文件名
 
-_PROMPTS = [re.compile(r"<([^<>\s]+)>"),                    # 华为用户视图 <SW-A>
-            re.compile(r"\[[~*]?([^\[\]\s]+)\]"),           # 华为系统视图 [SW-A] / VRP8 [~SW-A] [*SW-A]
-            re.compile(r"([A-Za-z0-9][\w.-]*)(?:\([^()\s]*\))?[#>]")]   # 思科 SW-A# SW-A> SW-A(config)#
+# 巡检只认 exec 模式: 华为 / H3C 用户视图 <名>, 思科 / 锐捷 名# / 名> (不带括号; 系统视图 [名]、(config)# 都不算)
+_PROMPTS = [re.compile(r"<([^<>\s]+)>"),
+            re.compile(r"([A-Za-z0-9][\w.-]*)[#>]")]
+
+
+# 不算设备提示符的最后一行: 长得像华为 [名] 的确认 / 补齐提示, 思科 tclsh, Linux shell
+_CONFIRM = re.compile(r"\[(?:[a-z]{1,8}(?:/[a-z]{1,8})+|y|n|yes|no|ok|cancel|default|enter|more|bootrom|bootload|confirm"
+                      r"|startup-config|running-config)\]|<(?:bootload|bootrom)>", re.I)
+# 思科 tclsh、引导程序 (rommon / loader / switch(boot) / grub / u-boot / bootloader)、Linux shell
+_BOOT_PROMPT = re.compile(r".*(?:\(tcl\)|-tcl|\(boot\))[#>]|rommon(?: \d+ ?)?>|loader>|grub>|u-boot>|bootloader>"
+                          r"|=>|switch:|ctrl>", re.I)
+# shell: 只认这几个精确的名字 (可带版本号), 区分大小写 —— SH# / SH-01# / Mesh-2# 这种主机名照样是设备提示符
+_SHELL_PROMPT = re.compile(r"(?:sh|bash|rbash|ash|dash|zsh|ksh|busybox)(?:-\d+(?:\.\d+)*)?[#$]|root[#$]")
+
+
+class _NotPrompt:
+    """引导程序 / tclsh 或 shell 提示符 (写闸门对登记成 linux 的槽位只用 _BOOT_PROMPT)."""
+
+    @staticmethod
+    def fullmatch(ln):
+        return _BOOT_PROMPT.fullmatch(ln) or _SHELL_PROMPT.fullmatch(ln)
+
+
+_NOT_PROMPT = _NotPrompt()
+# 设备不认这条命令 (输错 / 不支持 / 视图不对): 这一条算失败
+_INVALID = re.compile(r"^\s*(?:% ?(?:Invalid input|Incomplete command|Ambiguous command|Unknown command|"
+                      r"Unrecognized command)|Error: ?(?:Unrecognized command|Wrong parameter|Incomplete command|"
+                      r"Too many parameters|Ambiguous command))", re.I)
+_MARK = re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\n]*\]")     # conbroker 自己写进日志的标记行
+
+
+def at_prompt(text):
+    """串口最近输出的最后一行 (跳过 conbroker 标记行) 是提示符 -> 设备名, 否则 None."""
+    lines = [ln for ln in (text or "").replace("\r", "").split("\n") if ln.strip() and not _MARK.fullmatch(ln.strip())]
+    return parse_device(lines[-1]) if lines else None
 
 
 def parse_device(text):
     """输出最后一行是提示符就返回设备名, 否则 None (停在 Username:/Password:/半截输出上)."""
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    if not lines:
+    if not lines or _CONFIRM.fullmatch(lines[-1]) or _NOT_PROMPT.fullmatch(lines[-1]):
         return None
     for p in _PROMPTS:
         m = p.fullmatch(lines[-1])
@@ -205,7 +310,7 @@ def previous_archive(survey_dir, device, exclude=None):
 
 _STATUS = {"ok": "", "timeout": "超时, 没跑完", "refused": "conbroker 拒绝发送, 没跑",
            "error": "发送失败, 没跑完", "noprompt": "没回提示符, 没跑完", "changed": "提示符变了, 中止",
-           "skipped": "未执行"}
+           "skipped": "未执行", "invalid": "设备不认这条命令, 中止"}
 _SECTION = re.compile(r"===== \[(\d+)/(\d+)\] (.+?) =====(?: \((\w+): (.*)\))?")
 
 
@@ -219,6 +324,15 @@ def _split_output(out, cmd):
     return lines
 
 
+# 转义规则: 正文行以 "=====" 或 "########" 开头的, 写存档时前面加一个空格, 这样不会被当成存档段头或拓扑段头;
+# 读存档 / 导出都不去掉这个空格 (导出时还原就又能伪造拓扑段了).
+_HEAD_LIKE = ("=====", "########")
+
+
+def _esc(ln):
+    return " " + ln if ln.startswith(_HEAD_LIKE) else ln
+
+
 def format_archive(meta, sections):
     out = ["# ops-cart 只读巡检 (survey_core.py)",
            f"# 操作头: {meta['head']}  设备: {meta['device'] or '未知'}  厂商: {meta['vendor']}  时间: {meta['time']}",
@@ -229,18 +343,21 @@ def format_archive(meta, sections):
         if s["status"] != "ok":
             tag = f" ({s['status']}: {_STATUS[s['status']]}{'; ' + s['note'] if s['note'] else ''})"
         out.append(f"===== [{i}/{total}] {s['cmd']} ====={tag}")
-        out.extend(s["lines"])
+        out.extend(_esc(ln) for ln in s["lines"])
         out.append("")
     return "\n".join(out) + "\n"
 
 
 def parse_archive(text):
-    """存档 -> {命令: (状态, 正文行)}; 认不出的文件给空 dict."""
+    """存档 -> {命令: (状态, 正文行)}; 认不出的文件给空 dict. 同一条命令出现多次, 第 n 次记成 "命令 (第n次)"."""
     secs, cur = {}, None
-    for ln in text.splitlines():
+    for ln in text.split("\n"):                     # 只按 \n 切: splitlines 会把正文里的 \x0c \x1c 也当换行
         m = _SECTION.fullmatch(ln)
         if m:
-            cur = m.group(3)
+            cur, n = m.group(3), 1
+            while cur in secs:
+                n += 1
+                cur = f"{m.group(3)} (第{n}次)"
             secs[cur] = (m.group(4) or "ok", [])
         elif cur is not None:
             secs[cur][1].append(ln)
@@ -289,13 +406,64 @@ def not_comparable(old, new, prof):
     def st(d, c):
         return d[c][0] if c in d else "无"
     return [(c, st(old, c), st(new, c)) for c in _order(old, new)
-            if c not in skip and (st(old, c) not in ("ok", "无") or st(new, c) not in ("ok", "无"))]
+            if c not in skip and (st(old, c) not in ("ok", "无") or st(new, c) not in ("ok", "无"))
+            and not (st(old, c) == st(new, c) == "invalid")]     # 两次都不认: 这台设备没有这条, 不算噪音
+
+
+# ------------------------------------------------------------ 认厂商 (#56)
+
+# 只认版本信息里的具体软件名, 不认裸厂商名 (主机名 / Device name / uptime 行里常带别家名字).
+# 老 H3C 自称 "Huawei-3Com Versatile Routing Platform", 不含 "Huawei Versatile", 和华为不重叠.
+# 命中不止一家 = 认不准, 拒 (fail-closed), 不按顺序取第一个.
+_VENDOR_KEYS = [("h3c", re.compile(r"Comware (?:Platform )?Software|Huawei-3Com", re.I)),
+                ("ruijie", re.compile(r"Ruijie Networks|Ruijie General Operating System|RGOS \d", re.I)),
+                ("huawei", re.compile(r"Huawei Versatile Routing Platform", re.I)),
+                ("cisco", re.compile(r"Cisco IOS|Cisco Internetwork Operating System|Cisco Nexus Operating System",
+                                     re.I))]
+# 先 show 后 display: 华为 / H3C 收到 show 只报错; 思科收到 display 可能当主机名去解析 / telnet
+_PROBES = ("show version", "display version")             # 两条在各自厂商下都过白名单
+
+
+def _vendor_hits(lines):
+    body = "\n".join(lines)
+    return [v for v, pat in _VENDOR_KEYS if pat.search(body)]
+
+
+def probe_vendor(send, port, timeout=DEFAULT_TIMEOUT):
+    """先 show version, 认不出再 display version -> (厂商, "") 或 (None, 说明). 不抛异常.
+
+    每条探测和巡检命令一样判状态: 超时 / 被 conbroker 拒 / 没回提示符 / 发送失败就中止, 说明里写真实原因."""
+    seen = {}
+
+    def keep(p, c, t):
+        seen["out"] = send(p, c, t)
+        return seen["out"]
+    for cmd in _PROBES:
+        st, note, lines, _dev = _send_one(keep, port, cmd, timeout, None)
+        if st == "invalid":                 # 华为收到 show / 思科收到 display: 报错但回了提示符, 接着试
+            lines = []
+        elif st != "ok":
+            return None, f"认厂商时 {cmd} {_STATUS[st]}: {note}"
+        hits = _vendor_hits(lines)
+        if len(hits) > 1:
+            return None, f"{cmd} 的输出命中多个厂商 ({' / '.join(hits)}), 认不准; 用 --vendor 指定"
+        if hits:
+            return hits[0], ""
+        if cmd == "show version" and _show_family(seen.get("out")):
+            return None, "show version 的输出里认不出厂商 (停在 名#/名> 式提示符, 不再试 display); 用 --vendor 指定"
+    return None, "show version / display version 的输出里认不出厂商; 用 --vendor 指定"
+
+
+def _show_family(out):
+    """最后一行是 名# / 名> (思科 / 锐捷式), 不是华为的 <名> / [名]."""
+    lines = [ln.strip() for ln in (out or "").replace("\r", "").split("\n") if ln.strip()]
+    return bool(lines) and parse_device(lines[-1]) is not None and bool(_PROMPTS[1].fullmatch(lines[-1]))
 
 
 # ------------------------------------------------------------ 执行
 
 def _result(**kw):
-    r = {"ok": False, "head": None, "device": None, "path": None, "sections": [], "diff": None,
+    r = {"ok": False, "head": None, "vendor": None, "device": None, "path": None, "sections": [], "diff": None,
          "previous": None, "refused": [], "allowlist_miss": [], "error": None, "summary": ""}
     r.update(kw)
     return r
@@ -305,6 +473,11 @@ def _one(send, port, vendor, cmd, timeout, device):
     """发一条 -> (状态, 说明, 正文行, 设备名)."""
     if not is_readonly(cmd, vendor):                    # 发前再过一次, 不信预检之后清单没被动过
         return "refused", "白名单不放", [], device
+    return _send_one(send, port, cmd, timeout, device)
+
+
+def _send_one(send, port, cmd, timeout, device):
+    """send 一条并判状态 (调用方先过白名单) -> (状态, 说明, 正文行, 设备名)."""
     try:
         out = send(port, cmd, timeout)
     except Exception as e:                              # 真 send: conbroker 退出码非 0 / 子进程超时
@@ -320,7 +493,11 @@ def _one(send, port, vendor, cmd, timeout, device):
         return "noprompt", f"设备没回提示符, 最后一行: {last.strip()[:60]}", _split_output(out, cmd), device
     if device and name != device:
         return "changed", f"提示符从 {device} 变成了 {name}", _split_output(out, cmd), device
-    return "ok", "", _split_output(out, cmd), name
+    lines = _split_output(out, cmd)
+    bad = next((ln.strip() for ln in lines if _INVALID.match(ln)), None)
+    if bad:
+        return "invalid", f"设备不认: {bad[:80]}", lines, name
+    return "ok", "", lines, name
 
 
 def _compare(res, survey_dir, prof):
@@ -371,7 +548,7 @@ def gate_disabled(event=None):
     return rules["allowlist_disable"]
 
 
-def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None,
+def run_survey(port, vendor, send, *, tail, now=time.time, head=None, survey_dir=SURVEY_DIR, profiles=None,
                disabled=(), event=None):
     """跑一次巡检: 白名单预检 -> 逐条 send -> 存档 -> 和同设备上一份比. 不抛异常, 结果全在返回的 dict 里.
 
@@ -379,9 +556,24 @@ def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_D
     预检同时算 #75 的命令前缀白名单, 只记录 (allowlist_miss), 不影响跑不跑.
 
     send(port, cmd, timeout) -> conbroker send 的输出 (回显 + 正文 + 提示符); 出错可以抛异常.
+    tail(port) -> 串口最近几行 (必填, 真机用 conbroker_tail): 最后一行不是设备提示符就一条都不发.
     任何一条超时 / 没回提示符 / 被拒 / 提示符变了就中止, 后面的不发, 存档里逐段写明.
     """
     head = head or safe_name(os.path.basename(port))
+    # 发第一条 (含探测) 前先看设备停没停在提示符上
+    try:
+        recent = tail(port)
+    except Exception as e:
+        return _result(head=head, summary=f"巡检没跑: 读串口最近输出失败: {str(e) or type(e).__name__}")
+    if not at_prompt(recent):
+        last = next((ln.strip() for ln in reversed((recent or "").split("\n")) if ln.strip()), "")
+        return _result(head=head, summary="巡检没跑: 设备不在提示符上 (可能停在 Username / Password / [Y/N] / "
+                                          f"翻页或半截输出上), 最后一行: {last[:60]!r}; 先在面板里处理好再巡检")
+    if vendor == "auto":
+        vendor, why = probe_vendor(send, port)
+        if not vendor:
+            return _result(head=head, summary=f"巡检没跑: {why} (可选 {' / '.join(_RULES)}; "
+                                              f"面板在 serial.conf 的 survey_vendor 里指定)")
     if vendor not in _RULES:
         return _result(head=head, summary=f"巡检拒绝执行: 厂商 {vendor} 没有内置只读规则")
     prof = (profiles if profiles is not None else load_profiles()).get(vendor) or {}
@@ -396,22 +588,35 @@ def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_D
     miss = _shadow_precheck([c["cmd"] for c in cmds], vendor, disabled, event)
     t = time.localtime(now())
     sections, device, stop = [], None, None
+    paging = prof.get("paging")
+    if paging:                                          # 关分页: 会话级, 不进存档; 失败就整次中止
+        st, note, _lines, device = _one(send, port, vendor, paging, DEFAULT_TIMEOUT, device)
+        if st != "ok":
+            stop = f"关分页 {paging} 失败: {note}"
     for i, c in enumerate(cmds, 1):
         if stop:
             sections.append({"cmd": c["cmd"], "status": "skipped", "note": "", "lines": []})
             continue
         st, note, lines, device = _one(send, port, vendor, c["cmd"], c["timeout"], device)
         sections.append({"cmd": c["cmd"], "status": st, "note": note, "lines": lines})
-        if st != "ok":
+        if st not in ("ok", "invalid"):     # 设备不认 (路由器没有交换机命令): 这段标失败, 接着跑; 别的才中止
             stop = f"中止于 [{i}/{len(cmds)}] {c['cmd']}: {note}"
     done = sum(s["status"] == "ok" for s in sections)
-    res = _result(ok=stop is None, head=head, device=device, sections=sections, error=stop, allowlist_miss=miss)
+    invalid = [s["cmd"] for s in sections if s["status"] == "invalid"]
+    res = _result(ok=stop is None and not invalid, head=head, vendor=vendor, device=device, sections=sections,
+                  error=stop, allowlist_miss=miss)
+    if stop:
+        result = f"中止, 已跑 {done}/{len(cmds)}; {stop}"
+    elif invalid:
+        result = f"部分失败, 成功 {done}/{len(cmds)}; 设备不认: {', '.join(invalid)}"
+    else:
+        result = f"完成 {done}/{len(cmds)}"
 
     try:
         os.makedirs(survey_dir, exist_ok=True)
         path = archive_path(survey_dir, head, device or "unknown", t)
         meta = {"head": head, "device": device, "vendor": vendor, "time": time.strftime("%Y-%m-%d %H:%M", t),
-                "result": f"完成 {done}/{len(cmds)}" if res["ok"] else f"中止, 已跑 {done}/{len(cmds)}; {stop}"}
+                "result": result}
         with open(path, "x", encoding="utf-8") as f:
             f.write(format_archive(meta, sections))
         res["path"] = path
@@ -419,7 +624,10 @@ def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_D
         res["ok"] = False
         res["error"] = (stop + "; " if stop else "") + f"存档写不进去: {e}"
 
-    lines = [f"{device or '设备未知'} 巡检{'完成' if stop is None else '中止'}, 已跑 {done}/{len(cmds)} 条"]
+    word = "中止" if stop else ("部分失败" if invalid else "完成")
+    lines = [f"{device or '设备未知'} 巡检{word}, 成功 {done}/{len(cmds)} 条"]
+    if invalid and not stop:
+        lines.append("设备不认 (这台可能没有这些命令): " + ", ".join(invalid))
     if res["error"]:
         lines.append(res["error"])
     if res["path"]:
@@ -428,6 +636,17 @@ def run_survey(port, vendor, send, now=time.time, head=None, survey_dir=SURVEY_D
             lines += _compare(res, survey_dir, prof)
     res["summary"] = "\n".join(lines)
     return res
+
+
+def export_topo(text):
+    """存档 -> 拓扑脚本读的 "######## <命令>" 分段格式. 只导跑完 (ok) 的段, 没跑完的数据不全, 不导. 纯函数."""
+    out = []
+    for cmd, (st, lines) in parse_archive(text or "").items():
+        if st == "ok":
+            out.append(f"######## {cmd}")
+            out.extend(lines)
+            out.append("")
+    return "\n".join(out) + "\n" if out else ""
 
 
 def record(res, event=None):
@@ -454,6 +673,15 @@ def conbroker_send(port, cmd, timeout):
     return r.stdout
 
 
+def conbroker_tail(port, n=5):
+    """conbroker tail <口> -n N: 串口最近几行 (不发任何东西). 失败抛 RuntimeError."""
+    r = subprocess.run(_conbroker_cmd() + ["tail", port, "-n", str(n)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(serve_error(r.returncode, r.stderr))
+    return r.stdout.rstrip("\n")
+
+
 def _list_services():
     return parse_list(_run(["list"]))[1]
 
@@ -461,17 +689,46 @@ def _list_services():
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="串口一键只读巡检 (走 conbroker, 只发白名单里的只读命令)")
-    ap.add_argument("head", help="操作头, 如 con-1 或 /dev/con-1")
-    ap.add_argument("--vendor", default="huawei")
+    ap.add_argument("head", nargs="?", help="操作头, 如 con-1 或 /dev/con-1")
+    ap.add_argument("--vendor", default="auto", choices=["auto"] + list(_RULES),
+                    help="auto = 先 show version 再 display version 认厂商")
     ap.add_argument("--profiles", default=None, help=f"命令清单 JSON (默认 {PROFILES_PATH}, 没有就用内置)")
     ap.add_argument("--dir", default=SURVEY_DIR, help="存档目录")
+    ap.add_argument("--export-topo", metavar="存档", help="不巡检, 把一份存档转成拓扑脚本读的 ######## 分段格式")
+    ap.add_argument("-o", "--out", help="--export-topo 的输出文件 (默认打到标准输出; 已存在不覆盖, 除非 --force)")
+    ap.add_argument("--force", action="store_true", help="-o 的文件已存在时覆盖 (输入文件本身永远不覆盖)")
     a = ap.parse_args(argv)
+    if a.export_topo:
+        try:
+            with open(a.export_topo, encoding="utf-8") as f:
+                out = export_topo(f.read())
+            if a.out:
+                if os.path.exists(a.out) and os.path.samefile(a.out, a.export_topo):
+                    print("导出失败: 输出文件就是输入的存档, 不覆盖")
+                    return 2
+                flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                flags |= os.O_TRUNC if a.force else os.O_EXCL      # 不带 --force: 已存在 (含链接) 一律不碰
+                try:
+                    fd = os.open(a.out, flags, 0o644)
+                except FileExistsError:
+                    print(f"导出失败: {a.out} 已存在, 要覆盖加 --force")
+                    return 2
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(out)
+            else:
+                sys.stdout.write(out)
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"导出失败: {e}")
+            return 2
+        return 0
+    if not a.head:
+        ap.error("要给操作头 (或用 --export-topo 导出存档)")
     port = a.head if a.head.startswith("/") else "/dev/" + a.head
     name = match_service(port, _list_services())
     if not name:
         print(f"{port} 上没有在跑的 conbroker 服务, 先在串口面板开服务")
         return 2
-    r = run_survey(name, a.vendor, send=conbroker_send, head=safe_name(os.path.basename(port)),
+    r = run_survey(name, a.vendor, send=conbroker_send, tail=conbroker_tail, head=safe_name(os.path.basename(port)),
                    survey_dir=a.dir, profiles=load_profiles(a.profiles), disabled=gate_disabled())
     print(r["summary"])
     record(r)

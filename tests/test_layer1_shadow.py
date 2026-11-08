@@ -9,7 +9,7 @@ import serial_allowlist as sa
 import serial_write_core as sw
 import survey_core as sv
 from test_mcp_serial import Rig
-from test_survey_core import T0, fake_send
+from test_survey_core import _AT, T0, fake_send
 
 
 def _rules(tmp_path, doc):
@@ -57,14 +57,14 @@ CASES = [  # (cmd, vendor, at_prompt, mode, 现有规则下的 verdict)
     ("display logbuffer", "huawei", True, "exec", "pass"),              # is_readonly 放, 白名单不放
     ("display current-configuration", "huawei", True, "exec", "pass"),  # 大输出: 白名单 (写闸门) 不放
     ("dis version", "huawei", True, "exec", "confirm"),
-    ("screen-length 0 temporary", "huawei", True, "exec", "confirm"),   # 白名单放, is_readonly 不放 (#57 之前)
+    ("screen-length 0 temporary", "huawei", True, "exec", "pass"),      # #57 起 is_readonly 的 session 也放
     ("show version", "cisco", True, "exec", "pass"),
-    ("show ip route 2001:db8::1", "cisco", True, "exec", "pass"),
+    ("show ip route 2001:db8::1", "cisco", True, "exec", "confirm"),   # #57 起 is_readonly 拒带冒号的参数
     ("display version", "huawei", False, "config", "confirm"),
     ("display version", None, False, "config", "confirm"),
     ("save", "huawei", True, "exec", "confirm"),
     ("uname -a", "linux", True, "config", "confirm"),
-    ("show version", "ruijie", True, "exec", "confirm"),               # 锐捷 main 上还没有 is_readonly 规则
+    ("show version", "ruijie", True, "exec", "pass"),                  # #57 起锐捷有 is_readonly 规则
 ]
 
 
@@ -98,18 +98,21 @@ def test_shadow_fields_on_gate():
     assert g["verdict"] == "pass"                                   # 照旧按 is_readonly
     assert g["shadow"]["allowlist"] is None and g["shadow"]["readonly"] is True and g["shadow"]["pass"] is False
     g = sw.classify("screen-length 0 temporary", "huawei", True, r, mode="exec")
-    assert g["verdict"] == "confirm"
+    assert g["verdict"] == "pass"                                   # #57 起 is_readonly 的 session 放
     assert g["shadow"] == {"allowlist": "huawei:screen-length 0 temporary", "src": "survey",
-                           "readonly": False, "pass": False}
+                           "readonly": True, "pass": True}
 
 
 def test_shadow_with_extra_verbs_readonly():
-    """extra_verbs (规则文件开的 ping) 照旧第 1 层放行; 影子里 ping 不在白名单."""
+    """extra_verbs (规则文件开的 ping) 照旧第 1 层放行 (#57 起只在用户视图); 影子里 ping 不在白名单."""
     r = sw.load_rules(None)
     r["vendors"]["huawei"]["extra_verbs"] = ["ping"]
-    g = sw.classify("ping 192.0.2.1", "huawei", True, r, mode="exec")
+    g = sw.classify("ping 192.0.2.1", "huawei", True, r, user_view=True, mode="exec")
     assert g["verdict"] == "pass"
     assert g["shadow"]["readonly"] is True and g["shadow"]["allowlist"] is None
+    g = sw.classify("ping 192.0.2.1", "huawei", True, r, mode="exec")      # 不在用户视图: 加的动词不放
+    assert g["verdict"] == "confirm"
+    assert g["shadow"]["readonly"] is False and g["shadow"]["allowlist"] is None
 
 
 def test_shadow_disabled_entry():
@@ -206,7 +209,7 @@ def test_gate_allowlist_spec_read_only(tmp_path):
 
 def test_survey_default_profile_no_miss(tmp_path):
     ev, log = [], []
-    r = sv.run_survey("/dev/con-1", "huawei", send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
+    r = sv.run_survey("/dev/con-1", "huawei", tail=_AT, send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
                       profiles=sv.load_profiles(path="/x"), event=lambda k, m: ev.append((k, m)))
     assert r["ok"] and r["allowlist_miss"] == [] and ev == []
 
@@ -216,7 +219,7 @@ def test_survey_custom_profile_miss_logged_and_still_runs(tmp_path):
     prof = sv.load_profiles(path="/x")
     prof["huawei"]["commands"].append({"cmd": "display logbuffer", "timeout": 5})
     prof["huawei"]["commands"].append({"cmd": "display interface GigabitEthernet0/0/1", "timeout": 5})
-    r = sv.run_survey("/dev/con-1", "huawei", send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
+    r = sv.run_survey("/dev/con-1", "huawei", tail=_AT, send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
                       profiles=prof, event=lambda k, m: ev.append((k, m)))
     assert r["ok"] and "display logbuffer" in [c for _p, c, _t in log]           # 照常跑
     assert r["allowlist_miss"] == ["display logbuffer"]
@@ -227,14 +230,14 @@ def test_survey_custom_profile_miss_logged_and_still_runs(tmp_path):
 
 def test_survey_disabled_entry_is_miss(tmp_path):
     ev, log = [], []
-    r = sv.run_survey("/dev/con-1", "huawei", send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
+    r = sv.run_survey("/dev/con-1", "huawei", tail=_AT, send=fake_send(log), now=lambda: T0, survey_dir=str(tmp_path),
                       profiles=sv.load_profiles(path="/x"), event=lambda k, m: ev.append((k, m)),
                       disabled=["huawei:display arp"])
     assert r["ok"] and r["allowlist_miss"] == ["display arp"] and "禁用" in ev[0][1]
 
 
 def test_survey_refused_early_has_empty_miss(tmp_path):
-    r = sv.run_survey("/dev/con-1", "ruijie", send=fake_send([]), now=lambda: T0, survey_dir=str(tmp_path),
+    r = sv.run_survey("/dev/con-1", "juniper", tail=_AT, send=fake_send([]), now=lambda: T0, survey_dir=str(tmp_path),
                       profiles=sv.load_profiles(path="/x"))
     assert r["allowlist_miss"] == []
 
@@ -274,17 +277,22 @@ def test_gate_disabled_never_raises(monkeypatch):
 
 
 def test_readonly_blacklist_frozen():
-    """L3: #75 拍板冻结 is_readonly 的黑名单补丁. 要改这里先过维护者 (新绕过只进反例集)."""
+    """L3: #75 拍板冻结 is_readonly 的黑名单补丁. 要改这里先过维护者 (新绕过只进反例集).
+    基线是合并 #57 (H3C / 锐捷、session、tech-support, _FORBIDDEN 加 ? [ ] { }) 之后 main 上的规则."""
     assert sv._RULES == {
         "huawei": {"verbs": {"display"},
                    "pipes": {"include": True, "exclude": True, "begin": True, "section": True,
                              "count": False, "no-more": False},
-                   "deny": {"diagnostic-information"}},
+                   "deny": {"diagnostic-information"}, "session": {"screen-length 0 temporary"}},
+        "h3c": {"verbs": {"display"}, "pipes": {"include": True, "exclude": True, "begin": True},
+                "deny": {"diagnostic-information"}, "session": {"screen-length disable"}},
         "cisco": {"verbs": {"show"},
                   "pipes": {"include": True, "exclude": True, "begin": True, "section": True, "count": False},
-                  "deny": set()},
+                  "deny": {"tech-support"}, "session": {"terminal length 0"}},
+        "ruijie": {"verbs": {"show"}, "pipes": {"include": True, "exclude": True, "begin": True},
+                   "deny": {"tech-support"}, "session": {"terminal length 0"}},
     }
-    assert sv._FORBIDDEN == set(";&<>`$#!")
+    assert sv._FORBIDDEN == set(";&<>`$#!?[]{}")
     assert sv.MAX_LEN == 200
 
 

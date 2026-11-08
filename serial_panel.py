@@ -123,6 +123,7 @@ class SerialPanel(tk.Frame):
         self.chat_entry = tk.Entry(row, textvariable=self.chat_var, font=FONT, bg=BG2, fg=FG,
                                    insertbackground=FG, **th.SUNKEN, highlightthickness=2,
                                    highlightbackground=BG2, highlightcolor=th.PRIMARY)
+        self.chat_entry.no_ime = True       # 发往串口的命令, 不接中文输入 (中文输入的 NO_IME 约定)
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())
         _btn(row, "发送", self.chat_send, bg=th.PRIMARY).pack(side="left", padx=(6, 0))
@@ -414,7 +415,9 @@ class SerialPanel(tk.Frame):
     def survey(self):
         """#15 一键只读巡检: 后台跑 survey_core (走 conbroker send), 摘要经 self.ui 回主线程写进控制台.
 
-        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor, 默认 huawei.
+        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor
+        (huawei / h3c / cisco / ruijie), 默认 auto (#56 先 show version 再 display version 自动认).
+        发第一条前先 conbroker tail 看最后一行, 不在提示符上 (Username / Password / [Y/N] ...) 就不跑.
         """
         if self._surveying:
             return
@@ -424,14 +427,14 @@ class SerialPanel(tk.Frame):
             self._con_write([("text", f"\n[巡检] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
             return
         self._surveying = True
-        vendor = self.cfg.get("survey_vendor", "huawei")
+        vendor = self.cfg.get("survey_vendor", "auto")
         head = survey_core.safe_name(os.path.basename(dev))
         self._con_write([("text", f"\n[巡检] {dev} ({vendor}): 逐条发只读命令, 跑完前先别敲键\n")], "mark")
 
         def work():
             try:
                 r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head,
-                                           disabled=survey_core.gate_disabled())
+                                           tail=survey_core.conbroker_tail, disabled=survey_core.gate_disabled())
             except Exception as e:                 # run_survey 本不抛; 兜住, 免得按钮一直锁着
                 r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
             survey_core.record(r)

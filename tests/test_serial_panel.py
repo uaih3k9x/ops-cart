@@ -112,8 +112,8 @@ def test_survey_runs_in_background_and_reports_in_drain(monkeypatch):
     sp.SerialPanel.survey(p)                     # 跑着时再点不起第二个
     _join_bg()
     n = len(p.written)
-    assert p.after_calls == [] and seen["port"] == "/dev/con-1" and seen["vendor"] == "huawei"
-    assert seen["head"] == "con-1" and seen["send"] is survey_core.conbroker_send
+    assert p.after_calls == [] and seen["port"] == "/dev/con-1" and seen["vendor"] == "auto"
+    assert seen["head"] == "con-1" and seen["send"] is survey_core.conbroker_send and seen["tail"] is survey_core.conbroker_tail
     assert seen["disabled"] == ["huawei:display arp"]          # 和命令行同一个口径 (#75)
     assert len(logged) == 1
     sp.SerialPanel._run_ui(p)
