@@ -254,7 +254,8 @@ class ObserveWindow(tk.Toplevel):
     def _new_observer(self):
         log = oc.LogFile(os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log"))
         return oc.Observer(self.name, self.vendor, send=functools.partial(survey_core.conbroker_send, grace=oc.POLL_GRACE_S),
-                           log=log, busy=lambda: oc.agent_busy(self.dev))
+                           log=log, busy=lambda: oc.agent_busy(self.dev),
+                           shadow=functools.partial(oc.shadow_record, vendor=self.vendor, disabled=survey_core.gate_disabled()))
 
     def begin(self):
         """开始观察第一步: 看现场 (只认用户视图提示符), 在窗口里请人确认设备名. 这一步不往 console 发任何字节.

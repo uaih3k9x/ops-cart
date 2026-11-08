@@ -583,13 +583,14 @@ class Observer:
     """
 
     def __init__(self, port, vendor, send, profile=None, pacer=None, log=None, layouts=None,
-                 clock=time.monotonic, busy=None, wall=time.time):
+                 clock=time.monotonic, busy=None, wall=time.time, shadow=None):
         self.port, self.vendor, self.send = port, vendor, send
         self.profile = dict(load_profile(vendor), **(profile or {}))
         self.pacer = pacer or Pacer()
         self.log = log or _NoLog()
         self.layouts = layouts if layouts is not None else load_layouts()
         self.clock, self.busy, self.wall = clock, busy or (lambda: None), wall
+        self.shadow = shadow or (lambda cmd: None)  # #75 影子统计: 每条真发出去的命令记一笔, 只记录不拦
         self.state, self.error, self.warning, self.device, self.model = "idle", None, None, None, None
         self.reason = None              # 自己停下的原因 (到时长上限), stop() 不清
         self._t0 = None                 # 第一次 tick 的时间, 算总时长
@@ -653,6 +654,8 @@ class Observer:
         if not self.profile.get("poll") or bad or not parser_for(self.vendor):
             return None, (("白名单不放, 一条都不发: " + "; ".join(map(str, bad))) if bad else
                           f"厂商 {self.vendor} 没有轮询命令或解析器")
+        if not self.profile.get("version"):             # 要靠 display version 的输出确认是华为
+            return None, "profile 里没有 display version, 认不出厂商, 不开始"
         why = self.busy()
         if why:
             return None, why
@@ -753,6 +756,10 @@ class Observer:
         if bad:
             return None, (False if bad == "lost" else "busy")
         try:
+            self.shadow(cmd)                            # 影子统计出错也不影响放行
+        except Exception:
+            pass
+        try:
             out = self.send(self.port, cmd, self.profile["timeout"]) or ""
         except Exception as e:
             self.error = str(e) or type(e).__name__
@@ -770,6 +777,11 @@ class Observer:
             out, res = self._send_checked(ver)
             if out is None:
                 return res
+            hits = survey_core._vendor_hits(clean(out).split("\n"))
+            if hits != ["huawei"]:                      # 认不出是华为就停: 不拿华为的解析器去解析 H3C / 锐捷
+                seen = "/".join(hits) or "认不出"
+                self.state, self.error = "failed", f"暂只支持华为 (display version 看起来是 {seen}), 观察已停止"
+                return False
             self._ver_done, self.model = True, parse_model(out)
         parse = parser_for(self.vendor)
         found = []
@@ -882,6 +894,18 @@ def remove_snapshot(owner, path):
         return True
     except OSError:
         return False
+
+
+def shadow_record(cmd, vendor, disabled=(), event=None):
+    """#75 影子期: 观察真发出去的命令也计入第 1 层白名单统计 (和巡检同一口径: exec / survey 范围);
+    不命中的记 cartlog [observe] allowlist-miss. 只记录, 不影响放行. 不抛."""
+    try:
+        import serial_allowlist
+        m = serial_allowlist.match(cmd, vendor, mode="exec", scope="survey", disabled=disabled)
+        if not m["entry"]:
+            (event or cartlog.event)("observe", "allowlist-miss " + cartlog.fields(vendor=vendor, cmd=cmd, why=m["why"]))
+    except Exception:
+        pass
 
 
 def record(action, event=None, **kv):

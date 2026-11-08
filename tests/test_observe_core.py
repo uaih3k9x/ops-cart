@@ -596,7 +596,8 @@ def test_human_attached_counts_cached_incrementally(tmp_path):
 # ============================================================ 会话编排 (半自动: 人登录, 推车只读)
 
 PROMPT = "\n<SW-TEST>"
-VERSION_OUT = "display version\nHUAWEI S5735-L24T4S-A1 Routing Switch uptime is 1 day\n<SW-TEST>"
+VERSION_OUT = ("display version\nHuawei Versatile Routing Platform Software\n"
+               "VRP (R) software, Version 5.170\nHUAWEI S5735-L24T4S-A1 Routing Switch uptime is 1 day\n<SW-TEST>")
 
 
 class FakeDev:
@@ -866,11 +867,11 @@ def test_empty_parse_is_error_not_fresh():
 def test_cancel_stops_between_poll_commands():
     flag = {"stop": False}
     dev = FakeDev()
-    ob = _obs(dev, profile={"poll": ["display interface brief", "display interface brief"], "version": None})
+    ob = _obs(dev, profile={"poll": ["display interface brief", "display interface brief"]})
     assert ob.start(ob.probe()[0], cancelled=lambda: flag["stop"])
-    dev.before_send = lambda d, cmd: flag.update(stop=True)
+    dev.before_send = lambda d, cmd: flag.update(stop=True) if cmd != "display version" else None
     ob.tick(100)
-    assert dev.polls == ["display interface brief"]
+    assert dev.polls == ["display version", "display interface brief"]
 
 
 def test_unrecognised_phy_warning():
@@ -1146,3 +1147,57 @@ def test_idle_lock_keeps_polling_until_max_duration():
     assert ob.tick(100) is True
     assert ob.tick(200) is True
     assert ob.tick(401) is False and ob.state == "stopped"
+
+
+
+# ============================================================ 合入 main 之后: 影子统计 / 只认华为
+
+def test_poll_commands_recorded_in_shadow_stats():
+    seen = []
+    dev, ob = _started(shadow=lambda cmd: seen.append(cmd))
+    ob.tick(100)
+    assert seen == ["display version", "display interface brief"] == dev.polls
+
+
+def test_shadow_failure_does_not_block_polling():
+    def boom(cmd):
+        raise RuntimeError("影子统计挂了")
+    dev, ob = _started(shadow=boom)
+    assert ob.tick(100) is True and dev.polls == ["display version", "display interface brief"]
+
+
+def test_shadow_record_logs_misses_only(monkeypatch):
+    got = []
+    ev = lambda kind, msg: got.append((kind, msg))          # noqa: E731
+    oc.shadow_record("display interface brief", "huawei", (), event=ev)
+    hits = list(got)
+    oc.shadow_record("display something-not-in-allowlist-xyz", "huawei", (), event=ev)
+    assert all(k == "observe" and "allowlist-miss" in m for k, m in got)
+    assert len(got) == len(hits) + 1
+
+
+@pytest.mark.parametrize("ver,word", [
+    ("display version\nH3C Comware Platform Software\nComware Software, Version 7.1.064\n<SW-TEST>", "华为"),
+    ("display version\nRuijie General Operating System Software\nRGOS 11.4\n<SW-TEST>", "华为"),
+    ("display version\nsomething we cannot recognise\n<SW-TEST>", "华为"),
+])
+def test_only_huawei_confirmed_by_version_output(ver, word):
+    dev, ob = _started()
+    orig = dev.send
+
+    def send(port, cmd, timeout):
+        if cmd == "display version":
+            dev.polls.append(cmd)
+            dev.console += "\n" + ver
+            return ver
+        return orig(port, cmd, timeout)
+    ob.send = send
+    assert ob.tick(100) is False
+    assert dev.polls == ["display version"] and ob.state == "failed" and word in ob.error and not ob.ports
+
+
+def test_profile_without_version_command_refused():
+    dev = FakeDev()
+    ob = _obs(dev, profile={"version": None})
+    name, why = ob.probe()
+    assert name is None and "display version" in why and dev.polls == []
