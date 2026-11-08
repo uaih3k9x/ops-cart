@@ -10,6 +10,8 @@ import serial_write_core as sw  # noqa: E402
 T0 = 1_700_000_000.0
 DANGER = {"verdict": "confirm", "layer": 1, "reason": "带高危词", "danger": ["save"], "vendor": "huawei"}
 HOLD = {"verdict": "confirm", "layer": 1, "reason": "不在只读白名单里", "danger": [], "vendor": "huawei"}
+# 同槽位有挂起项时只收打断键 (#74 第四轮): 默认两条 = 高危命令 + Ctrl+C, 闸门结果照 classify_key 的
+CTRL_C = sw.classify_key("ctrl_c", "<SW1>")
 
 
 @pytest.fixture
@@ -23,11 +25,13 @@ def root():
     r.destroy()
 
 
-def _view(stop=False, items=(("save", DANGER), ("undo shutdown", HOLD))):
+def _view(stop=False, items=(("save", DANGER), ("key", "ctrl_c", CTRL_C))):
+    """items: (命令, 闸门) 或 (kind, 命令, 闸门)."""
     b = sw.Book.from_text(None, T0)
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
-    for cmd, gate in items:
-        b.submit(1, tok, "stdio:ops@x", "line", cmd, gate, T0, 30, name="SW1", context="<SW1>")
+    for it in items:
+        kind, cmd, gate = it if len(it) == 3 else ("line",) + tuple(it)
+        b.submit(1, tok, "stdio:ops@x", kind, cmd, gate, T0, 30, name="SW1", context="<SW1>")
     if stop:
         b.estop(1, "human:kiosk@local", "human", T0)
     return b.view(T0 + 2)
@@ -65,8 +69,8 @@ def _dlg(root, view, ask=True):
 def test_dialog_shows_what_agent_wants(root):
     d, _acts, _asked = _dlg(root, _view())
     text = "\n".join(_labels(d))
-    assert "Agent 想执行：save" in text and "Agent 想执行：undo shutdown" in text
-    assert "高危词：save" in text and "闸门理由：不在只读白名单里" in text and "操作头 1" in text
+    assert "Agent 想执行：save" in text and "Agent 想按：Ctrl+C" in text
+    assert "高危词：save" in text and "闸门理由：" + CTRL_C["reason"] in text and "操作头 1" in text
     assert "设备自报名（不可信）：SW1" in text and "操作头 1 · SW1" not in text
     b = _buttons(d)
     assert len(b["确认发送"]) == 2 and len(b["拒绝"]) == 2 and "急停本路" in b and "全部急停" in b
@@ -79,7 +83,7 @@ def test_confirm_danger_asks_twice_then_hands_off(root):
     by_id = {int(x.winfo_name().rsplit("-", 1)[1]): x for x in b}
     by_id[ids[0]].invoke()                           # save: 高危, 二次确认说不 -> 不交
     assert len(asked) == 1 and "save" in asked[0] and acts == []
-    by_id[ids[1]].invoke()                           # 普通的不再问
+    by_id[ids[1]].invoke()                           # 不带高危词的 (Ctrl+C) 不再问
     assert acts == [("confirm", ids[1])] and len(asked) == 1
 
 
@@ -189,3 +193,10 @@ def test_dialog_live_failure_is_ignored(root):
     d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=boom)
     d.update_idletasks()
     assert not any("当前最后一行" in t for t in _labels(d))
+
+
+def test_view_fixtures_build_without_display():
+    """不开 Tk 也跑: 夹具本身合不合闸门规则 (#74 后同槽位只能再挂 Ctrl+C). Mac 上整组 Tk 测试跳过时也能先红."""
+    assert len(_view()["pending"]) == 2
+    _view(stop=True)
+    assert len(_view(items=(("save", HOLD),))["pending"]) == 1

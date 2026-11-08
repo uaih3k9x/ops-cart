@@ -444,6 +444,61 @@ def test_pxe_zone_firewalld_off_is_skip():
     assert ac.judge_pxe_zone(None, None)[0] == ac.SKIP
 
 
+@pytest.mark.parametrize("link", ["unavailable", "disconnected"])
+def test_pxe_zone_no_link_is_skip_and_says_profile_is_pxe(link):
+    """LAN1 没插线: 连接没激活, 接口不在任何区是正常的; 配置里写了 pxe 就说插线后生效 (#38)."""
+    st, why = ac.judge_pxe_zone("", "", link=link, profile_zones=[("cart-eno1-static", "pxe")])
+    assert st == ac.SKIP and link in why and "配置已设 pxe，插线后生效" in why
+
+
+def test_pxe_zone_no_link_profile_without_pxe_fails():
+    """没链路但配置写的不是 pxe: 插线后照样落进默认区, 现在就报."""
+    st, why = ac.judge_pxe_zone("", "", link="unavailable", profile_zones=[("lan1-old", "")])
+    assert st == ac.FAIL and "插线后" in why and "nmcli" in why and "lan1-old" in why
+
+
+def test_pxe_zone_no_link_any_profile_not_pxe_fails_and_names_it():
+    """绑 eno1 的配置全是 pxe 才 SKIP; 有一个不是 (插线后哪个先起来不一定) 就报, 写出名字."""
+    st, why = ac.judge_pxe_zone("", "", link="unavailable",
+                                profile_zones=[("cart-eno1-static", "pxe"), ("Wired connection 1", "public")])
+    assert st == ac.FAIL and "Wired connection 1" in why and "public" in why and "cart-eno1-static" not in why
+
+
+def test_pxe_zone_no_link_no_profile_is_skip():
+    st, why = ac.judge_pxe_zone("", "", link="unavailable", profile_zones=[])
+    assert st == ac.SKIP and "没找到" in why and "MAC" in why
+
+
+def test_pxe_zone_link_up_without_zone_still_fails():
+    assert ac.judge_pxe_zone("", "", link="connected", profile_zones=[("cart-eno1-static", "pxe")])[0] == ac.FAIL
+
+
+def test_pxe_zone_no_link_but_zone_set_judged_as_before():
+    assert ac.judge_pxe_zone("pxe", PXE_PORTS, link="unavailable")[0] == ac.PASS
+    assert ac.judge_pxe_zone("public", "", link="unavailable")[0] == ac.FAIL
+
+
+def test_nm_device_state():
+    out = "wlp4s0:connected\ntailscale0:connected (externally)\neno1:unavailable\n"
+    assert ac.nm_device_state(out, "eno1") == "unavailable"
+    assert ac.nm_device_state(out, "tailscale0") == "connected"
+    assert ac.nm_device_state(out, "eno2") is None
+
+
+def test_nm_split_terse_unescapes():
+    assert ac.nm_split(r"my\:con:802-3-ethernet:") == ["my:con", "802-3-ethernet", ""]
+    assert ac.nm_split(r"a\\:b") == ["a" + "\\", "b"]                # 字段里的一个反斜杠转义成 \\
+    assert ac.nm_split(r"a\\\:b:c") == ["a" + "\\" + ":b", "c"]       # \\ 后面紧跟 \:
+
+
+def test_nm_field():
+    dump = "connection.id:cart-eno1-static\nconnection.uuid:u-1\nconnection.zone:pxe\nconnection.interface-name:eno1\n"
+    assert ac.nm_field(dump, "connection.zone") == "pxe"
+    assert ac.nm_field(dump, "connection.id") == "cart-eno1-static"
+    assert ac.nm_field("connection.zone:\n", "connection.zone") == ""
+    assert ac.nm_field("", "connection.zone") is None
+
+
 # ---- RapidOCR (#46): 可选, 没装不算错
 
 def test_judge_rapid():
