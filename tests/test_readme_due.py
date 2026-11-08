@@ -25,13 +25,17 @@ def commit(repo, subject, path="code.py"):
     git(repo, "commit", "-q", "-m", subject)
 
 
+def init(path):
+    git(path, "init", "-q", "-b", "main")
+    git(path, "config", "user.email", "t@example.com")
+    git(path, "config", "user.name", "t")
+    git(path, "config", "commit.gpgsign", "false")
+    commit(path, "初始 (#1)")
+
+
 @pytest.fixture
 def repo(tmp_path):
-    git(tmp_path, "init", "-q", "-b", "main")
-    git(tmp_path, "config", "user.email", "t@example.com")
-    git(tmp_path, "config", "user.name", "t")
-    git(tmp_path, "config", "commit.gpgsign", "false")
-    commit(tmp_path, "初始 (#1)")
+    init(tmp_path)
     commit(tmp_path, "README 整理", path="README.md")
     return tmp_path
 
@@ -84,10 +88,7 @@ def test_default_threshold_is_10(repo):
 
 
 def test_no_readme_commit_is_error(tmp_path, capsys):
-    git(tmp_path, "init", "-q", "-b", "main")
-    git(tmp_path, "config", "user.email", "t@example.com")
-    git(tmp_path, "config", "user.name", "t")
-    commit(tmp_path, "初始 (#1)")
+    init(tmp_path)
     assert rd.main(["--repo", str(tmp_path), "--ref", "main"]) == 2
 
 

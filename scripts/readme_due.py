@@ -2,7 +2,7 @@
 """README 该整理了吗: 数 <ref> 上最后一次改 README.md 之后合并了几个 PR.
 
 仓库用 squash 合并, PR 合并提交的标题以 "(#数字)" 结尾. 到阈值 (默认 10) 退出码 1, 否则 0; 出错 2.
-    python3 scripts/readme_due.py [--ref origin/main] [--threshold 10]
+    git fetch origin && python3 scripts/readme_due.py [--ref origin/main] [--threshold 10]   # 先 fetch, 否则数的是旧的 origin/main
 """
 
 import argparse
