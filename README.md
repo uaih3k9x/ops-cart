@@ -46,6 +46,7 @@
 | `wol_panel.py` · `wol_core.py` | 网络唤醒 |
 | `ch9329.py` · `kvm_core.py` · `kvm_broker.py` · `kvm_broker_core.py` | CH9329 协议栈和命令行；画面源与键鼠绑定；键鼠代理（`/run/ops-kvm/kvm.sock`） |
 | `serial_panel.py` · `serial_core.py` · `survey_core.py` | 串口面板、conbroker 接口、多厂商只读巡检 |
+| `observe_core.py` · `observe_panel.py` | 串口观察模式（#85，半自动）：人登录后确认设备名，推车只发 `display` 只读命令，画前面板和端口灯；有人 attach 就暂停，主动锁屏或到时长上限（默认 30 分钟）就停 |
 | `cart_snap.py` · `cart_ocr.py` · `ocr_rapid_worker.py` | 截一帧；OCR（优先 `cart-ocr` 服务，没开退回 Tesseract）；OCR 服务进程 |
 | `recipe.py` · `recipe_core.py` | 屏幕配方：截图 + OCR + 发键 |
 | `cart_mcp.py` · `mcp_core.py` | MCP 服务（stdio / HTTP，`--profile readonly` 只注册只看的工具，默认 `act`），审计日志；车机上 `pending / confirm / reject / estop / resume` |

@@ -29,6 +29,7 @@ import mcp_serial
 import sun_core
 import ups_core as uc
 import serial_core as sc
+import observe_panel
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
@@ -1185,7 +1186,7 @@ class Kiosk(tk.Tk):
         """先盖锁屏, 再撤自检页, 最后在锁屏底下放出主界面 -- 中间不留空档."""
         self._last_input = time.time()
         if self.gate.required:
-            self.lock()
+            self.lock("boot")
         if self._boot_win:
             self._boot_win.destroy()
             self._boot_win = None
@@ -1195,14 +1196,16 @@ class Kiosk(tk.Tk):
 
     # ------------------------------------------------------------ PIN 锁屏
 
-    def lock(self):
-        """全屏锁屏; 已锁则只提到最前."""
+    def lock(self, reason):
+        """全屏锁屏; 已锁则只提到最前. reason: "manual" = 人点了锁屏; 别的 (idle / boot / rebuild) 都是自动锁的.
+        #85 观察模式: 人主动锁屏才停止观察; 闲置自动锁屏只把观察窗口藏起来, 轮询照跑 (维护者定)."""
         if self._lock_win:
             self._lock_win.lift()
             return
         self._release_passthrough()
         self._close_confirm()                   # 确认框是置顶窗口, 别浮在锁屏上
         self._close_pxe_req()
+        observe_panel.hide_all(stop=reason == "manual")   # 观察窗口也是置顶的: 藏起来; 主动锁屏还停止观察
         self._pxe_seen.clear()                  # 解锁后还在等的申请再弹一次
         w = tk.Toplevel(self, bg=th.BG)
         w.overrideredirect(True)
@@ -1257,7 +1260,7 @@ class Kiosk(tk.Tk):
         if not self.gate.required:
             messagebox.showinfo("锁屏", "还没设 PIN, 先在终端跑 sudo kiosk-setpin")
             return
-        self.lock()
+        self.lock("manual")
 
     def _lock_tick(self, w):
         """锁屏每秒刷新时钟和公告; 解锁 / 这个锁屏窗口被换掉 (#32 重建) 后自动停."""
@@ -1282,6 +1285,7 @@ class Kiosk(tk.Tk):
             self._lock_win.destroy()
             self._lock_win, self._lock_net, self._lock_ups, self._lock_serve = None, None, None, None
             self._last_input = time.time()
+            observe_panel.show_all()                # 锁屏时藏起来的观察窗口放回来
         elif r == "locked":
             left = max(1, int(self.gate.locked_until - time.time()))
             self._lock_msg.config(text=f"错误次数过多，{left} 秒后再试", fg=th.BAD)
@@ -1308,7 +1312,7 @@ class Kiosk(tk.Tk):
         """闲置 IDLE_SECONDS 直接进锁屏 (时钟 + 公告 + PIN), 不再放屏保盖住公告."""
         if self.gate.required and kc.screensaver_due(self._last_input, time.time(), IDLE_SECONDS,
                                                      showing=self._lock_win is not None):
-            self.lock()
+            self.lock("idle")
         self._theme_tick()
         self.after(5000, self._idle_tick)
 
@@ -1359,7 +1363,7 @@ class Kiosk(tk.Tk):
         if self._lock_win is not None:
             self._lock_win.destroy()
             self._lock_win, self._lock_net, self._lock_ups, self._lock_serve = None, None, None, None
-            self.lock()
+            self.lock("rebuild")
         cartlog.event("theme", f"车机界面 {old} -> {self._theme} (锁屏时重建)")
 
     def _theme_setting(self):

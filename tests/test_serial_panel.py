@@ -146,3 +146,123 @@ def test_survey_vendor_from_serial_conf(monkeypatch):
     sp.SerialPanel.survey(p)
     _join_bg()
     assert seen["vendor"] == "cisco"
+
+
+# ------------------------------------------------------------ #85 巡检和观察互斥
+
+def test_survey_refused_while_observing(monkeypatch):
+    import observe_core
+    import survey_core
+
+    def boom(*a, **k):
+        raise AssertionError("不该跑")
+    monkeypatch.setattr(survey_core, "run_survey", boom)
+    observe_core._CLAIMS.clear()
+    observe_core.claim("/dev/con-1", "observe-w1")
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p)
+    _join_bg()
+    assert "观察" in p.written[-1] and not p._surveying
+    observe_core._CLAIMS.clear()
+
+
+def test_survey_holds_claim_until_done(monkeypatch):
+    import observe_core
+    import survey_core
+    import threading
+    observe_core._CLAIMS.clear()
+    gate = threading.Event()
+
+    def slow(*a, **k):
+        gate.wait(2)
+        return {"ok": True, "summary": "完成", "sections": []}
+    monkeypatch.setattr(survey_core, "run_survey", slow)
+    monkeypatch.setattr(survey_core, "record", lambda r: None)
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p)
+    assert (observe_core.holder("/dev/con-1") or "").startswith("survey-")
+    gate.set()
+    _join_bg()
+    assert observe_core.holder("/dev/con-1") is None        # 巡检线程一结束就放, 不等界面 (面板可能已经切走)
+
+
+def test_survey_tokens_unique_no_reentry(monkeypatch):
+    import threading
+    import observe_core
+    import survey_core
+    observe_core._CLAIMS.clear()
+    gate = threading.Event()
+
+    def slow(*a, **k):
+        gate.wait(2)
+        return {"ok": True, "summary": "完成", "sections": []}
+    monkeypatch.setattr(survey_core, "run_survey", slow)
+    monkeypatch.setattr(survey_core, "record", lambda r: None)
+    p1 = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    p2 = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p1)
+    sp.SerialPanel.survey(p2)                   # 另一个面板 (切走又切回来新建的) 不能重入
+    assert not p2._surveying and "巡检" in p2.written[-1]
+    gate.set()
+    _join_bg()
+    assert observe_core.holder("/dev/con-1") is None
+
+
+def test_survey_releases_claim_even_if_crashes(monkeypatch):
+    import observe_core
+    import survey_core
+    observe_core._CLAIMS.clear()
+
+    def boom(*a, **k):
+        raise RuntimeError("炸了")
+    monkeypatch.setattr(survey_core, "run_survey", boom)
+    monkeypatch.setattr(survey_core, "record", lambda r: None)
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p)
+    _join_bg()
+    assert observe_core.holder("/dev/con-1") is None
+
+
+def test_observe_refused_while_surveying():
+    import observe_core
+    observe_core._CLAIMS.clear()
+    observe_core.claim("/dev/con-1", "survey-abcd")
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.observe(p)
+    assert "巡检" in p.written[-1]
+    observe_core._CLAIMS.clear()
+
+
+def test_observe_vendor_falls_back_to_huawei_for_auto():
+    # #56 之后 survey_vendor 默认 auto; 观察只有华为的 brief 解析器
+    assert sp.observe_vendor({"survey_vendor": "auto"}) == "huawei"
+    assert sp.observe_vendor({}) == "huawei"
+    assert sp.observe_vendor({"survey_vendor": "h3c"}) == "huawei"
+    assert sp.observe_vendor({"survey_vendor": "huawei"}) == "huawei"
+
+
+@pytest.mark.parametrize("holder,word", [("tk-observe", "正在观察"), ("survey-abcd", "正在巡检")])
+def test_survey_refusal_says_who_holds_the_port(monkeypatch, holder, word):
+    import observe_core
+    import survey_core
+
+    def boom(*a, **k):
+        raise AssertionError("不该跑")
+    monkeypatch.setattr(survey_core, "run_survey", boom)
+    observe_core._CLAIMS.clear()
+    observe_core.claim("/dev/con-1", holder)
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p)
+    assert word in p.written[-1] and not p._surveying
+    observe_core._CLAIMS.clear()
+
+
+def test_observe_says_previous_still_finishing(monkeypatch):
+    import observe_core
+    import observe_panel
+    observe_core._CLAIMS.clear()
+    monkeypatch.setattr(observe_panel, "open_for", lambda *a, **k: None)
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    p.ddir = "/x"
+    sp.SerialPanel.observe(p)
+    assert "收尾" in p.written[-1]

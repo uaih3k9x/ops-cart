@@ -256,7 +256,7 @@ REQUIRED_PY = (
     "ime_core", "ime_proc", "ime_rime", "ime_tk", "ime_worker", "kiosk",
     "kiosk_core", "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core",
     "lamps_core", "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe",
-    "mcp_serial", "netmode_core", "netmode_panel", "netprof_core", "notify_core", "ocr_rapid_worker",
+    "mcp_serial", "netmode_core", "netmode_panel", "netprof_core", "notify_core", "observe_core", "observe_panel", "ocr_rapid_worker",
     "pet_core", "pet_render", "pet_sprites", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
     "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_allowlist", "serial_core",
     "serial_gate_model", "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme",

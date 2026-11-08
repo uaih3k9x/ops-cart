@@ -336,9 +336,12 @@ def _work_body(d, view, W, H):
     if len(problems) > 2:
         d.text((M + 40, y), "还有 %d 项" % (len(problems) - 2), font=_font(24), fill=DIM)
 
-    # 温度: 三列, 每列一条 0–100°C 的条
+    # 温度: 三列, 每列一条 0–100°C 的条; 观察模式 (#85) 开着时这块换成设备前面板
     y = 892
     temps = [t for t in (view.get("temps") or []) if len(t) > 1][:3]
+    if view.get("front"):
+        _front(d, view["front"], W)
+        temps = []
     if temps:
         cw = (W - 2 * M) // 3
         for i, (name, c) in enumerate(temps):
@@ -350,7 +353,7 @@ def _work_body(d, view, W, H):
             d.rounded_rectangle([x0, y + 46, x0 + max(10, int(bw * min(c, 100) / 100)), y + 56], 5,
                                 fill=_temp_color(c))
     rpms = [str(f[1]) for f in (view.get("fans") or [])
-            if isinstance(f, (list, tuple)) and len(f) > 1 and f[1]]
+            if isinstance(f, (list, tuple)) and len(f) > 1 and f[1] and not view.get("front")]
     if rpms:
         d.text((M, y + 72), "风扇 " + " · ".join(rpms[:3]) + " rpm", font=_font(26), fill=DIM)
     d.line([M, 1000, W - M, 1000], fill=LINE, width=2)
@@ -400,21 +403,60 @@ def work_tail(view, W=PANEL_W, H=PANEL_H):
     return rows
 
 
+FRONT_Y, FRONT_ROW, FRONT_GAP = 926, 30, 6       # 前面板: 两排口, 标题在上面 34 像素
+LOCKED_FRONT_Y = 734                             # 锁屏时画在分隔线下面、公告上面 (#85 闲置锁屏不停观察)
+
+
+def front_boxes(front, W=PANEL_W, y0=FRONT_Y):
+    """前面板每个口的框 [(框, 口)]; 列宽按最右一列平分, 最宽 48."""
+    ports = front.get("ports") or []
+    cols = max((p["x"] for p in ports), default=0) + 1
+    pitch = min(48, (W - 2 * M) // cols)
+    out = []
+    for p in ports:
+        x, y = M + p["x"] * pitch, y0 + p["y"] * (FRONT_ROW + FRONT_GAP)
+        out.append(([x, y, x + pitch - 4, y + FRONT_ROW], p))
+    return out
+
+
+def _front(d, front, W, y0=FRONT_Y):
+    title = front.get("title") or ""
+    d.text((M, y0 - 34), title, font=_font(24), fill=DIM)
+    if front.get("note"):           # 旧数据 / 出错 / 会话掉了: 灯全灰, 原因跟在标题后面
+        x = M + _font(24).getlength(title) + 20
+        line = wrap(str(front["note"]), _font(24), W - M - x, 1)
+        if line:
+            d.text((x, y0 - 34), line[0], font=_font(24), fill=WARN)
+    color = {"up": ACCENT, "admin": WARN, "standby": DIM, "unknown": th.MARK}
+    for box, p in front_boxes(front, W, y0):
+        lit = p.get("lit") and p.get("state") in color
+        fill = color[p["state"]] if lit else LINE
+        if p.get("shape") == "rj45":
+            d.rectangle(box, fill=fill)
+        else:
+            d.rounded_rectangle(box, 8, fill=fill)
+        d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), str(p.get("label", "")), font=_font(16),
+               fill=lc.LIT_FG if lit else DIM, anchor="mm")
+
+
 def _locked_lines(view, W, H):
     """锁屏公告排版: (字号, 行距, 各行, 第一行顶). 字框 (glyph_boxes) 和实际画字共用, 不能各算各的."""
     paras = paragraphs(view.get("notice")) or ["推车锁定中"]
-    room = H - 160 - 700                    # 分隔线以下、底部提示以上
+    base = LOCKED_FRONT_Y + 2 * (FRONT_ROW + FRONT_GAP) + 20 if view.get("front") else 700   # 观察中: 让出前面板
+    room = H - 160 - base                   # 分隔线以下、底部提示以上
     for size in (96, 80, 64, 52, 44):       # 字号从大往下试, 整段放得进为止
         lh = int(size * 1.3)
         lines = [ln for p in paras for ln in wrap(p, _font(size), W - 2 * M, 5)]
         if len(lines) * lh <= room:
             break
     lines = lines[:room // lh]
-    return size, lh, lines, 700 + max(0, (room - lh * len(lines)) // 2)
+    return size, lh, lines, base + max(0, (room - lh * len(lines)) // 2)
 
 
 def _locked_body(d, view, W, H):
-    """锁屏: 教室引导牌. 公告大字居中, 别的都不显示."""
+    """锁屏: 教室引导牌. 公告大字居中; 观察中 (#85 闲置锁屏不停观察) 时上面画一块不露设备名的前面板."""
+    if view.get("front"):
+        _front(d, view["front"], W, y0=LOCKED_FRONT_Y)
     size, lh, lines, top = _locked_lines(view, W, H)
     for i, line in enumerate(lines):
         d.text((W // 2, top + i * lh + lh // 2), line, font=_font(size), fill=FG, anchor="mm")
