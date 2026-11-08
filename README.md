@@ -26,7 +26,7 @@
 | 网页口 | 同一套状态、画面、键鼠、串口经浏览器访问，另有只读的 PXE 日志页。tailnet 放行，局域网要开关 + PIN |
 | 副屏 / UPS | USB 副屏常驻状态板和像素猫桌宠；APC UPS 直读 hidraw，低电量先预告，再倒计时关机 |
 | 联网 | 有线优先，无线兜底；锐捷 ePortal 自动认证；LAN1 / LAN2 按口选模式，每次切换都能撤回 |
-| Agent 接入 | MCP 服务开放串口、截屏、OCR、键鼠、WOL、PXE 申请、标签打印，分只读档和动手档（`--profile readonly / act`）。写操作要拿有期限的租约，键鼠和串口都过闸门，高危的挂起等人在车机上确认，挂起期间同一槽位不许直发；全部急停，解除只能在本机。远程审批目前只有服务端核心，还没接上 |
+| Agent 接入 | MCP 服务开放串口、截屏、OCR、键鼠、WOL、PXE 申请、标签打印，分只读档和动手档（`--profile readonly / act`）。写操作要拿有期限的租约，键鼠和串口都过闸门，高危的挂起等人在车机上确认，挂起期间同一槽位不许直发。串口回车 / 空格只在设备最后一行是命令提示符或翻页提示时直发，确认类提示或看不到最后一行要人确认，确认框上另列"设备最后一行（不可信）"；全部急停，解除只能在本机。远程审批目前只有服务端核心，还没接上 |
 | 蓝牙打字 | 手机经 BLE 把文字发到推车排队，不执行命令；安卓 App 在 `android/`，单元默认不开 |
 | 机房辅助 | LLDP 看对端交换机口、TSC 线缆 / 资产标签、关键事件推到手机、Clonezilla 整盘克隆、屏幕配方（如 `boot-pxe`）、夜间日志小结 |
 
@@ -49,7 +49,8 @@
 | `cart_snap.py` · `cart_ocr.py` · `ocr_rapid_worker.py` | 截一帧；OCR（优先 `cart-ocr` 服务，没开退回 Tesseract）；OCR 服务进程 |
 | `recipe.py` · `recipe_core.py` | 屏幕配方：截图 + OCR + 发键 |
 | `cart_mcp.py` · `mcp_core.py` | MCP 服务（stdio / HTTP，`--profile readonly` 只注册只看的工具，默认 `act`），审计日志；车机上 `pending / confirm / reject / estop / resume` |
-| `mcp_serial.py` · `serial_write_core.py` · `serial_gate_model.py` | 串口写：租约、闸门（白名单 + 可选决策模型）、挂起、急停 |
+| `mcp_serial.py` · `serial_write_core.py` · `serial_gate_model.py` | 串口写：租约、闸门（只读规则 + 按键白名单 + 可选决策模型）、挂起、急停 |
+| `serial_allowlist.py` | 第 1 层按厂商的命令前缀白名单，影子期：只记进 `gate.shadow`，放行仍按只读规则；MCP 工具 `gate_allowlist` 只读查看 |
 | `mcp_kvm.py` | MCP 键鼠 `kvm_*`（租约 + 闸门，逐行逐键查高危）、`screen_ocr`、`wol_send` |
 | `mcp_pxe.py` · `pxe_req_core.py` · `pxe_req_panel.py` · `pxe_log_core.py` | Agent 申请 PXE 解锁（人照抄确认码才生效）、`pxe_clients`；网页 PXE 日志页 |
 | `mcp_label.py` · `cart_label.py` · `tspl_preview.py` | MCP 标签工具；TSPL 生成；开发机上预览 |
@@ -145,6 +146,7 @@ macOS 上默认不开 Tk 窗口，相关用例跳过；`OPS_TK_TESTS=1` 才真�
 | [BLE_INPUT](docs/BLE_INPUT.md) | 蓝牙隔空打字：协议、配对、单元 |
 | [REMOTE_APPROVAL](docs/REMOTE_APPROVAL.md) | 远程审批第一阶段 |
 | [DESIGN_agent_mcp](docs/DESIGN_agent_mcp.md) | Agent / MCP 接入设计，含只读档 / 动手档 |
+| [DESIGN_layer1_allowlist](docs/DESIGN_layer1_allowlist.md) | 串口写闸门第 1 层白名单：格式、影子期、切换条件 |
 | [REMOTE_TUNNEL](docs/REMOTE_TUNNEL.md) | 备用远程通道 |
 | [udisp-protocol](docs/udisp-protocol.md) | USB 副屏协议 |
 | [PUBLIC_SAFETY](docs/PUBLIC_SAFETY.md) | 公开仓库安全约定 |

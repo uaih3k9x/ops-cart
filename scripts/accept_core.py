@@ -250,18 +250,18 @@ def _not_stdlib(names):
 
 # ---- 以下常量由 `python3 scripts/cart_accept.py --print-manifest` 生成, 测试比对仓库 ----
 REQUIRED_PY = (
-    "atomicfile", "ble_input", "ble_input_core", "cart_dream", "cart_label", "cart_mcp", "cart_ocr", "cart_snap",
-    "cartlog", "ch9329", "clone_core", "confirm_core", "confirm_panel", "dash_core",
-    "dash_render", "dash_service", "hidpdc", "httpserve", "ime_core", "ime_proc",
-    "ime_rime", "ime_tk", "ime_worker", "kiosk", "kiosk_core", "kiosk_ui_core",
-    "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core", "lamps_core", "lldp_core",
-    "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
-    "netmode_panel", "netprof_core", "notify_core", "ocr_rapid_worker", "pet_core", "pet_render",
-    "pet_sprites", "pxe_log_core", "pxe_req_core", "pxe_req_panel", "pxeserver", "recipe",
-    "recipe_core", "ruijie_portal", "serial_core", "serial_gate_model", "serial_panel", "serial_write_core",
-    "sun_core", "survey_core", "theme", "tspl_preview", "udisp", "udisp_usb",
-    "ups_core", "web_core", "webkiosk", "wifi_core", "wifi_panel", "wifi_prefer",
-    "wol_core", "wol_panel",
+    "atomicfile", "ble_input", "ble_input_core", "cart_dream", "cart_label", "cart_mcp",
+    "cart_ocr", "cart_snap", "cartlog", "ch9329", "clone_core", "confirm_core",
+    "confirm_panel", "dash_core", "dash_render", "dash_service", "hidpdc", "httpserve",
+    "ime_core", "ime_proc", "ime_rime", "ime_tk", "ime_worker", "kiosk",
+    "kiosk_core", "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core",
+    "lamps_core", "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe",
+    "mcp_serial", "netmode_core", "netmode_panel", "netprof_core", "notify_core", "ocr_rapid_worker",
+    "pet_core", "pet_render", "pet_sprites", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
+    "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_allowlist", "serial_core",
+    "serial_gate_model", "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme",
+    "tspl_preview", "udisp", "udisp_usb", "ups_core", "web_core", "webkiosk",
+    "wifi_core", "wifi_panel", "wifi_prefer", "wol_core", "wol_panel",
 )
 VENV_PY = (
     "dash_render", "dash_service", "pet_render", "udisp_usb",
@@ -551,6 +551,7 @@ MCP_TOOLS = {
     "#24": ("pxe_request", "pxe_requests", "pxe_retire"),
     "#41": ("kvm_status", "kvm_lease_acquire", "kvm_lease_renew", "kvm_lease_release", "kvm_key", "kvm_type",
             "screen_ocr", "wol_send", "pxe_clients"),
+    "#75": ("gate_allowlist",),
 }
 
 
