@@ -206,7 +206,7 @@ def test_password_box_emptied_when_taken(monkeypatch):
 
     class Obs:
         device = error = None
-        state, left = "failed", "none"
+        state, note = "failed", None
 
         def start(self, user, pw, cancelled=None):
             seen["pw"], seen["box"] = pw, list(box)
@@ -363,3 +363,41 @@ def test_serial_panel_no_autoconnect_or_wake_while_held():
     P._held = None
     assert sp.SerialPanel._auto_connect_ok(P()) is True
     assert sp.SerialPanel._wake_ok(P(), True) is True and sp.SerialPanel._wake_ok(P(), False) is False
+
+
+
+# ---- 不自动 quit: kiosk 退出时只给后台线程一点时间收尾, 同步记一笔
+
+def test_shutdown_joins_worker_briefly_and_logs(monkeypatch):
+    import threading
+    got = []
+    monkeypatch.setattr(oc, "record", lambda action, **kw: got.append((action, kw)))
+    w = _FakeWin()
+    w.worker = threading.Thread(target=lambda: w.stop_evt.wait(5), daemon=True)
+    w.worker.start()
+    op.ObserveWindow._shutdown(w, timeout=2)
+    assert w.stop_evt.is_set() and not w.worker.is_alive()
+    assert got and got[0][0] == "interrupted" and "Password:" in got[0][1]["note"]
+
+
+def test_shutdown_gives_up_after_timeout(monkeypatch):
+    import threading
+    import time as _t
+    monkeypatch.setattr(oc, "record", lambda action, **kw: None)
+    w = _FakeWin()
+    hang = threading.Event()
+    w.worker = threading.Thread(target=lambda: hang.wait(5), daemon=True)
+    w.worker.start()
+    t0 = _t.monotonic()
+    op.ObserveWindow._shutdown(w, timeout=0.3)
+    assert _t.monotonic() - t0 < 1.5
+    hang.set()
+
+
+def test_shutdown_without_worker_logs_nothing(monkeypatch):
+    got = []
+    monkeypatch.setattr(oc, "record", lambda action, **kw: got.append(action))
+    w = _FakeWin()
+    w.worker = None
+    op.ObserveWindow._shutdown(w)
+    assert got == []

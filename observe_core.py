@@ -7,10 +7,10 @@
   layout       接口名 -> 面板格子 (GE/XGE/25GE/40GE/100GE 分组, 奇数口上、偶数口下), 可按型号用 JSON 覆盖.
   lamp         灯: up 常亮, 有流量按 InUti/OutUti 闪 (lamps_core.blink_on), *down 琥珀, ^down 灰, down 灭.
   Pacer        轮询节奏: 按一轮实际耗时留空 (占空比), 日志在我们没发的时候长了 = 有人在用, 停手 quiet 秒后再来.
-  Observer     把上面串起来: start(登录) / tick(到点轮询一次) / stop(quit 退出登录).
+  Observer     把上面串起来: start(登录) / tick(到点轮询一次) / stop(只停轮询, 不往 console 发任何字节).
 
 只读: 轮询命令一律过 survey_core.is_readonly (整轮预检, 有一条不过一条都不发); 会话命令只多放
-SESSION_COMMANDS 这两条字面. 登录的唤醒 / 用户名 / 密码 / [Y/N] 回答由状态机按提示给出, 不走命令闸门.
+SESSION_COMMANDS 这一条字面 (关翻页). 登录的唤醒 / 用户名 / 密码 / [Y/N] 回答由状态机按提示给出, 不走命令闸门.
 
 密码: 只在 Login 里待到发出去那一步, 发完就丢; Step 的 repr 打码. 登录各步直接接 conbroker 本地口
 (broker_exchange, HELLO claude secret), 不走 `sudo ... conbroker send <密码>`: 那样密码会出现在进程参数和
@@ -19,8 +19,10 @@ sudo 的日志里. 轮询仍走 survey_core.conbroker_send (等提示符、自�
 先看现场再发 (conbroker 排队等人停手后照样写出去, 我们超时走了也收不回): 登录前读 conbroker 日志尾
 (往回找有效行, 跳过 conbroker 标记行和设备异步日志; 认不出现场就不开始),
 别人停在密码 / [Y/N] / 系统视图 / 半行命令 / 翻页上, 或 Agent 持有写租约, 一律不开始; 已经停在 <提示符> 上
-就借用这个会话, 退出时不 quit. 发密码前日志尾要静止 QUIET_S 秒并且正停在 Password:. 退出时只在
-<本设备> 用户视图上、没人在用时才 quit; 登录中途出错但密码已发出, 同样按这个规矩补一个 quit.
+就借用这个会话. 发密码前日志尾要静止 QUIET_S 秒并且正停在 Password:.
+
+不自动 quit (9x 定, #85): 要百分之百确认会话归属才能安全地 quit, 六轮审查都没收敛; 设备的 console 空闲超时
+(华为默认 10 分钟) 足够兜底. 退出观察只停轮询, console 留在登录状态, 界面和 cartlog 写明, 要立刻登出请人去敲 quit.
 """
 
 import functools
@@ -43,7 +45,8 @@ FRONT_STALE_S = 360                                # 这么久没轮询成功, �
 
 # ------------------------------------------------------------ 会话命令闸门
 
-SESSION_COMMANDS = frozenset({"screen-length 0 temporary", "quit"})   # 只认这两条字面
+SESSION_COMMANDS = frozenset({"screen-length 0 temporary"})   # 只认这一条字面; 不自动 quit, 所以 quit 不在里面
+IDLE_LOGOUT = "交给设备的空闲超时登出 (华为 console 默认 10 分钟); 需要立刻登出, 请人到 console 上执行 quit"
 
 
 def allowed(cmd, vendor):
@@ -314,7 +317,7 @@ class Login:
     之后只有亲眼看到 Username: 才发用户名, 看到 Password: 才发密码. 唤醒后直接是 Password: = 纯密码认证的
     console, 不支持, 停下. [Y/N] 一律 N. 认证失败不重试 (防锁账号), 看不懂的提示停下等人.
 
-    日志尾已经停在 <提示符> 上: 不唤醒, 借用这个会话 (borrowed, 退出时不 quit); 停在 Username: 上: 直接发用户名.
+    日志尾已经停在 <提示符> 上: 不唤醒, 借用这个会话 (borrowed, 只影响退出时的提示); 停在 Username: 上: 直接发用户名.
     authed: 见过登录后的提示符 (device 记下它的名字); pw_sent: 密码确实发出去了 (由调用方在 exchange 返回后置).
     """
     MAX_WAKE, MAX_ANSWER = 3, 3
@@ -359,7 +362,7 @@ class Login:
                 return Step("send", "user", self._user)
             if kind == "password":              # 回车唤醒直接到 Password: = console 只认密码 (没有 Username:)
                 return self._stop("console 用的是纯密码认证, 暂不支持; 请人登录后再观察 (会借用那个会话)")
-            if kind == "prompt":                # 唤醒出来是提示符 = 本来就登录着 (别人的会话), 借用, 退出不 quit
+            if kind == "prompt":                # 唤醒出来是提示符 = 本来就登录着 (别人的会话), 借用
                 self.authed = self.borrowed = True
                 return self._pager()
             if self._wakes >= self.MAX_WAKE:
@@ -372,7 +375,7 @@ class Login:
                 return Step("send", "pass", pw, secret=True)
             return self._stop(f"发了用户名没等到 Password:, 请人来处理: {last_line(output)[:40]!r}")
         if st == "pass":
-            if kind == "prompt":                    # 登录后亲眼见到的提示符名 = 本设备, quit 只认它
+            if kind == "prompt":                    # 登录后亲眼见到的提示符名 = 本设备, 轮询只认它
                 self.authed, self.device = True, prompt_name(last_line(output))
                 return self._pager()
             # 密码发出之后的报错只写分类, 不带设备原文 (万一回显了密码会经 cartlog / 状态栏带出去)
@@ -675,15 +678,15 @@ class _NoLog:
 class Observer:
     """一路串口的一次观察. 线程: start / tick / stop 都在同一个后台线程里调, 界面只读 ports / panel / state.
 
-    exchange(step) -> 输出: 登录各步和 quit (broker_exchange); send(port, cmd, timeout) -> 输出: 轮询
+    exchange(step) -> 输出: 登录各步 (broker_exchange); send(port, cmd, timeout) -> 输出: 轮询
     (survey_core.conbroker_send). log: LogFile (size / tail / read_from 偏移); 读不了一律不发. busy() -> Agent 占用原因.
     state: idle -> polling -> stopped; 登录失败 failed; 会话掉了 lost.
-    left: 退出时怎么处理的会话 — quit (发了) / borrowed (借来的, 不动) / skipped (没敢发, error 写原因) / none.
+    note: 退出后给人看的一句 (console 还登录着 / 可能还登录着, 交给空闲超时; 要立刻登出请人去 quit).
 
     白名单 (conbroker 排队等人停手后照样写出去, 我们超时走了也收不回, 所以拿不准就不发):
       发送: 现场 (日志尾往回找的有效行) 正好是这一步期望的状态, 且自上次确认 (字节偏移) 以来日志没有新增有效内容
             (conbroker 标记行和设备异步日志不算). 发密码前还要再静止 QUIET_S 秒. 不满足: 登录中止, 轮询跳过.
-      quit: 密码确实发出 (exchange 返回) + 登录后记下了提示符名 + 现场正是这个提示符 + 没人在用. 不满足就不发.
+      退出: 不发任何字节 (不自动 quit), 只停轮询、写明 console 的状态.
     """
 
     def __init__(self, port, vendor, exchange, send, profile=None, pacer=None, log=None,
@@ -698,7 +701,7 @@ class Observer:
         self.clock, self.busy = clock, busy or (lambda: None)
         self.sleep, self.wall, self.quiet_s = sleep, wall, quiet_s
         self.state, self.error, self.warning, self.device, self.model = "idle", None, None, None, None
-        self.left = "none"
+        self.note = None
         self.ports, self.panel, self.polled_at = {}, [], None
         self.login = None
         self.user_sent = False
@@ -727,18 +730,18 @@ class Observer:
 
     def _advance(self, to, out="", scan=True):
         """唯一能挪基线 (_off) 的入口 (有测试用 AST 盯着). 挪之前先扫 [旧偏移, 末尾) 和这次命令的输出 out:
-        有登出 / 重新登录的迹象, 或日志读不了, 就判 lost 不挪 (会话可能已经不是我们的了, 退出不 quit).
+        有登出 / 重新登录的迹象, 或日志读不了, 就判 lost 不挪 (会话可能已经不是我们的了, 不再往上发命令).
         scan=False 只给登录阶段的 _checkpoint 用: 那段里本来就有我们自己引出来的 Username: / Password:,
         而登录每一步发之前已经要求"没有新增有效内容 + 现场正是期望状态", 比扫更严."""
         old = self._off if self._based else None
         if self._based and to is None:          # 建立基线之后再读不到大小: 不挪, 一律 lost
-            return self._lost("读不到 conbroker 日志, 跳过的部分没法检查, 停止轮询, 退出时不 quit")
+            return self._lost("读不到 conbroker 日志, 跳过的部分没法检查, 停止轮询")
         if scan and self._based:
             new = self.log.read_from(old)
             if new is None or to is None or session_changed(new) or session_changed(out or ""):
-                return self._lost("会话可能已经不是我们的了 (日志里有登出 / 重新登录, 或读不了), 停止轮询, 退出时不 quit")
+                return self._lost("会话可能已经不是我们的了 (日志里有登出 / 重新登录, 或读不了), 停止轮询")
         elif scan and session_changed(out or ""):
-            return self._lost("会话可能已经不是我们的了 (输出里有登出 / 重新登录), 停止轮询, 退出时不 quit")
+            return self._lost("会话可能已经不是我们的了 (输出里有登出 / 重新登录), 停止轮询")
         self._off = to
         self._based = to is not None
         return True
@@ -945,7 +948,7 @@ class Observer:
         if self._ports_id is None:
             self._ports_id = ident
         elif ident != self._ports_id:           # 提示符名一样但口不一样: 换了线 / 换了设备
-            return self._lost("端口和登录时的不一样, 可能换了设备 (提示符名相同), 停止轮询, 退出时不 quit")
+            return self._lost("端口和登录时的不一样, 可能换了设备 (提示符名相同), 停止轮询")
         names = [p["name"] for p in found]
         if sorted(names) != sorted(self.ports):
             self.panel = layout(names, self.model, self.layouts)
@@ -955,45 +958,23 @@ class Observer:
 
     # ---- 退出
 
-    def _skip(self, why):
-        self.left, self.error = "skipped", f"{why}, 未退出登录, 请人到 console 上处理"
-
     def stop(self, now=None):
-        """退出观察. quit 白名单: 密码确实发出 + 登录后记下了提示符名 + 现场正是它 + 没人在用. 否则不发, 写明原因. 不抛."""
-        now = self.clock() if now is None else now
-        lg = self.login
-        if self.state == "lost":            # 会话已经没了 (回到登录提示), 没什么可退的
-            return
-        if self.state != "failed":
+        """退出观察: 只停轮询, 不往 console 发任何字节 (不自动 quit). note 写明 console 现在大概什么状态. 不抛."""
+        if self.state not in ("failed", "lost"):
             self.state = "stopped"
-        if not lg:
-            return
+        self.note = self.exit_note()
+
+    def exit_note(self):
+        lg = self.login
+        if not lg or self.state == "lost":          # 没登录过 / 会话已经不是推车的了: 没什么要交代的
+            return None
         if lg.borrowed:
-            self.left = "borrowed"
-            return
-        if not lg.pw_sent:
-            return
-        if not self.device:                 # 没亲眼见到登录后的提示符: 不 quit; 登录失败的原因保留
-            self.left = "skipped"
-            if self.state == "failed" and self.error:
-                self.error += " (密码可能已发出, 未退出登录, 请人到 console 上看一眼)"
-            else:
-                self.error = "密码可能已发出, 但登录后没见到提示符, 未退出登录, 请人到 console 上处理"
-            return
-        why = ("有人在用" if self.pacer.paused(now) else None) or self.busy() or self._attached()
-        if not why and not self._quiet():
-            why = "有人在用 (日志有新增)"
-        if not why:
-            kind, name = self._scene()
-            if kind != "prompt" or name != self.device:
-                why = f"设备不在 <{self.device}> 用户视图上 (停在 {kind if kind != 'prompt' else '别的设备'})"
-        if why:
-            return self._skip(why)
-        try:
-            self.exchange(Step("send", "cmd", "quit", expect=None, timeout=3))
-            self.left = "quit"
-        except Exception as e:
-            self.left, self.error = "skipped", f"quit 没发出去: {e}, 未退出登录"
+            return f"console 仍处于登录状态 (借用的会话, 推车没有登出), {IDLE_LOGOUT}"
+        if lg.authed:
+            return f"console 仍处于登录状态 (推车登录的会话), {IDLE_LOGOUT}"
+        if lg.pw_sent:
+            return f"密码可能已发出, console 可能仍处于登录状态, {IDLE_LOGOUT}"
+        return None
 
     def snapshot(self, head, now=None, owner=None):
         """给副屏的快照: 端口位置 + 状态, 没有凭据. ts = 写入时间, polled_at = 上次轮询成功的时间."""

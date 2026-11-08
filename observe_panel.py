@@ -249,7 +249,7 @@ class ObserveWindow(tk.Toplevel):
             obs.tick(time.monotonic())
             self.stop_evt.wait(0.5)
         obs.stop(time.monotonic())
-        oc.record("stop", head=self.head, device=obs.device, state=obs.state, left=obs.left, error=obs.error)
+        oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error, note=obs.note)
         life = getattr(self, "life", None)
         if life:
             life.worker_done()
@@ -266,13 +266,15 @@ class ObserveWindow(tk.Toplevel):
         self.title_lbl.config(text=f"观察 {self.dev} · {self.obs.device}" + (f" · {self.obs.model}" if self.obs.model else ""))
 
     def _ended(self):
-        """后台线程结束: 正常退出就关窗; 出了事 (失败 / 掉线 / 没敢 quit) 留着窗口说明, 登录行回来可以再登."""
+        """后台线程结束: 有话要交代 (console 还登录着 / 出错 / 掉线) 就留着窗口说明, 登录行回来可以再登; 没有就关窗."""
         obs, self.worker = self.obs, None
         self._console_back()
-        if self._closing and obs.left != "skipped":
+        if self._closing and not obs.note and not obs.error:
             return self.destroy()
         self._write_snap()
-        self.status.config(text=obs.error or "已停止", fg=th.BAD if obs.error else DIM)
+        text = "; ".join(x for x in (obs.error, obs.note) if x) or "已停止"
+        self.status.config(text=text, fg=th.BAD if obs.error else th.WARN if obs.note else DIM, wraplength=WIN_W - 2 * PAD,
+                           justify="left")
         if not self.login_row.winfo_ismapped():
             self.login_row.pack(fill="x", padx=PAD, pady=8, before=self.canvas)
         self.login_btn.config(state="normal")
@@ -330,18 +332,28 @@ class ObserveWindow(tk.Toplevel):
         self._hover = next((self.hits[i] for i in reversed(items) if i in self.hits), None)
 
     def close(self):
-        """后台线程在跑: 让它停下并 (现场对的话) quit, 结束后自己关窗; 没在跑直接关."""
+        """后台线程在跑: 让它停下 (只停轮询, 不往 console 发东西), 结束后说明 console 的状态; 没在跑直接关."""
         self._closing = True
         if self.worker:
-            self.hold.pause()               # 退出时也要"没人 attach 着"才 quit; 结束后 _ended 接回
             self.stop_evt.set()
             self.close_btn.config(state="disabled")
             self.status.config(text="退出中…", fg=DIM)
             return
         self.destroy()
 
-    def destroy(self):
+    def _shutdown(self, timeout=3):
+        """窗口被硬关 (kiosk 退出) 时后台线程还在跑: 先叫停, 给正在进行的那条 conbroker 交互最多 timeout 秒收尾,
+        同步记一笔 cartlog (之后进程可能就没了). 不等 stop 走完."""
         self.stop_evt.set()
+        worker = self.worker
+        if worker is None or not worker.is_alive():
+            return
+        oc.record("interrupted", head=self.head,
+                  note="观察被 kiosk 退出打断, console 可能仍在登录状态或停在 Password:, " + oc.IDLE_LOGOUT)
+        worker.join(timeout)
+
+    def destroy(self):
+        self._shutdown()
         self.hold.resume()
         oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
         self.life.window_gone()             # 后台线程还在跑就等它结束再放 claim

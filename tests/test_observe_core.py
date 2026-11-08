@@ -17,7 +17,7 @@ import observe_core as oc
 
 def test_session_commands_allowed():
     assert oc.allowed("screen-length 0 temporary", "huawei")
-    assert oc.allowed("quit", "huawei")
+    assert not oc.allowed("quit", "huawei")                     # 不自动 quit (9x 定): 闸门里也不放
     assert oc.allowed("display interface brief", "huawei")      # 白名单里的照放
 
 
@@ -570,7 +570,7 @@ def test_observer_login_poll_and_quit():
     assert ob.ports["GigabitEthernet0/0/6"]["in_uti"] == 12.5
     assert any(x["name"] == "XGigabitEthernet0/0/1" for x in ob.panel)
     ob.stop(now=200)
-    assert dev.sent[-1] == ("cmd", "quit") and ob.left == "quit"
+    assert "quit" not in [t for _r, t in dev.sent] and "推车登录" in ob.note and "空闲超时" in ob.note
     assert all(c in ("display version", "display interface brief") for c in dev.polls)
     assert ("pass", "***") in dev.sent and not any("s3cret" in str(x) for x in dev.sent)
 
@@ -651,39 +651,6 @@ def test_step_has_no_force_field():
 
 # ---- 中1: 退出时看现场
 
-def test_stop_skips_quit_while_human_active():
-    dev = FakeDev()
-    ob = _obs(dev)
-    ob.start("admin", "s3cret")
-    ob.tick(100)
-    ob.pacer.poke(150)
-    ob.stop(now=151)
-    assert "quit" not in [t for _r, t in dev.sent]
-    assert ob.left == "skipped" and "有人在用" in ob.error
-
-
-@pytest.mark.parametrize("tail_add", ["\n<SW-TEST>dis", "\n[SW-TEST]", "\n<OTHER-SW>", "\nUsername:", "\n  ---- More ----"])
-def test_stop_skips_quit_unless_at_own_user_view(tail_add):
-    dev = FakeDev()
-    ob = _obs(dev)
-    ob.start("admin", "s3cret")
-    ob.tick(100)
-    dev.console += tail_add
-    ob.stop(now=200)
-    assert "quit" not in [t for _r, t in dev.sent]
-    assert ob.left == "skipped" and "未退出登录" in ob.error
-
-
-def test_stop_skips_quit_when_someone_types_during_quiet_check():
-    dev = FakeDev()
-    ob = _obs(dev)
-    ob.start("admin", "s3cret")
-    ob.tick(100)
-    dev.on_sleep = lambda d: setattr(d, "console", d.console + "d")
-    ob.stop(now=200)
-    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "skipped"
-
-
 # ---- 中3: 登录前看现场
 
 def test_borrowed_session_not_woken_and_not_quit():
@@ -694,7 +661,7 @@ def test_borrowed_session_not_woken_and_not_quit():
     assert ob.borrowed and ob.device == "SW-TEST"
     ob.tick(100)
     ob.stop(now=200)
-    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "borrowed"
+    assert "quit" not in [t for _r, t in dev.sent] and "借用" in ob.note
 
 
 def test_console_already_at_username_skips_wake():
@@ -812,7 +779,7 @@ def test_pass_step_half_output_no_prompt_seen_never_quits():
     assert ob.start("admin", "s3cret") is False
     dev.console += "Info: The max number of VTY users is 5.\n<SW-TEST>"
     ob.stop(now=100)
-    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "skipped" and "未退出登录" in ob.error
+    assert "quit" not in [t for _r, t in dev.sent] and "密码可能已发出" in ob.note
 
 
 def test_pass_step_half_output_no_prompt_no_quit():
@@ -822,20 +789,6 @@ def test_pass_step_half_output_no_prompt_no_quit():
     ob.start("admin", "s3cret")
     ob.stop(now=100)
     assert "quit" not in [t for _r, t in dev.sent]
-
-
-def test_exchange_raises_after_password_then_quit():
-    dev = FakeDev()
-
-    def cmd(d):
-        if d.sent[-1][1] == "quit":
-            return "quit\n" + IDLE
-        raise OSError("超时")
-    dev.script["cmd"] = cmd
-    ob = _obs(dev)
-    assert ob.start("admin", "s3cret") is False
-    ob.stop(now=100)
-    assert dev.sent[-1] == ("cmd", "quit")
 
 
 def test_pager_off_judged_after_echo_not_by_async_log():
@@ -1063,7 +1016,7 @@ def test_async_log_after_prompt_borrows_without_wake_and_no_quit():
     assert "wake" not in _roles(dev) and ob.borrowed
     ob.tick(100)
     ob.stop(now=200)
-    assert ob.left == "borrowed" and "quit" not in [t for _r, t in dev.sent]
+    assert "借用" in ob.note and "quit" not in [t for _r, t in dev.sent]
 
 
 def test_async_log_after_sysview_refuses():
@@ -1080,16 +1033,6 @@ def test_unknown_tail_refuses_start(console):
     ob = _obs(dev)
     assert ob.start("admin", "s3cret") is False and dev.sent == []
     assert "回车" in ob.error
-
-
-def test_stop_looks_back_past_async_log():
-    dev = FakeDev()
-    ob = _obs(dev)
-    ob.start("admin", "s3cret")
-    ob.tick(100)
-    dev.console += "\n" + ASYNC + "\n"
-    ob.stop(now=200)
-    assert ob.left == "quit"
 
 
 # ---- 中2: conbroker 的断开标记晚到, 不算有人插话
@@ -1157,7 +1100,7 @@ def test_stop_after_lost_is_silent():
     ob.tick(100)
     msg = ob.error
     ob.stop(now=200)
-    assert ob.left == "none" and ob.error == msg and "未退出登录" not in ob.error
+    assert ob.note is None and ob.error == msg
 
 
 def test_errors_after_password_carry_no_device_text():
@@ -1169,15 +1112,6 @@ def test_errors_after_password_carry_no_device_text():
     _drive(lg, [USER, PASS, LOGGED])
     st = lg.feed("screen-length 0 temporary\nSECRETX")
     assert st.kind == "fail" and "SECRETX" not in st.note
-
-
-def test_stop_skip_message_carries_no_device_text():
-    dev = FakeDev()
-    ob = _obs(dev)
-    ob.start("admin", "s3cret")
-    dev.console += "\nSECRETX"
-    ob.stop(now=200)
-    assert ob.left == "skipped" and "SECRETX" not in ob.error
 
 
 def test_poll_error_carries_no_device_text():
@@ -1321,22 +1255,13 @@ def test_pw_sent_means_maybe_sent_once_exchange_starts():
     assert ob.login.pw_sent is True
     dev.console += "\n<SW-TEST>"
     ob.stop(now=100)
-    assert "quit" not in [t for _r, t in dev.sent] and "密码可能已发出" in ob.error
+    assert "quit" not in [t for _r, t in dev.sent] and "密码可能已发出" in ob.note
 
 
 def test_login_records_prompt_name_after_password():
     lg = oc.Login("admin", "s3cret")
     _drive(lg, [USER, PASS, LOGGED])
     assert lg.device == "SW-TEST" and lg.authed
-
-
-def test_stop_never_quits_without_device_name():
-    dev = FakeDev()
-    ob = _obs(dev)
-    ob.start("admin", "s3cret")
-    ob.device = None
-    ob.stop(now=100)
-    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "skipped"
 
 
 # ---- 中2: 按字节偏移看新增; 滑动窗口截断不算插话
@@ -1712,16 +1637,6 @@ def test_session_taken_over_while_reading_version_is_lost():
     assert "quit" not in [t for _r, t in dev.sent]
 
 
-def test_stop_skips_quit_while_someone_attached():
-    dev = FakeDev()
-    ob = _obs(dev)
-    ob.start("admin", "s3cret")
-    ob.tick(100)
-    dev.console += HUMAN_IN
-    ob.stop(now=300)
-    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "skipped" and "attach" in ob.error
-
-
 @pytest.mark.parametrize("script", [{"wake": "\nPlease choose (1/2):"}, {"user": "admin\n<SW-TEST>"}])
 def test_password_cleared_whatever_way_login_fails(script):
     dev = FakeDev()
@@ -1869,3 +1784,68 @@ def test_humans_boundaries(tmp_path, pad, chunk):
                                    ("x\x00", True), ("x\x1b", True), ("x\x7f", True), ("", False)])
 def test_bad_credential(s, bad):
     assert oc.bad_credential(s) is bad
+
+
+
+# ============================================================ 不自动 quit (9x 定)
+
+def test_quit_refused_by_gate_and_exchange(tmp_path):
+    assert "quit" not in oc.SESSION_COMMANDS and not oc.allowed("quit", "huawei")
+    with pytest.raises(ValueError):
+        oc.broker_exchange(str(tmp_path), "con-1", oc.Step("send", "cmd", "quit", expect=None, timeout=1))
+
+
+def test_no_quit_literal_in_observe_modules():
+    import ast
+    for mod in ("observe_core.py", "observe_panel.py"):
+        tree = ast.parse(open(os.path.join(os.path.dirname(oc.__file__), mod), encoding="utf-8").read())
+        assert not [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == "quit"], mod
+
+
+def _scenario(name):
+    dev = FakeDev()
+    if name == "borrowed":
+        dev.console = "\n<SW-TEST>"
+    elif name == "half_output_after_password":
+        dev.script["pass"] = "\n"
+    elif name == "exchange_error_after_password":
+        def boom(d):
+            raise OSError("x")
+        dev.script["cmd"] = boom
+    elif name == "auth_failed":
+        dev.script["pass"] = "\nError: Local authentication is rejected.\n\nUsername:"
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    if ob.state == "polling":
+        ob.tick(100)
+    if name == "lost":
+        dev.brief = "display interface brief\n\nUsername:"
+        ob.tick(200)
+    if name == "takeover":
+        dev.console += TAKEOVER
+        ob.tick(300)
+    return dev, ob
+
+
+@pytest.mark.parametrize("name", ["normal", "borrowed", "half_output_after_password", "exchange_error_after_password",
+                                  "auth_failed", "lost", "takeover"])
+def test_stop_never_sends_anything(name):
+    dev, ob = _scenario(name)
+    sent, console = list(dev.sent), dev.console
+    ob.stop(now=1000)
+    assert dev.sent == sent and dev.console == console                 # stop 不发任何字节
+    assert "quit" not in [t for _r, t in dev.sent]
+    assert ob.state in ("stopped", "failed", "lost")
+
+
+@pytest.mark.parametrize("name,want", [
+    ("normal", "推车登录"), ("borrowed", "借用"), ("half_output_after_password", "密码可能已发出"),
+    ("exchange_error_after_password", "推车登录"), ("lost", None), ("takeover", None),
+])
+def test_exit_note_says_what_console_is_left_in(name, want):
+    _dev, ob = _scenario(name)
+    ob.stop(now=1000)
+    if want is None:
+        assert ob.note is None
+    else:
+        assert want in ob.note and "空闲超时" in ob.note and "quit" in ob.note
