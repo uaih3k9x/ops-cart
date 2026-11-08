@@ -17,7 +17,7 @@ def _app(tmp_path, held=True):
     b = sw.Book.from_text(None, T0)
     if held:
         tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
-        b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, name="SW1")
+        b.submit(1, tok, "stdio:ops@x", "line", "save", DANGER, T0, 30, name="SW1", context="<SW1>")
     state = tmp_path / "serial-write.json"
     state.write_text(b.dumps())
     app.serial_peek = lambda: ms.peek(str(state), clock=lambda: T0 + 3)
@@ -120,3 +120,22 @@ def test_web_page_has_estop_and_no_confirm_button():
     html = (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
     assert 'id="estop-all"' in html and "/api/serial-write/${op}" in html and 'data-p="agent"' in html
     assert "data-confirm" not in html and "/api/serial-write/confirm" not in html
+
+
+def test_web_page_shows_intent_and_model_escaped():
+    import pathlib
+    import webkiosk
+    html = (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
+    assert "esc(it.intent)" in html and "esc(it.model)" in html
+    assert html.index("esc(c.trusted)") < html.index("${c.items.map(agentItem)")
+
+
+def test_web_item_order_reason_danger_note_model_intent_context():
+    import pathlib
+    import webkiosk
+    html = (pathlib.Path(webkiosk.STATIC_DIR) / "index.html").read_text()
+    body = html[html.index("function agentItem"):html.index("function agentCard")]
+    keys = ["esc(it.reason)", "esc(it.danger)", "esc(it.note)", "esc(it.model)", "esc(it.intent)", "esc(it.context)",
+            "esc(it.name)"]
+    pos = [body.index(k) for k in keys]
+    assert pos == sorted(pos)

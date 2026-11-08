@@ -53,7 +53,6 @@ READ_LINES = 80                 # read_output 默认行数
 NAME_TAIL = 30                  # 列执行绪时为认名字读多少行
 OUTPUT_TAIL = 200                # 判断"有没有设备输出"多看多少行
 RECENT_S = 3600                 # 多久内的输出算最近
-TAIL_TIMEOUT = 10
 MAX_IMAGE = 12 * 1024 * 1024    # 截图再大就是抓错东西了
 MAX_BODY = 256 * 1024           # 只读工具的请求都很小
 REBIND_S = 30                   # tailnet 地址晚到 (tailscaled 后起) 时多久再看一次
@@ -165,16 +164,7 @@ def real_slots():
     return lamps_core.slot_status(serial_core.data_dir(serial_core.serial_conf_read()))
 
 
-def conbroker_tail(dev, n):
-    """conbroker tail <口> -n N (以 serial.conf 的 user 身份); 失败抛 ToolError."""
-    try:
-        r = subprocess.run(serial_core._conbroker_cmd() + ["tail", dev, "-n", str(n)], capture_output=True,
-                           text=True, encoding="utf-8", errors="replace", timeout=TAIL_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise mc.ToolError(f"conbroker tail 跑不起来: {e}") from None
-    if r.returncode != 0:
-        raise mc.ToolError(f"conbroker tail 失败: {serial_core.serve_error(r.returncode, r.stderr)}")
-    return r.stdout.rstrip("\n")
+conbroker_tail = mcp_serial.conbroker_tail      # 写串口那边确认前也要重读, 实现放在 mcp_serial (#65)
 
 
 def real_snap(dev, readonly=False):

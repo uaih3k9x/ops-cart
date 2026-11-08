@@ -69,7 +69,7 @@ def test_peek_permission_error_means_all_stopped(tmp_path, monkeypatch):
 
 def test_send_confirmed_sends_and_finishes(rig):
     _tok, p = _held(rig)
-    it, status, out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send)
+    it, status, out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)
     assert status == "sent" and rig.sent == [("/dev/con-1", "save", False)]
     hist = rig.ok("pending_list")["history"][-1]
     assert hist["by"] == cc.BY_KIOSK and hist["status"] == "sent"
@@ -80,7 +80,7 @@ def test_send_confirmed_after_estop_raises_and_sends_nothing(rig):
     _tok, p = _held(rig)
     rig.ok("estop", {"slot": 1})
     with pytest.raises(ms.sw.Refused):
-        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send)
+        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)
     assert rig.sent == []
 
 
@@ -89,7 +89,7 @@ def test_send_confirmed_send_crash_clears_inflight(rig):
 
     def boom(*a):
         raise RuntimeError("x")
-    _it, status, _out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, boom)
+    _it, status, _out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, boom, rig.tail)
     assert status == "error" and "RuntimeError" in note
     assert rig.store.view()["slots"][0]["inflight"] is None
 
@@ -200,7 +200,7 @@ def test_cli_requests_subcommand(rig, tmp_path, monkeypatch):
 
 def test_human_action_confirm_reject_estop_resume(rig):
     _tok, p = _held(rig)
-    act = lambda op, arg: ms.human_action(rig.store, op, arg, cc.BY_KIOSK, lambda: rig.slots, rig.send)  # noqa: E731
+    act = lambda op, arg: ms.human_action(rig.store, op, arg, cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)  # noqa: E731
     assert "sent" in act("confirm", p["id"]) and rig.sent
     _tok2, p2 = _held(rig, slot=2, cmd="reboot")
     assert "拒绝" in act("reject", p2["id"])
@@ -218,5 +218,5 @@ def test_human_action_confirm_reject_estop_resume(rig):
 def test_human_action_confirm_failure_reported(rig):
     _tok, p = _held(rig)
     rig.reply = ("refused", "[conbroker: 拒绝发送, 密码]", "[conbroker: 拒绝发送, 密码]")
-    msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send)
+    msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)
     assert "refused" in msg and "密码" in msg
