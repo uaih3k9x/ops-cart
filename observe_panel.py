@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """串口观察模式的车机窗口 (#85): 输一次密码, 画设备前面板, 灯跟着真机亮灭闪. 逻辑在 observe_core.py.
 
-串口面板选中一路点"观察"打开; 每一路同时只开一个窗口. 线程纪律同 serial_panel: 后台线程 (登录 / 轮询 / quit)
+串口面板选中一路点"观察"打开; 每一路同时只开一个窗口, 和巡检互斥 (observe_core.claim). 线程纪律同 serial_panel: 后台线程 (登录 / 轮询 / quit)
 只往 self.ui 放东西, 界面只在 _tick 里改. 密码框读完立刻清空, 密码只经 Observer.start 传给登录状态机,
 不落盘不进日志. 会话掉了 / 登录失败 / 退出时没敢 quit, 窗口留着, 写明原因, 登录行回来可以再登.
 """
@@ -27,27 +27,8 @@ CELL, GAP, PAD = 40, 8, 16              # 口的格子 / 间隔 / 边距 (像素
 FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
 SNAP_S = 5                              # 多久给副屏写一次快照
 
-_OPEN = {}                              # 串口服务名 -> 占着它的窗口令牌
-_OPEN_LOCK = threading.Lock()
-
-
-def claim(name, token):
-    """每一路只许一个观察窗口: 两个 Observer 的登录会交错, 一个的 quit 会把另一个登出."""
-    with _OPEN_LOCK:
-        if _OPEN.get(name, token) != token:
-            return False
-        _OPEN[name] = token
-        return True
-
-
-def release(name, token):
-    with _OPEN_LOCK:
-        if _OPEN.get(name) == token:
-            del _OPEN[name]
-
-
 def _lit_color(state):
-    return {"up": th.LAMP_OK, "admin": th.LAMP_WARN, "standby": th.DIM}.get(state, OFF)
+    return {"up": th.LAMP_OK, "admin": th.LAMP_WARN, "standby": th.DIM, "unknown": th.MARK}.get(state, OFF)
 
 
 def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD, stale=False):
@@ -137,11 +118,11 @@ class ObserveWindow(tk.Toplevel):
         if self.worker or not user or not pw:
             return
         self.login_btn.config(state="disabled")
-        log = os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log")
+        log = oc.LogFile(os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log"))
         self.obs = oc.Observer(self.name, self.vendor,
                                exchange=functools.partial(oc.broker_exchange, self.ddir, self.name, vendor=self.vendor),
-                               send=functools.partial(survey_core.conbroker_send, grace=oc.POLL_GRACE_S), log_size=lambda: lamps_core.file_size(log),
-                               tail=lambda: oc.read_tail(log), busy=lambda: oc.agent_busy(self.head))
+                               send=functools.partial(survey_core.conbroker_send, grace=oc.POLL_GRACE_S), log=log,
+                               busy=lambda: oc.agent_busy(self.head))
         self.status.config(text="看现场、登录中…", fg=DIM)
         self._snap_at = 0
         self.stop_evt.clear()
@@ -212,6 +193,8 @@ class ObserveWindow(tk.Toplevel):
             self.status.config(text=port_info(obs.ports[self._hover]), fg=FG)
         elif obs.error:
             self.status.config(text=obs.error, fg=th.WARN)
+        elif obs.warning:
+            self.status.config(text=obs.warning, fg=th.WARN)
         elif obs.pacer.paused(time.monotonic()):
             self.status.config(text="有人在用串口, 暂停", fg=DIM)
         else:
@@ -234,14 +217,14 @@ class ObserveWindow(tk.Toplevel):
     def destroy(self):
         self.stop_evt.set()
         oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
-        release(self.name, self.token)
+        oc.release(self.name, self.token)
         super().destroy()
 
 
 def open_for(master, dev, name, vendor, ddir):
     """每一路只开一个; 已经开着就提到前面."""
     token = secrets.token_hex(4)
-    if not claim(name, token):
+    if not oc.claim(name, token):
         for w in master.winfo_children():
             if isinstance(w, ObserveWindow) and w.name == name:
                 w.lift()
@@ -250,5 +233,5 @@ def open_for(master, dev, name, vendor, ddir):
     try:
         return ObserveWindow(master, dev, name, vendor, ddir, token)
     except Exception:
-        release(name, token)
+        oc.release(name, token)
         raise

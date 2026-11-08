@@ -136,15 +136,21 @@ def test_panel_cells_grey_when_stale():
 
 
 def test_one_window_per_port():
-    op._OPEN.clear()
-    assert op.claim("con-1", "w1") is True
-    assert op.claim("con-1", "w2") is False
-    assert op.claim("con-2", "w3") is True
-    op.release("con-1", "w2")                   # 别人的不放
-    assert op.claim("con-1", "w4") is False
-    op.release("con-1", "w1")
-    assert op.claim("con-1", "w4") is True
-    op._OPEN.clear()
+    oc._CLAIMS.clear()
+    assert oc.claim("con-1", "w1") is True
+    assert oc.claim("con-1", "w2") is False
+    assert oc.claim("con-2", "w3") is True
+    oc.release("con-1", "w2")                   # 别人的不放
+    assert oc.claim("con-1", "w4") is False
+    oc.release("con-1", "w1")
+    assert oc.claim("con-1", "w4") is True
+    oc._CLAIMS.clear()
+
+
+def test_unknown_port_drawn_distinctly():
+    ports = [{"name": "GigabitEthernet0/0/1", "label": "1", "x": 0, "y": 0, "shape": "rj45", "state": "unknown"}]
+    cells = op.panel_cells(ports, {p["name"]: p for p in ports}, now=0)
+    assert cells[0]["fill"] not in (op.OFF, th.LAMP_OK, th.LAMP_WARN, th.DIM)
 
 
 def test_layout_view_picks_newest_fresh_of_several():

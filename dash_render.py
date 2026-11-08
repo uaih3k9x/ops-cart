@@ -398,7 +398,7 @@ def _front(d, front, W):
         line = wrap(str(front["note"]), _font(24), W - M - x, 1)
         if line:
             d.text((x, 892), line[0], font=_font(24), fill=WARN)
-    color = {"up": ACCENT, "admin": WARN, "standby": DIM}
+    color = {"up": ACCENT, "admin": WARN, "standby": DIM, "unknown": th.MARK}
     for box, p in front_boxes(front, W):
         lit = p.get("lit") and p.get("state") in color
         fill = color[p["state"]] if lit else LINE

@@ -144,3 +144,45 @@ def test_survey_vendor_from_serial_conf(monkeypatch):
     sp.SerialPanel.survey(p)
     _join_bg()
     assert seen["vendor"] == "cisco"
+
+
+# ------------------------------------------------------------ #85 巡检和观察互斥
+
+def test_survey_refused_while_observing(monkeypatch):
+    import observe_core
+    import survey_core
+
+    def boom(*a, **k):
+        raise AssertionError("不该跑")
+    monkeypatch.setattr(survey_core, "run_survey", boom)
+    observe_core._CLAIMS.clear()
+    observe_core.claim("/dev/con-1", "observe-w1")
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p)
+    _join_bg()
+    assert "观察" in p.written[-1] and not p._surveying
+    observe_core._CLAIMS.clear()
+
+
+def test_survey_holds_claim_until_done(monkeypatch):
+    import observe_core
+    import survey_core
+    observe_core._CLAIMS.clear()
+    monkeypatch.setattr(survey_core, "run_survey", lambda *a, **k: {"ok": True, "summary": "完成", "sections": []})
+    monkeypatch.setattr(survey_core, "record", lambda r: None)
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p)
+    assert observe_core.holder("/dev/con-1") == "survey"
+    _join_bg()
+    sp.SerialPanel._run_ui(p)
+    assert observe_core.holder("/dev/con-1") is None
+
+
+def test_observe_refused_while_surveying():
+    import observe_core
+    observe_core._CLAIMS.clear()
+    observe_core.claim("/dev/con-1", "survey")
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.observe(p)
+    assert "巡检" in p.written[-1]
+    observe_core._CLAIMS.clear()

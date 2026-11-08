@@ -22,6 +22,7 @@ import time
 import tkinter as tk
 
 import kvm_core as kvm
+import observe_core
 import survey_core
 import theme as th
 from serial_core import (  # noqa: F401  界面要用的 + 给老调用方的兼容名
@@ -424,6 +425,9 @@ class SerialPanel(tk.Frame):
         if not name:
             self._con_write([("text", f"\n[巡检] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
             return
+        if not observe_core.claim(name, "survey"):          # #85: 同一路观察和巡检互斥, 命令不能互相插
+            self._con_write([("text", f"\n[巡检] {dev} 正在观察, 先退出观察再巡检\n")], "mark")
+            return
         self._surveying = True
         vendor = self.cfg.get("survey_vendor", "huawei")
         head = survey_core.safe_name(os.path.basename(dev))
@@ -438,6 +442,7 @@ class SerialPanel(tk.Frame):
             return r
 
         def done(r):
+            observe_core.release(name, "survey")
             self._surveying = False
             self._con_write([("text", "\n[巡检] " + r["summary"].replace("\n", "\n       ") + "\n")], "mark")
         self._async(work, done)
@@ -448,6 +453,9 @@ class SerialPanel(tk.Frame):
         name = match_service(dev, self._serves)
         if not name:
             self._con_write([("text", f"\n[观察] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
+            return
+        if observe_core.holder(name) == "survey":
+            self._con_write([("text", f"\n[观察] {dev} 正在巡检, 等巡检跑完再观察\n")], "mark")
             return
         import observe_panel
         observe_panel.open_for(self, dev, name, self.cfg.get("survey_vendor", "huawei"), self.ddir)
