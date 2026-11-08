@@ -65,6 +65,7 @@ CASES = [  # (cmd, vendor, at_prompt, mode, 现有规则下的 verdict)
     ("save", "huawei", True, "exec", "confirm"),
     ("uname -a", "linux", True, "config", "confirm"),
     ("show version", "ruijie", True, "exec", "pass"),                  # #57 起锐捷有 is_readonly 规则
+    ("show aggregatePort summary", "ruijie", True, "exec", "confirm"),  # 白名单命中但 is_readonly 不过: 影子不升放行
 ]
 
 
@@ -101,6 +102,10 @@ def test_shadow_fields_on_gate():
     assert g["verdict"] == "pass"                                   # #57 起 is_readonly 的 session 放
     assert g["shadow"] == {"allowlist": "huawei:screen-length 0 temporary", "src": "survey",
                            "readonly": True, "pass": True}
+    g = sw.classify("show aggregatePort summary", "ruijie", True, r, mode="exec")
+    assert g["verdict"] == "confirm"                                # 白名单命中也不放: pass 要两边都过
+    assert g["shadow"] == {"allowlist": "ruijie:show aggregatePort summary", "src": "待核",
+                           "readonly": False, "pass": False}
 
 
 def test_shadow_with_extra_verbs_readonly():
