@@ -166,8 +166,10 @@ net use D: \\<推车装机地址>\drivers /user:winpe <密码>     # 驱动总�
 ## 坑
 
 - **Win11 内核的 PE 默认拒绝来宾访问**，所以装机共享一律账号登录。`net use` 要带 `/user:winpe`。
-- smbd 只听 `lo` 和 `eno1`（`bind interfaces only`）。开机时 LAN1 没插线就没地址、smbd 没绑上；插线来地址时
-  NetworkManager 的 `50-ops-cart-smb` 会重启 smbd 绑上。还不行就 `sudo systemctl restart smb`。
+- smbd 只听 `lo` 和 `eno1`（`bind interfaces only`）。LAN1 没插线就没地址，smbd 起来找不到接口会崩出 core（#95），
+  所以 `smb.service.d/ops-cart-lan1.conf` 在 LAN1 没地址时直接跳过 smbd（单元是 inactive，不是 failed）；插线来地址时
+  NetworkManager 的 `50-ops-cart-smb` 把 smbd（重）启起来。还不行就 `sudo systemctl restart smb`。
+  LAN1 没插线时 `smbclient -L //127.0.0.1` 也连不上，是正常的。
 - ISO 文件名只许 ASCII 字母数字和 `. _ -`；单元名按 `systemd-escape --path` 转义（`win11-24h2` →
   `srv-data-win-win11\x2d24h2.mount`），`systemctl status` 时要加引号。
 - ISO 按 UDF 挂（Windows 的 ISO 都是 UDF）。挂载带 `context=...samba_share_t`，SELinux enforcing 下 smbd 才读得到。

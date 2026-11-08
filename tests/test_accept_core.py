@@ -451,3 +451,38 @@ def test_judge_rapid():
     assert ac.judge_rapid(True, 0, "1.4.4")[0] == ac.PASS
     st, why = ac.judge_rapid(True, 1, "ImportError: libGL")
     assert st == ac.FAIL and "libGL" in why
+
+
+# ------------------------------------------------------------ 系统自带单元 (#95)
+
+def _props(act="inactive", sub="dead", en="enabled", result="success", status="0", load="loaded"):
+    return {"LoadState": load, "ActiveState": act, "SubState": sub, "UnitFileState": en,
+            "Result": result, "ExecMainStatus": status}
+
+
+def test_judge_smb_no_lan1_address_is_skip():
+    st, why = ac.judge_smb(_props(), lan1_up=False)
+    assert st == S and "LAN1" in why
+
+
+def test_judge_smb_crashed_is_fail_even_without_link():
+    """没链路时也不该有 failed (#95 之后 ExecCondition 只会跳过); 有 failed 就是又崩了 / 钩子没装."""
+    st, why = ac.judge_smb(_props("failed", "failed", result="core-dump", status="6"), lan1_up=False)
+    assert st == F and "core-dump" in why
+
+
+def test_judge_smb_lan1_up_must_run_when_enabled():
+    assert ac.judge_smb(_props(), lan1_up=True)[0] == F
+    assert ac.judge_smb(_props("active", "running"), lan1_up=True)[0] == P
+
+
+def test_judge_smb_not_installed_is_skip():
+    assert ac.judge_smb(_props(load="not-found", en=""), lan1_up=True)[0] == S
+    assert ac.judge_smb(None, lan1_up=True)[0] == S
+
+
+def test_logrotate_last_run_must_succeed():
+    st, why = ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"],
+                            _props("failed", "failed", en="static", result="exit-code", status="1"))
+    assert st == F
+    assert ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"], _props(en="static"))[0] == P

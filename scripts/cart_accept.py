@@ -254,6 +254,29 @@ def unit_checks():
     return [ac.Check(f"单元 {n}", spec["issue"], one(n)) for n, spec in ac.UNITS.items()]
 
 
+def system_unit_checks():
+    """系统自带的单元 (#95): smb 只绑 LAN1, 没地址时跳过算 SKIP; logrotate 每天 0 点跑, 上次失败 = 有日志没轮转."""
+    def show():
+        rc, out, _ = sh(["systemctl", "show", "-p", ac.SHOW_PROPS] + sorted(ac.SYSTEM_UNITS))
+        return None if rc == 127 else ac.parse_show(out)
+
+    def smb():
+        d = show()
+        if d is None:
+            return ac.SKIP, "没有 systemctl (不是推车)"
+        lan1_up = " inet " in sh(["ip", "-4", "-o", "addr", "show", "dev", "eno1"])[1]
+        return ac.judge_smb(d.get("smb.service"), lan1_up)
+
+    def logrotate():
+        d = show()
+        if d is None:
+            return ac.SKIP, "没有 systemctl (不是推车)"
+        return ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"], d.get("logrotate.service"))
+
+    return [ac.Check("单元 smb.service (装机共享)", "#95", smb),
+            ac.Check("单元 logrotate.service (日志轮转)", "#95", logrotate)]
+
+
 def chk_selinux():
     rc, out, _ = sh(["getenforce"])
     if rc == 127:
@@ -302,7 +325,7 @@ def log_checks():
             ac.Check("pxe-req.log (PXE 申请)", "#24", one(LOG + "/pxe-req.log", False)),
             ac.Check("serial-slot*.log (Agent 写串口)", "#21", slots),
             ac.Check("巡检存档 survey/", "#15", survey),
-            ac.Check("pxeserver.log", "#11", one(OPT + "/pxeserver.log", pxe)),
+            ac.Check("pxeserver.log (装机口)", "#95", one(LOG + "/pxeserver.log", pxe)),
             ac.Check("journald 落盘", "-", journal)]
 
 
@@ -767,7 +790,7 @@ def main(argv=None):
         print("清单读不懂, 不比对 sha256:", err)
     checks = ([ac.Check("以 root 运行", "-", chk_root), ac.Check("平台", "-", chk_platform)]
               + make_version_checks(expect, a.expect_build, manifest)
-              + unit_checks()
+              + unit_checks() + system_unit_checks()
               + [ac.Check("SELinux 模块 ops_cart_mounton (webkiosk 要)", "-", chk_selinux, timeout=70)]
               + log_checks() + font_checks() + config_checks() + import_checks()
               + issue_checks(expect))

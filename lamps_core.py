@@ -12,6 +12,7 @@ import re
 import struct
 import time
 
+import cartlog
 import theme as th
 
 SAMPLE_MS = 200
@@ -38,7 +39,7 @@ def slot_for_lamp(key):
     不存在的口, 面板显示"未插", 再点开服务 conbroker 就报"无 conN 这个设备"。
     """
     return f"/dev/{key}"
-PXE_LOG = "/opt/pxe/pxeserver.log"
+PXE_LOG = os.path.join(cartlog.LOG_DIR, "pxeserver.log")     # #95 跟 kiosk_core.PXE_LOG 一样
 SPKR = "/dev/input/by-path/platform-pcspkr-event-spkr"
 EV_SND, SND_TONE = 0x12, 0x02
 

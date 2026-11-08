@@ -346,6 +346,11 @@ UNITS = {
     "cart-fan-curve.service": _u(None, None, "-", oneshot=True),
     "cart-revtunnel.service": _u(None, None, "-", note="备用远程通道; 没 revtunnel.env 就不起"),
 }
+# 系统自带、不在 deploy/systemd 里的单元 (#95): smb 由 judge_smb 判 (要看 LAN1 有没有地址), logrotate 只看上次跑成没成
+SYSTEM_UNITS = {
+    "smb.service": _u(None, None, "#95", note="装机共享; 只绑 LAN1"),
+    "logrotate.service": _u(None, None, "#95", oneshot=True),
+}
 SHOW_PROPS = "Id,LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainStatus,NeedDaemonReload"
 _ENABLED = ("enabled", "enabled-runtime", "alias", "linked", "linked-runtime")
 
@@ -387,6 +392,16 @@ def judge_unit(spec, props):
     if enabled and act not in ("active", "activating", "reloading"):
         return FAIL, f"{state}: 开了自启却没在跑"
     return PASS, state
+
+
+def judge_smb(props, lan1_up):
+    """smb.conf 只绑 LAN1: 没地址时 smb.service.d/ops-cart-lan1.conf 让它跳过 (inactive), 这时 SKIP.
+    failed 不管有没有链路都 FAIL —— 跳过不会留下 failed, 有就是又崩了 / drop-in 没装."""
+    if not props or props.get("LoadState") != "loaded":
+        return SKIP, "没装 Samba"
+    if not lan1_up and props.get("ActiveState") != "failed":
+        return SKIP, f"LAN1 没地址 (没插线), smbd 等插线来地址再起 ({props.get('ActiveState')})"
+    return judge_unit(SYSTEM_UNITS["smb.service"], props)
 
 
 # ============================================================ SELinux / 字体 / 权限 / 配置

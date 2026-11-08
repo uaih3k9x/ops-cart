@@ -1002,7 +1002,7 @@ class PinGate:
 
 TFTP_ROOT = "/opt/pxe/tftp"
 PXE_MODE = "/opt/pxe/pxe-mode.json"
-PXE_LOG = "/opt/pxe/pxeserver.log"
+PXE_LOG = os.path.join(cartlog.LOG_DIR, "pxeserver.log")     # #95: /opt/pxe 是 usr_t, logrotate 读不了
 ARM_SECONDS = 30 * 60
 
 
