@@ -1080,3 +1080,28 @@ def test_no_pager_off_left():
     assert "pager_off" not in oc.DEFAULT_PROFILES["huawei"]
     src = open(oc.__file__, encoding="utf-8").read()
     assert "screen-length" not in src and "pager_off" not in src
+
+
+# ============================================================ 第十轮: 观察有总时长上限
+
+def test_observation_stops_at_max_duration():
+    dev, ob = _started(profile={"max_s": 300})
+    assert ob.tick(100) is True
+    assert ob.tick(350) is True or ob.state == "polling"
+    n = len(dev.polls)
+    assert ob.tick(401) is False and ob.state == "stopped" and "时长上限" in ob.reason
+    assert ob.tick(500) is False and len(dev.polls) == n
+    ob.stop()
+    assert ob.state == "stopped" and "时长上限" in ob.reason
+
+
+def test_default_max_duration_is_30_minutes():
+    assert oc.DEFAULT_PROFILES["huawei"]["max_s"] == 1800
+
+
+def test_profile_can_override_max_duration(tmp_path):
+    p = tmp_path / "prof.json"
+    p.write_text(json.dumps({"huawei": {"max_s": 600}}))
+    assert oc.load_profile("huawei", str(p))["max_s"] == 600
+    p.write_text(json.dumps({"huawei": {"max_s": "lots"}}))
+    assert oc.load_profile("huawei", str(p))["max_s"] == 1800

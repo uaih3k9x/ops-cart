@@ -227,6 +227,7 @@ class SerialPanel(tk.Frame):
             self.con_title.config(text=f"控制台 · 连接失败: {e}", fg=th.BAD)
             return
         self.sock, self._reconnect = s, False
+        self._conn_name, self._conn_dev = name, dev     # #85: 观察接管 / 接回控制台以这个为准
         self.term = TermFeed()
         self.con_title.config(text=f"控制台 · {dev} @ {self._serves.get(name, '?')} · 键盘直通串口",
                               fg=th.OK)

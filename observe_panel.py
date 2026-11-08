@@ -35,11 +35,14 @@ _WINDOWS = weakref.WeakSet()            # 开着的观察窗口: 锁屏时隐藏
 
 
 def hide_all():
-    """锁屏: 等待中的设备确认作废 (解锁后让人重新点), 窗口藏起来."""
+    """锁屏: 等待中的设备确认作废; 正在跑的观察停掉 (轮询会替人给 console 保活); 窗口藏起来. 解锁后不自动恢复."""
     for w in list(_WINDOWS):
         if _alive(w):
             if getattr(w, "_confirming", None):
                 w.cancel_confirm("锁屏了, 确认已取消; 解锁后请重新点 开始观察")
+            worker = getattr(w, "worker", None)
+            if worker is not None and worker.is_alive():
+                w.stop_for_lock()
             w.withdraw()
 
 
@@ -67,7 +70,16 @@ class ConsoleHold:
         self.name, self.panels, self.active = name, panels or oc.live_panels, False
 
     def _mine(self, p):
-        return _alive(p) and match_service(p.port_var.get(), p._serves) == self.name
+        """面板是不是 (或者刚才是) 连着这一路: 连着的以 _connect 成功时记下的服务名为准 (list 一时返回空也不会错);
+        没连着的看它选着的口 (记录里的口没变, 或者能从服务列表对上)."""
+        if not _alive(p):
+            return False
+        rec, dev = getattr(p, "_conn_name", None), getattr(p, "_conn_dev", None)
+        if getattr(p, "sock", None) and rec is not None:
+            return rec == self.name
+        if rec == self.name and dev is not None and p.port_var.get() == dev:
+            return True
+        return match_service(p.port_var.get(), p._serves) == self.name
 
     def pause(self):
         """登记并断开连着这一路的面板; 返回断没断开."""
@@ -200,6 +212,7 @@ class ObserveWindow(tk.Toplevel):
         self.life = Life(name, token)
         self._snap_err = None
         self._confirming = None             # (obs, 设备名): 等人在窗口里点 确认 / 取消
+        self._stop_reason = None            # 窗口这边叫停的原因 (锁屏)
         self.overrideredirect(True)
         W, H = WIN_W, WIN_H
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
@@ -253,6 +266,7 @@ class ObserveWindow(tk.Toplevel):
             return
         self._confirming = (obs, name)
         self.start_btn.config(state="disabled")
+        self.status.config(text="请确认设备名", fg=DIM)       # 别残留上一次的失败原因
         self._show_confirm(confirm_text(name))
 
     def confirm(self):
@@ -271,6 +285,7 @@ class ObserveWindow(tk.Toplevel):
             self.start_btn.config(state="normal")
             return
         self.obs = obs
+        self._stop_reason = None
         self._closing = False               # 上次点过退出观察、留着窗口再开始: 按钮恢复
         self.close_btn.config(state="normal", text="退出观察", command=self.close)
         self.status.config(text=f"观察 <{name}>…", fg=DIM)
@@ -317,6 +332,12 @@ class ObserveWindow(tk.Toplevel):
                 life.worker_done()
             self.ui.put(self._ended)
 
+    def stop_for_lock(self):
+        """锁屏: 停止观察 (按正常退出收尾, 面板照常接回), 解锁后不自动恢复, 要人重新点 开始观察."""
+        self._stop_reason = "锁屏, 观察已停止; 需要继续请解锁后重新点 开始观察"
+        self.stop_evt.set()
+        oc.record("stop", head=self.head, note="锁屏, 观察已停止")
+
     def _console_back(self):
         msg = self.hold.resume()
         if msg and _alive(self):
@@ -330,7 +351,8 @@ class ObserveWindow(tk.Toplevel):
         if self._closing and not obs.error:
             return self.destroy()
         self._write_snap()
-        self.status.config(text=obs.error or "已停止", fg=th.BAD if obs.error else DIM)
+        why = getattr(obs, "reason", None) or self._stop_reason
+        self.status.config(text=obs.error or why or "已停止", fg=th.BAD if obs.error else th.WARN if why else DIM)
         self.start_btn.config(state="normal")
         self.close_btn.config(state="normal", text="关闭" if self._closing else "退出观察",
                               command=self.destroy if self._closing else self.close)

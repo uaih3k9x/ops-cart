@@ -781,3 +781,86 @@ def test_new_panel_shows_observing_after_refresh():
     p = P()
     sp.SerialPanel._after_refresh(p, True)
     assert p.shown == 0 and p.connected == [True]
+
+
+# ============================================================ 第十轮
+
+def test_lock_stops_running_observation_without_auto_resume(monkeypatch):
+    import threading
+    got = []
+    monkeypatch.setattr(oc, "record", lambda action, **kw: got.append((action, kw)))
+    op._WINDOWS.clear()
+
+    class W(_Win):
+        _confirming = None
+
+        def __init__(self):
+            super().__init__()
+            self.stop_evt, self.head, self._stop_reason = threading.Event(), "con-1", None
+            self.worker = threading.Thread(target=lambda: None)
+            self.worker.start()
+            self.worker.join()
+            self.worker = threading.Thread(target=lambda: self.stop_evt.wait(5), daemon=True)
+            self.worker.start()
+
+        def stop_for_lock(self):
+            op.ObserveWindow.stop_for_lock(self)
+    w = W()
+    op._WINDOWS.add(w)
+    op.hide_all()
+    assert w.stop_evt.is_set() and "锁屏" in w._stop_reason
+    assert got and "锁屏" in got[0][1]["note"]
+    w.worker.join(2)
+    op.show_all()
+    assert w.stop_evt.is_set()                      # 解锁不会自动恢复
+    op._WINDOWS.clear()
+
+
+def test_ended_shows_stop_reason():
+    class Obs:
+        error, reason = None, "已到时长上限 (30 分钟), 需要继续请重新开始观察"
+
+    class W:
+        _closing, _stop_reason = False, None
+
+        def __init__(self):
+            self.obs, self.worker = Obs(), object()
+            self.status, self.start_btn, self.close_btn = _Lbl(), _Lbl(), _Lbl()
+            self.close = self.destroy = None
+
+        def _console_back(self):
+            pass
+
+        def _write_snap(self):
+            pass
+    w = W()
+    op.ObserveWindow._ended(w)
+    assert "时长上限" in w.status.kw["text"]
+    w = W()
+    w.obs.reason, w._stop_reason = None, "锁屏, 观察已停止"
+    op.ObserveWindow._ended(w)
+    assert "锁屏" in w.status.kw["text"]
+
+
+def test_console_hold_uses_recorded_connection_when_list_empty():
+    p = _Panel()
+    p._serves = {}                                  # list 一时返回空
+    p._conn_name, p._conn_dev = "/dev/con-1", "/dev/con-1"
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
+    assert h.pause() is True and p.calls == ["disconnect"]
+    h.resume()
+    assert p.calls[-1] == ("connect", False)
+
+
+def test_console_hold_ignores_panel_recorded_on_other_port():
+    p = _Panel()
+    p._conn_name, p._conn_dev = "/dev/con-2", "/dev/con-2"
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
+    assert h.pause() is False and p.calls == []
+
+
+def test_begin_clears_old_failure_text():
+    w = _BeginWin(("SW-TEST", None))
+    w.status.kw["text"] = "没开始: console 还没登录"
+    op.ObserveWindow.begin(w)
+    assert "没开始" not in w.status.kw["text"]

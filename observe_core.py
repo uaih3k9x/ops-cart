@@ -271,7 +271,8 @@ def slot_of(dev, realpath=os.path.realpath, slots=None):
 
 def agent_busy(dev, states=None, realpath=os.path.realpath):
     """Agent 写串口 (#21/#23) 占着这一路: 有写租约 / 在发 / 有命令等确认 / 急停中 -> 原因; 没有 None.
-    先把设备路径解析到 con-N 操作头; 解析不出来 / 状态读不懂都按占着算 (看不清就不轮询)."""
+    先把设备路径解析到 con-N 操作头; 解析不出来 / 状态读不懂都按占着算 (看不清就不轮询).
+    mcp_serial.peek() 只读 /run 下的状态文件 (不加锁、不走 IPC, 写的一方原子改名), 界面线程里调不会卡住."""
     n = slot_of(dev, realpath)
     if n is None:
         return "看不清这一路对应哪个操作头 (con-N), 查不了 Agent 占用, 按占用算"
@@ -521,13 +522,14 @@ class Pacer:
 # ------------------------------------------------------------ 会话编排
 
 DEFAULT_PROFILES = {"huawei": {"poll": ["display interface brief"], "version": "display version",
-                               "timeout": 20}}
+                               "timeout": 20,
+                               "max_s": 1800}}   # 观察总时长上限: 轮询会让 console 一直不空闲超时, 不能无限保活
 POLL_GRACE_S = 10       # conbroker send 子进程在 -t 之外多给的秒数 (巡检是 60); 退出观察最多等一轮 = 20 + 10 秒
 
 
 def load_profile(vendor, path=PROFILES_PATH):
     """内置 profile, JSON 只能改 poll / version / timeout (关翻页命令写死, 反正也要过闸门)."""
-    prof = dict(DEFAULT_PROFILES.get(vendor) or {"poll": [], "version": None, "timeout": 20})
+    prof = dict(DEFAULT_PROFILES.get(vendor) or {"poll": [], "version": None, "timeout": 20, "max_s": 1800})
     try:
         with open(path, encoding="utf-8") as f:
             over = json.load(f).get(vendor)
@@ -540,6 +542,8 @@ def load_profile(vendor, path=PROFILES_PATH):
             prof["version"] = over["version"]
         if isinstance(over.get("timeout"), (int, float)):
             prof["timeout"] = over["timeout"]
+        if isinstance(over.get("max_s"), (int, float)) and not isinstance(over["max_s"], bool) and over["max_s"] > 0:
+            prof["max_s"] = over["max_s"]
     return prof
 
 
@@ -585,6 +589,8 @@ class Observer:
         self.layouts = layouts if layouts is not None else load_layouts()
         self.clock, self.busy, self.wall = clock, busy or (lambda: None), wall
         self.state, self.error, self.warning, self.device, self.model = "idle", None, None, None, None
+        self.reason = None              # 自己停下的原因 (到时长上限), stop() 不清
+        self._t0 = None                 # 第一次 tick 的时间, 算总时长
         self.ports, self.panel, self.polled_at = {}, [], None
         self._ports_id = None           # 第一轮看到的物理口集合: sysname 一样的两台 (<HUAWEI>) 换了线靠它认
         self._ports_odd = False         # 上一轮口集合对不上 (可疑); 连续两轮对不上才判 lost
@@ -674,6 +680,13 @@ class Observer:
     def tick(self, now):
         """到点就轮询一轮. 发了且成功 True; 没到点 / 人在用 / 失败 False."""
         if self.state != "polling":
+            return False
+        if self._t0 is None:
+            self._t0 = now
+        limit = self.profile.get("max_s") or 1800
+        if now - self._t0 >= limit:         # 轮询会替人给 console 保活: 到点就停, 要继续请人重新开始
+            self.state = "stopped"
+            self.reason = f"已到时长上限 ({int(limit // 60)} 分钟), 需要继续请重新开始观察"
             return False
         self.pacer.note_log(self.log.size(), now)
         if self.pacer.paused(now) and not self._advance(self.log.size()):  # 人在用: 他敲的先扫一遍, 再从这里接着看
