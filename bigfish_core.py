@@ -4,7 +4,8 @@
 docs/BIGFISH_PANEL.md:
 - 状态: /home/bigfish/status/bigfish.json, bigfish 写, 车机 / 副屏只读. 车机不进它的容器、不读它的数据卷.
 - 急停: /run/bigfish-ctl/estop.json, 车机写 (root:bigfish 0640, seq 递增), 大肥鱼读; 解除全部急停时删掉.
-  写完 HARD_AFTER_S 秒内状态文件的 estop.seen 没变 true (或者离线), 车机 systemctl stop user@<bigfish uid>.service.
+  写完 HARD_AFTER_S 秒内状态文件没确认 (estop.seen; v1.1 还要 estop.seq 对上) 或者离线, 车机 loginctl
+  terminate-user bigfish + systemctl stop user@<bigfish uid>.service. 只有车机入口写 estop.json, 终端急停不写.
   两个目录都由大肥鱼那边的 setup-root.sh 建, 本仓库不加 tmpfiles.
 - 权限 (docs 有详细依据): estop.json 先 fchown 成 bigfish 组 + fchmod 0640 再改名, 不看 umask, bigfish 经属组可读
   (/run/bigfish-ctl 是 root:bigfish 0750). bigfish.json 由 root (kiosk / cart-dash, 单元无 ProtectHome) 读, 不靠
@@ -45,6 +46,11 @@ SAYS = "大肥鱼说："
 
 TASK_STATES = {"starting": "启动中", "running": "在做事", "done": "做完了", "failed": "失败",
                "cancelled": "已取消", "estopped": "急停中"}
+# stop_reason 只显示枚举 (ACP 的 stopReason + wrapper 自己的 estop / cancelled), 不认识的显示"其他", 不露原文
+STOP_REASONS = {"estop": "急停", "cancelled": "已取消", "end_turn": "正常结束", "max_tokens": "超出长度",
+                "max_turn_requests": "轮数到上限", "refusal": "模型拒绝"}
+BAD_SEQ = -1                # v1.1 estop.seq 给了但不合格: 当成和谁都对不上
+SEQ_MAX = 2 ** 53
 cartlog_event = cartlog.event
 
 
@@ -105,18 +111,20 @@ def _int(v, hi=STEP_MAX):
 
 
 def _offline(why):
-    return {"online": False, "why": why, "estop_seen": False, "current": None, "running_count": 0,
+    return {"online": False, "why": why, "estop_seen": False, "estop_seq": None, "current": None, "running_count": 0,
             "said": {"title": "", "output": [], "steps": []}}
 
 
 def _current(c):
     if not isinstance(c, dict) or c.get("state") not in TASK_STATES:
         return None
-    total = _int(c.get("steps_total"))
-    cur = _int(c.get("step_current"), total) if total is not None else None
+    total = _int(c.get("steps_total"))             # 0 = 总步数未知
+    cur = _int(c.get("step_current"), total or STEP_MAX) if total is not None else None
+    reason = c.get("stop_reason")
     return {"state": c["state"], "started_at": _num(c.get("started_at")), "elapsed_s": _num(c.get("elapsed_s"), 0),
             "steps_total": total, "step_current": cur,
-            "stop_reason": clean(c.get("stop_reason"), TRUSTED_STR_MAX), "source": clean(c.get("source"), TRUSTED_STR_MAX)}
+            "stop_reason": STOP_REASONS.get(reason, "其他") if isinstance(reason, str) and reason else "",
+            "source": clean(c.get("source"), TRUSTED_STR_MAX)}
 
 
 def _said(u):
@@ -145,8 +153,9 @@ def parse(text, now):
         return _offline("状态读不懂")
     if now - d["written_at"] > STALE_S or d["written_at"] - now > FUTURE_S:
         return _offline("离线")
-    es = d.get("estop")
-    return {"online": True, "why": "", "estop_seen": isinstance(es, dict) and es.get("seen") is True,
+    es = d.get("estop") if isinstance(d.get("estop"), dict) else {}
+    seq = None if "seq" not in es else (_int(es["seq"], SEQ_MAX) if _int(es["seq"], SEQ_MAX) is not None else BAD_SEQ)
+    return {"online": True, "why": "", "estop_seen": es.get("seen") is True, "estop_seq": seq,   # seq: v1.1
             "current": _current(d.get("current")), "running_count": _int(d.get("running_count")) or 0,
             "said": _said(d.get("untrusted"))}
 
@@ -161,8 +170,9 @@ def _doing(view):
     if cur is None:
         return "空闲"
     text = TASK_STATES[cur["state"]]
-    if cur["state"] == "running" and cur["steps_total"] and cur["step_current"] is not None:
-        text += f" · 第 {cur['step_current']}/{cur['steps_total']} 步"
+    if cur["state"] == "running" and cur["steps_total"] is not None and cur["step_current"] is not None:
+        total = f"/{cur['steps_total']}" if cur["steps_total"] else ""        # 总数 0 = 未知, 只说第几步
+        text += f" · 第 {cur['step_current']}{total} 步"
     return text
 
 
@@ -270,26 +280,36 @@ def estop_clear(path=None):
 
 
 class EstopWatch:
-    """写了急停之后每秒看一眼状态文件: estop.seen 为 true -> "seen"; 到了 HARD_AFTER_S 还没 (或者离线) -> "hard"."""
+    """写了急停之后每秒看一眼状态文件: 确认了 -> "seen"; 到了 HARD_AFTER_S 还没 (或者离线) -> "hard".
+    确认 = estop.seen 为 true; v1.1 起状态里有 estop.seq 时还要等于这次写的 seq (没有这个字段退回 v1)."""
 
-    def __init__(self, t0, wait=HARD_AFTER_S):
-        self.t0, self.wait = t0, wait
+    def __init__(self, t0, wait=HARD_AFTER_S, seq=None):
+        self.t0, self.wait, self.seq = t0, wait, seq
 
     def step(self, now, view):
-        if view["online"] and view["estop_seen"]:
+        echo = view.get("estop_seq")
+        if view["online"] and view["estop_seen"] and (echo is None or self.seq is None or echo == self.seq):
             return "seen"
         return "hard" if now - self.t0 >= self.wait else None
 
 
-def hard_stop(run, uid, why, event=None):
-    """硬急停: systemctl stop user@<uid>.service (bigfish 的整个用户管理器, rootless dockerd 跟着停), 记一条 cartlog.
-    -> (成功没有, 一句话). 恢复不归车机管."""
+def hard_stop(run, uid, why, event=None, user=USER):
+    """硬急停: 先 loginctl terminate-user (结束会话), 再 systemctl stop user@<uid>.service (整个用户管理器,
+    rootless dockerd 和容器跟着停), 都用列表参数; 记一条 cartlog. 成败看 systemctl 那条 (没有会话时
+    terminate-user 会失败, 不算). -> (成功没有, 一句话). 恢复不归车机管."""
     event = event or cartlog_event
     if uid is None:
         msg = "找不到 bigfish 用户, 没法硬停"
         event("bigfish", f"硬急停失败: {msg} ({why})")
         return False, msg
     unit = f"user@{uid}.service"
+    rc_t, _out = run(["loginctl", "terminate-user", user])
     rc, _out = run(["systemctl", "stop", unit])
-    event("bigfish", f"硬急停: systemctl stop {unit} rc={rc} ({why})")
-    return rc == 0, f"systemctl stop {unit} rc={rc}"
+    msg = f"loginctl terminate-user {user} rc={rc_t}; systemctl stop {unit} rc={rc}"
+    event("bigfish", f"硬急停: {msg} ({why})")
+    return rc == 0, msg
+
+
+def estop_active(path=None):
+    """estop.json 在不在 (在 = 大肥鱼还在拒任务). 面板据此显示"解除大肥鱼急停"."""
+    return os.path.lexists(path or ESTOP_PATH)

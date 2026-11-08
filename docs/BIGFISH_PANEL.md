@@ -33,6 +33,12 @@
 - 车机面板上的急停按钮，和现有的"Agent 全部急停"，都要挂到这个动作上。全部急停解除时，同步删除这个文件。
 - 硬急停兜底：写完 estop.json 后 10 秒内，如果状态文件里 `estop.seen` 没变成 true（或者状态文件离线），kiosk 就执行 `systemctl stop user@<bigfish 的 uid>.service`，按用户名查 uid，不要写死，并记一条 cartlog。面板显示"已硬停，需人工恢复"。恢复的事 kiosk 不管。
 
+## 一点五、v1.1 新增字段（向后兼容）
+
+- 状态文件 `estop` 新增 `seq`：wrapper 回显它最近处理过的那个 estop.json 的 `seq`。
+- 判定规则：kiosk 判"大肥鱼已急停"时，状态里有 `estop.seq`，就要求 `estop.seen == true` 并且 `estop.seq` 等于这次写入的 seq；字段给了但不是非负整数时，按对不上处理。字段是 `null` 时（wrapper 还没处理过任何 estop.json，或者文件不存在、读不懂），也算对不上。没有这个字段时，退回 v1 的判断，只看 `estop.seen == true`。
+- 兼容性：v1 的 wrapper 不写这个字段，判断照旧，`schema` 仍然是 1。
+
 ## 二、推车这边的实现（`bigfish_core.py`、`bigfish_panel.py`、`kiosk.py`）
 
 ### 读状态文件
@@ -41,10 +47,10 @@
 - 可信字段也做校验，不合格的单独丢掉，不影响其他字段：
   - `current.state` 不在白名单里，整个 `current` 丢弃。
   - `elapsed_s` 必须是 ≥ 0 的数字。
-  - `steps_total` 必须是 0 到 10000 的整数；`step_current` 是 0 到 `steps_total` 的整数，`steps_total` 不合格时 `step_current` 一起丢弃。
+  - `steps_total` 必须是 0 到 10000 的整数，0 表示总步数未知。`step_current` 是不超过 `steps_total` 的非负整数；`steps_total` 为 0 时上限是 10000；`steps_total` 不合格时，`step_current` 一起丢弃。显示时，总步数已知写"第 2/5 步"，为 0 时只写"第 2 步"。
   - `estop.seen` 只认布尔值 `true`。
   - `running_count` 必须是 ≥ 0 的整数。
-  - `stop_reason` 和 `source` 也照样清洗，最多 40 字。
+  - `stop_reason` 只按枚举显示，不显示原文：`estop` 显示"急停"，`cancelled` 显示"已取消"，`end_turn` 显示"正常结束"，`max_tokens` 显示"超出长度"，`max_turn_requests` 显示"轮数到上限"，`refusal` 显示"模型拒绝"，其他值一律显示"其他"。`source` 清洗后最多 40 字，不显示。
   - `writer` 和 `seq` 不显示。
 - 不可信字段先清洗再显示，清洗规则是 `confirm_core.one_line`：删 ANSI 和 OSC 转义，控制、格式字符（含双向覆盖、零宽字符、U+2028）换成 `?`，空白压成一个空格，超长截断加"…"。
   - `title` 最多 200 字。
@@ -59,8 +65,17 @@
   1. 读出旧 seq，没有或者读不懂就当 0，新 seq 等于旧值加 1。
   2. 用 `O_EXCL | O_NOFOLLOW` 建临时文件，先 `fchown` 成 bigfish 组、`fchmod 0640`，写入后 fsync。
   3. `rename` 覆盖正式文件。这样大肥鱼不会读到半个文件，也不会读到一个它没有权限读的文件。
-- 解除全部急停：串口那边解除成功后，删除 estop.json，同时清掉看门器。解除失败时保留文件。
-- 看门器：写完 estop.json 后每秒读一次状态文件。看到 `estop.seen == true` 就显示"大肥鱼已急停"。满 10 秒还没看到（或者状态文件离线），就在后台执行 `systemctl stop user@<uid>.service`，超时 30 秒，并记一条 cartlog（kind 为 `bigfish`，带上 rc 和原因）。成功后面板显示"已硬停，需人工恢复"，失败则显示"硬停失败: …"。
+- 解除全部急停：串口那边解除成功后，删除 estop.json，同时清掉看门器。解除失败时保留文件。如果串口那边已经没有急停、只剩 estop.json，"解除全部急停"的检查也照样放行，只删 estop.json。
+- **estop.json 残留后的恢复**：有三种情况会让 estop.json 留下来，而串口那边已经没有急停：在终端里 resume 解除；按路逐个解除；或者写完 estop.json 后串口急停本身失败了。这时大肥鱼会一直拒任务。恢复办法：
+  1. 在车机上：大肥鱼面板只要 estop.json 还在，就显示「解除大肥鱼急停」按钮。点它先验 PIN（没设 PIN 时直接过，和锁屏、电源用的是同一个闸门），通过后删掉 estop.json，不动串口。
+  2. 在终端里：手动删除文件 `sudo rm -f /run/bigfish-ctl/estop.json`。大肥鱼读不到这个文件后，就会恢复接活。
+- 只有车机上的入口会写 estop.json。在终端里执行 `mcp_serial` / `cart_mcp.py estop`（全部急停）只停串口，不写 estop.json。所以"全部急停也停大肥鱼"只对车机入口成立。
+- 看门器：写完 estop.json 后每秒读一次状态文件。看到确认（v1 只看 `estop.seen == true`，v1.1 还要 `estop.seq` 等于这次写的 seq）就显示"大肥鱼已急停"。满 10 秒还没看到确认，或者状态文件离线，就硬停：
+  1. 先执行 `loginctl terminate-user bigfish`，结束 bigfish 的会话。
+  2. 再执行 `systemctl stop user@<uid>.service`，停掉整个用户管理器，rootless dockerd 和所有容器会一起停。
+  - 两条命令都用列表参数调用，用户名和 uid 按 `pwd` 查，超时各 30 秒。成败只看 systemctl：bigfish 没有登录会话时，terminate-user 会失败，这不算硬停失败。
+  - 记一条 cartlog（kind 为 `bigfish`，带两条命令的 rc 和原因）。成功后面板显示"已硬停，需人工恢复"，失败则显示"硬停失败: …"。
+- 硬停之后，bigfish 下一次 ssh 登录会把 `user@` 拉起来。但只要 estop.json 还在，大肥鱼就会继续拒任务。
 - `/run/bigfish-ctl` 不存在，或者 estop.json 写不进去时，直接硬停。没有在急停的时候，如果目录不存在，面板最上面一行常驻"急停通道未就绪"。
 - 注意：解除急停时文件被删掉，所以下一次急停的 seq 会从 1 重新开始（见下面"权限核实"一节的最后一条）。
 
@@ -76,6 +91,9 @@
 - **软链接**：`O_NOFOLLOW` 只管最后一级路径。如果 bigfish 把 `/home/bigfish/status` 换成指向别处的链接，还有 fstat 的属主核对把关：目标文件属主必须是 bigfish 才会读，所以拿 root 才能读的文件冒充是行不通的。
 - 本仓库不建这两个目录（`/home/bigfish/status` 和 `/run/bigfish-ctl`），由大肥鱼那边的 `setup-root.sh` 负责。
 - **seq 会重新从 1 开始**：解除急停时 estop.json 会被删掉，下一次急停的 seq 从 1 重新开始。大肥鱼那边不要假定 seq 在多次急停之间一直递增，判断"有没有急停"要看文件在不在。
+
+### 在线 / 离线
+wrapper 是常驻的 bigfish 用户服务（bigfish-supervisor，用户单元），正常情况下一直在线，状态文件每 5 秒心跳一次。所以面板上出现"离线"或"不在线"，说明大肥鱼服务挂了，不是空闲。
 
 ### 确认 / 拒绝
 面板上的"确认 / 拒绝"按钮打开现有的确认框：先找有挂起项的第一路串口，没有就找键鼠。面板本身不做审批。现阶段大肥鱼只读，不会产生挂起项，所以这个按钮平时是灰的。

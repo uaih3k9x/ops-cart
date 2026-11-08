@@ -167,7 +167,8 @@ def test_watch_tick_escalates_to_hard_stop_after_deadline(monkeypatch):
     monkeypatch.setattr(kiosk.bfc, "cartlog_event", lambda kind, m: None)
     work, done, _key = _bg(calls, "bigfish-hard")[0]
     done(work())
-    assert ran == [["systemctl", "stop", "user@1001.service"]] and fake._bf_note == "已硬停，需人工恢复"
+    assert ran == [["loginctl", "terminate-user", "bigfish"], ["systemctl", "stop", "user@1001.service"]]
+    assert fake._bf_note == "已硬停，需人工恢复"
 
 
 def test_estop_without_channel_goes_hard_immediately(monkeypatch, tmp_path):
@@ -176,3 +177,52 @@ def test_estop_without_channel_goes_hard_immediately(monkeypatch, tmp_path):
     calls, fake = _ctl_fake()
     fake._serial_action("estop", None)
     assert _bg(calls, "bigfish-hard") and fake._bf_watch is None and _bg(calls, "serial-write")
+
+
+# ------------------------------------------------------------ estop.json 残留: 解除大肥鱼急停 (中1)
+
+def test_resume_all_allowed_when_only_estop_file_left():
+    """串口那边已经没有急停 (终端解除 / 按路解除 / human_action 失败), 只剩 estop.json: 解除全部急停照样删它."""
+    calls, fake = _ctl_fake()
+    bf.estop_write(1.0)
+    fake._sw_view = _view(None)                              # 没有一路在急停
+    fake._serial_action("resume", None)
+    assert not os.path.exists(bf.ESTOP_PATH) and not _bg(calls, "serial-write")
+
+
+def test_resume_all_with_nothing_to_resume_still_refused():
+    calls, fake = _ctl_fake()
+    fake._sw_view = _view(None)
+    fake._serial_action("resume", None)
+    assert calls["say"][-1][1] is False and not _bg(calls, "serial-write")
+
+
+def _resume_fake(pin_ok):
+    calls, fake = _ctl_fake()
+    fake._confirm_pin = lambda what: calls.setdefault("pin", []).append(what) or pin_ok
+    fake._bigfish_resume = kiosk.Kiosk._bigfish_resume.__get__(fake)
+    return calls, fake
+
+
+def test_bigfish_resume_needs_pin_and_deletes_file():
+    calls, fake = _resume_fake(True)
+    bf.estop_write(1.0)
+    fake._bigfish_resume()
+    assert calls["pin"] and not os.path.exists(bf.ESTOP_PATH) and fake._bf_watch is None
+
+
+def test_bigfish_resume_wrong_pin_keeps_file():
+    calls, fake = _resume_fake(False)
+    bf.estop_write(1.0)
+    fake._bigfish_resume()
+    assert os.path.exists(bf.ESTOP_PATH)
+
+
+def test_watch_requires_echo_of_this_seq(monkeypatch):
+    calls, fake = _ctl_fake()
+    fake._serial_action("estop", None)                       # seq 1
+    fake._serial_action("estop", None)                       # seq 2
+    v = bf.parse(json.dumps({"schema": 1, "written_at": 0, "estop": {"seen": True, "seq": 1}}), 0)
+    monkeypatch.setattr(kiosk.bfc, "load", lambda now: v)
+    fake._bigfish_watch_tick()
+    assert fake._bf_watch is not None                        # 回显的是上一次的 seq, 不算确认

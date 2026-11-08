@@ -17,9 +17,10 @@ TAGS = {"own": "FG", "dim": "DIM", "bad": "BAD", "untrusted": "AGENT"}
 
 class BigfishPanel(tk.Frame):
     def __init__(self, master, load=bf.load, pending=lambda: 0, on_confirm=None, on_estop=None, clock=time.time,
-                 note=lambda: "", ready=bf.channel_ready):
+                 note=lambda: "", ready=bf.channel_ready, estop_on=bf.estop_active, on_resume=None):
         super().__init__(master, bg=BG)
         self.load, self.pending, self.clock, self.note, self.ready = load, pending, clock, note, ready
+        self.estop_on = estop_on
         self.text = tk.Text(self, font=th.FONT_BIG, bg=BG, fg=th.FG, **th.FLAT, wrap="word",
                             state="disabled", padx=16, pady=12, cursor="arrow")
         self.text.pack(fill="both", expand=True)
@@ -30,6 +31,9 @@ class BigfishPanel(tk.Frame):
         bar.pack(fill="x", padx=12, pady=(0, 12))
         self.btn_confirm = self._btn(bar, "", th.GO_BG, th.GO_FG, on_confirm)
         self.btn_estop = self._btn(bar, "全部急停", th.ALERT_BG, th.WHITE, on_estop)
+        # estop.json 还在就显示: 终端 / 按路解除、串口急停失败后它会留下, 大肥鱼一直拒任务 (#97 审查中1)
+        self.btn_resume = self._btn(bar, "解除大肥鱼急停", th.BTN2, th.FG, on_resume)
+        self.btn_resume.pack_forget()
         self._job = None
         self.refresh()
 
@@ -53,6 +57,14 @@ class BigfishPanel(tk.Frame):
         n = self.pending()
         self.btn_confirm.config(text=f"确认 / 拒绝  {n}" if n else "确认 / 拒绝",
                                 state="normal" if n else "disabled")
+        try:
+            on = bool(self.estop_on())
+        except Exception:                   # noqa: BLE001
+            on = False
+        if on and not self.btn_resume.winfo_manager():
+            self.btn_resume.pack(side="left", padx=6)
+        elif not on and self.btn_resume.winfo_manager():
+            self.btn_resume.pack_forget()
         self._job = self.after(REFRESH_MS, self.refresh)
 
     def destroy(self):

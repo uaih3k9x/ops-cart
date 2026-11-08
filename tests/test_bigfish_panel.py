@@ -69,3 +69,17 @@ def test_panel_shows_note_from_kiosk(root):
                         clock=lambda: NOW)
     assert _texts(w).startswith("已硬停，需人工恢复")
     w.destroy()
+
+
+def test_panel_resume_button_only_when_estop_file_exists(root):
+    on, calls = [True], []
+    w = bp.BigfishPanel(root, load=lambda now: _running(), clock=lambda: NOW, estop_on=lambda: on[0],
+                        on_resume=lambda: calls.append("r"))
+    assert w.btn_resume.winfo_manager() == "pack"
+    w.btn_resume.invoke()
+    assert calls == ["r"]
+    on[0] = False
+    w.after_cancel(w._job)
+    w.refresh()
+    assert w.btn_resume.winfo_manager() == ""
+    w.destroy()

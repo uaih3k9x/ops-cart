@@ -563,6 +563,10 @@ class Kiosk(tk.Tk):
         """确认框和全部急停的按钮: 先按最近的视图看一眼 (不行就说为什么), 再到后台经 Store 执行.
         车机进程就是本机人, 确认 / 解除在这里允许; 确认会等到 conbroker 发完, 所以一定在后台."""
         why = cfc.check(self._sw_view if self._sw_view is not None else cfc.stopped_view(), op, arg)
+        if why and op == "resume" and arg is None and bfc.estop_active():
+            self._bigfish_ctl("resume")     # 串口那边已经没急停, 只剩大肥鱼的 estop.json (#97 审查中1): 照样放行
+            self._serial_say("已解除大肥鱼急停")
+            return
         if why:
             self._serial_say(why, ok=False)
             return
@@ -646,6 +650,13 @@ class Kiosk(tk.Tk):
         """就是执行器条上的"Agent 全部急停" (写大肥鱼急停信号挂在它上面)."""
         self._serial_action("estop", None)
 
+    def _bigfish_resume(self):
+        """面板上的"解除大肥鱼急停": 只删 estop.json, 不动串口; 要 PIN (没设 PIN 时直接过, 同 _confirm_pin)."""
+        if not self._confirm_pin("解除大肥鱼急停"):
+            return
+        self._bigfish_ctl("resume")
+        self.banner.config(text="已解除大肥鱼急停")
+
     def _bigfish_ctl(self, op):
         """全部急停 -> 写 estop.json 并看它 10 秒内确认没有; 通道不在 / 写不了直接硬停. 解除全部急停 -> 删掉."""
         if op == "resume":
@@ -661,12 +672,12 @@ class Kiosk(tk.Tk):
             self._bigfish_hard("急停通道未就绪")
             return
         try:
-            bfc.estop_write(now)
+            seq = bfc.estop_write(now)
         except OSError as e:
             self._bf_watch = None
             self._bigfish_hard(f"写不了急停文件: {e}")
             return
-        self._bf_watch, self._bf_note = bfc.EstopWatch(now), "等大肥鱼确认急停…"
+        self._bf_watch, self._bf_note = bfc.EstopWatch(now, seq=seq), "等大肥鱼确认急停…"
         self.after(1000, self._bigfish_watch_tick)
 
     def _bigfish_watch_tick(self):
@@ -819,7 +830,8 @@ class Kiosk(tk.Tk):
             # 串口面板: 打开时就指定要选的那一路, 列表回来后落位 (issue #5); 网口模式面板: 选中那个口 (#12)
             if name == "bigfish":           # #53: 确认 / 拒绝 / 急停都走现有入口
                 w = BigfishPanel(self.body, pending=self._bigfish_pending, on_confirm=self._bigfish_confirm,
-                                 on_estop=self._bigfish_estop, note=lambda: self._bf_note)
+                                 on_estop=self._bigfish_estop, note=lambda: self._bf_note,
+                                 on_resume=self._bigfish_resume)
             elif select and name in ("serial", "netmode"):
                 w = PANE_CLASSES[name](self.body, want=select)
             else:

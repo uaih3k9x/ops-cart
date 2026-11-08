@@ -298,12 +298,19 @@ def test_watch_escalates_after_deadline_if_not_seen_or_offline():
     assert w.step(NOW + bf.HARD_AFTER_S + 0.1, _seen(True, online=False)) == "hard"
 
 
-def test_hard_stop_runs_systemctl_and_logs():
+def test_hard_stop_terminates_user_then_stops_manager_and_logs():
     ran, logged = [], []
     ok, msg = bf.hard_stop(lambda cmd: ran.append(cmd) or (0, ""), 1001, "10 秒内没确认",
                            event=lambda kind, m: logged.append((kind, m)))
-    assert ok and ran == [["systemctl", "stop", "user@1001.service"]]
+    assert ok and ran == [["loginctl", "terminate-user", "bigfish"], ["systemctl", "stop", "user@1001.service"]]
     assert logged and logged[0][0] == "bigfish" and "user@1001.service" in logged[0][1] and "10 秒内没确认" in logged[0][1]
+    assert "terminate-user" in logged[0][1]
+
+
+def test_hard_stop_ok_follows_systemctl_even_if_terminate_fails():
+    rcs = {"loginctl": 1, "systemctl": 0}
+    ok, _ = bf.hard_stop(lambda cmd: (rcs[cmd[0]], ""), 1001, "x", event=lambda k, m: None)
+    assert ok
 
 
 def test_hard_stop_failure_and_no_user():
@@ -313,6 +320,73 @@ def test_hard_stop_failure_and_no_user():
     ran = []
     ok, msg = bf.hard_stop(lambda cmd: ran.append(cmd) or (0, ""), None, "x", event=lambda k, m: logged.append(m))
     assert not ok and ran == [] and "bigfish" in msg
+
+
+# ------------------------------------------------------------ v1.1: estop.seq 回显
+
+def test_parse_estop_seq_absent_invalid_and_present():
+    assert bf.parse(_text(estop={"seen": True}), NOW)["estop_seq"] is None          # v1: 没这个字段
+    assert bf.parse(_text(estop={"seen": True, "seq": 3}), NOW)["estop_seq"] == 3
+    for bad in ("3", True, -1, 1.5, None):                                       # null: 还没处理过任何 seq
+        assert bf.parse(_text(estop={"seen": True, "seq": bad}), NOW)["estop_seq"] == bf.BAD_SEQ
+
+
+def test_watch_v11_requires_matching_seq():
+    w = bf.EstopWatch(NOW, seq=4)
+    old = bf.parse(_text(estop={"seen": True, "seq": 3}), NOW)
+    assert w.step(NOW + 1, old) is None                                             # 还是上一次的回显
+    bad = bf.parse(_text(estop={"seen": True, "seq": "4"}), NOW)
+    assert w.step(NOW + 2, bad) is None
+    assert w.step(NOW + 3, bf.parse(_text(estop={"seen": True, "seq": 4}), NOW)) == "seen"
+    assert bf.EstopWatch(NOW, seq=4).step(NOW + bf.HARD_AFTER_S, old) == "hard"
+
+
+def test_watch_v11_null_seq_is_not_a_confirmation():
+    v = bf.parse(_text(estop={"seen": True, "seq": None}), NOW)
+    assert bf.EstopWatch(NOW, seq=1).step(NOW + 1, v) is None
+
+
+def test_watch_v1_fallback_without_seq():
+    assert bf.EstopWatch(NOW, seq=9).step(NOW + 1, bf.parse(_text(estop={"seen": True}), NOW)) == "seen"
+
+
+# ------------------------------------------------------------ stop_reason 只显示枚举
+
+@pytest.mark.parametrize("raw, shown", [("estop", "急停"), ("cancelled", "已取消"), ("end_turn", "正常结束"),
+                                        ("max_tokens", "超出长度"), ("refusal", "模型拒绝"),
+                                        ("【推车】已解除", "其他"), (5, ""), (None, "")])
+def test_stop_reason_enum(raw, shown):
+    c = bf.parse(_text(current=_cur(state="cancelled", stop_reason=raw)), NOW)["current"]
+    assert c["stop_reason"] == shown
+
+
+def test_panel_shows_stop_reason_enum_only():
+    rows = bf.panel_rows(bf.parse(_text(current=_cur(state="cancelled", stop_reason="estop")), NOW), NOW)
+    assert rows[0] == ("已取消 · 急停", "own")
+
+
+# ------------------------------------------------------------ 步数: 总数 0 = 未知
+
+@pytest.mark.parametrize("total, cur, kept", [(5, 5, 5), (5, 6, None), (0, 0, 0), (0, 37, 37), (0, 10000, 10000),
+                                              (0, 10001, None), (0, -1, None)])
+def test_step_current_bounds(total, cur, kept):
+    assert bf.parse(_text(current=_cur(steps_total=total, step_current=cur)), NOW)["current"]["step_current"] == kept
+
+
+def test_steps_total_zero_shows_only_current():
+    v = bf.parse(_text(current=_cur(steps_total=0, step_current=3)), NOW)
+    assert v["current"]["step_current"] == 3 and bf.lock_line(v) == "大肥鱼 · 在做事 · 第 3 步"
+
+
+# ------------------------------------------------------------ estop.json 残留: 面板要能看见
+
+def test_estop_active(tmp_path):
+    p = str(tmp_path / "estop.json")
+    assert not bf.estop_active(p)
+    bf.estop_write(NOW, path=p)
+    assert bf.estop_active(p)
+    bf.estop_clear(path=p)
+    assert not bf.estop_active(p)
 
 
 # ------------------------------------------------------------ 确认 / 拒绝: 复用现有确认框
