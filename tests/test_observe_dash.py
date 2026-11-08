@@ -16,7 +16,7 @@ def _snap(now, ports=None):
          "in_uti": 0, "out_uti": 0},
         {"name": "XGigabitEthernet0/0/1", "label": "1", "x": 2, "y": 0, "shape": "sfp", "state": "down",
          "in_uti": 0, "out_uti": 0}]
-    return {"ts": now, "head": "con-1", "device": "SW-TEST", "model": None, "state": "polling", "error": None,
+    return {"ts": now, "polled_at": now, "owner": "w1", "head": "con-1", "device": "SW-TEST", "model": None, "state": "polling", "error": None,
             "ports": ports}
 
 
@@ -28,7 +28,7 @@ def test_layout_view_has_front_when_observing():
 
 def test_layout_view_no_front_when_locked_stale_or_missing():
     assert dc.layout_view({"ts": 100, "observe": _snap(100)}, locked=True, now=101)["front"] is None
-    assert dc.layout_view({"ts": 100, "observe": _snap(0)}, now=oc.FRONT_STALE_S + 1)["front"] is None
+    assert dc.layout_view({"ts": 100, "observe": _snap(0)}, now=oc.WRITE_STALE_S + 1)["front"] is None
     assert dc.layout_view({"ts": 100}, now=101)["front"] is None
 
 
@@ -116,3 +116,32 @@ def test_draw_on_fake_canvas():
     texts = [c_[2]["text"] for c_ in c.calls if c_[0] == "text"]
     assert texts.count("1") == 2 and "2" in texts
     assert len(set(hits.values())) == 3 and all(isinstance(i, int) for i in hits)
+
+
+def test_render_stale_front_is_grey_with_note():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    snap = dict(_snap(1000), polled_at=1000 - oc.FRONT_STALE_S - 1)
+    v = dc.layout_view({"ts": 1000, "observe": snap}, now=1000)
+    assert v["front"]["stale"] and v["front"]["note"]
+    img = r.render(v)
+    (x0, y0, x1, y1), _p = r.front_boxes(v["front"])[0]
+    assert img.getpixel(((x0 + x1) // 2, y0 + 3)) == _rgb(th.DASH_LINE)
+
+
+def test_panel_cells_grey_when_stale():
+    ports = _snap(0)["ports"]
+    cells = op.panel_cells(ports, {p["name"]: p for p in ports}, now=0, stale=True)
+    assert {c["fill"] for c in cells} == {op.OFF}
+
+
+def test_one_window_per_port():
+    op._OPEN.clear()
+    assert op.claim("con-1", "w1") is True
+    assert op.claim("con-1", "w2") is False
+    assert op.claim("con-2", "w3") is True
+    op.release("con-1", "w2")                   # 别人的不放
+    assert op.claim("con-1", "w4") is False
+    op.release("con-1", "w1")
+    assert op.claim("con-1", "w4") is True
+    op._OPEN.clear()

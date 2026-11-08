@@ -391,7 +391,13 @@ def front_boxes(front, W=PANEL_W):
 
 
 def _front(d, front, W):
-    d.text((M, 892), front.get("title") or "", font=_font(24), fill=DIM)
+    title = front.get("title") or ""
+    d.text((M, 892), title, font=_font(24), fill=DIM)
+    if front.get("note"):           # 旧数据 / 出错 / 会话掉了: 灯全灰, 原因跟在标题后面
+        x = M + _font(24).getlength(title) + 20
+        line = wrap(str(front["note"]), _font(24), W - M - x, 1)
+        if line:
+            d.text((x, 892), line[0], font=_font(24), fill=WARN)
     color = {"up": ACCENT, "admin": WARN, "standby": DIM}
     for box, p in front_boxes(front, W):
         lit = p.get("lit") and p.get("state") in color

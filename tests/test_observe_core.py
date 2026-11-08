@@ -56,12 +56,11 @@ def test_login_order_wake_then_username_then_password():
     steps = _drive(lg, [USER, PASS, LOGGED, "screen-length 0 temporary\nInfo: The configuration takes effect on the current user terminal interface only.\n<SW-TEST>"])
     wake, user, pw, screen, done = steps
     # 1. 唤醒: 打码 + 强制, 等 Username: (第一下按键只是唤醒)
-    assert (wake.kind, wake.role, wake.secret, wake.force) == ("send", "wake", True, True)
+    assert (wake.kind, wake.role, wake.secret) == ("send", "wake", True)
     assert "s3cret" not in wake.text and "admin" not in wake.text
     assert oc.re.search(wake.expect, "Username:")
     # 2. 看到 Username: 才发用户名, 等 Password:
     assert (user.role, user.text, user.secret) == ("user", "admin", False)
-    assert user.force                                  # conbroker 停在 Username: 上不加 --force 会拒
     assert oc.re.search(user.expect, "Password:")
     # 3. 密码只走 secret
     assert (pw.role, pw.text, pw.secret) == ("pass", "s3cret", True)
@@ -479,47 +478,78 @@ def test_pacer_unknown_log_size_ignored():
 
 # ------------------------------------------------------------ 会话编排 (Observer)
 
-class FakeDev:
-    """假设备: login 走 exchange, 轮询走 send. 记下发出去的每一样."""
+IDLE = "\n\n  Press any key to get started\n"
+SCREEN_OK = ("screen-length 0 temporary\nInfo: The configuration takes effect on the current user terminal "
+             "interface only.\n<SW-TEST>")
 
-    def __init__(self, brief=BRIEF_S, logged_in=False):
-        self.brief, self.sent, self.polls = brief, [], []
-        self.logged_in = logged_in
+
+class FakeDev:
+    """假设备 + 假 conbroker 日志: console 是日志尾 (人和设备都往里写), exchange/send 的输出也追加进去.
+
+    script: {角色: 输出 或 fn(dev)->输出 (可抛异常)} 覆盖默认应答; later(n, text): 第 n 次读日志尾时有人插进一段;
+    on_sleep(dev): 等人停手那几秒里发生的事 (人敲键 / 设备吐日志).
+    """
+
+    def __init__(self, brief=BRIEF_S, console=IDLE):
+        self.brief, self.console = brief, console
+        self.sent, self.polls, self.script = [], [], {}
+        self.on_sleep, self._later = None, []
+
+    def later(self, n, text):
+        self._later.append([n, text])
+
+    def tail(self):
+        for item in self._later:
+            item[0] -= 1
+            if item[0] == 0:
+                self.console += item[1]
+        return self.console
+
+    def sleep(self, _s):
+        if self.on_sleep:
+            self.on_sleep(self)
+
+    def _out(self, text):
+        self.console += text
+        return text
 
     def exchange(self, step):
-        self.sent.append((step.role, step.text if not step.secret else "***"))
-        if step.role == "wake":
-            return "\n<SW-TEST>" if self.logged_in else USER
-        if step.role == "user":
-            return PASS
-        if step.role == "pass":
-            return LOGGED
-        if step.role == "cmd" and step.text == "quit":
-            return "\n\n  Press any key to get started"
-        return "\n<SW-TEST>"
+        self.sent.append((step.role, "***" if step.secret else step.text))
+        if step.role in self.script:
+            r = self.script[step.role]
+            return self._out(r(self) if callable(r) else r)
+        out = {"wake": USER, "bounce": USER, "user": PASS, "pass": LOGGED, "answer": "N\n<SW-TEST>"}.get(step.role)
+        if out is None:
+            out = "quit\n" + IDLE if step.text == "quit" else SCREEN_OK
+        return self._out(out)
 
     def send(self, port, cmd, timeout):
         self.polls.append(cmd)
         if cmd == "display version":
-            return "display version\nHUAWEI S5735-L24T4S-A1 Routing Switch uptime is 1 day\n<SW-TEST>"
-        return self.brief
+            return self._out("display version\nHUAWEI S5735-L24T4S-A1 Routing Switch uptime is 1 day\n<SW-TEST>")
+        return self._out(self.brief)
 
 
 def _obs(dev, **kw):
     kw.setdefault("pacer", oc.Pacer(duty=0.5, min_gap=1, max_gap=10, quiet=5))
-    return oc.Observer("con-1", "huawei", dev.exchange, dev.send, **kw)
+    kw.setdefault("clock", iter(range(10000)).__next__)
+    return oc.Observer("con-1", "huawei", dev.exchange, dev.send, tail=dev.tail, sleep=dev.sleep, **kw)
+
+
+def _roles(dev):
+    return [r for r, _t in dev.sent]
 
 
 def test_observer_login_poll_and_quit():
     dev = FakeDev()
-    ob = _obs(dev, clock=iter(range(1000)).__next__)
+    ob = _obs(dev)
     assert ob.start("admin", "s3cret") is True
     assert ob.device == "SW-TEST" and ob.model == "S5735-L24T4S-A1"
     assert ob.tick(100) is True
     assert ob.ports["GigabitEthernet0/0/6"]["in_uti"] == 12.5
     assert any(x["name"] == "XGigabitEthernet0/0/1" for x in ob.panel)
-    ob.stop()
-    assert dev.sent[-1] == ("cmd", "quit")
+    ob.stop(now=200)
+    assert dev.sent[-1] == ("cmd", "quit") and ob.left == "quit"
     assert all(c in ("display version", "display interface brief") for c in dev.polls)
     assert ("pass", "***") in dev.sent and not any("s3cret" in str(x) for x in dev.sent)
 
@@ -535,7 +565,7 @@ def test_observer_refuses_whole_round_if_any_poll_cmd_not_readonly():
 def test_observer_pauses_while_human_active():
     dev = FakeDev()
     sizes = {"v": 0}
-    ob = _obs(dev, log_size=lambda: sizes["v"], clock=iter(range(1000)).__next__)
+    ob = _obs(dev, log_size=lambda: sizes["v"])
     ob.start("admin", "s3cret")
     ob.tick(100)
     n = len(dev.polls)
@@ -547,19 +577,19 @@ def test_observer_pauses_while_human_active():
 
 def test_observer_marks_lost_session():
     dev = FakeDev()
-    ob = _obs(dev, clock=iter(range(1000)).__next__)
+    ob = _obs(dev)
     ob.start("admin", "s3cret")
     dev.brief = "display interface brief\n\nUsername:"
     assert ob.tick(100) is False
     assert ob.state == "lost"
     assert ob.tick(200) is False                       # 掉了就不再轮询
-    ob.stop()
+    ob.stop(now=300)
     assert dev.sent[-1][1] != "quit"                   # 掉线后没有会话可退, 不往 Username: 上发 quit
 
 
 def test_observer_keeps_last_ports_on_poll_error():
     dev = FakeDev()
-    ob = _obs(dev, clock=iter(range(1000)).__next__)
+    ob = _obs(dev)
     ob.start("admin", "s3cret")
     ob.tick(100)
 
@@ -572,7 +602,7 @@ def test_observer_keeps_last_ports_on_poll_error():
 
 def test_observer_login_fail_does_not_poll():
     dev = FakeDev()
-    dev.exchange = lambda step: "\nPlease choose (1/2):"
+    dev.script["wake"] = "\nPlease choose (1/2):"
     ob = _obs(dev)
     assert ob.start("admin", "s3cret") is False
     assert dev.polls == [] and ob.state == "failed"
@@ -580,7 +610,7 @@ def test_observer_login_fail_does_not_poll():
 
 def test_observer_snapshot_has_no_secrets():
     dev = FakeDev()
-    ob = _obs(dev, clock=iter(range(1000)).__next__)
+    ob = _obs(dev)
     ob.start("opsview", "s3cret")
     ob.tick(100)
     snap = ob.snapshot(head="con-1", now=123)
@@ -595,20 +625,317 @@ def test_record_event_has_no_secrets():
     assert got[0][0] == "observe" and "start" in got[0][1]
 
 
-# ------------------------------------------------------------ 副屏视图
+def test_step_has_no_force_field():
+    assert not hasattr(oc.Step("send", "wake", "x"), "force")
 
-def test_front_view_from_snapshot_and_staleness():
+
+# ---- 中1: 退出时看现场
+
+def test_stop_skips_quit_while_human_active():
     dev = FakeDev()
-    ob = _obs(dev, clock=iter(range(1000)).__next__)
+    ob = _obs(dev)
     ob.start("admin", "s3cret")
     ob.tick(100)
+    ob.pacer.poke(150)
+    ob.stop(now=151)
+    assert "quit" not in [t for _r, t in dev.sent]
+    assert ob.left == "skipped" and "有人在用" in ob.error
+
+
+@pytest.mark.parametrize("tail_add", ["dis", "\n[SW-TEST]", "\n<OTHER-SW>", "\nUsername:", "\n  ---- More ----"])
+def test_stop_skips_quit_unless_at_own_user_view(tail_add):
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    dev.console += tail_add
+    ob.stop(now=200)
+    assert "quit" not in [t for _r, t in dev.sent]
+    assert ob.left == "skipped" and "未退出登录" in ob.error
+
+
+def test_stop_skips_quit_when_someone_types_during_quiet_check():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    dev.on_sleep = lambda d: setattr(d, "console", d.console + "d")
+    ob.stop(now=200)
+    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "skipped"
+
+
+# ---- 中3: 登录前看现场
+
+def test_borrowed_session_not_woken_and_not_quit():
+    dev = FakeDev(console="\nInfo: something\n<SW-TEST>")
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is True
+    assert _roles(dev) == ["cmd"] and dev.sent[0][1] == "screen-length 0 temporary"
+    assert ob.borrowed and ob.device == "SW-TEST"
+    ob.tick(100)
+    ob.stop(now=200)
+    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "borrowed"
+
+
+def test_console_already_at_username_skips_wake():
+    dev = FakeDev(console=USER)
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is True
+    assert _roles(dev)[:2] == ["user", "pass"]
+
+
+@pytest.mark.parametrize("console", [
+    "\nUsername:admin\nPassword:", "\nSave? [Y/N]:", "\n<SW-TEST>dis", "\n[SW-TEST]", "\n[~SW-TEST-GigabitEthernet0/0/1]",
+    "\n  ---- More ----",
+])
+def test_refuses_start_when_console_mid_operation(console):
+    dev = FakeDev(console=console)
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert dev.sent == [] and ob.error
+
+
+def test_refuses_start_when_human_typing():
+    dev = FakeDev()
+    dev.on_sleep = lambda d: setattr(d, "console", d.console + "x")
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert dev.sent == [] and "有人在用" in ob.error
+
+
+def test_refuses_start_when_agent_holds_lease():
+    dev = FakeDev()
+    ob = _obs(dev, busy=lambda: "Agent 持有写租约")
+    assert ob.start("admin", "s3cret") is False
+    assert dev.sent == [] and "Agent" in ob.error
+
+
+def test_refuses_start_when_log_unreadable():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.tail = lambda: None
+    assert ob.start("admin", "s3cret") is False and dev.sent == []
+
+
+def test_agent_busy_from_write_state():
+    states = {1: {"writer": "agent", "estop": False, "sending": False},
+              2: {"writer": None, "estop": True, "sending": False},
+              3: {"writer": None, "estop": False, "sending": False}}
+    assert "租约" in oc.agent_busy("con-1", states=lambda: states)
+    assert "急停" in oc.agent_busy("con-2", states=lambda: states)
+    assert oc.agent_busy("con-3", states=lambda: states) is None
+    assert oc.agent_busy("ttyUSB0", states=lambda: states) is None
+
+
+def test_agent_busy_unreadable_state_refuses():
+    def boom():
+        raise ValueError("坏了")
+    assert oc.agent_busy("con-1", states=boom)
+
+
+# ---- 中2: 每步发送前确认没人插话
+
+def test_aborts_before_username_if_someone_typed_after_wake():
+    dev = FakeDev()
+    dev.script["wake"] = lambda d: (d.later(2, "adm"), USER)[1]
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert _roles(dev) == ["wake"] and "有人" in ob.error
+
+
+def test_password_not_sent_if_someone_types_before_it():
+    dev = FakeDev()
+
+    def typing(d):
+        if d.sent and d.sent[-1][0] == "user":
+            d.console += "abc"
+    dev.on_sleep = typing
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert "pass" not in _roles(dev)
+    ob.stop(now=100)
+    assert "quit" not in [t for _r, t in dev.sent]
+
+
+def test_password_waits_for_quiet_window():
+    dev = FakeDev()
+    naps = []
+    dev.on_sleep = lambda d: naps.append(d.sent[-1][0] if d.sent else None)
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    assert naps == [None, "user"]          # 开始前一次, 发密码前一次
+
+
+def test_cancel_between_steps():
+    dev = FakeDev()
+    ob = _obs(dev)
+    calls = {"n": 0}
+
+    def cancelled():
+        calls["n"] += 1
+        return calls["n"] > 1
+    assert ob.start("admin", "s3cret", cancelled=cancelled) is False
+    assert _roles(dev) == ["wake"]
+
+
+# ---- 中4: 登录成功后的失败路径要退出登录
+
+def test_pass_step_half_output_then_quit_when_prompt_confirmed():
+    dev = FakeDev()
+    dev.script["pass"] = "\n"                       # 超时只拿到半截
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    dev.console += "Info: The max number of VTY users is 5.\n<SW-TEST>"
+    ob.stop(now=100)
+    assert dev.sent[-1] == ("cmd", "quit") and ob.left == "quit"
+
+
+def test_pass_step_half_output_no_prompt_no_quit():
+    dev = FakeDev()
+    dev.script["pass"] = "\n"
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.stop(now=100)
+    assert "quit" not in [t for _r, t in dev.sent]
+
+
+def test_exchange_raises_after_password_then_quit():
+    dev = FakeDev()
+
+    def cmd(d):
+        if d.sent[-1][1] == "quit":
+            return "quit\n" + IDLE
+        raise OSError("超时")
+    dev.script["cmd"] = cmd
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    ob.stop(now=100)
+    assert dev.sent[-1] == ("cmd", "quit")
+
+
+def test_pager_off_judged_after_echo_not_by_async_log():
+    dev = FakeDev()
+    dev.script["cmd"] = ("screen-length 0 temporary\nInfo: The configuration takes effect on the current user "
+                         "terminal interface only.\nNov  7 2026 10:00:00 SW-TEST %%01IFNET/4/LINK_STATE(l): "
+                         "Error-down recovered.\n<SW-TEST>")
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is True and ob.pager_ok
+
+
+def test_pager_off_error_still_logged_in_and_polls():
+    lg = oc.Login("admin", "s3cret")
+    _drive(lg, [USER, PASS, LOGGED])
+    st = lg.feed("screen-length 0 temporary\n                ^\nError: Unrecognized command found at '^' position.\n<SW-TEST>")
+    assert st.kind == "done" and lg.pager_ok is False and lg.authed
+
+
+def test_forced_password_change_reported_precisely():
+    lg = oc.Login("admin", "s3cret")
+    _drive(lg, [USER, PASS, "\nThe password needs to be changed. Change now? [Y/N]:"])
+    st = lg.feed("N\nEnter Password:")
+    assert st.kind == "fail" and "改密" in st.note and "认证失败" not in st.note
+
+
+# ---- 低7: 轮询前看现场; conbroker 的标记行不算设备输出
+
+def test_classify_ignores_conbroker_markers():
+    text = IDLE + "\n[2026-11-07 10:00:00 Claude 发送: display interface brief]\ndisplay interface brief\n[conbroker: 60s 内没等到提示符]"
+    assert oc.classify(text) == "other"
+    assert oc.classify(IDLE + "\n[conbroker: 60s 内没等到提示符]") == "idle"
+    assert oc.classify("\n<SW-TEST>\n[2026-11-07 10:00:00 Claude 断开]\n") == "prompt"
+
+
+def test_poll_not_sent_when_console_back_at_login():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    n = len(dev.polls)
+    dev.console += "\nConfiguration console exit, please press any key to log on\n"
+    assert ob.tick(100) is False
+    assert len(dev.polls) == n and ob.state == "lost"
+
+
+def test_poll_timeout_marker_with_idle_is_lost():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    dev.brief = "display interface brief\n" + IDLE + "\n[conbroker: 60s 内没等到提示符]"
+    assert ob.tick(100) is False and ob.state == "lost"
+
+
+def test_poll_skipped_while_someone_mid_line():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    n = len(dev.polls)
+    dev.console += "dis"
+    assert ob.tick(100) is False and len(dev.polls) == n and ob.state == "polling"
+
+
+def test_prompt_with_space_in_sysname():
+    assert oc.classify("\n<Core SW 1>") == "prompt"
+    assert oc.prompt_name("<Core SW 1>") == "Core SW 1"
+
+
+# ------------------------------------------------------------ 副屏视图 (低5)
+
+def _polled(wall):
+    dev = FakeDev()
+    ob = _obs(dev, wall=lambda: wall)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    return ob
+
+
+def test_front_view_from_snapshot():
+    ob = _polled(1000)
     snap = ob.snapshot(head="con-1", now=1000)
+    assert snap["polled_at"] == 1000
     v = oc.front_view(snap, now=1001)
-    assert v["title"].startswith("con-1") and "SW-TEST" in v["title"]
+    assert v["title"].startswith("con-1") and "SW-TEST" in v["title"] and not v["stale"]
     states = {p["label"]: p["state"] for p in v["ports"] if p["shape"] == "rj45"}
     assert states["3"] == "admin" and states["2"] == "down"
-    assert oc.front_view(snap, now=1000 + oc.FRONT_STALE_S + 1) is None
     assert oc.front_view(None, now=1) is None and oc.front_view({"ts": "x"}, now=1) is None
+
+
+def test_front_view_gone_when_writer_died():
+    snap = _polled(1000).snapshot(head="con-1", now=1000)
+    assert oc.front_view(snap, now=1000 + oc.WRITE_STALE_S + 1) is None
+
+
+def test_front_view_grey_when_poll_old_or_error():
+    ob = _polled(1000)
+    snap = ob.snapshot(head="con-1", now=1000 + oc.FRONT_STALE_S + 5)     # 还在写, 但很久没轮询成功
+    v = oc.front_view(snap, now=1000 + oc.FRONT_STALE_S + 6)
+    assert v["stale"] and v["note"] and not any(p["lit"] for p in v["ports"])
+    ob.error = "没回提示符"
+    v = oc.front_view(ob.snapshot(head="con-1", now=1001), now=1001)
+    assert v["stale"] and "没回提示符" in v["note"]
+
+
+def test_front_view_never_polled_is_grey():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.panel = oc.auto_layout(["GigabitEthernet0/0/1"])
+    v = oc.front_view(ob.snapshot(head="con-1", now=5), now=5)
+    assert v["stale"]
+
+
+def test_remove_snapshot_only_own(tmp_path):
+    p = tmp_path / "observe.json"
+    p.write_text(json.dumps({"owner": "a"}))
+    assert oc.remove_snapshot("b", str(p)) is False and p.exists()
+    assert oc.remove_snapshot("a", str(p)) is True and not p.exists()
+    assert oc.remove_snapshot("a", str(p)) is False
+
+
+def test_read_tail_strips_marks(tmp_path):
+    p = tmp_path / "con-1.log"
+    p.write_bytes(b"x" * 9000 + b"\r\n<SW-TEST>\r\n[2026-11-07 10:00:00 Claude \xe6\x96\xad\xe5\xbc\x80]\r\n")
+    t = oc.read_tail(str(p), 4096)
+    assert len(t) <= 4096 and oc.classify(t) == "prompt"
+    assert oc.read_tail(str(tmp_path / "nope.log")) is None
 
 
 # ------------------------------------------------------------ 真 exchange: 直接接 conbroker 本地口
@@ -666,10 +993,10 @@ def test_module_never_writes_password_to_disk(tmp_path, monkeypatch):
     # 整个流程跑一遍, 目录里不出现密码
     monkeypatch.chdir(tmp_path)
     dev = FakeDev()
-    ob = _obs(dev, clock=iter(range(1000)).__next__)
+    ob = _obs(dev)
     ob.start("admin", "s3cret")
     ob.tick(100)
-    ob.stop()
+    ob.stop(now=200)
     for root, _d, files in os.walk(tmp_path):
         for f in files:
             assert b"s3cret" not in open(os.path.join(root, f), "rb").read()

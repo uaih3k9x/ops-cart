@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """串口观察模式的车机窗口 (#85): 输一次密码, 画设备前面板, 灯跟着真机亮灭闪. 逻辑在 observe_core.py.
 
-串口面板选中一路点"观察"打开. 线程纪律同 serial_panel: 后台线程 (登录 / 轮询 / quit) 只往 self.ui 放东西,
-界面只在 _tick 里改. 密码框读完立刻清空, 密码只经 Observer.start 传给登录状态机, 不落盘不进日志.
+串口面板选中一路点"观察"打开; 每一路同时只开一个窗口. 线程纪律同 serial_panel: 后台线程 (登录 / 轮询 / quit)
+只往 self.ui 放东西, 界面只在 _tick 里改. 密码框读完立刻清空, 密码只经 Observer.start 传给登录状态机,
+不落盘不进日志. 会话掉了 / 登录失败 / 退出时没敢 quit, 窗口留着, 写明原因, 登录行回来可以再登.
 """
 
 import functools
 import os
 import queue
+import secrets
 import threading
 import time
 
@@ -25,16 +27,34 @@ CELL, GAP, PAD = 40, 8, 16              # 口的格子 / 间隔 / 边距 (像素
 FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
 SNAP_S = 5                              # 多久给副屏写一次快照
 
+_OPEN = {}                              # 串口服务名 -> 占着它的窗口令牌
+_OPEN_LOCK = threading.Lock()
+
+
+def claim(name, token):
+    """每一路只许一个观察窗口: 两个 Observer 的登录会交错, 一个的 quit 会把另一个登出."""
+    with _OPEN_LOCK:
+        if _OPEN.get(name, token) != token:
+            return False
+        _OPEN[name] = token
+        return True
+
+
+def release(name, token):
+    with _OPEN_LOCK:
+        if _OPEN.get(name) == token:
+            del _OPEN[name]
+
 
 def _lit_color(state):
     return {"up": th.LAMP_OK, "admin": th.LAMP_WARN, "standby": th.DIM}.get(state, OFF)
 
 
-def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD):
-    """面板格子 + 当前端口状态 -> 要画的东西 [{name, box, fill, fg, shape, label}]."""
+def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD, stale=False):
+    """面板格子 + 当前端口状态 -> 要画的东西 [{name, box, fill, fg, shape, label}]. stale: 数据不可信, 全灰."""
     out = []
     for c in panel:
-        state, lit = oc.lamp(ports.get(c["name"]), now)
+        state, lit = ("unknown", False) if stale else oc.lamp(ports.get(c["name"]), now)
         x0, y0 = pad + c["x"] * (cell + gap), pad + c["y"] * (cell + gap)
         out.append({"name": c["name"], "box": (x0, y0, x0 + cell, y0 + cell), "shape": c.get("shape", "rj45"),
                     "label": c.get("label", ""), "fill": _lit_color(state) if lit else OFF,
@@ -68,12 +88,13 @@ def port_info(p):
 
 
 class ObserveWindow(tk.Toplevel):
-    def __init__(self, master, dev, name, vendor, ddir, head=None):
+    def __init__(self, master, dev, name, vendor, ddir, token, head=None):
         super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=th.PRIMARY, **th.DIALOG)
-        self.dev, self.name, self.vendor, self.ddir = dev, name, vendor, ddir
+        self.dev, self.name, self.vendor, self.ddir, self.token = dev, name, vendor, ddir, token
         self.head = head or survey_core.safe_name(os.path.basename(dev))
         self.ui, self.stop_evt = queue.Queue(), threading.Event()
-        self.obs, self.hits, self._snap_at, self._hover = None, {}, 0, None
+        self.obs, self.worker, self.hits, self._snap_at, self._hover = None, None, {}, 0, None
+        self._closing = False
         self.overrideredirect(True)
         W, H = 1100, 440
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
@@ -86,8 +107,9 @@ class ObserveWindow(tk.Toplevel):
         bar.pack(fill="x")
         self.title_lbl = tk.Label(bar, text=f"观察 {self.dev}", font=th.FONT_BIG, bg=th.TITLE, fg=th.WHITE, padx=12)
         self.title_lbl.pack(side="left")
-        tk.Button(bar, text="退出观察", font=FONT, command=self.close, bg=th.BTN2, fg=FG, **th.RAISED,
-                  cursor="hand2", padx=10).pack(side="right", padx=6, pady=4)
+        self.close_btn = tk.Button(bar, text="退出观察", font=FONT, command=self.close, bg=th.BTN2, fg=FG,
+                                   **th.RAISED, cursor="hand2", padx=10)
+        self.close_btn.pack(side="right", padx=6, pady=4)
         self.login_row = tk.Frame(self, bg=BG)
         self.login_row.pack(fill="x", padx=PAD, pady=8)
         self.user_var, self.pass_var = tk.StringVar(), tk.StringVar()
@@ -112,35 +134,47 @@ class ObserveWindow(tk.Toplevel):
     def login(self):
         user, pw = self.user_var.get().strip(), self.pass_var.get()
         self.pass_var.set("")                       # 读完就清
-        if self.obs or not user or not pw:
+        if self.worker or not user or not pw:
             return
         self.login_btn.config(state="disabled")
         log = os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log")
         self.obs = oc.Observer(self.name, self.vendor,
                                exchange=functools.partial(oc.broker_exchange, self.ddir, self.name, vendor=self.vendor),
-                               send=survey_core.conbroker_send, log_size=lambda: lamps_core.file_size(log))
-        self.status.config(text="登录中…", fg=DIM)
-        threading.Thread(target=self._work, args=(self.obs, user, pw), daemon=True).start()
+                               send=survey_core.conbroker_send, log_size=lambda: lamps_core.file_size(log),
+                               tail=lambda: oc.read_tail(log), busy=lambda: oc.agent_busy(self.head))
+        self.status.config(text="看现场、登录中…", fg=DIM)
+        self.stop_evt.clear()
+        self.worker = threading.Thread(target=self._work, args=(self.obs, user, pw), daemon=True)
+        self.worker.start()
 
     def _work(self, obs, user, pw):
-        ok = obs.start(user, pw)
+        ok = obs.start(user, pw, cancelled=self.stop_evt.is_set)
         del pw
         oc.record("start", head=self.head, device=obs.device, ok=ok, error=obs.error)
-        self.ui.put(self._logged_in if ok else self._failed)
+        if ok:
+            self.ui.put(self._logged_in)
         while ok and not self.stop_evt.is_set() and obs.state == "polling":
             obs.tick(time.monotonic())
             self.stop_evt.wait(0.5)
-        obs.stop()
-        oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error)
+        obs.stop(time.monotonic())
+        oc.record("stop", head=self.head, device=obs.device, state=obs.state, left=obs.left, error=obs.error)
+        self.ui.put(self._ended)
 
     def _logged_in(self):
         self.login_row.pack_forget()
         self.title_lbl.config(text=f"观察 {self.dev} · {self.obs.device}" + (f" · {self.obs.model}" if self.obs.model else ""))
 
-    def _failed(self):
-        self.status.config(text=self.obs.error or "登录失败", fg=th.BAD)
-        self.obs = None
+    def _ended(self):
+        """后台线程结束: 正常退出就关窗; 出了事 (失败 / 掉线 / 没敢 quit) 留着窗口说明, 登录行回来可以再登."""
+        obs, self.worker = self.obs, None
+        if self._closing and obs.left != "skipped":
+            return self.destroy()
+        self.status.config(text=obs.error or "已停止", fg=th.BAD if obs.error else DIM)
+        if not self.login_row.winfo_ismapped():
+            self.login_row.pack(fill="x", padx=PAD, pady=8, before=self.canvas)
         self.login_btn.config(state="normal")
+        self.close_btn.config(state="normal", text="关闭" if self._closing else "退出观察",
+                              command=self.destroy if self._closing else self.close)
 
     # ------------------------------------------------------------ 界面
 
@@ -150,25 +184,27 @@ class ObserveWindow(tk.Toplevel):
                 self.ui.get_nowait()()
         except queue.Empty:
             pass
+        if not self.winfo_exists():
+            return
         obs = self.obs
         if obs and obs.panel:
-            self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time()))
-        if obs and obs.state in ("polling", "lost"):
+            stale = obs.state != "polling" or bool(obs.error)
+            self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time(), stale=stale))
+        if obs and self.worker and obs.state == "polling":
             self._status(obs)
             if time.monotonic() - self._snap_at > SNAP_S:
                 self._snap_at = time.monotonic()
                 try:
-                    atomicfile.write_json(oc.STATE_PATH, obs.snapshot(self.head))
+                    atomicfile.write_json(oc.STATE_PATH, obs.snapshot(self.head, owner=self.token))
                 except OSError:
                     pass
-        if self.winfo_exists():
-            self.after(FRAME_MS, self._tick)
+        self.after(FRAME_MS, self._tick)
 
     def _status(self, obs):
         if self._hover and self._hover in obs.ports:
             self.status.config(text=port_info(obs.ports[self._hover]), fg=FG)
         elif obs.error:
-            self.status.config(text=obs.error, fg=th.BAD if obs.state == "lost" else th.WARN)
+            self.status.config(text=obs.error, fg=th.WARN)
         elif obs.pacer.paused(time.monotonic()):
             self.status.config(text="有人在用串口, 暂停", fg=DIM)
         else:
@@ -179,13 +215,33 @@ class ObserveWindow(tk.Toplevel):
         self._hover = next((self.hits[i] for i in reversed(items) if i in self.hits), None)
 
     def close(self):
-        self.stop_evt.set()                         # 后台线程发 quit 退出登录
-        try:
-            os.remove(oc.STATE_PATH)
-        except OSError:
-            pass
+        """后台线程在跑: 让它停下并 (现场对的话) quit, 结束后自己关窗; 没在跑直接关."""
+        self._closing = True
+        if self.worker:
+            self.stop_evt.set()
+            self.close_btn.config(state="disabled")
+            self.status.config(text="退出中…", fg=DIM)
+            return
         self.destroy()
+
+    def destroy(self):
+        self.stop_evt.set()
+        oc.remove_snapshot(self.token)
+        release(self.name, self.token)
+        super().destroy()
 
 
 def open_for(master, dev, name, vendor, ddir):
-    return ObserveWindow(master, dev, name, vendor, ddir)
+    """每一路只开一个; 已经开着就提到前面."""
+    token = secrets.token_hex(4)
+    if not claim(name, token):
+        for w in master.winfo_children():
+            if isinstance(w, ObserveWindow) and w.name == name:
+                w.lift()
+                return w
+        return None
+    try:
+        return ObserveWindow(master, dev, name, vendor, ddir, token)
+    except Exception:
+        release(name, token)
+        raise
