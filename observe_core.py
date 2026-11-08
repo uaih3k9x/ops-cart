@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """串口观察模式 (#85): 人在 console 上登录好, 推车只发只读命令, 把端口状态画成前面板. 纯逻辑, 不碰 Tk.
 
-半自动 (9x 定): 推车完全不碰登录, 往 console 发的只有只读白名单里的命令. 人自己登录好之后点
+半自动 (维护者定): 推车完全不碰登录, 往 console 发的只有只读白名单里的命令. 人自己登录好之后点
 "开始观察": probe() 读 conbroker 日志尾, 现场正是用户视图提示符 <xxx> 才给人确认设备名, 人确认后 start(xxx).
 
   parse_brief  display interface brief (华为 S / AR / VRP8); PARSERS 按厂商留位置给 H3C / 锐捷.
@@ -847,7 +847,7 @@ _STATE_NOTE = {"idle": "准备开始", "failed": "没开始", "lost": "会话掉
 def front_view(doc, now, stale_s=FRONT_STALE_S, locked=False):
     """快照 -> 副屏前面板区块 {title, stale, note, ports: [{x, y, shape, label, state, lit}]}; 没有 / 车机没在写 None.
     准备中 / 没开始 / 掉线 / 很久没轮询成功 / 出错: 灯全灰 (stale), note 写原因; 还没有端口也照样给标题和原因.
-    locked: 车机锁着屏 (闲置锁屏不停观察, 9x 定): 照常画端口灯和端口号, 但不露设备名 / 型号 / 接口全名 /
+    locked: 车机锁着屏 (闲置锁屏不停观察, 维护者定): 照常画端口灯和端口号, 但不露设备名 / 型号 / 接口全名 /
     设备原文, 标题只写"串口观察中 · con-N · 剩余 xx 分钟", 停止原因只给不带设备名的说法."""
     if not isinstance(doc, dict) or not isinstance(doc.get("ts"), (int, float)) or now - doc["ts"] > WRITE_STALE_S:
         return None

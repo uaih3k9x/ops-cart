@@ -1198,7 +1198,7 @@ class Kiosk(tk.Tk):
 
     def lock(self, reason):
         """全屏锁屏; 已锁则只提到最前. reason: "manual" = 人点了锁屏; 别的 (idle / boot / rebuild) 都是自动锁的.
-        #85 观察模式: 人主动锁屏才停止观察; 闲置自动锁屏只把观察窗口藏起来, 轮询照跑 (9x 定)."""
+        #85 观察模式: 人主动锁屏才停止观察; 闲置自动锁屏只把观察窗口藏起来, 轮询照跑 (维护者定)."""
         if self._lock_win:
             self._lock_win.lift()
             return

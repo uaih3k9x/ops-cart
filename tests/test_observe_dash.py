@@ -39,7 +39,7 @@ def test_layout_view_has_front_when_observing():
 
 
 def test_layout_view_locked_front_hides_device_identity():
-    # 闲置锁屏不停观察 (9x 定): 副屏照常画端口灯和端口号, 但不露设备名 / 型号 / 接口全名
+    # 闲置锁屏不停观察 (维护者定): 副屏照常画端口灯和端口号, 但不露设备名 / 型号 / 接口全名
     snap = dict(_snap(100), model="S5735-L24T4S-A1", ends_at=100 + 600)
     v = dc.layout_view({"ts": 100, "observe": snap}, locked=True, now=101)
     f = v["front"]
