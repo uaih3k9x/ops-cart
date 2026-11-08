@@ -80,7 +80,7 @@ def collect(ctx):
         "kvm_agent": _pull(ctx, "kvm_agent", None),  # 键鼠 Agent 状态 {stopped, pending, writer, sending} (#43)
         "agent": _pull(ctx, "agent", None),         # Agent 写串口每槽位 [{estop, pending, writer, sending}] #23
         "theme": _pull(ctx, "theme", dict(THEME_DARK)),  # 深浅模式 {mode, setting, next_switch} #31
-        "observe": _pull(ctx, "observe", None),     # 串口观察模式的端口快照 (#85), 车机写 observe.json
+        "observe": _pull(ctx, "observe", []),       # 串口观察模式的快照 (#85), 车机每一路写一份 observe/<操作头>.json
     }
     return snap
 
@@ -307,6 +307,12 @@ def _serve(guard, now):
     return {"text": n["text"], "level": "bad"}
 
 
+def _front(docs, now):
+    """每一路一份观察快照 (新写的在前), 取第一份车机还在写的."""
+    docs = [docs] if isinstance(docs, dict) else docs if isinstance(docs, list) else []
+    return next((v for v in (observe_core.front_view(d, now) for d in docs) if v), None)
+
+
 def layout_view(snap, locked=False, active=(), now=None):
     """快照 + 锁屏状态 + 正在动的计数器 → 版面模型. 渲染层只认这个结构.
 
@@ -344,7 +350,7 @@ def layout_view(snap, locked=False, active=(), now=None):
         "peers": [] if locked else peers(snap),      # 锁屏是教室引导牌, 不露交换机名
         "serve": _serve(snap.get("pxe"), now),       # 锁屏也显示: 发地址影响整个网段
         "stale": stale(snap, now),
-        "front": None if locked else observe_core.front_view(snap.get("observe"), now),   # 观察中的设备前面板 (#85)
+        "front": None if locked else _front(snap.get("observe"), now),   # 观察中的设备前面板 (#85)
     }
     return view
 
@@ -601,7 +607,7 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "agent": lambda: agent_sample(),
         "kvm_agent": lambda: kvm_sample(),
         "theme": theme_sampler(),
-        "observe": lambda: observe_core.read_snapshot(),
+        "observe": lambda: observe_core.read_snapshots(),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)

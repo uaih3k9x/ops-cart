@@ -412,12 +412,13 @@ def record(res, event=None):
 
 # ------------------------------------------------------------ 真 send (conbroker) / 命令行
 
-def conbroker_send(port, cmd, timeout):
-    """经 conbroker send 发一条 (等提示符、自动翻页、人在敲时它自己排队). 非只读命令直接拒, 不起子进程."""
+def conbroker_send(port, cmd, timeout, grace=60):
+    """经 conbroker send 发一条 (等提示符、自动翻页、人在敲时它自己排队). 非只读命令直接拒, 不起子进程.
+    grace: 子进程在 -t 之外多等的秒数 (conbroker 排队等人停手也算在里面); 观察模式收紧到 10."""
     if not any(is_readonly(cmd, v) for v in _RULES):
         raise ValueError(f"白名单不放: {cmd!r}")
     r = subprocess.run(_conbroker_cmd() + ["send", port, cmd, "-t", str(timeout)],
-                       capture_output=True, text=True, timeout=timeout + 60)
+                       capture_output=True, text=True, timeout=timeout + grace)
     if r.returncode != 0:
         raise RuntimeError(serve_error(r.returncode, r.stderr))
     return r.stdout

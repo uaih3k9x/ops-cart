@@ -140,9 +140,10 @@ class ObserveWindow(tk.Toplevel):
         log = os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log")
         self.obs = oc.Observer(self.name, self.vendor,
                                exchange=functools.partial(oc.broker_exchange, self.ddir, self.name, vendor=self.vendor),
-                               send=survey_core.conbroker_send, log_size=lambda: lamps_core.file_size(log),
+                               send=functools.partial(survey_core.conbroker_send, grace=oc.POLL_GRACE_S), log_size=lambda: lamps_core.file_size(log),
                                tail=lambda: oc.read_tail(log), busy=lambda: oc.agent_busy(self.head))
         self.status.config(text="看现场、登录中…", fg=DIM)
+        self._snap_at = 0
         self.stop_evt.clear()
         self.worker = threading.Thread(target=self._work, args=(self.obs, user, pw), daemon=True)
         self.worker.start()
@@ -169,6 +170,7 @@ class ObserveWindow(tk.Toplevel):
         obs, self.worker = self.obs, None
         if self._closing and obs.left != "skipped":
             return self.destroy()
+        self._write_snap()
         self.status.config(text=obs.error or "已停止", fg=th.BAD if obs.error else DIM)
         if not self.login_row.winfo_ismapped():
             self.login_row.pack(fill="x", padx=PAD, pady=8, before=self.canvas)
@@ -190,15 +192,20 @@ class ObserveWindow(tk.Toplevel):
         if obs and obs.panel:
             stale = obs.state != "polling" or bool(obs.error)
             self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time(), stale=stale))
-        if obs and self.worker and obs.state == "polling":
+        if obs and self.worker and obs.state == "polling" and not self._closing:
             self._status(obs)
-            if time.monotonic() - self._snap_at > SNAP_S:
-                self._snap_at = time.monotonic()
-                try:
-                    atomicfile.write_json(oc.STATE_PATH, obs.snapshot(self.head, owner=self.token))
-                except OSError:
-                    pass
+        if obs and time.monotonic() - self._snap_at > SNAP_S:
+            self._write_snap()
         self.after(FRAME_MS, self._tick)
+
+    def _write_snap(self):
+        """登录中 / 观察中 / 失败 / 掉线都写, 副屏照实显示; 关窗时删掉自己这份."""
+        self._snap_at = time.monotonic()
+        try:
+            os.makedirs(oc.STATE_DIR, exist_ok=True)
+            atomicfile.write_json(oc.snapshot_path(self.head), self.obs.snapshot(self.head, owner=self.token))
+        except OSError:
+            pass
 
     def _status(self, obs):
         if self._hover and self._hover in obs.ports:
@@ -226,7 +233,7 @@ class ObserveWindow(tk.Toplevel):
 
     def destroy(self):
         self.stop_evt.set()
-        oc.remove_snapshot(self.token)
+        oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
         release(self.name, self.token)
         super().destroy()
 

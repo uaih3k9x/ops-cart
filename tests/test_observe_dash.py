@@ -35,7 +35,7 @@ def test_layout_view_no_front_when_locked_stale_or_missing():
 def test_collect_pulls_observe():
     snap = dc.collect({"observe": lambda: _snap(5), "now": lambda: 5})
     assert snap["observe"]["device"] == "SW-TEST"
-    assert dc.collect({"now": lambda: 5})["observe"] is None
+    assert dc.collect({"now": lambda: 5})["observe"] == []
 
 
 def test_render_draws_front_lamps():
@@ -145,3 +145,26 @@ def test_one_window_per_port():
     op.release("con-1", "w1")
     assert op.claim("con-1", "w4") is True
     op._OPEN.clear()
+
+
+def test_layout_view_picks_newest_fresh_of_several():
+    a, b = dict(_snap(100), head="con-1"), dict(_snap(105), head="con-2")
+    v = dc.layout_view({"ts": 105, "observe": [b, a]}, now=106)
+    assert v["front"]["title"].startswith("con-2")
+    v = dc.layout_view({"ts": 105, "observe": [dict(b, ts=0), a]}, now=106)
+    assert v["front"]["title"].startswith("con-1")
+
+
+def test_layout_view_shows_logging_in_without_ports():
+    doc = dict(_snap(100, ports=[]), state="idle", polled_at=None)
+    v = dc.layout_view({"ts": 100, "observe": [doc]}, now=101)
+    assert v["front"]["note"] == "登录中" and v["front"]["ports"] == []
+    pytest.importorskip("PIL")
+    import dash_render as r
+    r.render(v)
+
+
+def test_default_ctx_reads_per_port_snapshots(tmp_path, monkeypatch):
+    monkeypatch.setattr(oc, "STATE_DIR", str(tmp_path))
+    (tmp_path / "con-3.json").write_text('{"ts": 1, "head": "con-3"}')
+    assert [d["head"] for d in oc.read_snapshots()] == ["con-3"]
