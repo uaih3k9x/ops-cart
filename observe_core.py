@@ -525,6 +525,7 @@ DEFAULT_PROFILES = {"huawei": {"poll": ["display interface brief"], "version": "
                                "timeout": 20,
                                "max_s": 1800}}   # 观察总时长上限: 轮询会让 console 一直不空闲超时, 不能无限保活
 MAX_S_CAP = 4 * 3600    # 观察总时长上限最多配到 4 小时
+TIMEOUT_CAP = 120       # 单条命令等提示符最多配到 120 秒
 POLL_GRACE_S = 10       # conbroker send 子进程在 -t 之外多给的秒数 (巡检是 60); 退出观察最多等一轮 = 20 + 10 秒
 
 
@@ -541,8 +542,9 @@ def load_profile(vendor, path=PROFILES_PATH):
             prof["poll"] = over["poll"]
         if "version" in over:
             prof["version"] = over["version"]
-        if isinstance(over.get("timeout"), (int, float)):
-            prof["timeout"] = over["timeout"]
+        t = over.get("timeout")
+        if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 1 <= t <= TIMEOUT_CAP:
+            prof["timeout"] = t
         m = over.get("max_s")
         if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and 0 < m <= MAX_S_CAP:
             prof["max_s"] = m
@@ -862,7 +864,8 @@ def front_view(doc, now, stale_s=FRONT_STALE_S, locked=False):
         out.append({"x": p.get("x", 0), "y": p.get("y", 0), "shape": p.get("shape", "rj45"),
                     "label": p.get("label", ""), "state": st, "lit": lit})
     if locked:
-        title = " · ".join(x for x in ("串口观察中", str(doc.get("head") or "")) if x)
+        title = " · ".join(x for x in ("串口观察中" if state == "polling" else "串口观察已停止",
+                                       str(doc.get("head") or "")) if x)
         ends = doc.get("ends_at")
         if state == "polling" and isinstance(ends, (int, float)):
             title += f" · 剩余 {max(0, math.ceil((ends - now) / 60))} 分钟"

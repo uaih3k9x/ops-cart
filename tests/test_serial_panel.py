@@ -239,3 +239,30 @@ def test_observe_vendor_falls_back_to_huawei_for_auto():
     assert sp.observe_vendor({}) == "huawei"
     assert sp.observe_vendor({"survey_vendor": "h3c"}) == "huawei"
     assert sp.observe_vendor({"survey_vendor": "huawei"}) == "huawei"
+
+
+@pytest.mark.parametrize("holder,word", [("tk-observe", "正在观察"), ("survey-abcd", "正在巡检")])
+def test_survey_refusal_says_who_holds_the_port(monkeypatch, holder, word):
+    import observe_core
+    import survey_core
+
+    def boom(*a, **k):
+        raise AssertionError("不该跑")
+    monkeypatch.setattr(survey_core, "run_survey", boom)
+    observe_core._CLAIMS.clear()
+    observe_core.claim("/dev/con-1", holder)
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    sp.SerialPanel.survey(p)
+    assert word in p.written[-1] and not p._surveying
+    observe_core._CLAIMS.clear()
+
+
+def test_observe_says_previous_still_finishing(monkeypatch):
+    import observe_core
+    import observe_panel
+    observe_core._CLAIMS.clear()
+    monkeypatch.setattr(observe_panel, "open_for", lambda *a, **k: None)
+    p = _SurveyPanel("/dev/con-1", {"/dev/con-1": "9600"})
+    p.ddir = "/x"
+    sp.SerialPanel.observe(p)
+    assert "收尾" in p.written[-1]

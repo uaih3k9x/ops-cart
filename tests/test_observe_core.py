@@ -1233,3 +1233,32 @@ def test_observe_cmd_ok():
     assert not oc.observe_cmd_ok("screen-length 0 temporary", "huawei")
     assert not oc.observe_cmd_ok("show version", "cisco")
     assert not oc.observe_cmd_ok("display current-configuration | save x", "huawei")
+
+
+# ============================================================ 第十三轮
+
+@pytest.mark.parametrize("raw", ["NaN", "true", "-5", "0", "86400", "Infinity", "\"20\""])
+def test_timeout_must_be_finite_between_1_and_120(tmp_path, raw):
+    p = tmp_path / "prof.json"
+    p.write_text('{"huawei": {"timeout": %s}}' % raw)
+    assert oc.load_profile("huawei", str(p))["timeout"] == 20
+
+
+def test_timeout_in_range_kept(tmp_path):
+    p = tmp_path / "prof.json"
+    p.write_text('{"huawei": {"timeout": 45}}')
+    assert oc.load_profile("huawei", str(p))["timeout"] == 45
+
+
+@pytest.mark.parametrize("state", ["stopped", "lost", "failed"])
+def test_locked_title_says_stopped_when_not_polling(state):
+    doc = {"ts": 100, "polled_at": 100, "head": "con-1", "device": "SW-TEST", "state": state,
+           "error": None, "reason": None, "ends_at": 700, "ports": []}
+    v = oc.front_view(doc, now=101, locked=True)
+    assert v["title"] == "串口观察已停止 · con-1" and "SW-TEST" not in repr(v)
+
+
+def test_locked_title_polling():
+    doc = {"ts": 100, "polled_at": 100, "head": "con-1", "device": "SW-TEST", "state": "polling",
+           "error": None, "reason": None, "ends_at": 700, "ports": []}
+    assert oc.front_view(doc, now=101, locked=True)["title"] == "串口观察中 · con-1 · 剩余 10 分钟"
