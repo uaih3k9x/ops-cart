@@ -212,7 +212,23 @@ def test_nm_dispatcher_starts_smb_on_lan1_up():
     s = (ROOT / "deploy" / "srv-data" / "50-ops-cart-smb").read_text()
     # 开机没地址时 smbd 被跳过 (没在跑), try-restart 拉不起来; 要 restart, 但只对开了自启的 (没装 / 没启用不动)
     assert '"eno1"' in s and "try-restart" not in s
-    assert "systemctl is-enabled -q smb.service && systemctl restart smb.service" in s
+    assert ("{ systemctl is-enabled -q smb.service || systemctl is-active -q smb.service; } "
+            "&& systemctl restart smb.service") in s
+
+
+@pytest.mark.parametrize("enabled,active,want_restart", [
+    (0, 1, True), (1, 0, True), (1, 1, False),          # 0 = 是 (systemctl 退出码); 手工起的没开自启也要重绑
+])
+def test_nm_dispatcher_restart_decision(tmp_path, enabled, active, want_restart):
+    log = tmp_path / "calls"
+    fake = tmp_path / "systemctl"
+    fake.write_text(f"#!/bin/sh\necho \"$*\" >> {log}\n"
+                    f"case \"$1\" in is-enabled) exit {enabled};; is-active) exit {active};; esac\nexit 0\n")
+    fake.chmod(0o755)
+    hook = ROOT / "deploy" / "srv-data" / "50-ops-cart-smb"
+    r = subprocess.run(["bash", str(hook), "eno1", "up"], env={"PATH": f"{tmp_path}:/usr/bin:/bin"})
+    assert r.returncode == 0
+    assert ("restart smb.service" in log.read_text()) == want_restart
     r = subprocess.run(["bash", "-n", str(ROOT / "deploy" / "srv-data" / "50-ops-cart-smb")],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -270,6 +286,8 @@ def test_cli_clone_password_twice_for_smbpasswd(tmp_path):
     assert r.returncode == 0 and r.stdout == "Example-pass1\nExample-pass1\n"     # smbpasswd -s 要两遍
 
 
-def test_setup_samba_installs_lan1_dropin():
-    s = (ROOT / "scripts" / "setup-samba.sh").read_text()
-    assert "deploy/srv-data/smb-lan1.conf\" /etc/systemd/system/smb.service.d/ops-cart-lan1.conf" in s
+def test_setup_samba_does_not_install_lan1_dropin():
+    """仓库生成的 smb.conf 带 lo, LAN1 没地址时 smbd 也有 127.0.0.1 可绑, 不会崩; 再装 lan1 drop-in 反而没插线时整个跳过.
+    lan1 drop-in 只给手工配置的推车 (docs/MIGRATE_95.md)."""
+    assert "srv-data/smb-lan1.conf" not in (ROOT / "scripts" / "setup-samba.sh").read_text()
+    assert sections(sb.smb_conf(IP, PREFIX, None))["global"]["interfaces"].split()[0] == "lo"

@@ -462,7 +462,16 @@ def _props(act="inactive", sub="dead", en="enabled", result="success", status="0
 
 def test_judge_smb_no_lan1_address_is_skip():
     st, why = ac.judge_smb(_props(), lan1_up=False)
-    assert st == S and "LAN1" in why
+    assert st == S and "LAN1" in why and "稍等" in why
+
+
+def test_judge_smb_failed_hints_missing_lan1_dropin():
+    crashed = _props("failed", "failed", result="core-dump", status="6")
+    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False)
+    assert st == F and "ops-cart-lan1.conf" in why and " lo" in why
+    st, why = ac.judge_smb(dict(crashed, DropInPaths="/etc/systemd/system/smb.service.d/ops-cart-lan1.conf"),
+                           lan1_up=False)
+    assert st == F and "没装" not in why
 
 
 def test_judge_smb_crashed_is_fail_even_without_link():
@@ -486,3 +495,9 @@ def test_logrotate_last_run_must_succeed():
                             _props("failed", "failed", en="static", result="exit-code", status="1"))
     assert st == F
     assert ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"], _props(en="static"))[0] == P
+
+
+def test_judge_logrotate_failed_points_to_journal():
+    st, why = ac.judge_logrotate(_props("failed", "failed", en="static", result="exit-code", status="1"))
+    assert st == F and "journalctl -u logrotate" in why
+    assert ac.judge_logrotate(_props(en="static"))[0] == P

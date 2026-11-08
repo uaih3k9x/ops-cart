@@ -394,14 +394,26 @@ def judge_unit(spec, props):
     return PASS, state
 
 
+LAN1_DROPIN = "ops-cart-lan1.conf"
+
+
 def judge_smb(props, lan1_up):
     """smb.conf 只绑 LAN1: 没地址时 smb.service.d/ops-cart-lan1.conf 让它跳过 (inactive), 这时 SKIP.
-    failed 不管有没有链路都 FAIL —— 跳过不会留下 failed, 有就是又崩了 / drop-in 没装."""
+    failed 不管有没有链路都 FAIL —— 跳过不会留下 failed, 有就是又崩了 / drop-in 没装 / smb.conf 没带 lo."""
     if not props or props.get("LoadState") != "loaded":
         return SKIP, "没装 Samba"
-    if not lan1_up and props.get("ActiveState") != "failed":
-        return SKIP, f"LAN1 没地址 (没插线), smbd 等插线来地址再起 ({props.get('ActiveState')})"
-    return judge_unit(SYSTEM_UNITS["smb.service"], props)
+    act = props.get("ActiveState")
+    if not lan1_up and act != "failed":
+        return SKIP, f"LAN1 没地址 (没插线), smbd 等插线来地址再起 ({act}); 刚开机的话稍等再跑"
+    st, why = judge_unit(SYSTEM_UNITS["smb.service"], props)
+    if act == "failed" and LAN1_DROPIN not in props.get("DropInPaths", ""):
+        why += f"; 没装 smb.service.d/{LAN1_DROPIN}, smb.conf 的 interfaces 也该带 lo (docs/MIGRATE_95.md)"
+    return st, why
+
+
+def judge_logrotate(props):
+    st, why = judge_unit(SYSTEM_UNITS["logrotate.service"], props)
+    return (st, why + "; 看 journalctl -u logrotate (多半是哪份日志打不开)") if st == FAIL else (st, why)
 
 
 # ============================================================ SELinux / 字体 / 权限 / 配置

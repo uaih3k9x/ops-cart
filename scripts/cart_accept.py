@@ -257,7 +257,7 @@ def unit_checks():
 def system_unit_checks():
     """系统自带的单元 (#95): smb 只绑 LAN1, 没地址时跳过算 SKIP; logrotate 每天 0 点跑, 上次失败 = 有日志没轮转."""
     def show():
-        rc, out, _ = sh(["systemctl", "show", "-p", ac.SHOW_PROPS] + sorted(ac.SYSTEM_UNITS))
+        rc, out, _ = sh(["systemctl", "show", "-p", ac.SHOW_PROPS + ",DropInPaths"] + sorted(ac.SYSTEM_UNITS))
         return None if rc == 127 else ac.parse_show(out)
 
     def smb():
@@ -271,7 +271,7 @@ def system_unit_checks():
         d = show()
         if d is None:
             return ac.SKIP, "没有 systemctl (不是推车)"
-        return ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"], d.get("logrotate.service"))
+        return ac.judge_logrotate(d.get("logrotate.service"))
 
     return [ac.Check("单元 smb.service (装机共享)", "#95", smb),
             ac.Check("单元 logrotate.service (日志轮转)", "#95", logrotate)]
