@@ -1,238 +1,146 @@
 # ops-cart
 
-> 硬件级自动化运维推车 —— 装机、KVM、串口、以及替你蹲机房的那台机器。
+硬件级运维推车：装机、KVM、串口，以及替你蹲机房的那台机器。
 
-一台二手 X 光安检识别盒,改造成了远程运维车。目标机器没系统、没网络、
-卡在 BIOS,推过去插上线就能处理。**人在被窝,车在机房。**
+一台二手 X 光安检识别盒改成的远程运维车。目标机器没系统、没网络、卡在 BIOS，推过去插上线就能处理。
 
 ```
 目标机器 ◄── HDMI ── SC0710 / MS2130 采集 ──┐
 目标机器 ◄── USB ─── CH9329 键鼠注入 ───────┤
-目标机器 ◄── 网线 ── PXE 装机口 ────────────┤ 推车 (Rocky 9) ── 有线 / 无线 ── tailnet ──► 你
+目标机器 ◄── 网线 ── PXE 装机口 (LAN1) ─────┤ 推车 (Rocky 9) ── 有线 / 无线 ── tailnet ──► 你
 交换机   ◄── 串口 ── FT232R ───────────────┘
 ```
 
-软件全部自研,只用 Python 标准库 + Tkinter,跑在车上的东西不装第三方包;
-唯一例外是副屏服务 `cart-dash`,画图和推 USB 要 Pillow / pyusb,装在单独的 `/opt/pxe/venv` 里。
+车上的程序只用 Python 3.9 标准库 + Tkinter。例外各自装在单独的 venv 里：副屏 `cart-dash` 要 Pillow / pyusb（`/opt/pxe/venv`），OCR 常驻服务 `cart-ocr` 要 RapidOCR（`/opt/pxe/ocr-venv`，可选）。
 
-## 能干什么
+当前版本见 [`VERSION`](VERSION)。
 
-- **装机**:自研 PXE 服务端(DHCP + proxyDHCP + TFTP),目标机器网线直插即全自动装 Rocky 9;
-  按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器只能进救援。
-  服务端自己也守规矩:租约到期回收、池满不发、不是自己的租约不吭声;装机口上看见别人的 DHCP 就转代理模式(不发地址、只给引导),
-  网口上没有自己的地址就不回包;TFTP / HTTP 发装机菜单和 ks 前再核一遍装机模式和 MAC
-- **KVM**:HDMI 采集低延迟预览,CH9329 透传键鼠(绝对鼠标,VMware 式 Ctrl+Alt 释放);
-  开机自动选有信号的画面源
-- **串口**:串口 console 面板,交换机/防火墙/服务器在网络炸了的时候也够得着
-- **车机界面**:无 WM 直跑的全屏 Kiosk —— 街机风开机自检、实时状态板、右侧二级菜单、PIN 锁屏
-  (输错冷却逐次翻倍、封顶 15 分钟,计数落 `/run`,重启 kiosk 不清零);外部命令和串口收发都在后台线程,
-  结果经队列回主线程
-- **网页版 Kiosk**:同一套状态、画面、键鼠与串口经浏览器远程访问,tailnet 永远放行,局域网需开关 + PIN;
-  只认白名单里的 Host、POST 必须同源,输错冷却按来源 IP 分开;以专用用户跑,操作写审计日志(PIN、打字内容不记)
-- **联网**:有线优先、无线兜底(拔网线约 17 秒切换);内置无线管理面板,
-  校园网锐捷 ePortal 无浏览器自动认证(认证页主机首次记住,之后跳到陌生主机不发账号);
-  改当前出口那条无线前先确认,换连接先建后删、新密码连不上自动回退;
-  LAN1 / LAN2 按网口选模式(关闭 / DHCP / 静态一页填完,含网关、DNS、出口优先级),每次切换都能撤,
-  确认框直接列出要执行的命令和 undo 命令,切失败自动回到原来的
-- **副屏与 UPS**:USB 副屏常驻状态板(`cart-dash` 统一采集,车机和副屏读同一份快照);
-  APC UPS 直读 hidraw 拿电量、负载、市电状态;低电量两段式:≤40% 或估计剩不到 15 分钟先琥珀一行预告(推到手机),
-  到 15% 再 30 秒倒计时、插回市电自动取消,走完才正常关机(日志 `/var/log/ops-cart/ups.log`);屏幕底下一排虚拟指示灯(CDE 前面板),颜色看自检、闪烁看活动
-- **OCR 与屏幕配方**:截图识字带坐标;`recipe.py boot-pxe` 自动进启动菜单选网络启动
-- **Agent 接入**:MCP 服务把串口输出、截屏、推车状态开放给 Claude Code 等现成 Agent;写串口要拿有期限的写租约,
-  只读命令直发、其余挂起等人在推车上确认,Agent 和人都能一键急停(只停发送,不往设备插字节),解除只能人在本机
-- **机房辅助**:LLDP 显示网线对面的交换机和口;串口一键只读巡检并比对配置漂移;TSC 线缆/资产标签;关键事件推到手机;Clonezilla 整盘克隆(解锁 MAC + 目标盘显式匹配)
+## 能做什么
 
-## 代码地图
-
-车上运行的模块都在根目录,部署时平铺进 `/opt/pxe/`。
-
-| 文件 | 职责 |
+| 功能 | 说明 |
 |---|---|
-| [`pxeserver.py`](pxeserver.py) | PXE 服务端:DHCP 租约表、TFTP(块号回绕、流式读)、装机口守卫 `PxeGuard`(状态写 `/run/ops-cart/pxe-guard.json`)、grub 菜单模板(全仓库只此一处);Linux / Windows 通用 |
-| [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);ks 和装机菜单只给报出解锁 MAC 的请求(防误装,MAC 是客户端自报的,不是访问控制),`.bak` 一律 404;LAN1 没插线就等地址出现,不退出 |
-| [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter);深浅按快照里的 `theme`(#32):开机那一刻定主界面和自检页用哪套,之后模式变了等锁屏且没人碰时整个重建,开着面板 / 对话框 / 透传时不换;「画面设置」里「界面:自动 / 深 / 浅」写 `/etc/ops-cart/theme.json` 的档位并记 events.log |
-| [`kiosk_ui_core.py`](kiosk_ui_core.py) | GUI 的界面逻辑:`UiBridge`(后台结果回主线程)、左侧面板状态机、右侧菜单定义、装机定时器判定、CH9329 发送线程与鼠标位移拆分 |
-| [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、状态采集、nmcli 命令、装机模式与装机网段(读 `pxe.env`)、PIN 闸门;`python3 kiosk_core.py --write-rescue` 给部署脚本写救援菜单 |
-| [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
-| [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序;面板底部改校园网认证账号、立即认证、看最近结果 |
-| [`wifi_prefer.py`](wifi_prefer.py) | 定时让优先级真正生效:看得见更高优先级的已保存网络就切过去,失败冷却 30 分钟 |
-| [`netmode_panel.py`](netmode_panel.py) · [`netmode_core.py`](netmode_core.py) | 网口模式(#12):LAN1 / LAN2 每个口一个模式(关闭 / DHCP / 静态),切换 = undo 当前 → apply 新,失败撤新的、恢复原来的,再不行落到干净状态(LAN1 关闭、LAN2 DHCP);每个模式记下自己建的 `cart-` 连接(按 uuid)和改过的内核参数原值,状态写 `/var/lib/ops-cart/netmode.json`;第一次接管一个口时,新模式起来后把这个口上的旧连接备份到 `/var/lib/ops-cart/nm-backup/` 再删(备份不成就不删);网关一直能填,主出口只有 Wi-Fi,LAN2 填了网关自动当备用出口(metric 排在 Wi-Fi 后面,常量在 `wifi_core`,#7 共用),LAN1 永不当出口、网关只走「经网关去的网段」;无线永远不碰。设计见 [`docs/NETMODE.md`](docs/NETMODE.md) |
-| [`netprof_core.py`](netprof_core.py) | 网口共用小件:认旧连接名、静态地址校验 `static_form` / 按对端预填(不猜 /24)、DHCP 探测(没插线不探测,结果算"未知";pxeserver 守卫用) |
-| [`wol_panel.py`](wol_panel.py) · [`wol_core.py`](wol_core.py) | 网络唤醒:常用目标清单 + 临时输 MAC,从选定网口广播魔术包 |
-| [`atomicfile.py`](atomicfile.py) | 防断电写文件:临时文件 → fsync → 改名,配置要么旧要么新 |
-| [`cartlog.py`](cartlog.py) | 日志分层:机器事件进 `/var/log/ops-cart/`(logrotate 轮转),`CART-LOG.md` 只收一行摘要 |
-| [`webkiosk.py`](webkiosk.py) · [`web_core.py`](web_core.py) · [`web/`](web/) | 网页版远程管理口(标准库 http.server + xterm.js);单独的 `webkiosk.service`,专用用户 `ops-web`,默认不开机自启 |
-| [`ruijie_portal.py`](ruijie_portal.py) | 锐捷 ePortal 自动登录,只在连着配置里写的那个 SSID 时跑(配置没写 SSID 就不跑);认证页主机白名单 `portal_hosts`(空时首次成功自动记住);结果写 `/run/ops-cart/campus-auth-status.json` 给面板和状态板 |
-| [`kvm_core.py`](kvm_core.py) | 画面源 ↔ 键鼠绑定:CH9329 按 CH343 序列号认身份;没绑或不在线 = 只看不操作,绝不退回随便一块 |
-| [`ch9329.py`](ch9329.py) | CH9329 键鼠注入协议栈(独占打开,被占用报 `Ch9329Busy`、拔线报 `Ch9329Gone`),也可当命令行工具用;键鼠代理在跑时命令行经代理发(默认算 agent),不在就直开 |
-| [`kvm_broker.py`](kvm_broker.py) · [`kvm_broker_core.py`](kvm_broker_core.py) | 键鼠常驻代理(`kvm-broker.service`):统一持有 CH9329,车机 / 网页口 / 命令行 / 配方都经本地 socket `/run/ops-kvm/kvm.sock`(行式 JSON,0660 给 dialout)发键;人永远优先,人 3 秒内动过键鼠 agent 就暂停排队;急停只丢 agent 没发的、不插任何按键,解除要人;每次发键记来源到 `/var/log/ops-cart/kvm.log`。代理不在各客户端退回直开 + flock。纯逻辑(解析、拆步、仲裁、租约钩子、日志行)在 `_core` |
-| [`serial_panel.py`](serial_panel.py) · [`serial_core.py`](serial_core.py) | 串口会话面板:只认在跑的 conbroker 服务,断了自动重连,粘贴按行限速;CH9329 所在的口不许开服务。纯逻辑(读 `serial.conf`、conbroker 命令与输出解析、选口、终端字节)在 `serial_core`,不碰 Tk,无界面的服务都用它 |
-| [`cart_snap.py`](cart_snap.py) | 采集卡截一帧(推车锁屏时也能拿;不给 `-o` 时输出到 `/run/ops-cart` 下的私有文件) |
-| [`cart_mcp.py`](cart_mcp.py) · [`mcp_core.py`](mcp_core.py) | 推车 MCP 服务(#19 只读部分 + #20 标签;写串口见下一行 #21):给 Claude Code 这类现成 Agent 列串口执行绪(槽位 1–4,名字从华为 `<名>`/`[名]` 提示符认)、读输出(走 conbroker tail)、截屏、看推车状态和 PXE 模式;列执行绪时带写租约持有者。stdio(ssh 即认证)或 HTTP(只绑本机和 tailnet 地址、Bearer 令牌见 [`examples/mcp.example.json`](examples/mcp.example.json));协议用标准库实现,每次调用一行 JSON 审计进 `/var/log/ops-cart/mcp-audit.log`。设计见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) |
-| [`mcp_serial.py`](mcp_serial.py) · [`serial_write_core.py`](serial_write_core.py) | 串口写路径(#21):MCP 工具 `lease_acquire/renew/release`、`send_command`(只收一行可打印 ASCII)、`send_key`(回车 / 翻页空格 / Ctrl+C)、`pending_list`、`estop`。每槽位同时一个写入者,租约默认 60 秒要续、过期作废;闸门第 1 层:认得出厂商(华为提示符自动认,思科 / 锐捷 / Linux 在 [`examples/serial_gate.example.json`](examples/serial_gate.example.json) 登记)、停在提示符上、过只读白名单才直发,带 save/reboot/reset/format/delete 等高危词的永远要人确认;第 2 层(#22,[`serial_gate_model.py`](serial_gate_model.py),规则文件 `model.enabled` 打开,默认关):其余命令交决策模型按命令 + 设备最近输出 + Agent 声明的 `intent` 判,放行直发,判拦 / 超时 / 报错 / 格式不对 / 预算超限一律挂起等人确认,理由进日志;Ctrl+C 要人确认。急停单条 / 全部:撤租约、丢挂起,不往设备发任何东西。状态 `/run/ops-cart/serial-write.json`(读不懂 = 全部急停),每槽位 JSONL 日志 `/var/log/ops-cart/serial-slot<N>.log`。车机上 `cart_mcp.py pending / confirm / reject / estop / resume`,确认和解除只认本机终端(不经 sshd / tailscaled) |
-| [`confirm_core.py`](confirm_core.py) · [`confirm_panel.py`](confirm_panel.py) | Agent 写串口确认 UI(#23):执行器条操作头急停红 / 待确认黄闪 / Agent 输入紫闪,点开确认框确认 / 拒绝 / 急停 / 解除(高危词再问一次),另有「Agent 全部急停」块;网页「Agent」页只能急停和拒绝(经 `/run/ops-cart/serial-req/` 投请求,root 的 `cart-serial-req.path` 执行),确认和解除只在车机;副屏操作头同色并写挂起数和急停。状态读不懂 = 全部急停 |
-| [`mcp_kvm.py`](mcp_kvm.py) | MCP 看和动被测机(#41):`screen_ocr` 读屏幕字、键鼠 `kvm_*`(写租约、只经代理、全部急停收回、高危内容挂起等车机确认)、`wol_send`(只发 LAN1) |
-| [`mcp_pxe.py`](mcp_pxe.py) · [`pxe_req_core.py`](pxe_req_core.py) · [`pxe_req_panel.py`](pxe_req_panel.py) | 经 MCP 申请 PXE 解锁(#24):`pxe_request(purpose, mac \| batch)` 按现有 `clone_plan` / 守卫算清单、发随机确认码,**只挂起不解锁**(码和清单摘要不回给 Agent);车机弹申请框(谁、用途、清单、确认码),人照抄确认码、推车重算清单和申请时一样才 `pxe_arm`。申请 10 分钟作废,「Agent 全部急停」同时作废未确认的申请;`pxe_requests` 只读看结果,`pxe_retire` 提前上锁(只收紧,直接执行)。网页不给确认。状态 `/run/ops-cart/pxe-req.json`(root 0600,读不懂 = 没有申请),日志 `/var/log/ops-cart/pxe-req.log` |
-| [`pxe_log_core.py`](pxe_log_core.py) | 网页「PXE 日志」页(#24 后续):只读 `pxe-req.log` 和 `events.log` 的 `[pxe]` 行的尾部,按 MAC 分组(一条涉及几台进几组,没 MAC 的进「未关联」),字段白名单,确认码和清单摘要绝不出;网页不显示在等的申请、不给确认也不给拒绝 |
-| [`cart_ocr.py`](cart_ocr.py) | 截图 OCR(tesseract);退出码 0 找到 / 1 没找到 / 2 出错 |
-| [`mcp_label.py`](mcp_label.py) | MCP 标签工具(#20,挂在 `cart_mcp` 上):`label_preview` 查仅 ASCII、`cart_label.LIMITS` 长度、出界和对折,回检查结果 + SVG;`label_print` 校验不过或打印机开盖/缺纸/缺碳带就拒,**默认只打 1 张**,批量要带单张打样回的 `proof`(10 分钟、一次性、绑版面)和人确认的原话 `confirmed`,都进审计;`label_printer_status` 读 `ESC !?` 状态字节;`label_abbrev_propose` 只回缩写对照表 diff,不写回。对照表优先读推车本地 `/etc/ops-cart/label_abbrev.json` |
-| [`cart_label.py`](cart_label.py) | TSC 标签机 TSPL 生成器(只出字节流,打印由调用方 `cat > /dev/usb/lp0`):旗形线缆标签(上下对折、下半份旋转 180°)、推车线标、刻度尺、资产标签(PDF → pdftoppm → BITMAP);校准常量集中在文件头;缩写对照表校验见 [`examples/label_abbrev.json`](examples/label_abbrev.json) |
-| [`tspl_preview.py`](tspl_preview.py) | 不在打印机边上时把 TSPL 画成 HTML/SVG:旗面轮廓、折痕、对折后正反面;查出界和对折对称。开发机工具 |
-| [`lldp_core.py`](lldp_core.py) | LLDP/CDP 被动监听(只收不发):LAN1/LAN2 对面是哪台交换机的哪个口,经 cart-dash 进快照,副屏和状态板显示;给线缆标签对端出建议值 |
-| [`survey_core.py`](survey_core.py) | 串口一键只读巡检:命令白名单 fail-closed(只认全称 `display`/`show`),走 conbroker 发、存档、和上一份比对配置漂移;串口面板「巡检」按钮 |
-| [`notify_core.py`](notify_core.py) | 关键事件推到手机(UPS、守卫、校园网认证、服务挂了、非正常重启):只读状态文件、只在变化时推、防抖冷却;渠道 ntfy、飞书群自定义机器人或推车专用飞书应用(只开发消息权限),默认不外发 |
-| [`recipe_core.py`](recipe_core.py) · [`recipe.py`](recipe.py) | 屏幕自动化配方:截图 + OCR + CH9329,第一个配方 `boot-pxe` 自动进启动菜单选网络启动;配方里不许出现保存类按键 |
-| [`clone_core.py`](clone_core.py) | 整盘克隆(Clonezilla over PXE):解锁用途 clone-save / clone-restore、启动参数生成、目标盘按型号/序列号显式匹配(绝不默认 sda)、批量清单确认;见 [`docs/CLONE.md`](docs/CLONE.md) |
-| [`srv_data_core.py`](srv_data_core.py) · [`samba_core.py`](samba_core.py) | 数据盘和装机库(#11):数据盘按 UUID 挂 `/srv/data`(XFS、nofail,没装盘照常开机)、ISO 只读挂载单元(单元名按 systemd-escape 转义)、目录布局;Samba 配置生成(只绑 LAN1、hosts allow 装机网段、装机共享账号登录、克隆共享照 `clone.json`)、firewalld 规则。部署 `scripts/setup-srv-data.sh` / `scripts/setup-samba.sh`,见 [`docs/DATA_DISK.md`](docs/DATA_DISK.md) |
-| [`dash_core.py`](dash_core.py) | 状态快照的可测核心:采集(慢项各有节奏)、原子写 `/run/ops-cart/state.json`(带 ts/seq)、过期判定、副屏版面模型;车机也读这份快照 |
-| [`sun_core.py`](sun_core.py) | 按日出日落判断深色 / 浅色(#31,NOAA 算法、不联网):档位 auto / dark / light,auto 下日出日落后留缓冲(默认 20 分钟)不来回跳,没配经纬度或配置读不懂按深色;配置 `/etc/ops-cart/theme.json`(样例 [`examples/theme.example.json`](examples/theme.example.json),坐标是格林尼治天文台,推车位置在车上配);结果由 cart-dash 写进快照 `theme` |
-| [`dash_service.py`](dash_service.py) · [`dash_render.py`](dash_render.py) | `cart-dash` 常驻进程:每 200 ms 采集,版面变了才重画(Pillow,竖屏画、横屏发),副屏拔了照写快照、3 秒重连;车机 kiosk 没就绪(kiosk.json 里的 pid 不在了)画开机自检,逐行出结果;`--once --preview` 导出画面不推屏;每帧按快照里的 `theme.mode` 切配色,模式一变下一帧整帧换(#32) |
-| [`pet_core.py`](pet_core.py) · [`pet_render.py`](pet_render.py) · [`pet_sprites.py`](pet_sprites.py) | 副屏桌宠(#35):原创像素猫,只在锁屏且没事时出现,能在公告字、分隔线和底部空地之间跑(有红灯不上分隔线),路人猫(奶牛、大橘、梨花)随机来,靠近才哈气,偶尔打成一团烟,动时整帧 8 fps、睡着 2 fps,不在就不推;行为、绘制、精灵分开,猫出错只摘猫不影响状态板;`--no-pet` 关掉;`/etc/ops-cart/pet-skin.json` 可换主猫的样子(纯数据,现场自备,不进仓库) |
-| [`udisp.py`](udisp.py) · [`udisp_usb.py`](udisp_usb.py) | USB 副屏(xfz1986 / ESP32-P4)协议:16 字节帧头打包、假 zlp 收尾、从 iInterface 读分辨率;传输层走 pyusb,协议层不碰 USB。协议笔记见 [`docs/udisp-protocol.md`](docs/udisp-protocol.md) |
-| [`ups_core.py`](ups_core.py) · [`hidpdc.py`](hidpdc.py) | 推车 UPS:`hidpdc` 用标准库解析 HID Power Device 描述符、直读 hidraw(不装 NUT),读不到退回 upower;有 hidraw 就以它的 OL/OB 为准;低电量两段式的判断 `shutdown_stage`(预告 / 倒计时 / 关机,车机和副屏共用) |
-| [`theme.py`](theme.py) | 车机 / 副屏的颜色、字体、斜边都在这里,业务代码只引用名字(测试扫描兜底);两套同名配色 `DARK` / `LIGHT`(CDE 深色 #28、CDE 浅色 #30),`use(mode)` 切换(默认深色),模块级别名用 `follow()` 跟着换;`setup(root)` 启动时(和换配色后)挑字体(Unifont,没有退回 Noto)、设 Tk 默认控件的 option 数据库;`unreadable(w)` 查控件树里字和底够不够 4.5:1 |
-| [`lamps_core.py`](lamps_core.py) | 执行器条(屏幕底下)虚拟指示灯:每灯盯一个单调计数器(日志大小、网卡字节数、键鼠发送次数),变了就闪;串口操作头 `/dev/con-1~4` 收到 ^G 亮红 |
-| [`cart_dream.py`](cart_dream.py) | 推车"做梦":每晚 02:00 把 `CART-LOG.md` 新增部分交给车上的 Claude Code 整理成小结(不给工具、有花费上限、失败不前进),标题显示在锁屏底部 |
+| 装机 | 自研 PXE 服务端（DHCP + proxyDHCP + TFTP + HTTP），网线直插自动装 Rocky 9。只有车机上解锁、在倒计时内的那个 MAC 能装，其他机器只进救援。装机口上有别人的 DHCP 就转代理模式；自己发地址时限时，默认 30 分钟 |
+| KVM | HDMI 采集预览，CH9329 透传键鼠，开机自动选有信号的画面源。键鼠统一经常驻代理 `kvm-broker`，人优先 |
+| 串口 | conbroker 串口 console 面板，一键只读巡检，并和上一份比对配置漂移 |
+| 车机 | 无 WM 全屏 Kiosk：开机自检、状态板、PIN 锁屏、CDE 深浅两套配色（按日出日落自动切），屏幕底下一排虚拟指示灯 |
+| 网页口 | 同一套状态、画面、键鼠、串口经浏览器访问，另有只读的 PXE 日志页。tailnet 放行，局域网要开关 + PIN |
+| 副屏 / UPS | USB 副屏常驻状态板和像素猫桌宠；APC UPS 直读 hidraw，低电量先预告，再倒计时关机 |
+| 联网 | 有线优先，无线兜底；锐捷 ePortal 自动认证；LAN1 / LAN2 按口选模式，每次切换都能撤回 |
+| Agent 接入 | MCP 服务开放串口、截屏、OCR、键鼠、WOL、PXE 申请、标签打印。写操作要拿有期限的租约，高危操作挂起，等人在车机上确认；全部急停，解除只能在本机 |
+| 机房辅助 | LLDP 看对端交换机口、TSC 线缆 / 资产标签、关键事件推到手机、Clonezilla 整盘克隆、屏幕配方（如 `boot-pxe`）、夜间日志小结 |
+
+## 部件
+
+车上运行的模块都在根目录，部署时平铺进 `/opt/pxe/`。`*_core.py` 是不碰硬件、不碰 Tk 的纯逻辑，测试主要测它们。
+
+| 模块 | 职责 |
+|---|---|
+| `pxeserver.py` · `httpserve.py` | PXE 服务端和装机口守卫 `PxeGuard`；引导和仓库的静态 HTTP，ks 和装机菜单只给解锁的 MAC |
+| `kiosk.py` · `kiosk_core.py` · `kiosk_ui_core.py` | 车机界面；自检计划表、状态采集、装机模式、PIN 闸门；界面状态机 |
+| `theme.py` · `sun_core.py` · `lamps_core.py` | 配色、字体、斜边（`DARK` / `LIGHT`）；日出日落定深浅；底部指示灯 |
+| `ks_panel.py` | Kickstart 表单编辑，带备份和破坏性指令校验 |
+| `wifi_panel.py` · `wifi_core.py` · `wifi_prefer.py` · `ruijie_portal.py` | 无线管理、优先级生效、校园网认证 |
+| `netmode_panel.py` · `netmode_core.py` · `netprof_core.py` | 网口模式（关闭 / DHCP / 静态），可撤回 |
+| `wol_panel.py` · `wol_core.py` | 网络唤醒 |
+| `ch9329.py` · `kvm_core.py` · `kvm_broker.py` · `kvm_broker_core.py` | CH9329 协议栈和命令行；画面源与键鼠绑定；键鼠代理（`/run/ops-kvm/kvm.sock`） |
+| `serial_panel.py` · `serial_core.py` · `survey_core.py` | 串口面板、conbroker 接口、只读巡检 |
+| `cart_snap.py` · `cart_ocr.py` · `ocr_rapid_worker.py` | 截一帧；OCR（优先 `cart-ocr` 服务，没开退回 Tesseract）；OCR 服务进程 |
+| `recipe.py` · `recipe_core.py` | 屏幕配方：截图 + OCR + 发键 |
+| `cart_mcp.py` · `mcp_core.py` | MCP 服务（stdio / HTTP），审计日志；车机上 `pending / confirm / reject / estop / resume` |
+| `mcp_serial.py` · `serial_write_core.py` · `serial_gate_model.py` | 串口写：租约、闸门（白名单 + 可选决策模型）、挂起、急停 |
+| `mcp_kvm.py` | MCP 键鼠 `kvm_*`、`screen_ocr`、`wol_send` |
+| `mcp_pxe.py` · `pxe_req_core.py` · `pxe_req_panel.py` · `pxe_log_core.py` | Agent 申请 PXE 解锁（人照抄确认码才生效）、`pxe_clients`；网页 PXE 日志页 |
+| `mcp_label.py` · `cart_label.py` · `tspl_preview.py` | MCP 标签工具；TSPL 生成；开发机上预览 |
+| `confirm_core.py` · `confirm_panel.py` | 串口 / 键鼠写操作的确认框和急停 UI |
+| `webkiosk.py` · `web_core.py` · `web/` | 网页口（专用用户 `ops-web`，默认不自启） |
+| `dash_service.py` · `dash_core.py` · `dash_render.py` | `cart-dash`：采集状态快照 `/run/ops-cart/state.json`，画副屏 |
+| `pet_core.py` · `pet_render.py` · `pet_sprites.py` | 副屏桌宠 |
+| `udisp.py` · `udisp_usb.py` | USB 副屏协议和传输 |
+| `ups_core.py` · `hidpdc.py` | UPS 读数和低电量判断；HID Power Device 解析 |
+| `lldp_core.py` · `notify_core.py` · `clone_core.py` | LLDP 被动监听；手机推送（ntfy / 飞书）；整盘克隆 |
+| `srv_data_core.py` · `samba_core.py` | 数据盘 `/srv/data` 和 Samba 装机库 |
+| `cart_dream.py` · `cartlog.py` · `atomicfile.py` | 夜间日志小结；日志分层；防断电写文件 |
 
 | 目录 | 内容 |
 |---|---|
-| [`tests/`](tests/) | 离线单测,不接任何硬件也能全绿 |
-| [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
-| [`fonts/`](fonts/) | 车机和副屏的界面字体 Unifont 16px 点阵(OTF + 授权原文),部署装到 `/usr/local/share/fonts/ops-cart/`;取不到车机退回 Noto,自检 `UI FONT` 一行变 WARN |
-| [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
-| [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查,`cart_accept.py` 推车只读验收(逐项 PASS / FAIL / SKIP / 人工,纯逻辑在 `accept_core.py`);`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
-| [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md)、[备用远程通道](docs/REMOTE_TUNNEL.md) |
-| [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
-| [`plymouth/`](plymouth/) | 开机画面主题 |
-| [`windows/`](windows/) | 在 Windows 上跑 PXE 服务端的部署脚本 |
+| `deploy/` | systemd 单元、sysctl、journald、logrotate、tmpfiles、firewalld 区、SELinux 小模块、`kiosk` 等命令 |
+| `scripts/` | 铺引导文件、构建号、冒烟、验收、公开安全检查、OCR / Samba / 数据盘安装、README 计数 |
+| `examples/` | 各配置文件的样例（自检、ks、MCP、闸门、推送、主题、换皮、标签缩写等） |
+| `fonts/` · `icons/` · `plymouth/` | 界面字体 Unifont、顶栏网络图标、开机画面 |
+| `windows/` | 在 Windows 上跑 PXE 服务端 |
+| `tests/` | 离线单测，不接硬件 |
 
-## 快速开始
+## 部署
 
-```bash
-# 离线全测(本机什么版本都行,但代码要能在推车的 Python 3.9 上跑,tests/test_py39_compat.py 守着语法)
-python3 -m pytest -q
+升级已有推车：照 [`docs/DEPLOY_1.11.00.md`](docs/DEPLOY_1.11.00.md) 整包拷（备份、落位、SELinux 模块、重启顺序、验证、回滚），之后各版新增的部件按下表补上。装完跑只读验收 `scripts/cart_accept.py`，用法和人工部分见 [`docs/ACCEPT_1.11.md`](docs/ACCEPT_1.11.md)。
 
-# CH9329 注入
-python3 ch9329.py --port /dev/ttyACM0 type "hello from cart"
-python3 ch9329.py --port /dev/ttyACM0 combo ctrl alt delete
-python3 ch9329.py estop --all                  # 键鼠代理在跑时: 急停 agent 的键鼠输入
-python3 ch9329.py --src human resume --all     # 解除急停 (要人来)
-
-# PXE 服务端(地址是示例;推车上由 /etc/ops-cart/pxe.env 给出)
-python3 pxeserver.py serve --ip 192.0.2.1 --prefix 24 \
-    --pool 192.0.2.10,192.0.2.20 --tftp-root /opt/pxe/tftp --iface eno1
-
-# 公开仓库脱敏检查(本地词表放 .public-safe.local,不进仓库)
-python3 scripts/check_public_safe.py .
-
-# 截图找字
-python3 cart_ocr.py shot.png --find "Boot Menu"
-```
-
-## 部署到推车
-
-升级已有推车按 `docs/DEPLOY_<版本>.md` 一步步来(备份、重启顺序、验证、回滚)。从零装:
+从零装的骨架：
 
 ```bash
-scripts/stamp-build.sh                         # 生成 BUILD(提交数 + 哈希)
+scripts/stamp-build.sh                                   # 生成 BUILD (提交数 + 短哈希)
 scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web icons fonts cart:/opt/pxe/
-# 界面字体 (#28): 只装 OTF (Rocky 9 的 FreeType 读不了 OTB); 别装 bitmap-fangsongti-fonts (会抢全系统默认 monospace)
-sudo install -D -m 644 /opt/pxe/fonts/unifont-18.0.01.otf /usr/local/share/fonts/ops-cart/unifont-18.0.01.otf && sudo fc-cache -f
-sudo install -d -m 755 /etc/ops-cart
-sudo install -m 644 deploy/pxe.env.example /etc/ops-cart/pxe.env   # 改成现场的装机网段
+# 以下在推车上
+sudo install -D -m 644 /opt/pxe/fonts/unifont-18.0.01.otf /usr/local/share/fonts/ops-cart/ && sudo fc-cache -f
+sudo install -D -m 644 deploy/pxe.env.example /etc/ops-cart/pxe.env      # 改成现场装机网段
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo cp deploy/sysctl.d/* /etc/sysctl.d/ && sudo sysctl --system
-sudo mkdir -p /etc/systemd/journald.conf.d && sudo cp deploy/journald.conf.d/* /etc/systemd/journald.conf.d/ && sudo systemctl restart systemd-journald
-sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/ && sudo cp deploy/tmpfiles.d/ops-cart.conf /etc/tmpfiles.d/
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
-sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk
-sudo cp deploy/bin/kiosk-setpin /usr/local/bin/ && sudo kiosk-setpin
-sudo systemctl enable --now kiosk.service cart-boot-success.timer campus-auth.timer wifi-prefer.timer
-sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, 各客户端退回直开 (#9)
-# 网页管理口按需 (专用用户 + 预建 web.conf, 见单元注释):
-#   sudo useradd -r -s /sbin/nologin ops-web
-#   sudo install -o ops-web -g ops-web -m 0600 /dev/null /opt/pxe/web.conf
-#   sudo systemctl enable --now webkiosk.service
-# LAN1 防火墙区 (#38): 没放进 pxe 区时新机器拿不到地址 (netmode 新建的配置自带; 老配置手工改一次):
-#   sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload
-#   sudo nmcli con mod cart-eno1-static connection.zone pxe && sudo nmcli con up cart-eno1-static
-# screen_ocr 的 OCR 常驻服务 (#47, 可选; 不开退回 Tesseract, 彩色桌面读不出):
-#   sudo bash scripts/setup-ocr.sh deploy/ocr-requirements.txt && sudo systemctl enable --now cart-ocr
-# Agent 接入 (MCP) 按需: stdio 不用装单元, HTTP 先配令牌:
-#   sudo install -m 0600 examples/mcp.example.json /etc/ops-cart/mcp.json   (改掉 CHANGE-ME)
-#   sudo systemctl enable --now cart-mcp.service
-#   claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio
-# 标签工具 (#20) 要缩写对照表: sudo install -m 0644 examples/label_abbrev.json /etc/ops-cart/   (真实资产名的缩写只加在这份里)
-# 串口写闸门规则 (可选; 不放就是内置: 华为提示符自动认, 只放行 display / show, 决策模型不开;
-#   开第 2 层把 model.enabled 改 true, 模型走 serial.conf 那个 user 的 ~/.claude 线路, 同 cart-dream):
-#   sudo install -m 644 examples/serial_gate.example.json /etc/ops-cart/serial-gate.json
-# Agent 挂起的写命令在车机上确认 (退出到终端; 经 ssh 不认):
-#   sudo python3 /opt/pxe/cart_mcp.py pending          # 看挂起的
-#   sudo python3 /opt/pxe/cart_mcp.py confirm 3        # 敲 yes 才发
-#   sudo python3 /opt/pxe/cart_mcp.py estop            # 全部急停 (哪都能停); resume 1|all 只认本机
-# #23 起车机上点操作头方块确认; 网页急停 / 拒绝要开 (先建 ops-web 用户, tmpfiles 建 serial-req 目录):
-#   sudo systemctl enable --now cart-serial-req.path
+sudo cp deploy/tmpfiles.d/ops-cart.conf /etc/tmpfiles.d/ && sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
+sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/
+sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk && sudo cp deploy/bin/kiosk-setpin deploy/bin/cart-fan-curve /usr/local/bin/
+sudo kiosk-setpin
+sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload   # LAN1 要在 pxe 区
 ```
 
-tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py --write-rescue`)。
-装机菜单只在车机上解锁装机模式时按 MAC 生成,TFTP / HTTP 两头都会核对装机模式;
-所以 Windows 脚本和手工放进 tftp 的自动装机菜单都装不了机,这是故意的。
+| 单元 | 作用 | 开不开 |
+|---|---|---|
+| `kiosk.service` · `cart-dash.service` · `kvm-broker.service` | 车机、副屏 + 快照、键鼠代理 | 开 |
+| `pxe-server` · `pxe-http-boot` · `pxe-http-repo` | 装机三件套 | 开 |
+| `cart-boot-success.timer` · `wifi-prefer.timer` · `campus-auth.timer` · `cart-fan-curve.service` | 开机成功标记、无线优先级、校园网认证、风扇曲线 | 开 |
+| `cart-notify.timer` · `cart-dream.timer` | 手机推送（没配只记日志）、夜间小结 | 按需 |
+| `webkiosk.service` · `cart-serial-req.path` | 网页口，网页急停 / 拒绝 | 按需，先建 `ops-web` 用户 |
+| `cart-mcp.service` | MCP 的 HTTP 方式（stdio 不用单元：`claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio`） | 按需，先配 `/etc/ops-cart/mcp.json` |
+| `cart-ocr.service` | OCR 常驻服务，`scripts/setup-ocr.sh` 装 | 可选 |
+| `cart-revtunnel.service` | 备用远程通道 | 可选，见 [`docs/REMOTE_TUNNEL.md`](docs/REMOTE_TUNNEL.md) |
 
-运行时状态都在 `/run/ops-cart/`(tmpfiles 建,重启推车清空):`pxe-guard.json` 是装机口守卫状态(`pxe-renew.json` 是车机给它的续期请求),
-`pin-gate.json` 是车机 PIN 输错计数,`mpv.sock` 给 `cart_snap.py` 用,`serial-write.json` 是串口写租约 / 挂起 / 急停(重启即全部清掉,挂起的命令不会在重启后冒出来),`pxe-req.json` 是 Agent 的 PXE 解锁申请(同样重启清掉)。
-要跨重启的放 `/var/lib/ops-cart/`:`netmode.json` 记每个网口的模式和占了什么(断电后照样知道怎么撤,见 [`docs/NETMODE.md`](docs/NETMODE.md))。
-`pxe-server` 发现装机口上有别的 DHCP 不再停服,转**代理模式**(`pxe-guard.json` 里 `"state": "proxy"`、`"leases": false`):
-67 口不发地址,只对 x86-64 UEFI 的 PXE 客户端回 yiaddr=0 的引导 OFFER,4011 / TFTP / HTTP 照常;
-LAN1 拔掉再插上会重新探测,没有别人就恢复自己发地址。探测出错或拿不准一律按代理模式。
-代理模式要生效,推车的 `PXE_IP` 得在那个网段里(别人发的地址见 `pxe-guard.json` 的 `offered`)。
-网络里没有别的 DHCP、推车自己发地址时**限时**(默认 30 分钟,`pxe.env` 里 `PXE_SERVE_MINUTES` 改,0 = 不限时):
-车机顶栏下一整条红、锁屏和副屏头部都显示"正在给整个网段发地址 剩 mm:ss";到点转 `"state": "expired"`:
-新机器一个地址都不给(PXE 客户端只回引导,同代理模式),已经发出去且没过期的租约照常续,装到一半的机器不断网。
-点车机上那条续期(确认后写 `/run/ops-cart/pxe-renew.json`,守卫 2 秒内认),从当时起再给一段限时。
-限时从第一次自己发地址算起;iPXE 接管网卡那几秒掉线不重新计时,LAN1 拔掉超过 60 秒再插才重新计时,重启 `pxe-server` 也重新计时。
-开始 / 到时 / 续期都写 `events.log` 的 `[pxe]`,到时停发还会推手机(#16)。
+配置都在 `/etc/ops-cart/`（照 `examples/` 改），运行时状态在 `/run/ops-cart/`（重启清空），要跨重启的在 `/var/lib/ops-cart/`，日志在 `/var/log/ops-cart/`。
 
-装机网段只在 `/etc/ops-cart/pxe.env` 里定(`pxe-*` 三个单元和车机生成的 grub 菜单共用),车机界面不再改 LAN1 地址;
-`pxe-server` 的 `--iface eno1` 写死在单元里。校园网认证配置在 `/etc/ops-cart/campus-auth.json`(要写 `ssid`)。
+推车常被直接拔电挪走：SSD 带掉电保护，脏页 5 秒落盘，配置一律原子写，系统日志落盘（`journalctl -b -1`），来电自动开机。能关还是先关：挪车前短按一下电源键。
 
-开机自检和状态板共用一张计划表 `/opt/pxe/selftest.json`
-(照 [`examples/selftest.example.json`](examples/selftest.example.json) 改网卡名、串口、PCI ID、要 ping 的主机),
-没有就用内置默认。加检查项:写一个 `kiosk_core.check_xxx(ctx, **参数)` 返回 `(状态, 说明)`,登记进 `CHECKS`。
+## 开发和测试
 
-换皮:把 `branding.json` 和 `logo.png` 放进 `/opt/pxe/branding/`,见 [`examples/branding/`](examples/branding/)。
+```bash
+python3 -m pytest -q                         # 离线全测; 代码要能在推车的 Python 3.9 上跑 (test_py39_compat 守着)
+python3 scripts/check_public_safe.py .       # 公开仓库安全检查, 本地词表放 .public-safe.local
+python3 scripts/readme_due.py                # README 上次整理后合并了几个 PR, 到 10 个退出码 1 (--threshold 改)
+scripts/smoke-kiosk.sh                       # Xvfb 无头冒烟
 
-## CH9329 协议笔记
-
-```
-帧:        57 AB ADDR CMD LEN DATA... SUM      校验 = 整帧求和, 含帧头
-键盘 0x02: [modifier, 0, key×6]                8 字节
-绝对 0x04: [0x02, 按键, xL, xH, yL, yH, 滚轮]   坐标 0~4095
-相对 0x05: [0x01, 按键, dx, dy, 滚轮]           位移 int8
+python3 ch9329.py --port /dev/ttyACM0 type "hello"          # 键鼠代理在跑时经代理发
+python3 pxeserver.py serve --ip 192.0.2.1 --prefix 24 --pool 192.0.2.10,192.0.2.20 \
+    --tftp-root /opt/pxe/tftp --iface eno1
+python3 cart_ocr.py shot.png --find "Boot Menu"             # 找到 0 / 没找到 1 / 出错 2
 ```
 
-datasheet 不写"校验含帧头"—— 真机的应答帧会。
+macOS 上默认不开 Tk 窗口，相关用例跳过；`OPS_TK_TESTS=1` 才真开。GUI 的毛病多半在实机上才暴露，单测全绿不等于能跑。
 
-## 设计原则
+这是公开仓库，不放真实地址、MAC、主机名、人名和本机路径，约定见 [`docs/PUBLIC_SAFETY.md`](docs/PUBLIC_SAFETY.md)。
 
-- **车是外设,脑在远端**:采集和注入在车上,OCR 与决策可以放在 tailnet 任意一端
-- **物理层优先**:键鼠走 USB、画面走 HDMI、console 走串口,机房网络怎么炸都不断
-- **单测覆盖协议,实机验证行为**:GUI 层的 bug 几乎都是实机暴露的,单测绿不代表能跑
-- **危险动作前置**:装机口永不进交换机(rogue DHCP,服务端自己也会盯着,看见别人就停)、改管理口必弹警告、
-  `clearpart --all` 必亮校验条、备份永远先于写入
+## 文档
 
-## 已实测
-
-- 全自动 PXE 装 Rocky 9.8(UEFI + AMI 固件)
-- SC0710 / MS2130 采集预览,CH9329 键鼠透传上屏
-- 有线 ↔ 无线自动切换,锐捷 ePortal 自动认证
-- Kiosk 实机常驻 + Xvfb 无头冒烟
+| 文档 | 内容 |
+|---|---|
+| [DEPLOY_1.11.00](docs/DEPLOY_1.11.00.md) · [1.08.03](docs/DEPLOY_1.08.03.md) · [1.06.00](docs/DEPLOY_1.06.00.md) | 各版部署清单 |
+| [ACCEPT_1.11](docs/ACCEPT_1.11.md) | 人工验收单 |
+| [NETMODE](docs/NETMODE.md) | 网口模式设计 |
+| [CLONE](docs/CLONE.md) | 整盘克隆 |
+| [DATA_DISK](docs/DATA_DISK.md) | 数据盘和装机库 |
+| [WINPE](docs/WINPE.md) | Windows PE 引导 |
+| [DESIGN_agent_mcp](docs/DESIGN_agent_mcp.md) | Agent / MCP 接入设计 |
+| [REMOTE_TUNNEL](docs/REMOTE_TUNNEL.md) | 备用远程通道 |
+| [udisp-protocol](docs/udisp-protocol.md) | USB 副屏协议 |
+| [PUBLIC_SAFETY](docs/PUBLIC_SAFETY.md) | 公开仓库安全约定 |
+| [OPTIMIZE_PLAN_20261025](docs/OPTIMIZE_PLAN_20261025.md) | 10-25 优化方案 |
+| [fonts/README](fonts/README.md) | 字体来源和授权 |
 
 ## License
 
 MIT
-
-## 断电与挪车
-
-推车常被直接拔电挪走,做了几层兜底:盘是带掉电保护的企业级 SSD;脏页 5 秒内落盘;配置一律原子写;
-系统日志落盘(`journalctl -b -1` 看上一次断电前);BIOS 设了来电自动开机;GRUB 在上次没正常启动时自动出菜单。
-**但能关就关**:挪车前短按一下电源键,十来秒正常关机,不用进菜单。
