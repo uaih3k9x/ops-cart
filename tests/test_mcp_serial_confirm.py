@@ -7,7 +7,22 @@ import pytest
 
 import confirm_core as cc
 import mcp_serial as ms
+import serial_write_core as sw
 from test_mcp_serial import T0, Rig, cli
+
+# 人确认后没发的几种结果: #74 recheck 拦下 (refused); #65 Book.confirm 拦下 (stale: 挂起后设备有新输出, 作废;
+# prompt: 读不到设备, 还挂着). 合并后设备输出变了的先被 #65 拦, 到不了 recheck; recheck 本身见 test_recheck_direct_*.
+NOT_SENT = ("refused", "stale", "prompt")
+
+
+def _confirm(rig, pid):
+    """人在车机上确认 -> (status 或 Refused 的错误码, 说明)."""
+    try:
+        _it, status, _out, note = ms.send_confirmed(rig.store, pid, cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                    tail=rig.tail, rules=lambda: rig.rules)
+    except sw.Refused as e:
+        return e.code, str(e)
+    return status, note
 
 
 @pytest.fixture
@@ -69,7 +84,7 @@ def test_peek_permission_error_means_all_stopped(tmp_path, monkeypatch):
 
 def test_send_confirmed_sends_and_finishes(rig):
     _tok, p = _held(rig)
-    it, status, out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)
+    it, status, out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail)
     assert status == "sent" and rig.sent == [("/dev/con-1", "save", False)]
     hist = rig.ok("pending_list")["history"][-1]
     assert hist["by"] == cc.BY_KIOSK and hist["status"] == "sent"
@@ -80,7 +95,7 @@ def test_send_confirmed_after_estop_raises_and_sends_nothing(rig):
     _tok, p = _held(rig)
     rig.ok("estop", {"slot": 1})
     with pytest.raises(ms.sw.Refused):
-        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)
+        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail)
     assert rig.sent == []
 
 
@@ -89,7 +104,7 @@ def test_send_confirmed_send_crash_clears_inflight(rig):
 
     def boom(*a):
         raise RuntimeError("x")
-    _it, status, _out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, boom, rig.tail)
+    _it, status, _out, note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, boom, tail=rig.tail)
     assert status == "error" and "RuntimeError" in note
     assert rig.store.view()["slots"][0]["inflight"] is None
 
@@ -200,7 +215,7 @@ def test_cli_requests_subcommand(rig, tmp_path, monkeypatch):
 
 def test_human_action_confirm_reject_estop_resume(rig):
     _tok, p = _held(rig)
-    act = lambda op, arg: ms.human_action(rig.store, op, arg, cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)  # noqa: E731
+    act = lambda op, arg: ms.human_action(rig.store, op, arg, cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail)  # noqa: E731
     assert "sent" in act("confirm", p["id"]) and rig.sent
     _tok2, p2 = _held(rig, slot=2, cmd="reboot")
     assert "拒绝" in act("reject", p2["id"])
@@ -218,5 +233,418 @@ def test_human_action_confirm_reject_estop_resume(rig):
 def test_human_action_confirm_failure_reported(rig):
     _tok, p = _held(rig)
     rig.reply = ("refused", "[conbroker: 拒绝发送, 密码]", "[conbroker: 拒绝发送, 密码]")
-    msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, rig.tail)
+    msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail)
     assert "refused" in msg and "密码" in msg
+
+
+# ------------------------------------------------------------ 审查 #74 第二轮: 确认挂起的回车 / 空格时重看设备
+
+def _held_enter(rig):
+    tok = rig.lease(1)
+    rig.tail_text["/dev/con-1"] = "Router#"
+    rig.slots[0]["mtime"] = rig.store.clock() - 1                       # 刚动过: 挂起
+    p = rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert p["status"] == "pending"
+    return p
+
+
+def test_confirm_held_enter_rechecks_and_refuses_on_confirm_prompt(rig):
+    """chain.py: 先挂 reload、再挂 enter; 人先批 reload, 设备停在 [confirm], 再批 enter 不能替人回答."""
+    p = _held_enter(rig)
+    rig.tail_text["/dev/con-1"] = "Router#reload\nProceed with reload? [confirm]"
+    status, note = _confirm(rig, p["id"])
+    assert rig.sent == [] and status in NOT_SENT
+    assert "Proceed with reload? [confirm]" in note and "重新" in note
+    assert rig.store.view()["slots"][0]["inflight"] is None
+    assert rig.ok("pending_list")["history"][-1]["status"] in ("refused", "dropped")
+
+
+@pytest.mark.parametrize("now_text", ["display x\n  Input: 12 packets", None])
+def test_confirm_held_enter_refuses_off_whitelist_or_unreadable(rig, now_text):
+    p = _held_enter(rig)
+    if now_text is None:
+        rig.tail_text.pop("/dev/con-1")
+    else:
+        rig.tail_text["/dev/con-1"] = now_text
+    status, note = _confirm(rig, p["id"])
+    assert status in NOT_SENT and rig.sent == [] and note
+
+
+def test_confirm_held_enter_sends_when_still_at_prompt(rig):
+    p = _held_enter(rig)                                                 # 人确认时就是人在场: 不再看 5 秒窗口
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail)
+    assert status == "sent" and rig.sent == [("/dev/con-1", "", False)]
+
+
+def test_human_action_confirm_held_enter_reports_current_line(rig):
+    p = _held_enter(rig)
+    rig.tail_text["/dev/con-1"] = "Proceed with reload? [confirm]"
+    try:
+        msg = ms.human_action(rig.store, "confirm", p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail)
+    except sw.Refused as e:                                             # #65: 设备有新输出, 作废
+        msg = f"{e.code}: {e}"
+    assert ("refused" in msg or "stale" in msg) and "[confirm]" in msg and rig.sent == []
+
+
+def test_cli_confirm_held_enter_rechecks(rig):
+    from test_mcp_serial import cli
+    p = _held_enter(rig)
+    rig.tail_text["/dev/con-1"] = "Proceed with reload? [confirm]"
+    rc, text = cli(rig, "confirm", str(p["id"]))
+    assert rig.sent == [] and "[confirm]" in text
+
+
+# ------------------------------------------------------------ 审查 #74 第三轮: send_command 发 y 的同一条链
+
+def _sc(rig, cmd, tok):
+    return rig.ok("send_command", {"slot": 1, "command": cmd, "lease": tok})
+
+
+def test_poc_reload_then_y_chain_is_blocked(rig):
+    """设备停 Router#: 挂起 reload, 再挂起 y -> 第二条不收 (回答词不能排在别的挂起项后面)."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p1 = _sc(rig, "reload", tok)
+    assert p1["status"] == "pending"
+    for ans in ("y", "yes", "n", "no", "Y", "c", "confirm", "yes please", "ye", "display version"):
+        r = rig.call("send_command", {"slot": 1, "command": ans, "lease": tok})
+        assert r["isError"] and "前面" in r["content"][0]["text"], ans
+    assert rig.sent == []
+
+
+def test_confirm_line_refused_when_device_moved_onto_confirm_prompt(rig):
+    """挂起时停在 Router#, 人确认时设备已经停在 [confirm]: 不发, 显示当前最后一行."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = _sc(rig, "y", tok)
+    assert p["status"] == "pending"
+    held = rig.store.view()["pending"][0]
+    assert held["gate"]["line"] == "Router#"                              # 挂起命令也记下当时最后一行
+    rig.tail_text["/dev/con-1"] = "Router#reload\nProceed with reload? [confirm]"
+    status, note = _confirm(rig, p["id"])
+    assert status in NOT_SENT and rig.sent == [] and "Proceed with reload? [confirm]" in note
+    assert "send_command 发 y" not in note
+
+
+def test_confirm_line_sent_when_prompt_unchanged(rig):
+    """save 后设备停在 [Y/N], Agent 挂起 y, 人确认时仍停在 [Y/N]: 照常发."""
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    tok = rig.lease(1)
+    p = _sc(rig, "y", tok)
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "sent" and rig.sent == [("/dev/con-1", "y", False)]
+
+
+def test_confirm_line_refused_when_tail_unreadable(rig):
+    tok = rig.lease(1)
+    p = _sc(rig, "save", tok)
+    rig.tail_text.pop("/dev/con-1")
+    status, note = _confirm(rig, p["id"])
+    assert status in NOT_SENT and rig.sent == [] and ("看不到" in note or "读不到" in note)
+
+
+def test_recheck_passes_vendor(rig):
+    """存活变异: recheck_key 要按登记的厂商判 (登记思科时华为式 <SW1> 不算提示符)."""
+    rig.tail_text["/dev/con-1"] = "R1#"
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    p = _held_enter(rig)
+    rig.tail_text["/dev/con-1"] = "<SW1>"
+    status, _note = _confirm(rig, p["id"])
+    assert status in NOT_SENT and rig.sent == []
+
+
+def test_recheck_covers_space(rig):
+    tok = rig.lease(1)
+    rig.tail_text["/dev/con-1"] = "Router#"
+    rig.slots[0]["mtime"] = rig.store.clock() - 1
+    p = rig.ok("send_key", {"slot": 1, "key": "space", "lease": tok})
+    assert p["status"] == "pending"
+    rig.tail_text["/dev/con-1"] = "Proceed with reload? [confirm]"
+    status, _note = _confirm(rig, p["id"])
+    assert status in NOT_SENT and rig.sent == []
+
+
+def test_send_key_passes_vendor(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "<SW1>"                                 # rig 默认一分钟没动静
+    tok = rig.lease(1)
+    assert rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})["status"] == "pending"
+    assert rig.sent == []
+
+
+def test_direct_key_refused_if_slot_touched_between_look_and_send(rig):
+    """先判后占: 读 tail 之后、begin 之前该槽位有过人确认 / 发送结果, 就不直发."""
+    tok = rig.lease(1)
+    p = _sc(rig, "save", tok)                                            # 挂一条, 待会儿在"读 tail 之后"被人确认
+    orig = rig.tail
+
+    def tail_then_human_confirms(dev, n):
+        out = orig(dev, n)
+        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=orig,
+                          rules=lambda: rig.rules)
+        return out
+    rig.tail = tail_then_human_confirms
+    rig.store.run(lambda b, now: None)
+    r = rig.call("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert r["isError"] and any(w in r["content"][0]["text"] for w in ("变", "旧了"))   # snap (#74) 或发送序号 (#65)
+    assert [s[1] for s in rig.sent] == ["save"]                          # 回车没跟着发出去
+
+
+def test_log_last_line_reads_conbroker_log(tmp_path):
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / (ms.lamps_core._safe("/dev/con-1") + ".log")).write_bytes(b"x" * 9000 + b"\nRouter#reload\nProceed with reload? [confirm]")
+    assert ms.log_last_line("/dev/con-1", ddir=str(tmp_path)) == "Proceed with reload? [confirm]"
+    assert ms.log_last_line("/dev/con-2", ddir=str(tmp_path)) is None
+
+
+
+# ------------------------------------------------------------ 审查 #74 第四轮
+
+def test_poc_a_model_judging_while_human_confirms_other(rig):
+    """send_command 直发也要先判后占: 第 2 层模型判的时候人批了挂起的 reload, 模型放行的 y 不能落在 [confirm] 上."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "reload", "lease": tok, "timeout_s": 1})
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail,
+                          rules=lambda: rig.rules)
+        rig.tail_text["/dev/con-1"] = "Proceed with reload? [confirm]"
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.call("send_command", {"slot": 1, "command": "y", "lease": tok})
+    out = r["content"][0]["text"]
+    assert r["isError"] or '"pending"' in out                            # 第五轮起: 设备变了先转挂起
+    assert [x[1] for x in rig.sent] == ["reload"]
+
+
+def test_send_command_snap_catches_confirm_even_if_device_line_same(rig):
+    """设备最后一行没变、日志也安静, 但模型判的时候人确认过别的挂起项: 靠 snap 拦下, 不直发."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "interface g0/1", "lease": tok, "timeout_s": 1})
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send, tail=rig.tail,
+                          rules=lambda: rig.rules)
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.call("send_command", {"slot": 1, "command": "description x", "lease": tok})
+    assert r["isError"] and any(w in r["content"][0]["text"] for w in ("变", "旧了"))   # snap (#74) 或发送序号 (#65)
+    assert [x[1] for x in rig.sent] == ["interface g0/1"]
+
+
+def test_poc_c_syslog_after_confirm_prompt_still_refused(rig):
+    """确认命令时重看改白名单: [confirm] 后又刷一行 syslog, 也不发."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = _sc(rig, "interface g0/1", tok)
+    rig.tail_text["/dev/con-1"] = ("Proceed with reload? [confirm]\n*Nov  6 10:00:01: %LINK-3-UPDOWN: "
+                                   "Interface Gi0/1, changed state to down")
+    status, note = _confirm(rig, p["id"])
+    assert status in NOT_SENT and rig.sent == [] and "%LINK-3-UPDOWN" in note
+
+
+def test_confirm_line_uses_registered_vendor_whitelist(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = _sc(rig, "interface g0/1", tok)
+    rig.tail_text["/dev/con-1"] = "<SW1>"                                 # 登记了思科, 华为式提示符不算
+    status, _note = _confirm(rig, p["id"])
+    assert status in NOT_SENT and rig.sent == []
+
+
+@pytest.mark.parametrize("now,want", [("<SW1>save\nContinue? [Y/N]:", "sent"),
+                                      ("<SW1>save\nContinue? [Y/N]:\nNov 6 %%01IFNET/4/LINK_STATE x", "stale"),
+                                      ("<SW1>", "stale")])     # 回到提示符: recheck 放行, 但 #65 有新输出就作废
+def test_answer_pending_at_confirm_prompt_needs_same_prompt(rig, now, want):
+    """挂起时就停在确认提示上 (人明确在回答): 确认时还是同一行才发, 变了 (刷了日志 / 已经回到提示符) 不发."""
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    tok = rig.lease(1)
+    p = _sc(rig, "y", tok)
+    rig.tail_text["/dev/con-1"] = now
+    status, _note = _confirm(rig, p["id"])
+    assert status == want
+
+
+def test_card_flags_answer_to_confirm_prompt():
+    import serial_write_core as sw_
+    b = sw_.Book.from_text(None, 1000.0)
+    tok = b.acquire(1, "a", 1000.0)["lease"]
+    b.submit(1, tok, "a", "line", "y", dict(sw_._gate("confirm", "x"), line="Continue? [Y/N]:"), 1000.0, 10,
+             context="Continue? [Y/N]:")
+    shown = cc.card(b.view(1000.0), 1)["items"][0]
+    assert "这条会回答设备的确认提示" in shown["line"] and "确认提示" not in shown["reason"]
+
+
+# ------------------------------------------------------------ 审查 #74 第五轮
+
+def _before_prompt(text):
+    return text.split("确认发送?")[0]
+
+
+def test_cli_confirm_answer_no_warning(rig):
+    """停在 Destination filename [startup-config]? 时挂起 show running-config: 命令行确认前必须醒目警告."""
+    from test_mcp_serial import cli
+    rig.tail_text["/dev/con-1"] = "Router#copy run start\nDestination filename [startup-config]?"
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "show running-config", "lease": tok})
+    assert p["status"] == "pending"
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="n\n")
+    head = _before_prompt(text)
+    assert "这条会回答设备的确认提示" in head and "挂起时" in head
+    assert "当前最后一行：Destination filename [startup-config]?" in head
+    assert "设备现在不在提示符上" in head
+
+
+def test_cli_confirm_warns_when_device_off_prompt_for_any_command(rig):
+    from test_mcp_serial import cli
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "interface g0/1", "lease": tok})
+    rig.tail_text["/dev/con-1"] = "Router#\n  Input: 12 packets"                 # 现在停在半截输出上
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="n\n")
+    head = _before_prompt(text)
+    assert "设备现在不在提示符上" in head and "当前最后一行：Input: 12 packets" in head
+    rig.tail_text["/dev/con-1"] = "Router#"                                      # 回到提示符: 不警告
+    rc, text = cli(rig, "confirm", str(p["id"]), stdin="n\n")
+    assert "设备现在不在提示符上" not in _before_prompt(text)
+
+
+def test_cli_pending_shows_lines(rig):
+    from test_mcp_serial import cli
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    tok = rig.lease(1)
+    rig.ok("send_command", {"slot": 1, "command": "y", "lease": tok})
+    rc, text = cli(rig, "pending")
+    assert "这条会回答设备的确认提示" in text and "当前最后一行：Continue? [Y/N]:" in text
+
+
+def test_layer2_pass_rechecks_device_before_send(rig):
+    """第 2 层放行后、begin 之前再看一次: 模型判的时候现场的人在车机上敲了 copy run start, 就不直发."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        rig.tail_text["/dev/con-1"] = "Router#copy run start\nDestination filename [startup-config]?"
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.ok("send_command", {"slot": 1, "command": "terminal width 200", "lease": tok})   # #57 起 terminal length 0 走第 1 层
+    assert r["status"] == "pending" and rig.sent == []
+
+
+def test_layer2_pass_held_if_log_moved_recently(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    rig.model()
+    orig = rig.llm
+
+    def slow(i, d, c):
+        rig.slots[0]["mtime"] = rig.store.clock() - 1                         # 判的时候日志动过
+        return orig(i, d, c)
+    rig.llm = slow
+    r = rig.ok("send_command", {"slot": 1, "command": "terminal width 200", "lease": tok})   # #57 起 terminal length 0 走第 1 层
+    assert r["status"] == "pending" and rig.sent == []
+
+
+def test_layer2_pass_still_sends_when_unchanged(rig):
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "Router#"
+    tok = rig.lease(1)
+    rig.model()
+    r = rig.ok("send_command", {"slot": 1, "command": "terminal length 0", "lease": tok})
+    assert r["status"] == "sent"
+
+
+def test_same_confirm_line_exception_needs_log_unchanged(rig):
+    """唯一例外 (挂起时和确认时同一确认行) 还要日志大小没变: 挂起后日志有新字节就不走例外."""
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    rig.slots[0]["count"] = 1000
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "y", "lease": tok})
+    rig.slots[0]["count"] = 1040                                               # 中间有人敲过又删掉 / 刷新了同一行
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "refused" and rig.sent == []
+
+
+def test_same_confirm_line_exception_sends_when_log_unchanged(rig):
+    rig.tail_text["/dev/con-1"] = "<SW1>save\nContinue? [Y/N]:"
+    rig.slots[0]["count"] = 1000
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "y", "lease": tok})
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "sent"
+
+
+@pytest.mark.parametrize("line", ["Overwrite? [N]o/[Y]es", "Password:", "  Input: 12 packets, 5678 bytes"])
+def test_off_prompt_both_times_is_refused(rig, line):
+    """挂起时和确认时都停在不在提示符上、也不是确认提示的行: 不发."""
+    rig.tail_text["/dev/con-1"] = f"<SW1>x\n{line}"
+    tok = rig.lease(1)
+    p = rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})
+    assert p["status"] == "pending"
+    _it, status, _out, _note = ms.send_confirmed(rig.store, p["id"], cc.BY_KIOSK, lambda: rig.slots, rig.send,
+                                                 tail=rig.tail, rules=lambda: rig.rules)
+    assert status == "refused" and rig.sent == []
+
+
+# ------------------------------------------------------------ 合并 #65 后: 直接测 #74 的 recheck
+# 设备输出变了的情况端到端先被 #65 拦下, recheck 在这里单独测, 保证它自己的白名单判断不退化.
+
+def _rc(kind, cmd, now, vendor=None, was=None, was_size=None, size=None):
+    def tail(dev, n):
+        if now is None:
+            raise ms.mc.ToolError("conbroker tail 失败")
+        return now
+    gate = {k: v for k, v in (("line", was), ("log_size", was_size)) if v is not None}
+    it = {"kind": kind, "cmd": cmd, "slot": 1, "gate": gate}
+    return ms.recheck(it, "/dev/con-1", tail, lambda: {"slots": {1: vendor}} if vendor else {}, size=size)
+
+
+@pytest.mark.parametrize("kind,cmd,now,vendor,was,sizes,shown", [
+    ("key", "enter", "Router#reload\nProceed with reload? [confirm]", None, None, (None, None),
+     "Proceed with reload? [confirm]"),
+    ("key", "enter", "display x\n  Input: 12 packets", None, None, (None, None), "Input: 12 packets"),
+    ("key", "enter", None, None, None, (None, None), "(看不到)"),
+    ("key", "enter", "<SW1>", "cisco", None, (None, None), "<SW1>"),
+    ("key", "space", "Proceed with reload? [confirm]", None, None, (None, None), "[confirm]"),
+    ("line", "y", "Router#reload\nProceed with reload? [confirm]", "cisco", "Router#", (None, None), "[confirm]"),
+    ("line", "save", None, None, None, (None, None), "看不到"),
+    ("line", "interface g0/1", "Proceed with reload? [confirm]\n*Nov  6 10:00:01: %LINK-3-UPDOWN: x", "cisco",
+     "Router#", (None, None), "%LINK-3-UPDOWN"),
+    ("line", "interface g0/1", "<SW1>", "cisco", "Router#", (None, None), "<SW1>"),
+    ("line", "y", "Continue? [Y/N]:", None, "Continue? [Y/N]:", (10, 11), "Continue? [Y/N]:"),   # 同一行但日志有新字节
+])
+def test_recheck_direct_refuses(kind, cmd, now, vendor, was, sizes, shown):
+    msg = _rc(kind, cmd, now, vendor, was, was_size=sizes[0], size=sizes[1])
+    assert msg and shown in msg and "重新挂起" in msg and "send_command 发 y" not in msg
+
+
+@pytest.mark.parametrize("kind,cmd,now,vendor,was,sizes", [
+    ("key", "enter", "Router#", None, None, (None, None)),
+    ("key", "ctrl_c", None, None, None, (None, None)),                      # 打断键不重看
+    ("line", "y", "<SW1>", None, "Continue? [Y/N]:", (None, None)),        # 回到提示符: 白名单放行
+    ("line", "y", "<SW1>save\nContinue? [Y/N]:", None, "Continue? [Y/N]:", (10, 10)),   # 同一确认行、日志没动
+])
+def test_recheck_direct_passes(kind, cmd, now, vendor, was, sizes):
+    assert _rc(kind, cmd, now, vendor, was, was_size=sizes[0], size=sizes[1]) is None

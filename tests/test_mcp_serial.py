@@ -17,7 +17,7 @@ PROMPT = "display clock\n2026-10-30\n<SW1>"
 
 
 def _slots(present=(True, True, False, True), baud=("9600", "9600", None, None)):
-    return [{"dev": f"/dev/con-{n}", "present": p, "baud": b, "count": 0}
+    return [{"dev": f"/dev/con-{n}", "present": p, "baud": b, "count": 0, "mtime": T0 - 60}   # 一分钟没动静
             for n, p, b in zip(range(1, 5), present, baud)]
 
 
@@ -190,11 +190,13 @@ def test_danger_word_held_even_if_display(rig):
 def test_not_at_prompt_is_held(rig):
     rig.tail_text["/dev/con-1"] = "Username:"
     tok = rig.lease(1)
-    assert rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})["status"] == "pending"
+    p = rig.ok("send_command", {"slot": 1, "command": "display version", "lease": tok})
+    assert p["status"] == "pending"
+    rig.store.run(lambda b, now: b.reject(p["id"], "human", now))     # 有挂起项时不收下一条 (#74 第四轮)
     rig.tail_text.pop("/dev/con-1")                                   # 读不到输出: 不挂起也不发 (#65 没法核对现场)
     rig.clock.t += 1
     assert "读不到" in rig.err("send_command", {"slot": 1, "command": "display clock", "lease": tok})
-    assert rig.sent == [] and len(rig.ok("pending_list")["pending"]) == 1
+    assert rig.sent == [] and len(rig.ok("pending_list")["pending"]) == 0     # 第一条已拒, 这条没挂
 
 
 @pytest.mark.parametrize("cmd", ["display version\rsave", "save\x08", "\x03", "display\tversion", "-h"])
@@ -285,8 +287,9 @@ def test_model_not_asked_for_readonly_danger_or_no_lease_or_estop(rig):
 
 def test_intent_without_model_still_logged(rig):
     tok = rig.lease(1)
-    rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok, "intent": "  改描述  "})
+    p = rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok, "intent": "  改描述  "})
     assert rig.log(1)[-1]["gate"]["intent"] == "改描述"
+    rig.store.run(lambda b, now: b.reject(p["id"], "human", now))
     rig.ok("send_command", {"slot": 1, "command": "quit", "lease": tok, "intent": "   "})
     assert "intent" not in rig.log(1)[-1]["gate"]
 
@@ -310,6 +313,46 @@ def test_keys(rig):
     assert len(rig.sent) == 2
     keys = [r for r in rig.log(1) if r.get("kind") == "key"]
     assert [r["cmd"] for r in keys] == ["enter", "space", "ctrl_c"]
+
+
+@pytest.mark.parametrize("line", ["Proceed with reload? [confirm]", "Destination filename [startup-config]?",
+                                  "Warning: The current configuration will be written to the device. Continue? [Y/N]:"])
+def test_enter_on_confirm_prompt_is_held(rig, line):
+    """#73: 有人敲了 reload 没回答就走了, Agent 一个回车不能替他确认."""
+    tok = rig.lease(1)
+    rig.tail_text["/dev/con-1"] = f"<SW1>\n{line}"
+    for key in ("enter", "space"):
+        out = rig.ok("send_key", {"slot": 1, "key": key, "lease": tok})
+        assert out["status"] == "pending" and "确认提示" in out["reason"]
+        rig.store.run(lambda b, now, i=out["id"]: b.reject(i, "human", now))   # 同槽位有挂起项时不收下一个 (#74 第二轮)
+    assert rig.sent == []
+
+
+def test_enter_refused_when_tail_unreadable(rig):
+    """#73: 看不到设备停在哪, 回车不直发; #65: 挂起要带设备上下文, 读不到就不挂 -> 直接拒, 一个字节都不发."""
+    tok = rig.lease(1)
+    rig.tail_text.pop("/dev/con-1")
+    assert "读不到" in rig.err("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert rig.sent == [] and rig.ok("pending_list")["pending"] == []
+
+
+def test_enter_held_while_log_is_fresh(rig):
+    """#74 审查: 人正在敲 (设备日志几秒内还在动), Agent 的回车进 conbroker 排队, 人停手后可能正好替他确认."""
+    tok = rig.lease(1)
+    rig.slots[0]["mtime"] = T0 - 1
+    out = rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})
+    assert out["status"] == "pending" and "动静" in out["reason"]
+    rig.store.run(lambda b, now: b.reject(out["id"], "human", now))
+    rig.slots[0]["mtime"] = None                                       # 取不到: 按可能有人在用
+    assert rig.ok("send_key", {"slot": 1, "key": "enter", "lease": tok})["status"] == "pending"
+    assert rig.call("send_key", {"slot": 1, "key": "space", "lease": tok})["isError"]   # 前面有挂起: 不收
+    assert rig.sent == []
+
+
+def test_more_page_space_still_passes(rig):
+    tok = rig.lease(1)
+    rig.tail_text["/dev/con-1"] = "display current\nline\n  ---- More ----"
+    assert rig.ok("send_key", {"slot": 1, "key": "space", "lease": tok})["status"] == "sent"
 
 
 # ------------------------------------------------------------ 急停
@@ -390,9 +433,10 @@ def test_read_stat_parses_comm_with_spaces(tmp_path):
 
 def cli(rig, *argv, stdin="yes\n", local=True):
     out = io.StringIO()
-    rc = ms.cli(list(argv), store=rig.store, send=rig.send, slots=lambda: rig.slots,
+    rc = ms.cli(list(argv), store=rig.store, send=rig.send, slots=lambda: rig.slots, tail=rig.tail,
+                rules=lambda: rig.rules,
                 local=lambda: (local, "测试" if local else "经 sshd 进来的"), stdin=io.StringIO(stdin), out=out,
-                env={"SUDO_USER": "ops"}, tail=lambda dev, n: rig.tail(dev, n))
+                env={"SUDO_USER": "ops"})
     return rc, out.getvalue()
 
 
