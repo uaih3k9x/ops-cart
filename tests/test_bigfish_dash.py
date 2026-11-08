@@ -27,7 +27,7 @@ def test_layout_view_bigfish_not_a_string_is_dropped():
 def test_bigfish_sample_reads_status_file(tmp_path, monkeypatch):
     import bigfish_core as bf
     p = tmp_path / "status.json"
-    p.write_text(json.dumps({"v": 1, "updated": 1000.0, "state": "idle"}))
+    p.write_text(json.dumps({"schema": 1, "written_at": 1000.0, "current": None}))
     monkeypatch.setattr(bf, "STATUS_PATH", str(p))
     monkeypatch.setattr(bf, "bigfish_uid", lambda user=bf.USER: os.getuid())
     assert dc.bigfish_sample(clock=lambda: 1001.0) == "大肥鱼 · 空闲"

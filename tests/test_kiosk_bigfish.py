@@ -71,3 +71,108 @@ def test_estop_is_the_existing_all_estop():
     calls, fake = _fake(None)
     fake._bigfish_estop()
     assert calls["serial"] == [("estop", None)]
+
+
+# ------------------------------------------------------------ 急停挂在现有"全部急停"上 (接口 v1)
+
+import json  # noqa: E402
+import os  # noqa: E402
+
+import bigfish_core as bf  # noqa: E402
+import confirm_core as cfc  # noqa: E402
+
+
+def _ctl_fake(status=None):
+    """带 _serial_action / _bigfish_ctl / 看门 / 硬停的假 self; after 和后台都记下来不真跑."""
+    calls = {"bg": [], "after": [], "say": [], "hard": []}
+    fake = SimpleNamespace(_sw_view=None, _kvm_view=None, _sw_store=object(), _confirm_win=None, banner=_Lab(),
+                           _bf_watch=None, _bf_note="")
+    fake.ui = SimpleNamespace(run_bg=lambda work, done, key=None: calls["bg"].append((work, done, key)) or True)
+    fake.after = lambda ms, fn: calls["after"].append(fn)
+    fake._serial_say = lambda text, ok=True: calls["say"].append((text, ok))
+    for name in ("_serial_action", "_bigfish_ctl", "_bigfish_watch_tick", "_bigfish_hard", "_bigfish_estop"):
+        setattr(fake, name, getattr(kiosk.Kiosk, name).__get__(fake))
+    return calls, fake
+
+
+def _bg(calls, key):
+    return [c for c in calls["bg"] if c[2] == key]
+
+
+def test_all_estop_writes_estop_file_and_starts_watch():
+    calls, fake = _ctl_fake()
+    fake._serial_action("estop", None)
+    d = json.loads(open(bf.ESTOP_PATH).read())
+    assert d["seq"] == 1 and d["by"] == "kiosk"
+    assert _bg(calls, "serial-write") and fake._bf_watch is not None and calls["after"]
+    fake._bigfish_estop()                                    # 面板按钮 = 同一个动作
+    assert json.loads(open(bf.ESTOP_PATH).read())["seq"] == 2
+
+
+def test_single_slot_estop_does_not_touch_bigfish():
+    calls, fake = _ctl_fake()
+    fake._serial_action("estop", 2)
+    assert not os.path.exists(bf.ESTOP_PATH) and fake._bf_watch is None
+
+
+def test_resume_all_deletes_estop_file_on_success(monkeypatch):
+    calls, fake = _ctl_fake()
+    fake._serial_action("estop", None)
+    fake._sw_view = cfc.stopped_view()                       # 已经全部急停了, 才能解除
+    fake._serial_action("resume", None)
+    work, done, _key = _bg(calls, "serial-write")[-1]
+    assert os.path.exists(bf.ESTOP_PATH)                     # 串口那边还没解除成功
+    done("已解除 全部槽位 的急停")
+    assert not os.path.exists(bf.ESTOP_PATH) and fake._bf_watch is None and fake._bf_note == ""
+
+
+def test_resume_failure_keeps_estop_file():
+    calls, fake = _ctl_fake()
+    fake._serial_action("estop", None)
+    fake._sw_view = cfc.stopped_view()
+    fake._serial_action("resume", None)
+    _work, done, _key = _bg(calls, "serial-write")[-1]
+    done(RuntimeError("nope"))
+    assert os.path.exists(bf.ESTOP_PATH)
+
+
+def _status(monkeypatch, seen, online=True):
+    v = bf.parse(json.dumps({"schema": 1, "written_at": 0, "estop": {"seen": seen}}), 0) if online \
+        else bf.parse(None, 0)
+    monkeypatch.setattr(kiosk.bfc, "load", lambda now: v)
+
+
+def test_watch_tick_seen_stops_watching(monkeypatch):
+    calls, fake = _ctl_fake()
+    fake._serial_action("estop", None)
+    _status(monkeypatch, True)
+    fake._bigfish_watch_tick()
+    assert fake._bf_watch is None and "已急停" in fake._bf_note and not _bg(calls, "bigfish-hard")
+
+
+def test_watch_tick_escalates_to_hard_stop_after_deadline(monkeypatch):
+    calls, fake = _ctl_fake()
+    t = [1000.0]
+    monkeypatch.setattr(kiosk.time, "time", lambda: t[0])
+    fake._serial_action("estop", None)
+    _status(monkeypatch, False)
+    fake._bigfish_watch_tick()
+    assert fake._bf_watch is not None and not _bg(calls, "bigfish-hard")
+    t[0] += bf.HARD_AFTER_S
+    fake._bigfish_watch_tick()
+    assert fake._bf_watch is None
+    ran = []
+    monkeypatch.setattr(kiosk.bfc, "bigfish_uid", lambda user=bf.USER: 1001)
+    monkeypatch.setattr(kiosk.kc, "run", lambda cmd, timeout=5: ran.append(cmd) or (0, ""))
+    monkeypatch.setattr(kiosk.bfc, "cartlog_event", lambda kind, m: None)
+    work, done, _key = _bg(calls, "bigfish-hard")[0]
+    done(work())
+    assert ran == [["systemctl", "stop", "user@1001.service"]] and fake._bf_note == "已硬停，需人工恢复"
+
+
+def test_estop_without_channel_goes_hard_immediately(monkeypatch, tmp_path):
+    monkeypatch.setattr(kiosk.bfc, "ESTOP_DIR", str(tmp_path / "nope"))
+    monkeypatch.setattr(kiosk.bfc, "ESTOP_PATH", str(tmp_path / "nope" / "estop.json"))
+    calls, fake = _ctl_fake()
+    fake._serial_action("estop", None)
+    assert _bg(calls, "bigfish-hard") and fake._bf_watch is None and _bg(calls, "serial-write")

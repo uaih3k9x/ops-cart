@@ -1,68 +1,71 @@
-# 大肥鱼面板：接口约定（#53）
+# 大肥鱼面板：接口约定 v1（#53）
 
 车机（root）和大肥鱼（普通用户 `bigfish`，rootless Docker）之间只通过两个文件交换信息。车机不进大肥鱼的容器，不读 dsh 的数据卷，也不调用大肥鱼的任何接口。
 
-## 1. 状态文件（大肥鱼写，车机和副屏只读）
+下面第一部分是两边定稿的约定原文（v1 最终版），第二部分说明推车这边具体怎么实现，方便两边对照。
 
-- 路径：`/run/bigfish/status.json`。目录由 tmpfiles 建：`d /run/bigfish 0755 bigfish bigfish -`，推车重启后清空。
-- 写入方：大肥鱼一侧在宿主上以 bigfish 身份运行的进程（建议由 mcp-wrapper 写，任务表在它手里）。
-- 文件属主必须是 bigfish，权限 0644，必须是普通文件。写法：同目录临时文件，写完后 `rename` 覆盖，不要原地改写。
-- 车机读取方式：`O_NOFOLLOW | O_NONBLOCK` 打开，`fstat` 检查是普通文件、属主是 bigfish，最多读 64 KiB。不满足任何一条都按"不在线"处理。
-- 刷新：至少每 10 秒重写一次 `updated`，空闲时也要写。车机发现 `updated` 落后超过 30 秒，或者比当前时间快 5 秒以上，就显示"状态过期"。
+## 一、约定原文（v1 最终版）
 
-```json
-{
-  "v": 1,
-  "updated": 1762600000.0,
-  "state": "running",
-  "task": {
-    "id": "t-1a2b",
-    "state": "running",
-    "started": 1762599875.0,
-    "title": "看一下 con-1 上是什么设备",
-    "step": "cart_serial_tail",
-    "focus": "con-1",
-    "output": ["最近输出的几行", "最多 5 行"]
-  }
-}
-```
+【状态文件】`/home/bigfish/status/bigfish.json`。目录 0711，文件 0644，属主 bigfish（按用户名查 uid）。大小不超过 64 KB，空闲时每 5 秒心跳一次。读取时：
+- 用 O_NOFOLLOW 打开，fstat 核对三项：是普通文件、属主 uid 正确、大小不超过上限。
+- JSON 坏了就丢弃。
+- `written_at` 超过 20 秒没更新，显示为"离线"。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `v` | 整数，固定为 `1` | 不是 1 就按"状态读不懂"处理 |
-| `updated` | 数字（epoch 秒） | 写入时刻 |
-| `state` | `idle` / `running` / `estopped` | 包装层自己的状态。`estopped` 表示看到了急停（见第 2 节） |
-| `task` | 对象或 `null` | 当前或最近一个任务。空闲时可以是 `null` |
-| `task.id` | 字符串 | 车机不显示，留给排障 |
-| `task.state` | `starting` / `running` / `completed` / `cancelled` / `failed` | 同 `bigfish_get_task` 的 state |
-| `task.started` | 数字（epoch 秒） | 用来显示"已经做了多久" |
-| `task.title` | 字符串，**不可信** | 派活提示词的第一行 |
-| `task.step` | 字符串，**不可信** | 当前工具调用的 title |
-| `task.focus` | `con-1`…`con-4` / `kvm`，可省略 | 只认这几个值，其他值车机直接丢弃。由包装层根据工具名和参数推出来，不要直接取模型输出 |
-| `task.output` | 字符串数组，**不可信** | 最近输出，车机只取最后 5 行 |
+可信的顶层字段（类型和取值仍然要校验）：
+- `schema`: 1
+- `writer`
+- `seq`
+- `written_at`
+- `estop`: {`seen`, `since`}
+- `current`: null，或者 {`task_id`, `state`（starting|running|done|failed|cancelled|estopped）, `started_at`, `elapsed_s`, `steps_total`, `step_current`, `stop_reason`, `source`}
+- `running_count`
 
-其他字段车机一律忽略，所以不要往里放 key、令牌、prompt 全文或工具参数原文。
+不可信字段 `untrusted`：
+- `title`：最长 200 字
+- `output_tail`：最后 2 KB
+- `steps`：最多 10 项，每项 {`title` 最长 120 字, `status`}
 
-车机对不可信字段的处理：删除 ANSI 转义和控制、格式字符（含双向覆盖、零宽字符），所有空白压成一个空格，只显示一行，每行最多 200 字。面板上每一行都加"大肥鱼说："前缀，用单独的颜色和等宽字显示，链接不渲染，内容不执行。锁屏和副屏上只显示由 `state` 和 `focus` 枚举出来的一行，例如"大肥鱼 · 空闲""大肥鱼 · 在看 con-1"，不显示原文。
+这几项都要清洗后只当纯文本显示，并标明"大肥鱼说："。
 
-文件不存在显示"大肥鱼不在线"，内容坏了显示"状态读不懂"，太旧显示"状态过期"。
+【急停】
+- 目录 `/run/bigfish-ctl`，root:bigfish 0750，由大肥鱼那边的 setup-root.sh 用 tmpfiles 建，推车仓库不加 tmpfiles。目录不存在时，面板显示"急停通道未就绪"，急停直接走下面的硬急停。
+- kiosk 急停时原子写 `/run/bigfish-ctl/estop.json`，权限 root:bigfish 0640，内容 `{"seq": n, "at": unix, "by": "kiosk"}`。seq 每次加 1，可以存在同一个文件里，先读旧值再加。解除急停时删除这个文件。
+- 车机面板上的急停按钮，和现有的"Agent 全部急停"，都要挂到这个动作上。全部急停解除时，同步删除这个文件。
+- 硬急停兜底：写完 estop.json 后 10 秒内，如果状态文件里 `estop.seen` 没变成 true（或者状态文件离线），kiosk 就执行 `systemctl stop user@<bigfish 的 uid>.service`，按用户名查 uid，不要写死，并记一条 cartlog。面板显示"已硬停，需人工恢复"。恢复的事 kiosk 不管。
 
-## 2. 急停信号（推车写，大肥鱼读）
+## 二、推车这边的实现（`bigfish_core.py`、`bigfish_panel.py`、`kiosk.py`）
 
-不新增信号文件，直接复用推车现有的公开急停标记：
+### 读状态文件
+- 打开方式是 `os.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)`：加 O_NONBLOCK 是为了防止对方放一个 FIFO 把车机卡住。打开后用 fstat 核对三项（普通文件、`st_uid` 等于 `pwd.getpwnam("bigfish")`、`st_size` ≤ 64 KiB），任何一条不满足就当作没有数据。这样 bigfish 就没法用软链接让 root 替它读出 /etc/shadow 之类的文件。
+- 只认 `schema == 1`，`written_at` 必须是数字。超过 20 秒没更新，或者比当前时间快 5 秒以上，都显示"离线"。文件不存在显示"不在线"，内容坏了显示"状态读不懂"。未知字段一律忽略。
+- 可信字段也做校验，不合格的单独丢掉，不影响其他字段：
+  - `current.state` 不在白名单里，整个 `current` 丢弃。
+  - `elapsed_s` 必须是 ≥ 0 的数字。
+  - `steps_total` 必须是 0 到 10000 的整数；`step_current` 是 0 到 `steps_total` 的整数，`steps_total` 不合格时 `step_current` 一起丢弃。
+  - `estop.seen` 只认布尔值 `true`。
+  - `running_count` 必须是 ≥ 0 的整数。
+  - `stop_reason` 和 `source` 也照样清洗，最多 40 字。
+  - `writer` 和 `seq` 不显示。
+- 不可信字段先清洗再显示，清洗规则是 `confirm_core.one_line`：删 ANSI 和 OSC 转义，控制、格式字符（含双向覆盖、零宽字符、U+2028）换成 `?`，空白压成一个空格，超长截断加"…"。
+  - `title` 最多 200 字。
+  - `output_tail` 只取最后 2048 个字符，按行切开，每行单独清洗，只显示最后 5 行。
+  - `steps` 只取前 10 项，`title` 最多 120 字，`status` 最多 20 字。
+- 面板上，每一行大肥鱼的话都加"大肥鱼说："前缀，用单独的颜色和等宽字，并且缩进。Text 里只插入纯文字，不认链接，不执行任何内容。
+- 锁屏（车机右上角）和副屏锁屏页只显示一行，例如"大肥鱼 · 空闲""大肥鱼 · 在做事 · 第 2/5 步""大肥鱼 · 急停中"。这一行只用可信字段拼出来，不包含原文。
 
-- 路径：`/run/ops-cart/serial-estop.json`，root 写，0644，所在目录 `/run/ops-cart` 为 root 0755，bigfish 可读。
-- 内容示例：`{"slots": [1, 2, 3, 4], "all": true, "kvm": true}`。`mcp_serial.Store` 每次操作后都会原子重写这个文件。
-- **`all` 为 `true` 就是急停**。车机执行器条上的"Agent 全部急停"、确认框和大肥鱼面板上的"全部急停"、网页急停、命令行 `cart_mcp.py estop`，以及 Agent 自己调用急停，全部汇到这一个文件。"解除全部急停"只能在车机上做，解除后 `all` 变回 `false`。只停某一路时 `all` 仍为 `false`，大肥鱼不用管。
+### 急停
+- 入口都在 `Kiosk._serial_action("estop", None)`：执行器条上的"Agent 全部急停"、串口和键鼠确认框里的"全部急停"、大肥鱼面板上的"全部急停"，走的都是它。它在串口急停之前先写 estop.json，所以写 estop.json 不会因为串口那边正忙而被耽误。只急停某一路时不写。
+- 写入流程：
+  1. 读出旧 seq，没有或者读不懂就当 0，新 seq 等于旧值加 1。
+  2. 用 `O_EXCL | O_NOFOLLOW` 建临时文件，先 `fchown` 成 bigfish 组、`fchmod 0640`，写入后 fsync。
+  3. `rename` 覆盖正式文件。这样大肥鱼不会读到半个文件，也不会读到一个它没有权限读的文件。
+- 解除全部急停：串口那边解除成功后，删除 estop.json，同时清掉看门器。解除失败时保留文件。
+- 看门器：写完 estop.json 后每秒读一次状态文件。看到 `estop.seen == true` 就显示"大肥鱼已急停"。满 10 秒还没看到（或者状态文件离线），就在后台执行 `systemctl stop user@<uid>.service`，超时 30 秒，并记一条 cartlog（kind 为 `bigfish`，带上 rc 和原因）。成功后面板显示"已硬停，需人工恢复"，失败则显示"硬停失败: …"。
+- `/run/bigfish-ctl` 不存在，或者 estop.json 写不进去时，直接硬停。没有在急停的时候，如果目录不存在，面板最上面一行常驻"急停通道未就绪"。
+- 注意：解除急停时文件被删掉，所以下一次急停的 seq 会从 1 重新开始。
 
-大肥鱼一侧（wrapper）需要做到：
+### 确认 / 拒绝
+面板上的"确认 / 拒绝"按钮打开现有的确认框：先找有挂起项的第一路串口，没有就找键鼠。面板本身不做审批。现阶段大肥鱼只读，不会产生挂起项，所以这个按钮平时是灰的。
 
-1. 至少每秒检查一次这个文件（可以先 `stat` 看 mtime，变了再读）。
-2. 读到 `all: true` 时：对所有 `starting` / `running` 的任务发 ACP `session/cancel`，状态文件的 `state` 改成 `estopped`，并且立即重写一次状态文件，不等 10 秒的周期。
-3. 急停期间 `bigfish_submit_task` 直接返回错误（例如"推车急停中"），不新建会话。
-4. 文件不存在时按没有急停处理（推车刚开机，还没人动过串口状态）。文件存在但读不懂（不是 JSON、`all` 不是布尔值）时按急停处理。
-5. 读到 `all: false` 后恢复接活。已经取消的任务不会自动重跑。
-
-## 3. 确认 / 拒绝
-
-大肥鱼面板上的"确认 / 拒绝"按钮会打开现有的确认框：先找有挂起项的第一路串口，没有就找键鼠。面板本身不做审批，也不写任何文件。现阶段大肥鱼只读，不会产生挂起项，所以这个按钮平时是灰的。
+### 部署
+推车仓库不用改 tmpfiles。`/home/bigfish/status` 和 `/run/bigfish-ctl` 两个目录都由大肥鱼那边的 `setup-root.sh` 建。在那边部署之前，车机面板会显示"大肥鱼不在线"和"急停通道未就绪"。这时按下全部急停会直接硬停 bigfish 的用户管理器；如果推车上还没有 bigfish 用户，只会记一条"找不到 bigfish 用户"的 cartlog。
