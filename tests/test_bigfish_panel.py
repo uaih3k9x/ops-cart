@@ -1,5 +1,6 @@
 """bigfish_panel Tk 冒烟测试 (#53): 真起 Tk (没显示就跳过); 状态从假 load 来, 按钮交给回调."""
 
+import gc
 import json
 
 import pytest
@@ -21,6 +22,7 @@ def root():
     r.withdraw()
     yield r
     r.destroy()
+    gc.collect()        # Tk 控件的循环引用在主线程收掉; 留给别的线程 (测试里的 HTTP 服务线程) 收会 Tcl_AsyncDelete abort
 
 
 def _running():
