@@ -78,6 +78,9 @@ class ConfirmDialog(tk.Toplevel):
         self._meta, self._reason = {}, {}
         if not c["items"]:
             tk.Label(self.body, text="没有等确认的命令", font=FONT, bg=BG, fg=DIM).pack(pady=20)
+        if c.get("trusted"):                                # 可信记录 (#65): 推车自己记的, 正常字色, 和设备输出分开
+            tk.Label(self.body, text=c["trusted"], font=FONT, bg=BG, fg=FG, anchor="w", justify="left",
+                     wraplength=700).pack(fill="x", pady=(0, 4))
         for it in c["items"]:
             self._item(it)
         if c["stopped"]:
@@ -103,6 +106,18 @@ class ConfirmDialog(tk.Toplevel):
         self._reason[it["id"]].pack(fill="x")
         if it["danger"]:
             tk.Label(f, text=it["danger"], font=FONT_BIG, bg=CARD, fg=th.BAD, anchor="w").pack(fill="x")
+        if it.get("note"):
+            tk.Label(f, text=it["note"], font=FONT, bg=CARD, fg=th.BAD, anchor="w", justify="left",
+                     wraplength=680).pack(fill="x")
+        for key in ("model", "intent"):                     # 模型理由 / Agent 自述 (#65 第六 / 七轮: 排在提示后、设备输出前): 不可信, 灰字一行
+            if it.get(key):
+                tk.Label(f, text=it[key], font=FONT, bg=CARD, fg=DIM, anchor="w", justify="left",
+                         wraplength=680).pack(fill="x")
+        if it.get("context"):                               # 设备最近输出 (#65): 不可信, 灰字等宽, 只作参考
+            tk.Label(f, text=it["context"], font=th.font(14, mono=True), bg=CARD, fg=DIM, anchor="w",
+                     justify="left", wraplength=680).pack(fill="x")
+        if it.get("name"):                                  # 设备自报名 (#65 第八轮): 条目末尾, 不可信
+            tk.Label(f, text=it["name"], font=FONT, bg=CARD, fg=DIM, anchor="w").pack(fill="x")
         row = tk.Frame(f, bg=CARD)
         row.pack(anchor="e", pady=(4, 0))
         self._btn(row, "确认发送", "go", lambda: self._confirm(it), name=f"confirm-{it['id']}")
@@ -137,6 +152,9 @@ class KvmDialog(ConfirmDialog):
         self._meta = {}
         if not c["items"]:
             tk.Label(self.body, text="没有等确认的内容", font=FONT, bg=BG, fg=DIM).pack(pady=20)
+        if c.get("trusted"):                                # 可信记录 (#65): 推车自己记的, 正常字色, 和设备输出分开
+            tk.Label(self.body, text=c["trusted"], font=FONT, bg=BG, fg=FG, anchor="w", justify="left",
+                     wraplength=700).pack(fill="x", pady=(0, 4))
         for it in c["items"]:
             self._item(it)
         if c["stopped"]:

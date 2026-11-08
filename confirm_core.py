@@ -11,6 +11,7 @@
 """
 
 import json
+import re
 
 import lamps_core as lc
 import serial_write_core as sw
@@ -92,22 +93,120 @@ def summary(states):
 
 # ------------------------------------------------------------ 确认框
 
+UNTRUSTED_MAX = 200         # Agent 自述 / 模型理由显示多少字
+
+
+def one_line(text, limit=UNTRUSTED_MAX):
+    """不可信文字 -> 一行: 删 ANSI 转义, 所有空白 (含换行、U+2028) 压成一个空格, 控制 / 格式字符换成 ?, 截短.
+    防它在审批界面上伪造出推车自己的块 (#65 第六轮)."""
+    s = sw._show(" ".join(sw._ANSI.sub("", str(text or "")).split())).strip()
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _intent(item):
+    it = (item.get("gate") or {}).get("intent")
+    return f"Agent 自述（不可信）：（{one_line(it)}）" if it else ""
+
+
+def _reasons(item):
+    """闸门理由 -> (推车自己的部分, 模型理由行). 第 2 层模型的理由单独标不可信、压成一行."""
+    reason = str(item.get("reason") or "-")
+    model = (item.get("gate") or {}).get("model") or {}
+    for key, label in (("reason", "模型理由（不可信）："), ("error", "模型出错（不可信）：")):
+        m = model.get(key)
+        if isinstance(m, str) and m.strip() and m not in ("off", "danger"):
+            own = reason[:-len(m)].rstrip(" :：,，") if reason.endswith(m) else reason   # 只切后缀, 不改推车自己的话
+            return own or "-", label + one_line(m)
+    return reason, ""
+
+
+def _name(item):
+    """设备自报的名字 (提示符里认的): 显示前再洗一遍 (旧状态文件里的没洗过), 放条目末尾, 标不可信 (#65 第八轮)."""
+    name = sw.clean_name(item.get("name"))
+    return f"设备自报名（不可信）：{name}" if name else ""
+
+
 def _want(item):
     if item.get("kind") == "key":
         return f"Agent 想按：{KEY_LABEL.get(item['cmd'], item['cmd'])}"
     return f"Agent 想执行：{item['cmd']}"
 
 
+def _context(item):
+    """挂起时设备最近输出 (#65): 来自被测设备, 不可信, 只给审批的人参考."""
+    lines = ((item.get("context") or {}).get("lines")) or []
+    return ("设备最近输出（来自设备，不可信，仅供参考）：\n" + "\n".join("| " + ln for ln in lines)) if lines else ""
+
+
+
+
+def _note(item):
+    """只有规则文件里登记为华为的槽位省掉这句 (华为提示符带视图名). 自动认出来的华为不省: 自动认只看最后一行像
+    不像 <名>/[名], Linux 的 PS1 也能伪装成这个样子 (#65 第四轮)."""
+    gate = item.get("gate") or {}
+    if gate.get("vendor") == "huawei" and gate.get("vendor_registered") is True:
+        return ""
+    return "注意：这类设备的提示符不带对象名，提示符不能证明作用对象；先看「可信记录」一块再确认"
+
+
+TRUST_CMD_MAX = 60          # 可信记录里每条命令显示多少字
+UNSURE = {"timeout": "超时", "unknown": "发送进程没回来", "error": "出错"}
+
+
+def _entry(e):
+    """一条可信记录 -> 一行: 连续空白压成一个、超长截断、命令用「」括起来 (防止折行 / 补空格伪造成多条)."""
+    if e.get("kind") == "key":
+        cmd = KEY_LABEL.get(e["cmd"], e["cmd"]) + (f" ×{e['count']}" if e.get("count", 1) > 1 else "")
+    else:
+        cmd = " ".join(str(e.get("cmd", "")).split())
+    if len(cmd) > TRUST_CMD_MAX:
+        cmd = cmd[:TRUST_CMD_MAX] + "…"
+    st = e.get("status")
+    mark = (f"［{UNSURE[st]}：可能已发/可能未发］" if st in UNSURE else "［发送中］" if st == "sending"
+            else "［conbroker 拒发，没发出］" if st == "refused" else "")
+    by = f"（人确认 {e['by']}）" if e.get("by") else ""
+    return f"  #{e['id']} 「{cmd}」{by}{mark}"
+
+
+LOST_WARN = ("  ！！更早的可能改变视图 / 对象的记录已被挤掉，无法确认作用对象 —— 建议拒绝，"
+             "让 Agent 重新进入目标视图后再提交")
+
+
+def _trusted(slot_view):
+    """推车自己记的本槽位实际发出的命令 (#65): 可信, 和设备输出分开显示; 没有记录也明说.
+    留着的可能改视图的命令全显示 (最多 CHANGE_KEEP 条). 不替人下"现在在哪个对象上"的结论: 缩写、视图内命令、
+    exit / telnet 推车认不准 (第六轮删掉了那一行)."""
+    tr = slot_view.get("trusted") or {}
+    changes, recent = tr.get("changes") or [], tr.get("recent") or []
+    head = "可信记录（推车自己记的本槽位实际发出的命令；不含人在车机 / 网页直接敲的键）："
+    lost = "  （更早的记录已被挤掉，无法确认作用对象）"
+    if not changes and not recent:
+        return head + ("\n" + lost + "\n" + LOST_WARN if tr.get("lost") else "无记录")
+    rows = [head]
+    if tr.get("lost"):
+        rows += [lost, LOST_WARN]
+    rows += [_entry(e) for e in changes] if changes else \
+        ([] if tr.get("lost") else ["  （无可能改变视图 / 对象的命令记录）"])
+    if tr.get("after"):
+        rows.append(f"之后还有 {tr['after']} 条只读命令 / 按键" + ("，最近的：" if recent else ""))
+        rows += [_entry(e) for e in recent]
+    return "\n".join(rows)
+
+
+LINE_SHOW_MAX = 160          # 确认框里挂起时 / 当前最后一行显示多少字
+
+
 def _line_info(p, live=None, vendor=None):
     """挂起时设备停在哪一行 (按键和命令都记, #74 第二、三轮); 给了 live 再附上当前最后一行. 都是设备输出, 只当数据显示.
     挂起时那一行不代表现在: 人确认时推车会重看一次. 车机确认框和命令行共用 (第五轮).
+    两行都过 one_line (#65 第六轮: 不可信文字压成一行、洗掉控制 / 格式字符, 防伪造推车自己的块).
     醒目警告: 挂起时就停在确认提示上 (这条在回答它); 设备现在不在 (本槽位厂商的) 提示符上."""
     line = (p.get("gate") or {}).get("line")
-    out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{line}" if line else ""
+    out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{one_line(line, LINE_SHOW_MAX)}" if line else ""
     if line and p.get("kind") == "line" and sw.is_confirm_prompt(line):
         out = "\n！！这条会回答设备的确认提示（挂起时设备就停在上面），确认前看清楚" + out
     if live:
-        out += f"\n当前最后一行：{live}"
+        out += f"\n当前最后一行：{one_line(live, LINE_SHOW_MAX)}"
         if not sw.at_any_prompt(live, vendor):
             out += "\n！！设备现在不在提示符上，这条发出去可能替人回答问题"
     return out
@@ -117,7 +216,6 @@ def card(view, n, live=None, vendor=None):
     """槽位 n 的确认框 -> {title, status, stopped, items}. items 每条 {id, head, meta, reason, danger}."""
     s = next(x for x in view["slots"] if x["slot"] == n)
     items = [p for p in view["pending"] if p["slot"] == n]
-    name = next((p.get("name") for p in items if p.get("name")), None)
     status = []
     if s["estop"]:
         e = s["estop"]
@@ -132,10 +230,12 @@ def card(view, n, live=None, vendor=None):
     for p in items:
         out.append({"id": p["id"], "head": _want(p),
                     "meta": f"#{p['id']} · 来自 {p['who']} · {p.get('age_s', 0)} 秒前",
-                    "reason": f"闸门理由：{p.get('reason') or '-'}" + _line_info(p, live, vendor),
-                    "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else ""})
-    return {"title": f"操作头 {n}" + (f" · {name}" if name else ""), "status": status,
-            "stopped": bool(s["estop"]), "items": out}
+                    "reason": f"闸门理由：{one_line(_reasons(p)[0], 300)}" + _line_info(p, live, vendor), "model": _reasons(p)[1],
+                    "intent": _intent(p),
+                    "danger": ("高危词：" + "、".join(p["danger"])) if p.get("danger") else "",
+                    "context": _context(p), "note": _note(p), "name": _name(p)})
+    return {"title": f"操作头 {n}", "status": status,
+            "stopped": bool(s["estop"]), "items": out, "trusted": _trusted(s) if out else ""}
 
 
 # ------------------------------------------------------------ 键鼠 (#42 #43): 同一套配色, 灯在下排

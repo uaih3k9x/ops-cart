@@ -49,9 +49,10 @@ class KsPanel(tk.Frame):
         tk.Label(row, text="主机名:", font=FONT, bg=th.PANEL,
                  fg=th.TEXT).pack(side="left")
         self.host_var = tk.StringVar()
-        tk.Entry(row, textvariable=self.host_var, width=18, font=FONT_MONO,
-                 bg=th.BG, fg=th.FG, insertbackground=th.FG,
-                 **th.SUNKEN).pack(side="left", padx=4)
+        host_e = tk.Entry(row, textvariable=self.host_var, width=18, font=FONT_MONO,
+                          bg=th.BG, fg=th.FG, insertbackground=th.FG, **th.SUNKEN)
+        host_e.no_ime = True                # 主机名, 不接中文输入 (中文输入的 NO_IME 约定)
+        host_e.pack(side="left", padx=4)
         tk.Button(row, text="改主机名", font=FONT, command=self.apply_hostname,
                   bg=th.PRIMARY, fg=th.FG, activebackground=th.ACTIVE,
                   **th.RAISED, cursor="hand2", padx=10).pack(side="left", padx=4)

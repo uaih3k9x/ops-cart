@@ -26,7 +26,7 @@ install -m 644 "$MNT/EFI/BOOT/grubx64.efi"        "$TFTP/grubx64.efi"
 install -m 644 "$MNT/images/pxeboot/vmlinuz"      "$TFTP/vmlinuz"
 install -m 644 "$MNT/images/pxeboot/initrd.img"   "$TFTP/initrd.img"
 
-echo "==> grub.cfg: 只留救援菜单 (本脚本不写菜单; 装机菜单由推车上解锁时按 MAC 单独下发)"
+echo "==> grub.cfg: 只留默认菜单, 超时本地盘 (本脚本不写菜单; 装机菜单由推车上解锁时按 MAC 单独下发)"
 [ -f /etc/ops-cart/pxe.env ] || { echo "缺 /etc/ops-cart/pxe.env (照 deploy/pxe.env.example 写)"; exit 1; }
 python3 /opt/pxe/kiosk_core.py --write-rescue --root "$TFTP"
 # 老部署留下的 EFI/BOOT 菜单: 带 inst.ks 的上一步已删, 不带的也不要, 菜单只认 tftp 根这一份
