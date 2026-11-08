@@ -8,8 +8,10 @@
 打印机写入和状态读取都是注入的函数, 测试不碰 /dev/usb/lp0.
 """
 
+import contextlib
 import copy
 import difflib
+import fcntl
 import json
 import os
 import secrets
@@ -17,11 +19,17 @@ import select
 import threading
 import time
 
+import atomicfile
 import cart_label as cl
+import cartlog
 import mcp_core as mc
 import tspl_preview as tp
 
 PRINTER = "/dev/usb/lp0"
+PRINTER_LOCK = "/run/ops-cart/printer.lock"     # 进程间: 两档各一个进程, 查状态和打印要串行 (#49)
+PRINTER_LOCK_WAIT_S = 10
+STATUS_CACHE = "/run/ops-cart/printer-status.json"  # 只读档查状态的跨进程缓存 (root 0600)
+STATUS_COOLDOWN_S = 3           # 只读档: 这么久内再查直接回缓存, 不碰打印机 (#60: 循环查状态会饿死动手档打印)
 ABBREV_PATHS = ("/etc/ops-cart/label_abbrev.json",          # 推车本地 (可含真实资产名), 有就用它
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "label_abbrev.json"))
 MAX_LABELS = 30                 # 一次最多这么多张; 再多分几次打
@@ -154,14 +162,16 @@ def propose_abbrev(table, path, category, entries):
 class LabelTool(mc.Tool):
     """mc.Tool 默认标只读; 打印要标成会出纸. labels 的 items 结构补进 inputSchema."""
 
-    def __init__(self, name, description, params, fn, read_only=True):
-        super().__init__(name, description, params, fn)
-        self.read_only = read_only
+    def __init__(self, name, description, params, fn, *, kind):
+        super().__init__(name, description, params, fn, kind=kind)
+
+    @property
+    def read_only(self):
+        return self.kind == mc.READONLY
 
     def spec(self):
         s = super().spec()
-        s["annotations"] = {"readOnlyHint": self.read_only, "destructiveHint": False,
-                            "idempotentHint": self.read_only, "openWorldHint": False}
+        s["annotations"].update(idempotentHint=self.read_only, destructiveHint=False)    # 打印最坏废一张, 不碰设备配置
         props = s["inputSchema"]["properties"]
         if "labels" in props:
             props["labels"]["items"] = LABEL_ITEM
@@ -184,9 +194,30 @@ LABELS = {"type": "array", "required": True,
           "description": f"每张一个对象, 1~{MAX_LABELS} 张. 只认 ASCII (打印机内置字体没有中文)"}
 
 
-def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secrets.token_urlsafe(12), guides=None):
+def _no_lock(**_kw):
+    return contextlib.nullcontext()
+
+
+def _cache_read(path, t):
+    """-> 缓存 {t, byte} 或 None (没有 / 读不懂 / 时间在将来)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            c = json.load(f)
+        ok = (isinstance(c, dict) and isinstance(c.get("t"), (int, float)) and not isinstance(c.get("t"), bool)
+              and isinstance(c.get("byte"), int) and not isinstance(c.get("byte"), bool) and 0 <= c["byte"] <= 255
+              and c["t"] <= t)
+        return c if ok else None
+    except (OSError, ValueError):
+        return None
+
+
+def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secrets.token_urlsafe(12), guides=None,
+                      xlock=_no_lock, readonly=False, status_cache=None, wall=time.time):
     """write(bytes) 发给打印机; status() -> 状态字节 int; abbrev() -> (对照表 dict, 路径).
-    都可以抛 mc.ToolError. guides 默认 tspl_preview.cable_guides(). 测试里全换成假的."""
+    都可以抛 mc.ToolError. guides 默认 tspl_preview.cable_guides(). 测试里全换成假的.
+    xlock(wait_s=...) -> 进程间打印机锁 (上下文); readonly (#49): 只回只读工具 (不含 label_print).
+    只读档查状态 (#60): status_cache 是跨进程缓存文件, STATUS_COOLDOWN_S 内回缓存; 拿打印机锁不等 (wait_s=0),
+    拿不到就回缓存 (标 busy) 或说忙 —— 只读 Agent 循环查状态不能让动手档打印拿不到锁."""
     guides = guides or tp.cable_guides()
     proofs, lock = {}, threading.Lock()         # proof -> (版面, 发出时刻); 进程内, 重启就没了
 
@@ -234,7 +265,7 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
         probs, data, _ = render(kind, labels, guides)
         if probs:
             raise mc.ToolError("不打, 校验没过: " + "; ".join(probs))
-        with lock:                              # 一台打印机: 查令牌、查状态、写、发令牌整段串行
+        with lock, xlock():                     # 一台打印机: 查令牌、查状态、写、发令牌整段串行 (进程内 + 进程间)
             t = now()
             why = _take_proof(kind, a.get("proof"), a.get("confirmed"), t) if batch else None
             for p in [p for p, (_, t0) in proofs.items() if t - t0 > PROOF_TTL]:
@@ -256,7 +287,28 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
         return [mc.json_content(out)]
 
     def printer_status(_a):
-        return [mc.json_content(decode_status(status()))]
+        if not readonly:
+            with lock, xlock():                 # ESC !? 的回字节别被别的进程的查询 / 打印抢走
+                return [mc.json_content(decode_status(status()))]
+        with lock:                              # 同进程也串行 (同上)
+            t = wall()
+            c = _cache_read(status_cache, t) if status_cache else None
+            if c and t - c["t"] < STATUS_COOLDOWN_S:
+                return [mc.json_content(dict(decode_status(c["byte"]), cached=True, age_s=round(t - c["t"], 1)))]
+            try:
+                with xlock(wait_s=0):           # 只读档不排队抢锁
+                    b = status()
+            except mc.ToolError as e:
+                if c and "忙" in str(e):
+                    return [mc.json_content(dict(decode_status(c["byte"]), cached=True, busy=True,
+                                                 age_s=round(t - c["t"], 1)))]
+                raise
+            if status_cache:
+                try:
+                    atomicfile.write_json(status_cache, {"t": wall(), "byte": b}, mode=0o600)
+                except OSError:
+                    pass
+            return [mc.json_content(decode_status(b))]
 
     def abbrev_propose(a):
         cat, entries = a["category"], a["entries"]
@@ -266,13 +318,13 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
         table, path = abbrev()
         return [mc.json_content(propose_abbrev(table, path, cat, entries))]
 
-    return [
+    tools = [
         LabelTool("label_preview",
                   "标签预览 (不打印): 查仅 ASCII、长度上限 (cable 对端<=12/本端<=23, text 大字<=11/小字<=23)、"
                   "出界和对折对称, 回检查结果 JSON + 前几张的 SVG (文本). abbrev=true 先按缩写对照表把中文/长名缩短, "
                   "回包里的 labels 就是要打的内容.",
                   {"kind": KIND, "labels": LABELS,
-                   "abbrev": {"type": "boolean", "default": False, "description": "先套缩写对照表"}}, preview),
+                   "abbrev": {"type": "boolean", "default": False, "description": "先套缩写对照表"}}, preview, kind=mc.READONLY),
         LabelTool("label_print",
                   "打标签 (TSC 标签机). 校验同 label_preview, 不过就拒; 打印机开盖/缺纸/缺碳带也拒. "
                   "默认只许 1 张, 回一个 proof; 批量 (>1 张) 必须带同版面单张打样回的 proof (10 分钟内, 一次性) "
@@ -281,17 +333,18 @@ def build_label_tools(write, status, abbrev, now=time.time, token=lambda: secret
                    "proof": {"type": "string", "maxLength": 64, "description": "批量才要: 单张打样回的 proof"},
                    "confirmed": {"type": "string", "maxLength": 200,
                                  "description": "批量才要: 人看过样张后确认的原话, 记进审计"}},
-                  do_print, read_only=False),
+                  do_print, kind=mc.ACT),
         LabelTool("label_printer_status",
                   "读标签机状态字节 (ESC !?): ok / 开盖 / 卡纸 / 缺纸 / 缺碳带 / 暂停 / 打印中, 可能多项同时.",
-                  {}, printer_status),
+                  {}, printer_status, kind=mc.READONLY),
         LabelTool("label_abbrev_propose",
                   "提议往缩写对照表加/改条目 (原文 -> ASCII 缩写): 回校验问题和 diff. 只提议, 不写回; 写回要人做.",
                   {"category": {"type": "string", "pattern": r"[a-z][a-z0-9_]{0,31}", "required": True,
                                 "description": "类别, 如 vendor / device_type / role / port / medium / location"},
                    "entries": {"type": "object", "required": True, "description": "{原文: 缩写}, 1~20 条"}},
-                  abbrev_propose),
+                  abbrev_propose, kind=mc.READONLY),
     ]
+    return [t for t in tools if t.kind == mc.READONLY] if readonly else tools
 
 
 # ------------------------------------------------------------ 真设备 (推车上)
@@ -343,5 +396,39 @@ def real_abbrev(paths=ABBREV_PATHS):
     raise mc.ToolError(f"没有缩写对照表 (找过 {', '.join(paths)})")
 
 
-def real_label_tools():
-    return build_label_tools(write=real_write, status=real_status, abbrev=real_abbrev)
+def _lock_note(msg):
+    try:
+        cartlog.event("label", msg)
+    except Exception:                   # noqa: BLE001  记不下也不能挡打印
+        pass
+
+
+@contextlib.contextmanager
+def printer_lock(path=None, wait_s=PRINTER_LOCK_WAIT_S, sleep=time.sleep, note=_lock_note):
+    """进程间打印机锁 (flock). 等 wait_s 秒还拿不到就报忙, 不无限等.
+    锁文件打不开 (/run/ops-cart 不在之类): 不拒打, 退回只有进程内锁 (调用方已拿着), 记一条事件."""
+    path = path or PRINTER_LOCK
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        note(f"打印机锁 {path} 打不开 ({e}), 只用进程内锁; 两个 MCP 进程同时用打印机可能抢状态字节")
+        yield
+        return
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise mc.ToolError(f"打印机忙 (别的进程在查状态或打印, 等了 {wait_s:g} 秒), 稍后再试") from None
+                sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def real_label_tools(readonly=False):
+    return build_label_tools(write=real_write, status=real_status, abbrev=real_abbrev, xlock=printer_lock,
+                             readonly=readonly, status_cache=STATUS_CACHE)

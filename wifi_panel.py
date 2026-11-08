@@ -107,8 +107,10 @@ class WifiPanel(BridgePanel):
         form.pack(fill="x", padx=16, pady=(8, 4))
         tk.Label(form, text="网络:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left")
         self.ssid_var = tk.StringVar()
-        tk.Entry(form, textvariable=self.ssid_var, width=20, font=FONT_MONO, bg=th.BG, fg=FG,
-                 insertbackground=FG, **th.SUNKEN).pack(side="left", padx=6, ipady=3)
+        ssid_e = tk.Entry(form, textvariable=self.ssid_var, width=20, font=FONT_MONO, bg=th.BG, fg=FG,
+                          insertbackground=FG, **th.SUNKEN)
+        ssid_e.no_ime = True                # 不接中文输入 (中文输入的 NO_IME 约定)
+        ssid_e.pack(side="left", padx=6, ipady=3)
         tk.Label(form, text="密码:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(10, 0))
         self.pw_var = tk.StringVar()
         self.pw_entry = tk.Entry(form, textvariable=self.pw_var, width=24, show="*", font=FONT_MONO,
@@ -136,8 +138,10 @@ class WifiPanel(BridgePanel):
         self.auth_user = tk.StringVar(value=conf.get("user", ""))
         self.auth_pw = tk.StringVar(value=conf.get("password", ""))
         tk.Label(row, text="账号:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(4, 0))
-        tk.Entry(row, textvariable=self.auth_user, width=16, font=FONT_MONO, bg=th.BG, fg=FG,
-                 insertbackground=FG, **th.SUNKEN).pack(side="left", padx=6, ipady=3)
+        user_e = tk.Entry(row, textvariable=self.auth_user, width=16, font=FONT_MONO, bg=th.BG, fg=FG,
+                          insertbackground=FG, **th.SUNKEN)
+        user_e.no_ime = True                # 认证账号, 不接中文输入
+        user_e.pack(side="left", padx=6, ipady=3)
         tk.Label(row, text="密码:", font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(10, 0))
         self.auth_pw_entry = tk.Entry(row, textvariable=self.auth_pw, width=20, show="*", font=FONT_MONO,
                                       bg=th.BG, fg=FG, insertbackground=FG, **th.SUNKEN)

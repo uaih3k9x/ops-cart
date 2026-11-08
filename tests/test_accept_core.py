@@ -155,6 +155,7 @@ def test_units_table_matches_deploy():
         assert spec["oneshot"] == ("Type=oneshot" in text), name
         assert spec["issue"], name
     assert ac.UNITS["cart-mcp.service"]["enabled"] is None          # 默认不开, 开了也行
+    assert ac.UNITS["cart-mcp-ro.service"]["enabled"] is None       # 只读档 (#49) 同样按需
 
 
 SHOW = """Id=kiosk.service

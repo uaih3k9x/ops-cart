@@ -77,7 +77,7 @@ def test_groups_by_mac_newest_first(tmp_path):
             f"2026-10-30 10:01:00 [pxe] 装机模式解锁 mac={M1} 30 分钟; 用途 rocky (自动装机)",
             "2026-10-30 10:02:00 [kvm] 跟 PXE 无关",
             f"2026-10-30 10:20:00 [pxe] 装机菜单被取走 mac={M1} from 192.0.2.50",
-            "2026-10-30 10:30:00 [pxe] 装机模式上锁, 只剩救援菜单",
+            "2026-10-30 10:30:00 [pxe] 装机模式上锁, 只剩默认菜单 (超时本地盘)",
             f"2026-10-30 10:31:00 [pxe-req] ev=request id=9 macs={M3}")    # [pxe-req] 是 JSONL 的复写, 不重复收
     out = pl.load(req, ev)
     assert [g["mac"] for g in out["groups"]] == [M2, M3, M1]
@@ -87,7 +87,7 @@ def test_groups_by_mac_newest_first(tmp_path):
                                                            ("req", "request")]
     assert g1["events"][1]["by"] == "human:kiosk" and g1["events"][1]["what"] == pl.EV_LABEL["confirm"]
     assert out["groups"][0]["events"][0]["macs"] == [M2, M3]
-    assert [e["msg"] for e in out["unlinked"]] == ["装机模式上锁, 只剩救援菜单"]
+    assert [e["msg"] for e in out["unlinked"]] == ["装机模式上锁, 只剩默认菜单 (超时本地盘)"]
 
 
 def test_bad_code_without_macs_joins_its_request(tmp_path):

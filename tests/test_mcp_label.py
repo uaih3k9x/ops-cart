@@ -1,7 +1,12 @@
 """mcp_label (#20) 的离线测试: 假打印机 (写入/状态都换掉), 不碰 /dev/usb/lp0."""
 
+import contextlib
+import fcntl
 import json
 import os
+import stat
+import threading
+import time
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -454,3 +459,103 @@ def test_real_abbrev_prefers_local_table(tmp_path):
     assert path.endswith("label_abbrev.json") and "vendor" in t
     with pytest.raises(mc.ToolError, match="对照表"):
         ml.real_abbrev(paths=(str(tmp_path / "none.json"),))
+
+
+# ------------------------------------------------------------ #60 第三轮: 只读档查状态不饿死动手档
+
+def _ro_tools(status, xlock=lambda **kw: contextlib.nullcontext(), cache=None, wall=None):
+    return {t.name: t for t in ml.build_label_tools(
+        write=lambda d: None, status=status, abbrev=lambda: ({}, "x"), xlock=xlock, readonly=True,
+        status_cache=cache, wall=wall or Clock())}
+
+
+def test_readonly_status_cooldown_uses_cache_across_processes(tmp_path):
+    cache, t, calls = str(tmp_path / "printer-status.json"), Clock(), []
+    a = _ro_tools(lambda: calls.append(1) or 0x00, cache=cache, wall=t)
+    b = _ro_tools(lambda: calls.append(1) or 0x04, cache=cache, wall=t)      # 另一个只读进程
+    first = json.loads(a["label_printer_status"].fn({})[0]["text"])
+    assert first["ok"] is True and "cached" not in first
+    t.t += ml.STATUS_COOLDOWN_S - 0.5
+    again = json.loads(b["label_printer_status"].fn({})[0]["text"])
+    assert again["cached"] is True and again["ok"] is True and len(calls) == 1
+    t.t += 1
+    fresh = json.loads(b["label_printer_status"].fn({})[0]["text"])
+    assert "cached" not in fresh and fresh["ok"] is False and len(calls) == 2
+    assert stat.S_IMODE(os.stat(cache).st_mode) == 0o600
+
+
+def test_readonly_status_future_or_bad_cache_refreshes(tmp_path):
+    cache, t, calls = str(tmp_path / "c.json"), Clock(), []
+    for content in ('{"t": 999999999999, "byte": 0}', "{oops", '{"t": "x", "byte": 0}', '{"t": 1000, "byte": "x"}'):
+        with open(cache, "w") as f:
+            f.write(content)
+        tools = _ro_tools(lambda: calls.append(1) or 0x00, cache=cache, wall=t)
+        assert "cached" not in json.loads(tools["label_printer_status"].fn({})[0]["text"]), content
+    assert len(calls) == 4
+
+
+def test_readonly_status_does_not_wait_for_printer_lock(tmp_path):
+    """只读档不抢锁: 拿不到就回缓存 (标 busy) 或直接说忙, 不等."""
+    lockp, cache, t = str(tmp_path / "printer.lock"), str(tmp_path / "c.json"), Clock()
+    xlock = lambda **kw: ml.printer_lock(lockp, **kw)                        # noqa: E731
+    tools = _ro_tools(lambda: 0x00, xlock=xlock, cache=cache, wall=t)
+    tools["label_printer_status"].fn({})
+    t.t += ml.STATUS_COOLDOWN_S + 1
+    fd = os.open(lockp, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)                                           # 动手档正在打印
+    try:
+        t0 = time.monotonic()
+        d = json.loads(tools["label_printer_status"].fn({})[0]["text"])
+        assert time.monotonic() - t0 < 0.5 and d["cached"] is True and d["busy"] is True
+        os.unlink(cache)
+        with pytest.raises(mc.ToolError, match="忙"):
+            tools["label_printer_status"].fn({})
+    finally:
+        os.close(fd)
+
+
+def test_readonly_status_loop_cannot_starve_act_print(tmp_path):
+    """4 个线程不停查只读状态 (每次读 0.2 秒), 动手档 10 秒内一定拿到打印机锁."""
+    lockp, cache = str(tmp_path / "printer.lock"), str(tmp_path / "c.json")
+    tools = _ro_tools(lambda: time.sleep(0.2) or 0x00, xlock=lambda **kw: ml.printer_lock(lockp, **kw), cache=cache,
+                      wall=time.time)
+    stop = threading.Event()
+
+    def spin():
+        while not stop.is_set():
+            try:
+                tools["label_printer_status"].fn({})
+            except mc.ToolError:
+                pass
+    ts = [threading.Thread(target=spin, daemon=True) for _ in range(4)]
+    [t.start() for t in ts]
+    time.sleep(0.3)
+    t0 = time.monotonic()
+    try:
+        with ml.printer_lock(lockp, wait_s=10):
+            took = time.monotonic() - t0
+    finally:
+        stop.set()
+        [t.join(5) for t in ts]
+    assert took < 3
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_printer_status_serialised_in_process(readonly, tmp_path):
+    """同进程并发 printer_status 串行 (ESC !? 的回字节不能被另一个线程读走)."""
+    live, peak, gate = [0], [0], threading.Lock()
+
+    def status():
+        with gate:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.05)
+        with gate:
+            live[0] -= 1
+        return 0x00
+    tools = {t.name: t for t in ml.build_label_tools(write=lambda d: None, status=status, abbrev=lambda: ({}, "x"),
+                                                     readonly=readonly, status_cache=None)}
+    ts = [threading.Thread(target=tools["label_printer_status"].fn, args=({},)) for _ in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert peak[0] == 1

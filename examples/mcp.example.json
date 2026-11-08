@@ -1,8 +1,14 @@
 {
-  "_说明": "放到 /etc/ops-cart/mcp.json (root 0600). tokens: 名字 -> 令牌, 名字进审计日志的 who. 令牌用 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' 生成, 短于 24 字符的不认 (下面的占位就不认). hosts: 用主机名访问时把名字加进来 (挡 DNS rebinding), 直接用 IP 不用加.",
+  "_说明": "放到 /etc/ops-cart/mcp.json (root 0600). tokens: 名字 -> 令牌, 名字进审计日志的 who. 令牌用 python3 -c 'import secrets; print(secrets.token_urlsafe(32))' 生成, 短于 24 字符的不认 (下面的占位就不认). hosts: 用主机名访问时把名字加进来 (挡 DNS rebinding), 直接用 IP 不用加. 档位 (#49): 顶层 port/tokens 给动手档 (cart_mcp.py http, 默认 --profile act); readonly 段给只读档 (cart_mcp.py http --profile readonly), 两档各起一个进程、令牌分开, 只读令牌在动手档不认 (和只读令牌同值的动手令牌也不认); 没有 readonly 段 = 只读档谁都进不来.",
   "port": 8765,
   "tokens": {
     "claude-laptop": "CHANGE-ME"
+  },
+  "readonly": {
+    "port": 8766,
+    "tokens": {
+      "agent-readonly": "CHANGE-ME"
+    }
   },
   "hosts": []
 }

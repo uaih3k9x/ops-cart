@@ -45,6 +45,7 @@ class NetModePanel(BridgePanel):
         var.trace_add("write", lambda *_: (on_change or self._form_changed)())
         e = tk.Entry(parent, textvariable=var, width=width, font=FONT_MONO, bg=th.BG, fg=FG,
                      insertbackground=FG, **th.SUNKEN, disabledbackground=BOX)
+        e.no_ime = True                     # 网络参数, 不接中文输入 (中文输入的 NO_IME 约定)
         e.pack(side="left", padx=6, ipady=3)
         e.bind("<Return>", lambda _e: self.apply())
         return e
