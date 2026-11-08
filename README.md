@@ -103,8 +103,9 @@ sudo kiosk-setpin
 sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload
 # LAN1 (eno1) 的主地址必须就是 pxe.env 的 PXE_IP, 且在 pxe 区; 否则三件套 active 也装不了机. 二选一:
 #   车机「网口模式」把 LAN1 设成静态 PXE_IP (netmode 建的连接自带 pxe 区), 或者:
-sudo nmcli con add type ethernet ifname eno1 con-name lan1-pxe ipv4.method manual \
-    ipv4.addresses <PXE_IP>/<PXE_PREFIX> connection.zone pxe && sudo nmcli con up lan1-pxe
+. /etc/ops-cart/pxe.env
+sudo nmcli con add type ethernet ifname eno1 con-name Lan1-pxe ipv4.method manual \
+    ipv4.addresses "$PXE_IP/$PXE_PREFIX" connection.zone pxe && sudo nmcli con up Lan1-pxe
 sudo python3 -m venv /opt/pxe/venv && sudo /opt/pxe/venv/bin/pip install pillow pyusb   # cart-dash 用这个 venv
 sudo bash scripts/setup-cart.sh      # 先把 Rocky minimal ISO 放到脚本里写的路径; 校验后铺 tftp 和 HTTP 仓库, 只写默认菜单
 sudo install -m 644 examples/ks.cfg.example /opt/pxe/http/ks.cfg   # 改掉里面的密码 hash 和分区再用
