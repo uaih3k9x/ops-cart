@@ -80,8 +80,8 @@
 | [`tspl_preview.py`](tspl_preview.py) | 不在打印机边上时把 TSPL 画成 HTML/SVG:旗面轮廓、折痕、对折后正反面;查出界和对折对称。开发机工具 |
 | [`lldp_core.py`](lldp_core.py) | LLDP/CDP 被动监听(只收不发):LAN1/LAN2 对面是哪台交换机的哪个口,经 cart-dash 进快照,副屏和状态板显示;给线缆标签对端出建议值 |
 | [`survey_core.py`](survey_core.py) | 串口一键只读巡检:命令白名单 fail-closed(只认全称 `display`/`show`),走 conbroker 发、存档、和上一份比对配置漂移;串口面板「巡检」按钮 |
-| [`observe_core.py`](observe_core.py) | 串口观察模式(#85):华为 console 登录状态机(见 `Username:` 才发用户名、密码只走 secret)、解析 `display interface brief`、接口名排成前面板、灯和闪烁、按耗时自适应轮询、人在用时暂停 |
-| [`observe_panel.py`](observe_panel.py) | 观察模式车机窗口:串口面板「观察」打开,输一次密码,画前面板;副屏同步画一块 |
+| [`observe_core.py`](observe_core.py) | 串口观察模式(#85,半自动):人在 console 上登录好,推车只发只读命令;看现场(只认用户视图提示符)、解析 `display interface brief`、接口名排成前面板、灯和闪烁、按耗时自适应轮询、有人 attach 或在用时暂停 |
+| [`observe_panel.py`](observe_panel.py) | 观察模式车机窗口:串口面板「观察」打开,人登录后点「开始观察」、确认设备名,画前面板;副屏同步画一块 |
 | [`notify_core.py`](notify_core.py) | 关键事件推到手机(UPS、守卫、校园网认证、服务挂了、非正常重启):只读状态文件、只在变化时推、防抖冷却;渠道 ntfy、飞书群自定义机器人或推车专用飞书应用(只开发消息权限),默认不外发 |
 | [`recipe_core.py`](recipe_core.py) · [`recipe.py`](recipe.py) | 屏幕自动化配方:截图 + OCR + CH9329,第一个配方 `boot-pxe` 自动进启动菜单选网络启动;配方里不许出现保存类按键 |
 | [`clone_core.py`](clone_core.py) | 整盘克隆(Clonezilla over PXE):解锁用途 clone-save / clone-restore、启动参数生成、目标盘按型号/序列号显式匹配(绝不默认 sda)、批量清单确认;见 [`docs/CLONE.md`](docs/CLONE.md) |

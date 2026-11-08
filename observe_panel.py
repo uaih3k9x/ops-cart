@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""串口观察模式的车机窗口 (#85): 输一次密码, 画设备前面板, 灯跟着真机亮灭闪. 逻辑在 observe_core.py.
+"""串口观察模式的车机窗口 (#85, 半自动): 人在 console 上登录好, 点"开始观察", 确认设备名, 推车画前面板.
 
-串口面板选中一路点"观察"打开; 每一路同时只开一个窗口, 和巡检互斥 (observe_core.claim). 线程纪律同 serial_panel:
-后台线程 (登录 / 轮询) 只往 self.ui 放东西, 界面只在 _tick 里改. 密码框读完立刻清空, 密码只经 Observer.start
-传给登录状态机, 不落盘不进日志. 观察全程占着车机串口面板对这一路的连接 (面板上显示"观察中"), 结束后接回.
-会话掉了 / 登录失败 / 退出后 console 还登录着, 窗口留着写明, 登录行回来可以再登. 不自动 quit.
+推车不碰登录, 只发只读命令 (逻辑在 observe_core.py). 串口面板选中一路点"观察"打开; 每一路同时只开一个窗口,
+和巡检互斥 (observe_core.claim). 线程纪律同 serial_panel: 后台线程 (轮询) 只往 self.ui 放东西, 界面只在 _tick 里改.
+观察全程占着车机串口面板对这一路的连接 (面板上显示"观察中"), 结束后接回. 有人 attach 着就不轮询.
 """
 
 import functools
 import os
 import queue
-import secrets
+from secrets import token_hex
 import threading
 import time
 
 import tkinter as tk
+from tkinter import messagebox
 
 import atomicfile
 import lamps_core
@@ -30,23 +30,6 @@ WIN_W, WIN_H = 1100, 440
 CANVAS_W = WIN_W - 2 * PAD              # 画布左右各让出 PAD
 FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
 SNAP_S = 5                              # 多久给副屏写一次快照
-
-_LOGIN_SLOT = set()                     # 同一时间只许一个观察窗口处于登录阶段 (共用一个车机控制台, 不能互相暂停 / 接回)
-_SLOT_LOCK = threading.Lock()
-
-
-def login_slot(token):
-    with _SLOT_LOCK:
-        if _LOGIN_SLOT and token not in _LOGIN_SLOT:
-            return False
-        _LOGIN_SLOT.add(token)
-        return True
-
-
-def login_slot_done(token):
-    with _SLOT_LOCK:
-        _LOGIN_SLOT.discard(token)
-
 
 def _alive(w):
     try:
@@ -188,6 +171,7 @@ class ObserveWindow(tk.Toplevel):
         self.hold = ConsoleHold(panel, name)      # 车机控制台本身是 attach 着的"人"
         self.life = Life(name, token)
         self._snap_err = None
+        self.ask = lambda title, msg: messagebox.askyesno(title, msg, parent=self)   # 人确认设备名
         self.overrideredirect(True)
         W, H = WIN_W, WIN_H
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
@@ -203,72 +187,59 @@ class ObserveWindow(tk.Toplevel):
         self.close_btn = tk.Button(bar, text="退出观察", font=FONT, command=self.close, bg=th.BTN2, fg=FG,
                                    **th.RAISED, cursor="hand2", padx=10)
         self.close_btn.pack(side="right", padx=6, pady=4)
-        self.login_row = tk.Frame(self, bg=BG)
-        self.login_row.pack(fill="x", padx=PAD, pady=8)
-        self.user_var, self.pass_var = tk.StringVar(), tk.StringVar()
-        for label, var, show in (("用户名", self.user_var, ""), ("密码", self.pass_var, "•")):
-            tk.Label(self.login_row, text=label, font=FONT, bg=BG, fg=th.TEXT).pack(side="left", padx=(0, 4))
-            e = tk.Entry(self.login_row, textvariable=var, show=show, font=FONT, width=16, bg=CARD, fg=FG,
-                         insertbackground=FG, **th.SUNKEN)
-            e.pack(side="left", padx=(0, 12), ipady=4)
-            e.bind("<Return>", lambda _e: self.login())
-        self.login_btn = tk.Button(self.login_row, text="登录", font=FONT, command=self.login, bg=th.PRIMARY, fg=FG,
+        self.start_btn = tk.Button(bar, text="开始观察", font=FONT, command=self.begin, bg=th.PRIMARY, fg=FG,
                                    **th.RAISED, cursor="hand2", padx=12)
-        self.login_btn.pack(side="left")
+        self.start_btn.pack(side="right", padx=6, pady=4)
         self.canvas = tk.Canvas(self, bg=CARD, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=PAD)
         self.canvas.bind("<Motion>", self._on_hover)
         self.canvas.bind("<Button-1>", self._on_hover)
-        self.status = tk.Label(self, text="", font=FONT_MONO, bg=BG, fg=DIM, anchor="w")
+        self.status = tk.Label(self, text="先在 console 上登录, 停在 <设备名> 后点 开始观察", font=FONT_MONO, bg=BG,
+                               fg=DIM, anchor="w", justify="left", wraplength=WIN_W - 2 * PAD)
         self.status.pack(fill="x", padx=PAD, pady=8)
 
     # ------------------------------------------------------------ 后台
 
-    def login(self):
-        user, pw = self.user_var.get().strip(), self.pass_var.get()
-        self.pass_var.set("")                       # 读完就清
-        if oc.bad_credential(user) or oc.bad_credential(pw):
-            self.status.config(text="用户名或密码里有控制字符 (回车 / 换行等), 请重新输入", fg=th.WARN)
-            return
-        if self.worker or not user or not pw:
-            return
-        self._closing = False               # 上次点过退出观察、留着窗口再登录: 按钮恢复
-        self.close_btn.config(state="normal", text="退出观察", command=self.close)
-        if not login_slot(self.token):
-            self.status.config(text="另一个观察窗口正在登录, 等它登完再来", fg=th.WARN)
-            return
-        self.login_btn.config(state="disabled")
+    def _new_observer(self):
         log = oc.LogFile(os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log"))
-        self.obs = oc.Observer(self.name, self.vendor,
-                               exchange=functools.partial(oc.broker_exchange, self.ddir, self.name, vendor=self.vendor),
-                               send=functools.partial(survey_core.conbroker_send, grace=oc.POLL_GRACE_S), log=log,
-                               busy=lambda: oc.agent_busy(self.head))
-        self.status.config(text="看现场、登录中…", fg=DIM)
+        return oc.Observer(self.name, self.vendor, send=functools.partial(survey_core.conbroker_send, grace=oc.POLL_GRACE_S),
+                           log=log, busy=lambda: oc.agent_busy(self.head))
+
+    def begin(self):
+        """开始观察: 看现场 (只认用户视图提示符) -> 人确认设备名 -> 后台线程开始轮询. 这一步不往 console 发任何字节."""
+        if self.worker:
+            return
+        obs = self._new_observer()
+        name, why = obs.probe()
+        if why:
+            self.status.config(text=f"没开始: {why}", fg=th.WARN)
+            return
+        if not self.ask("开始观察", confirm_text(name)):
+            return
+        self.obs = obs
+        self._closing = False               # 上次点过退出观察、留着窗口再开始: 按钮恢复
+        self.close_btn.config(state="normal", text="退出观察", command=self.close)
+        self.start_btn.config(state="disabled")
+        self.status.config(text=f"观察 <{name}>…", fg=DIM)
         self._snap_at = 0
         self.stop_evt.clear()
         self.hold.pause()                   # 观察全程占着车机控制台对这一路的连接 (有人 attach 就不轮询); 结束时接回
-        box = [pw]                          # 一次性容器: 线程取出后清空, 不在 Thread._args 里一直挂着
-        del pw
-        self.worker = threading.Thread(target=self._work, args=(self.obs, user, box), daemon=True)
+        self._spawn(obs, name)
+
+    def _spawn(self, obs, name):
+        self.worker = threading.Thread(target=self._work, args=(obs, name), daemon=True)
         self.life.worker_started()
         self.worker.start()
 
-    def _work(self, obs, user, box):
-        pw = box.pop() if box else ""
+    def _work(self, obs, name):
         try:
-            try:
-                ok = obs.start(user, pw, cancelled=self.stop_evt.is_set)
-            finally:
-                del pw
-                login_slot_done(self.token)
+            ok = obs.start(name, cancelled=self.stop_evt.is_set)
             oc.record("start", head=self.head, device=obs.device, ok=ok, error=obs.error)
-            if ok:
-                self.ui.put(self._logged_in)
             while ok and not self.stop_evt.is_set() and obs.state == "polling":
                 obs.tick(time.monotonic())
                 self.stop_evt.wait(0.5)
             obs.stop(time.monotonic())
-            oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error, note=obs.note)
+            oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error)
         finally:                            # 不管怎么结束: 放占用 (窗口已关的话) 并通知界面 (接回控制台在 _ended 里)
             life = getattr(self, "life", None)
             if life:
@@ -281,23 +252,15 @@ class ObserveWindow(tk.Toplevel):
             self._snap_err = msg            # 借状态栏的提示位说一声
             self.status.config(text=msg, fg=th.WARN)
 
-    def _logged_in(self):
-        self.login_row.pack_forget()
-        self.title_lbl.config(text=f"观察 {self.dev} · {self.obs.device}" + (f" · {self.obs.model}" if self.obs.model else ""))
-
     def _ended(self):
-        """后台线程结束: 有话要交代 (console 还登录着 / 出错 / 掉线) 就留着窗口说明, 登录行回来可以再登; 没有就关窗."""
+        """后台线程结束: 出了事 (没开始 / 掉线 / 出错) 留着窗口说明, 可以再点开始观察; 点了退出且没事就关窗."""
         obs, self.worker = self.obs, None
         self._console_back()
-        if self._closing and not obs.note and not obs.error:
+        if self._closing and not obs.error:
             return self.destroy()
         self._write_snap()
-        text = "; ".join(x for x in (obs.error, obs.note) if x) or "已停止"
-        self.status.config(text=text, fg=th.BAD if obs.error else th.WARN if obs.note else DIM, wraplength=WIN_W - 2 * PAD,
-                           justify="left")
-        if not self.login_row.winfo_ismapped():
-            self.login_row.pack(fill="x", padx=PAD, pady=8, before=self.canvas)
-        self.login_btn.config(state="normal")
+        self.status.config(text=obs.error or "已停止", fg=th.BAD if obs.error else DIM)
+        self.start_btn.config(state="normal")
         self.close_btn.config(state="normal", text="关闭" if self._closing else "退出观察",
                               command=self.destroy if self._closing else self.close)
 
@@ -319,12 +282,13 @@ class ObserveWindow(tk.Toplevel):
                                                       width=width if width > 1 else CANVAS_W))
         if obs and self.worker and obs.state == "polling" and not self._closing:
             self._status(obs)
+            self.title_lbl.config(text=f"观察 {self.dev} · {obs.device}" + (f" · {obs.model}" if obs.model else ""))
         if obs and time.monotonic() - self._snap_at > SNAP_S:
             self._write_snap()
         self.after(FRAME_MS, self._tick)
 
     def _write_snap(self):
-        """登录中 / 观察中 / 失败 / 掉线都写, 副屏照实显示; 关窗时删掉自己这份."""
+        """准备中 / 观察中 / 没开始 / 掉线都写, 副屏照实显示; 关窗时删掉自己这份."""
         self._snap_at = time.monotonic()
         try:
             os.makedirs(oc.STATE_DIR, exist_ok=True)
@@ -368,7 +332,7 @@ class ObserveWindow(tk.Toplevel):
         worker = self.worker
         if worker is None or not worker.is_alive():
             return
-        oc.record("interrupted", head=self.head, note=interrupt_note(getattr(self, "obs", None)))
+        oc.record("interrupted", head=self.head, note="观察被 kiosk 退出打断")
         worker.join(timeout)
 
     def destroy(self):
@@ -379,25 +343,13 @@ class ObserveWindow(tk.Toplevel):
         super().destroy()
 
 
-def interrupt_note(obs):
-    """kiosk 退出打断观察时记的那句: 按走到哪一步写, 轮询阶段不写"停在 Password:"."""
-    lg = getattr(obs, "login", None)
-    if obs is None:
-        state = "看不出走到哪一步, console 可能仍在登录状态或停在 Password:"
-    elif obs.state == "polling":
-        state = "console 仍处于推车登录的状态"
-    elif lg is not None and getattr(lg, "pw_sent", False):
-        state = "密码可能已发出, console 可能仍在登录状态"
-    elif getattr(obs, "user_sent", False):
-        state = "用户名已发出, console 可能停在 Password:"
-    else:
-        return "观察被 kiosk 退出打断 (还没往 console 发过凭据)"
-    return f"观察被 kiosk 退出打断, {state}, {oc.IDLE_LOGOUT}"
+def confirm_text(name):
+    return f"检测到 <{name}>, 开始观察这台设备?"
 
 
 def open_for(master, dev, name, vendor, ddir):
     """每一路只开一个; 已经开着就提到前面. 窗口挂在 kiosk 根窗口下: 切走串口面板不会把观察窗口一起销毁."""
-    token = secrets.token_hex(4)
+    token = token_hex(4)
     root = master.winfo_toplevel()
     if not oc.claim(name, token):
         for w in root.winfo_children():

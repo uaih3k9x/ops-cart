@@ -164,7 +164,7 @@ def test_layout_view_picks_newest_fresh_of_several():
 def test_layout_view_shows_logging_in_without_ports():
     doc = dict(_snap(100, ports=[]), state="idle", polled_at=None)
     v = dc.layout_view({"ts": 100, "observe": [doc]}, now=101)
-    assert v["front"]["note"] == "登录中" and v["front"]["ports"] == []
+    assert v["front"]["note"] == "准备开始" and v["front"]["ports"] == []
     pytest.importorskip("PIL")
     import dash_render as r
     r.render(v)
@@ -197,25 +197,6 @@ class _FakeWin:
         self.ui, self.stop_evt, self.head = queue.Queue(), threading.Event(), "con-1"
         self._logged_in = self._ended = self._console_back = None
         self.token = "t"
-
-
-def test_password_box_emptied_when_taken(monkeypatch):
-    monkeypatch.setattr(oc, "record", lambda *a, **k: None)
-    box = ["s3cret"]
-    seen = {}
-
-    class Obs:
-        device = error = None
-        state, note = "failed", None
-
-        def start(self, user, pw, cancelled=None):
-            seen["pw"], seen["box"] = pw, list(box)
-            return False
-
-        def stop(self, now=None):
-            pass
-    op.ObserveWindow._work(_FakeWin(), Obs(), "admin", box)
-    assert seen == {"pw": "s3cret", "box": []} and box == []
 
 
 def test_snapshot_write_failure_reported(tmp_path, monkeypatch):
@@ -297,17 +278,6 @@ def test_console_hold_reports_failed_resume():
     h.pause()
     msg = h.resume()
     assert msg and "手动" in msg
-
-
-def test_only_one_window_logging_in_at_a_time():
-    op._LOGIN_SLOT.clear()
-    assert op.login_slot("a") is True
-    assert op.login_slot("b") is False
-    op.login_slot_done("b")
-    assert op.login_slot("b") is False
-    op.login_slot_done("a")
-    assert op.login_slot("b") is True
-    op._LOGIN_SLOT.clear()
 
 
 def test_life_releases_claim_only_when_window_and_worker_both_gone():
@@ -396,7 +366,7 @@ def test_shutdown_joins_worker_briefly_and_logs(monkeypatch):
     w.worker.start()
     op.ObserveWindow._shutdown(w, timeout=2)
     assert w.stop_evt.is_set() and not w.worker.is_alive()
-    assert got and got[0][0] == "interrupted" and "Password:" in got[0][1]["note"]
+    assert got and got[0][0] == "interrupted" and "打断" in got[0][1]["note"]
 
 
 def test_shutdown_gives_up_after_timeout(monkeypatch):
@@ -438,7 +408,7 @@ def test_work_always_finishes_life_and_posts_ended(monkeypatch):
         device = error = note = None
         state = "polling"
 
-        def start(self, user, pw, cancelled=None):
+        def start(self, name, cancelled=None):
             return True
 
         def tick(self, now):
@@ -447,68 +417,10 @@ def test_work_always_finishes_life_and_posts_ended(monkeypatch):
         def stop(self, now=None):
             pass
     with pytest.raises(RuntimeError):
-        op.ObserveWindow._work(w, Obs(), "admin", ["pw"])
+        op.ObserveWindow._work(w, Obs(), "SW-TEST")
     assert oc.holder("con-1") is None
     assert not w.ui.empty()
     oc._CLAIMS.clear()
-
-
-def test_work_does_not_resume_console_after_login():
-    w = _FakeWin()
-    resumed = []
-    w._console_back = lambda: resumed.append(1)
-
-    class Obs:
-        device = error = note = None
-        state = "failed"
-
-        def start(self, user, pw, cancelled=None):
-            return True
-
-        def stop(self, now=None):
-            pass
-    import observe_core
-    orig = observe_core.record
-    observe_core.record = lambda *a, **k: None
-    try:
-        op.ObserveWindow._work(w, Obs(), "admin", ["pw"])
-    finally:
-        observe_core.record = orig
-    queued = []
-    while not w.ui.empty():
-        queued.append(w.ui.get())
-    assert w._console_back not in queued                 # 登录完不接回, 观察全程占着; _ended 时才接回
-
-
-@pytest.mark.parametrize("state,user_sent,pw_sent,want,not_want", [
-    ("polling", True, True, "推车登录", "Password:"),
-    ("idle", True, False, "Password:", None),
-    ("idle", True, True, "可能仍在登录状态", None),
-    ("idle", False, False, None, None),
-])
-def test_shutdown_note_by_phase(monkeypatch, state, user_sent, pw_sent, want, not_want):
-    import threading
-    got = []
-    monkeypatch.setattr(oc, "record", lambda action, **kw: got.append(kw.get("note")))
-    w = _FakeWin()
-
-    class Lg:
-        pass
-    lg = Lg()
-    lg.pw_sent = pw_sent
-
-    class Obs:
-        pass
-    w.obs = Obs()
-    w.obs.state, w.obs.user_sent, w.obs.login = state, user_sent, lg
-    w.worker = threading.Thread(target=lambda: w.stop_evt.wait(5), daemon=True)
-    w.worker.start()
-    op.ObserveWindow._shutdown(w, timeout=2)
-    note = got[0]
-    if want:
-        assert want in note
-    if not_want:
-        assert not_want not in note
 
 
 def test_serial_panel_connect_refused_while_observing():
@@ -552,3 +464,63 @@ def test_console_hold_for_whole_observation_until_ended():
     assert "/dev/con-1" in p._held               # 仍然登记着, 面板不会自动接 / 发唤醒
     h.resume()
     assert p.calls[-1] == ("connect", False) and p._held == set()
+
+
+
+# ------------------------------------------------------------ 半自动: 开始观察 = 看现场 + 人确认设备名
+
+class _Lbl:
+    def __init__(self):
+        self.kw = {}
+
+    def config(self, **kw):
+        self.kw.update(kw)
+
+
+class _BeginWin:
+    """ObserveWindow.begin 用到的那些属性的替身."""
+
+    def __init__(self, probe, answer=True):
+        self.worker, self.obs, self._closing, self.asked, self.spawned = None, None, True, [], []
+        self.status, self.close_btn, self.start_btn = _Lbl(), _Lbl(), _Lbl()
+        self.stop_evt = __import__("threading").Event()
+        self.hold = op.ConsoleHold(None, "/dev/con-1")
+        self._probe, self._answer, self.close = probe, answer, None
+
+    def _new_observer(self):
+        win = self
+
+        class O:
+            def probe(self):
+                return win._probe
+        return O()
+
+    def ask(self, title, msg):
+        self.asked.append(msg)
+        return self._answer
+
+    def _spawn(self, obs, name):
+        self.spawned.append(name)
+
+
+def test_begin_refuses_with_reason_without_asking():
+    w = _BeginWin((None, "console 还没登录 (停在 Username:), 请先在 console 上登录"))
+    op.ObserveWindow.begin(w)
+    assert "还没登录" in w.status.kw["text"] and w.asked == [] and w.spawned == []
+
+
+def test_begin_asks_to_confirm_device_name():
+    w = _BeginWin(("SW-TEST", None), answer=False)
+    op.ObserveWindow.begin(w)
+    assert w.asked == [op.confirm_text("SW-TEST")] and "<SW-TEST>" in w.asked[0] and w.spawned == []
+    w = _BeginWin(("SW-TEST", None), answer=True)
+    op.ObserveWindow.begin(w)
+    assert w.spawned == ["SW-TEST"] and w._closing is False and w.close_btn.kw["text"] == "退出观察"
+
+
+def test_begin_holds_panel_console_for_whole_observation():
+    p = _Panel()
+    w = _BeginWin(("SW-TEST", None))
+    w.hold = op.ConsoleHold(p, "/dev/con-1")
+    op.ObserveWindow.begin(w)
+    assert p.calls == ["disconnect"] and p._held == {"/dev/con-1"}       # 人用面板登录的: 观察期间借走
