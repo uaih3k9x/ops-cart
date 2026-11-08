@@ -4,8 +4,9 @@
 #   journalctl -fu ops-cart-deploy          # 看进度
 # 包的布局见 docs/DEPLOY_1.16.01.md 第 3 步. 只从 1.16.00 升; 不是就停 (跳过版本检查: sudo systemd-run --setenv=FORCE=1 --unit=ops-cart-deploy --collect bash .../install.sh).
 # 照 install-1.16.00.sh 来 (备份 + rollback.sh + deploy.marker + 包核对 + trap), 这一版多 #95 迁移:
-# pxeserver.log 挪进日志目录、logrotate 配置; smb.conf interfaces 加 lo + lan1 drop-in + NM 钩子 (只给手工配置的 Samba).
-# 不碰 /etc/ops-cart, 不碰大肥鱼的目录, 不装数据盘那份 smb drop-in, 不跑 setup-samba.sh.
+# pxeserver.log 挪进日志目录、logrotate 配置; smb 推车上没在用, 直接 disable --now (维护者定).
+# 不碰 /etc/ops-cart, 不碰大肥鱼的目录; 不改 smb.conf、不装 smb drop-in / NM 钩子、不跑 setup-samba.sh
+# (以后要用 smb 照 docs/MIGRATE_95.md 第 2 节恢复).
 set -Eeuo pipefail
 
 PKG=$(cd "$(dirname "$0")" && pwd)
@@ -15,8 +16,6 @@ SYS=${SYS:-/etc/systemd/system}
 ETC=${ETC:-/etc/ops-cart}
 LOG=${LOG:-/var/log/ops-cart}
 LRD=${LRD:-/etc/logrotate.d}
-SAMBA=${SAMBA:-/etc/samba}
-NMD=${NMD:-/etc/NetworkManager/dispatcher.d}
 FROM=1.16.00
 EXPECT_TO=1.16.01
 TO=$(cat "$PKG/opt/VERSION" 2>/dev/null || true)
@@ -24,8 +23,6 @@ CHANGED_UNITS="pxe-server.service"
 # 改过代码 (或 import 了改过的模块)、要重启的常驻服务, 部署前开着的才重启; kiosk 会回到锁屏.
 # pxe-server 只换单元 (日志路径), 在第 3 段停 / 起; kvm-broker、pxe-http-* 这版没改, 不动.
 RESTART="cart-dash kiosk webkiosk cart-mcp cart-mcp-ro"
-SMB_DROPIN=$SYS/smb.service.d/ops-cart-lan1.conf
-SMB_HOOK=$NMD/50-ops-cart-smb
 B=""
 DONE=""
 FORCE_CMD="sudo systemd-run --setenv=FORCE=1 --unit=ops-cart-deploy --collect bash $0"
@@ -49,44 +46,12 @@ trap 'on_err $LINENO' ERR
 # ssh 断线 / Ctrl-C / systemctl stop: 不走 ERR, 也要给回滚提示
 trap 'echo >&2; echo "!! 被信号打断." >&2; hint_rollback; exit 130' INT TERM HUP
 
-# smb.conf 的 interfaces 前面加 lo. check: 只看能不能改 (0 = 要改, 3 = 已经带 lo); 给了 out 就把改好的写到 out.
-# 只认 [global] 里恰好一行 interfaces; 别的情况 (0 行 / 多行 / 在别的段) 一律不改, 交给人.
-smb_lo() {
-    python3 -I - "$@" <<'PY'
-import re, sys
-src, out = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else None)
-lines = open(src, encoding="utf-8").read().split("\n")
-sec, hits = None, []
-for i, l in enumerate(lines):
-    m = re.match(r"\s*\[([^\]]+)\]\s*$", l)
-    if m:
-        sec = m.group(1).strip().lower()
-        continue
-    if re.match(r"\s*interfaces\s*=", l, re.I):
-        hits.append((i, sec))
-if len(hits) != 1 or hits[0][1] != "global":
-    print("!!   smb.conf 里 interfaces 不是 [global] 里恰好一行 (%s), 不自动改" % hits, file=sys.stderr)
-    sys.exit(1)
-i = hits[0][0]
-m = re.match(r"(\s*)interfaces\s*=\s*(.*)$", lines[i], re.I)
-indent, val = m.group(1), m.group(2).strip()
-if "lo" in val.replace(",", " ").split():
-    sys.exit(3)
-if not val:
-    print("!!   smb.conf 的 interfaces 是空的, 不自动改", file=sys.stderr)
-    sys.exit(1)
-if out:
-    lines[i] = "%sinterfaces = lo %s" % (indent, val)
-    open(out, "w", encoding="utf-8").write("\n".join(lines))
-PY
-}
-
 [ "$(id -u)" = 0 ] || die "要 root: sudo bash $0"
 [ -f "$PKG/opt/BUILD" ] || die "包里缺 BUILD"
 grep -q -- '-dirty' "$PKG/opt/BUILD" && die "BUILD 带 -dirty, 包不是从干净提交打的"
 [ "$TO" = "$EXPECT_TO" ] || die "包里 VERSION 是 '$TO', 不是 $EXPECT_TO"
-for f in $(for u in $CHANGED_UNITS; do echo "systemd/$u"; done) etc/logrotate.d/ops-cart smb/smb-lan1.conf \
-         smb/50-ops-cart-smb accept/cart_accept.py accept/accept_core.py accept/accept-manifest.json \
+for f in $(for u in $CHANGED_UNITS; do echo "systemd/$u"; done) etc/logrotate.d/ops-cart \
+         accept/cart_accept.py accept/accept_core.py accept/accept-manifest.json \
          opt/kiosk.py opt/bigfish_core.py opt/observe_core.py; do
     [ -f "$PKG/$f" ] || die "包不全: 缺 $f"
 done
@@ -144,20 +109,6 @@ for root, _, names in os.walk(os.path.join(pkg, "opt")):
         if rel != "BUILD" and "/opt/pxe/" + rel not in listed:     # BUILD 上面单独比过 manifest 的 build
             extra.append("opt/" + rel)
 extra += ["systemd/" + u for u in sorted(units) if "/etc/systemd/system/" + u not in listed]
-# smb/ 下两份 (lan1 drop-in、NM 钩子) 不在验收清单里 (setup-samba 的推车不装 drop-in), sha256 见包里的 smb/SHA256SUMS
-sums = os.path.join(pkg, "smb", "SHA256SUMS")
-if not os.path.exists(sums):
-    bad.append("缺 smb/SHA256SUMS")
-else:
-    for line in open(sums, encoding="utf-8"):
-        want, name = line.split()
-        try:
-            got = hashlib.sha256(open(os.path.join(pkg, "smb", name), "rb").read()).hexdigest()
-        except OSError:
-            bad.append("缺 smb/" + name)
-            continue
-        if got != want:
-            bad.append("sha256 不一致 smb/" + name)
 for e in sorted(extra):
     print("    警告: 包里有, manifest 没列 (照样装, 不核对): " + e, file=sys.stderr)
 for b in bad:
@@ -184,24 +135,6 @@ fi
 if ls "$OPT"/tftp/grub.cfg-* >/dev/null 2>&1; then
     die "tftp 里有按 MAC 解锁的菜单 ($(ls "$OPT"/tftp/grub.cfg-* | xargs -n1 basename | tr '\n' ' ')), 有机器在装, 先等装完 / 上锁再装"
 fi
-# ---- Samba 先看清楚, 不合预期就整个不装 (还没动任何东西)
-SMB=""
-if [ -f "$SAMBA/smb.conf" ]; then
-    grep -q "setup-samba.sh" "$SAMBA/smb.conf" && \
-        die "$SAMBA/smb.conf 是 setup-samba.sh 生成的: 这个脚本只管手工配置的 Samba. 照 docs/MIGRATE_95.md 第 2 节做"
-    [ ! -e "$SYS/smb.service.d/ops-cart.conf" ] || die "$SYS/smb.service.d/ops-cart.conf (数据盘那份) 已经在了, 和手工配置对不上, 先查"
-    command -v testparm >/dev/null || die "没有 testparm, 改不了 smb.conf"
-    testparm -s "$SAMBA/smb.conf" >/dev/null 2>&1 || die "现在的 smb.conf 就过不了 testparm, 不动它, 先查: testparm -s"
-    rc=0; smb_lo "$SAMBA/smb.conf" || rc=$?
-    case $rc in
-        0) SMB=edit ;;
-        3) SMB=haslo ;;
-        *) die "smb.conf 的 interfaces 不是预期的样子, 不自动改 (照 docs/MIGRATE_95.md 2.1 手工做)" ;;
-    esac
-else
-    echo "    $SAMBA/smb.conf 没有: 这台没装 Samba, 跳过 smb 那一段"
-fi
-
 echo "==> $CUR ($(cat "$OPT/BUILD" 2>/dev/null)) -> $TO ($(cat "$PKG/opt/BUILD"))"
 
 # 现在开着的服务: 装完重启它们, 回滚时也无条件重启它们 (新代码起不来停掉的也要拉回来)
@@ -209,6 +142,13 @@ ACTIVE=""
 for s in $RESTART; do if systemctl is-active --quiet "$s"; then ACTIVE="$ACTIVE $s"; fi; done
 PXE_WAS=""
 if systemctl is-active --quiet pxe-server; then PXE_WAS=1; fi
+# smb 部署前的样子: 回滚照原样恢复 (enabled 才 enable, active 才 start). 没装 Samba 就整段不管
+SMB=""; SMB_EN=""; SMB_ACT=""
+if [ "$(systemctl show -p LoadState --value smb.service 2>/dev/null || true)" = loaded ]; then
+    SMB=1
+    if systemctl is-enabled --quiet smb.service; then SMB_EN=1; fi
+    if systemctl is-active --quiet smb.service; then SMB_ACT=1; fi
+fi
 
 # ---- 1. 备份
 TS=$(date +%Y%m%d-%H%M%S)
@@ -218,12 +158,6 @@ cp -a "$OPT"/*.py "$OPT/VERSION" "$OPT/BUILD" "$OPT/web" "$OPT/icons" "$B/"
 for u in $CHANGED_UNITS; do cp -a "$SYS/$u" "$B/etc/systemd/"; done
 if [ -f "$LRD/ops-cart" ]; then cp -a "$LRD/ops-cart" "$B/etc/logrotate.d/"; fi
 cp -a "$ETC" "$B/etc/ops-cart"
-if [ -n "$SMB" ]; then
-    mkdir -p "$B/samba"
-    cp -a "$SAMBA/smb.conf" "$B/samba/smb.conf"
-    if [ -e "$SMB_DROPIN" ]; then cp -a "$SMB_DROPIN" "$B/samba/ops-cart-lan1.conf"; fi
-    if [ -e "$SMB_HOOK" ]; then cp -a "$SMB_HOOK" "$B/samba/50-ops-cart-smb"; fi
-fi
 PXE_RESTART=""
 if [ -n "$PXE_WAS" ]; then PXE_RESTART=pxe-server; fi
 cat > "$B/rollback.sh" <<EOF
@@ -237,16 +171,12 @@ B=$B
 cp -a \$B/*.py \$B/VERSION \$B/BUILD $OPT/
 rm -rf $OPT/web $OPT/icons && cp -a \$B/web \$B/icons $OPT/
 for u in $CHANGED_UNITS; do install -m 644 \$B/etc/systemd/\$u $SYS/\$u; done
-# Samba: smb.conf 换回备份; lan1 drop-in / NM 钩子 部署前没有就删, 有就换回
-if [ -f \$B/samba/smb.conf ]; then
-    cp -a \$B/samba/smb.conf $SAMBA/smb.conf
-    if [ -f \$B/samba/ops-cart-lan1.conf ]; then cp -a \$B/samba/ops-cart-lan1.conf $SMB_DROPIN; else rm -f $SMB_DROPIN; fi
-    if [ -f \$B/samba/50-ops-cart-smb ]; then cp -a \$B/samba/50-ops-cart-smb $SMB_HOOK; else rm -f $SMB_HOOK; fi
-fi
 systemctl daemon-reload
-if [ -f \$B/samba/smb.conf ]; then systemctl try-restart smb.service || true; fi    # 在跑才重启 (用回旧 interfaces)
-# 部署前开着的这几个: 不看现在状态, 直接重启
 BAD=""
+# smb 照部署前的样子 (部署前: 装了=${SMB:-0} 自启=${SMB_EN:-0} 在跑=${SMB_ACT:-0}); 部署前没在跑 (含 failed) 的不拉起
+if [ "${SMB_EN:-0}" = 1 ]; then systemctl enable smb.service || BAD="\$BAD smb(enable)"; fi
+if [ "${SMB_ACT:-0}" = 1 ]; then systemctl start smb.service || BAD="\$BAD smb(start)"; fi
+# 部署前开着的这几个: 不看现在状态, 直接重启
 for s in $ACTIVE $PXE_RESTART; do systemctl restart \$s || BAD="\$BAD \$s"; done
 if [ -f \$B/deploy.marker ]; then mv \$B/deploy.marker \$B/deploy.marker.rolled-back; fi   # 回滚完可以再装
 echo "回滚完: \$(cat $OPT/VERSION) \$(cat $OPT/BUILD)"
@@ -277,35 +207,11 @@ if [ -n "$PXE_WAS" ]; then systemctl start pxe-server; echo "    起 pxe-server"
 install -m 644 "$PKG/etc/logrotate.d/ops-cart" "$LRD/ops-cart"
 restorecon "$LRD/ops-cart"
 
-# ---- 5. Samba (#95): interfaces 加 lo, lan1 drop-in, NM 钩子. 不跑 setup-samba.sh, 不装数据盘那份 drop-in
+# ---- 5. smb: 推车上没在用, 停掉并关自启 (维护者定); smb.conf 原样不动. 以后要用照 docs/MIGRATE_95.md 第 2 节
 if [ -n "$SMB" ]; then
-    echo "==> smb: interfaces 加 lo, LAN1 没地址就跳过, 来地址钩子拉起"
-    if [ "$SMB" = edit ]; then
-        NEW=$SAMBA/.smb.conf.ops-cart-$TS
-        smb_lo "$SAMBA/smb.conf" "$NEW"
-        if ! testparm -s "$NEW" >/dev/null 2>&1; then
-            rm -f "$NEW"; die "加了 lo 的 smb.conf 过不了 testparm, 没换 (原文件没动)"
-        fi
-        cat "$NEW" > "$SAMBA/smb.conf"            # 原文件原地改写: 属主、权限、SELinux 标签都不变
-        rm -f "$NEW"
-        if ! testparm -s "$SAMBA/smb.conf" 2>/dev/null | grep -qE '^\s*interfaces = lo '; then
-            cp -a "$B/samba/smb.conf" "$SAMBA/smb.conf"
-            die "换上的 smb.conf 校验不过, 已换回备份"
-        fi
-        grep -nE '^\s*interfaces' "$SAMBA/smb.conf" | sed 's/^/    /'
-    else
-        echo "    smb.conf 的 interfaces 已经带 lo, 不改"
-    fi
-    install -d -m 755 "$SYS/smb.service.d"
-    install -m 644 "$PKG/smb/smb-lan1.conf" "$SMB_DROPIN"
-    install -m 755 "$PKG/smb/50-ops-cart-smb" "$SMB_HOOK"
-    restorecon "$SMB_DROPIN" "$SMB_HOOK"
-    systemctl daemon-reload
+    echo "==> smb: disable --now (没在用)"
+    systemctl disable --now smb.service
     systemctl reset-failed smb.service || true
-    # 正在跑的也要重启才用上新的 interfaces; LAN1 没地址时 ExecCondition 让它跳过 (inactive, 不算失败)
-    if systemctl is-enabled --quiet smb.service || systemctl is-active --quiet smb.service; then
-        systemctl restart smb.service || true
-    fi
 fi
 
 # ---- 6. 重启 (开着的才重启)
@@ -326,10 +232,10 @@ echo "done=1" >> "$B/deploy.marker"
 # ---- 7. 收尾检查 (只报告, 不回滚): smb 不该 failed; logrotate 跑一次, 清掉上次的 failed
 SMB_STATE=""
 if [ -n "$SMB" ]; then
-    if systemctl is-failed --quiet smb.service; then
-        SMB_STATE="!! smb.service 还是 failed: journalctl -u smb -n 50; systemctl show -p DropInPaths smb.service"
+    if systemctl is-failed --quiet smb.service || systemctl is-enabled --quiet smb.service; then
+        SMB_STATE="!! smb.service 没停干净: systemctl status smb; systemctl is-enabled smb"
     else
-        SMB_STATE="smb.service $(systemctl is-active smb.service || true) (LAN1 没线时 inactive 是对的)"
+        SMB_STATE="smb.service 已停用 (disabled, inactive); 要用照 docs/MIGRATE_95.md 第 2 节"
     fi
     echo "    $SMB_STATE"
 fi
@@ -359,6 +265,6 @@ logrotate $LR_STATE
   [ ] 车机回到锁屏, 右上角有"大肥鱼 · ..."一行; 副屏锁屏页也有这一行
   [ ] 主菜单"大肥鱼"进面板: 状态正常显示, 大肥鱼的话带"大肥鱼说:"前缀; 没有"急停通道未就绪"
   [ ] 串口面板"观察": 人登录后开始观察, 前面板和端口灯对得上真机; 退出观察不往 console 发东西 (#85)
-  [ ] LAN1 没插线: systemctl --failed 里没有 smb; 插线来地址后 smb active
+  [ ] systemctl is-enabled smb 是 disabled; systemctl --failed 里没有 smb
   [ ] 车机真屏跑确认框 + 大肥鱼面板 Tk 测试 (命令见第 8 步, skip 不算过)
 EOF

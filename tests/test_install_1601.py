@@ -1,5 +1,5 @@
-"""scripts/install-1.16.01.sh: 假推车目录 + 假 systemctl / python3 / id / testparm / restorecon 跑一遍.
-照 test_install_script.py (1.16.00) 的写法; 这版多 #95 迁移: pxeserver.log、logrotate、smb.conf 加 lo、lan1 drop-in、NM 钩子."""
+"""scripts/install-1.16.01.sh: 假推车目录 + 假 systemctl / python3 / id / restorecon 跑一遍.
+照 test_install_script.py (1.16.00) 的写法; 这版多 #95 迁移 (pxeserver.log、logrotate) 和 smb disable --now."""
 import hashlib
 import json
 import os
@@ -17,17 +17,6 @@ SCRIPT = ROOT / "scripts" / "install-1.16.01.sh"
 PACK = ROOT / "scripts" / "pack-1.16.01.sh"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="要 bash")
-
-HAND_SMB = """# 手工写的: 只给 LAN1 装机口
-[global]
-    workgroup = WORKGROUP
-    interfaces = 192.0.2.1/24
-    bind interfaces only = yes
-
-[win10]
-    path = /srv/win10
-"""
-
 
 def _exe(path, body):
     path.write_text("#!/bin/bash\n" + body)
@@ -52,18 +41,13 @@ def _write_manifest(pkg, build=None):
     (pkg / "accept" / "accept-manifest.json").write_text(json.dumps(m))
 
 
-def _write_smb_sums(pkg):
-    d = pkg / "smb"
-    (d / "SHA256SUMS").write_text("".join(f"{_sha(d / n)}  {n}\n" for n in ("smb-lan1.conf", "50-ops-cart-smb")))
-
-
 @pytest.fixture
 def cart(tmp_path):
-    opt, sysd, etc, log, lrd, samba, nmd, pkg, bin_ = (
-        tmp_path / n for n in ("opt", "sys", "etc", "log", "logrotate.d", "samba", "nmd", "pkg", "bin"))
-    for d in (opt / "web", opt / "icons", opt / "tftp", sysd, etc, log, lrd, samba, nmd, bin_,
+    opt, sysd, etc, log, lrd, pkg, bin_ = (
+        tmp_path / n for n in ("opt", "sys", "etc", "log", "logrotate.d", "pkg", "bin"))
+    for d in (opt / "web", opt / "icons", opt / "tftp", sysd, etc, log, lrd, bin_,
               pkg / "opt" / "web", pkg / "opt" / "icons", pkg / "systemd", pkg / "etc" / "logrotate.d",
-              pkg / "smb", pkg / "accept"):
+              pkg / "accept"):
         d.mkdir(parents=True)
     (opt / "VERSION").write_text("1.16.00\n")
     (opt / "BUILD").write_text("323 2b28f24\n")
@@ -72,7 +56,6 @@ def cart(tmp_path):
     (opt / "pxeserver.log").write_text("old pxe log\n")
     (sysd / "pxe-server.service").write_text("old unit --log /opt/pxe/pxeserver.log\n")
     (lrd / "ops-cart").write_text("/var/log/ops-cart/*.log /opt/pxe/pxeserver.log {}\n")
-    (samba / "smb.conf").write_text(HAND_SMB)
     (etc / "pxe.env").write_text("PXE_IP=x\n")
     (etc / "serial.conf").write_text("keep\n")
 
@@ -83,9 +66,6 @@ def cart(tmp_path):
     (pkg / "opt" / "web" / "index.html").write_text("new\n")
     (pkg / "systemd" / "pxe-server.service").write_text("new unit --log /var/log/ops-cart/pxeserver.log\n")
     (pkg / "etc" / "logrotate.d" / "ops-cart").write_text("/var/log/ops-cart/*.log {}\n")
-    (pkg / "smb" / "smb-lan1.conf").write_text("[Service]\nExecCondition=true\n")
-    (pkg / "smb" / "50-ops-cart-smb").write_text("#!/bin/bash\nexit 0\n")
-    _write_smb_sums(pkg)
     shutil.copy(SCRIPT, pkg / "install.sh")
     for f in ("cart_accept.py", "accept_core.py"):
         (pkg / "accept" / f).write_text("x\n")
@@ -109,6 +89,10 @@ case "$1" in
   is-active) grep -qx "$svc" {active} && exit 0; exit 3;;
   is-enabled) grep -qx "$svc" {enabled} && exit 0; exit 1;;
   is-failed) grep -qx "$svc" {failed} && exit 0; exit 1;;
+  show) [ -f {tmp_path}/no-smb ] && echo not-found || echo loaded; exit 0;;
+  disable) grep -vx "$svc" {enabled} > {enabled}.n || true; mv {enabled}.n {enabled}
+           grep -vx "$svc" {active} > {active}.n || true; mv {active}.n {active}; exit 0;;
+  enable) grep -qx "$svc" {enabled} || echo "$svc" >> {enabled}; exit 0;;
   reset-failed) grep -vx "$svc" {failed} > {failed}.n || true; mv {failed}.n {failed}; exit 0;;
   stop) grep -vx "$svc" {active} > {active}.n || true; mv {active}.n {active}; exit 0;;
   start|restart)
@@ -120,14 +104,8 @@ case "$1" in
 esac
 exit 0
 """)
-    # 假 testparm: 文件里有 BROKEN 就报错; 否则原样吐出来 (真 testparm -s 也是打印整理后的配置)
-    _exe(bin_ / "testparm", f"""echo "testparm $*" >> {calls}
-f="${{@: -1}}"
-grep -q BROKEN "$f" && {{ echo "bad" >&2; exit 1; }}
-cat "$f"
-""")
     _exe(bin_ / "restorecon", f'echo "restorecon $*" >> {calls}\n')
-    # 假 python3: 验收只记一笔; 别的 (内联的 manifest 核对、smb_lo) 交给真 python
+    # 假 python3: 验收只记一笔; 别的 (内联的 manifest 核对) 交给真 python
     _exe(bin_ / "python3", f"""echo "python3 $*" >> {calls}
 case "$1" in
   */cart_accept.py) [ -f {tmp_path}/term-in-accept ] && kill -TERM $PPID; sleep 0.2;;
@@ -136,9 +114,9 @@ esac
 exit 0
 """)
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", OPT=str(opt), SYS=str(sysd), ETC=str(etc),
-               LOG=str(log), LRD=str(lrd), SAMBA=str(samba), NMD=str(nmd), SETTLE="0", MIN_OPT_FILES="1")
-    return dict(tmp=tmp_path, opt=opt, sys=sysd, etc=etc, log=log, lrd=lrd, samba=samba, nmd=nmd, pkg=pkg,
-                env=env, calls=calls, fail=fail, brk=brk, active=active, failed=failed, bin=bin_)
+               LOG=str(log), LRD=str(lrd), SETTLE="0", MIN_OPT_FILES="1")
+    return dict(tmp=tmp_path, opt=opt, sys=sysd, etc=etc, log=log, lrd=lrd, pkg=pkg,
+                env=env, calls=calls, fail=fail, brk=brk, active=active, enabled=enabled, failed=failed, bin=bin_)
 
 
 def run(cart, extra_env=None):
@@ -158,14 +136,6 @@ def calls(cart):
     return cart["calls"].read_text().splitlines()
 
 
-def dropin(cart):
-    return cart["sys"] / "smb.service.d" / "ops-cart-lan1.conf"
-
-
-def hook(cart):
-    return cart["nmd"] / "50-ops-cart-smb"
-
-
 # ------------------------------------------------------------ 正常路径
 
 def test_happy_path_installs_code_and_leaves_config(cart):
@@ -182,11 +152,10 @@ def test_happy_path_installs_code_and_leaves_config(cart):
     assert (b / "VERSION").read_text() == "1.16.00\n"
     assert (b / "etc" / "systemd" / "pxe-server.service").read_text().startswith("old unit")
     assert (b / "etc" / "logrotate.d" / "ops-cart").read_text().startswith("/var/log/ops-cart/*.log /opt/pxe")
-    assert (b / "samba" / "smb.conf").read_text() == HAND_SMB
     assert (b / "etc" / "ops-cart" / "serial.conf").exists()
     assert "cart_accept.py" in cart["calls"].read_text()
     assert "rollback.sh" in r.stdout
-    assert not any(l.startswith(("enable", "disable")) for l in calls(cart))
+    assert not any(l.startswith(("enable", "start smb", "restart smb")) for l in calls(cart))
 
 
 def test_restart_scope_follows_changed_code(cart):
@@ -249,118 +218,73 @@ def test_logrotate_failure_is_reported_not_rolled_back(cart):
     assert (cart["opt"] / "VERSION").read_text() == "1.16.01\n"
 
 
-# ------------------------------------------------------------ smb (#95)
+# ------------------------------------------------------------ smb: 没在用, disable --now (维护者定)
 
-def test_smb_conf_gets_lo_and_keeps_everything_else(cart):
+def test_smb_disabled_now_and_reset_failed(cart):
     r = run(cart)
     assert r.returncode == 0, r.stderr
-    new = (cart["samba"] / "smb.conf").read_text()
-    assert new == HAND_SMB.replace("interfaces = 192.0.2.1/24", "interfaces = lo 192.0.2.1/24")
-    assert not list(cart["samba"].glob(".smb.conf.ops-cart-*"))            # 临时文件收掉了
-
-
-def test_smb_dropin_and_hook_installed_but_not_data_disk_dropin(cart):
-    r = run(cart)
-    assert r.returncode == 0, r.stderr
-    assert dropin(cart).read_text() == (cart["pkg"] / "smb" / "smb-lan1.conf").read_text()
-    assert hook(cart).stat().st_mode & 0o777 == 0o755
-    assert not (cart["sys"] / "smb.service.d" / "ops-cart.conf").exists()   # 数据盘那份绝不装
     c = calls(cart)
-    assert "reset-failed smb.service" in c and "restart smb.service" in c
-    assert c.index("reset-failed smb.service") < c.index("restart smb.service")
-    assert any(l.startswith("restorecon") and str(hook(cart)) in l for l in c)
+    assert "disable --now smb.service" in c and "reset-failed smb.service" in c
+    assert c.index("disable --now smb.service") < c.index("reset-failed smb.service")
+    assert "smb.service" not in cart["enabled"].read_text().split()
+    assert "smb.service" not in cart["failed"].read_text().split()
+    assert "已停用" in r.stdout and "MIGRATE_95" in r.stdout
+    assert not any(l.startswith(("restart smb", "start smb", "enable")) for l in c)
 
 
-def test_script_never_runs_setup_samba_or_installs_data_disk_dropin():
-    code = [l for l in SCRIPT.read_text().splitlines() if not l.lstrip().startswith("#")]
-    assert not any("setup-samba.sh" in l and "grep" not in l and "die" not in l for l in code)
-    assert not any("smb-ops-cart.conf" in l for l in code)
-
-
-def test_smb_already_has_lo_is_left_alone(cart):
-    conf = HAND_SMB.replace("interfaces = 192.0.2.1/24", "interfaces = lo 192.0.2.1/24")
-    (cart["samba"] / "smb.conf").write_text(conf)
-    r = run(cart)
-    assert r.returncode == 0, r.stderr
-    assert (cart["samba"] / "smb.conf").read_text() == conf
-    assert "已经带 lo" in r.stdout and dropin(cart).exists()
-
-
-@pytest.mark.parametrize("conf, why", [
-    (HAND_SMB.replace("bind interfaces only", "interfaces = 198.51.100.1/24\n    bind interfaces only"), "两行"),
-    (HAND_SMB.replace("    interfaces = 192.0.2.1/24\n", ""), "没有"),
-    (HAND_SMB.replace("    interfaces = 192.0.2.1/24\n", "") + "    interfaces = 192.0.2.1/24\n", "不在 global"),
-])
-def test_unexpected_smb_conf_refused_before_touching_anything(cart, conf, why):
-    (cart["samba"] / "smb.conf").write_text(conf)
-    r = run(cart)
-    assert r.returncode != 0 and "interfaces" in r.stderr, why
-    assert backups(cart) == []
-    assert (cart["opt"] / "VERSION").read_text() == "1.16.00\n"
-    assert (cart["samba"] / "smb.conf").read_text() == conf
-
-
-def test_generated_smb_conf_refused(cart):
-    (cart["samba"] / "smb.conf").write_text("# 由 scripts/setup-samba.sh 生成\n" + HAND_SMB)
-    r = run(cart)
-    assert r.returncode != 0 and "setup-samba.sh" in r.stderr and "MIGRATE_95" in r.stderr
-    assert backups(cart) == []
-
-
-def test_data_disk_dropin_present_refused(cart):
-    (cart["sys"] / "smb.service.d").mkdir()
-    (cart["sys"] / "smb.service.d" / "ops-cart.conf").write_text("x\n")
-    r = run(cart)
-    assert r.returncode != 0 and "ops-cart.conf" in r.stderr
-    assert backups(cart) == []
-
-
-def test_current_smb_conf_failing_testparm_refused(cart):
-    (cart["samba"] / "smb.conf").write_text(HAND_SMB + "# BROKEN\n")
-    r = run(cart)
-    assert r.returncode != 0 and "testparm" in r.stderr
-    assert backups(cart) == []
-
-
-def test_edited_smb_conf_failing_testparm_keeps_original(cart):
-    """改出来的那份过不了 testparm: 不换上去, 原文件不动, 停下给回滚."""
-    tp = cart["bin"] / "testparm"
-    tp.write_text(tp.read_text().replace('grep -q BROKEN "$f"', 'grep -qE "BROKEN|interfaces = lo" "$f"'))
-    r = run(cart)
-    assert r.returncode != 0 and "过不了 testparm" in r.stderr
-    (b,) = backups(cart)
-    assert f"bash {b}/rollback.sh" in r.stderr
-    assert (cart["samba"] / "smb.conf").read_text() == HAND_SMB
-    assert not list(cart["samba"].glob(".smb.conf.ops-cart-*"))
+def test_script_does_not_touch_smb_config():
+    code = "\n".join(l for l in SCRIPT.read_text().splitlines() if not l.lstrip().startswith("#"))
+    for bad in ("smb.conf", "setup-samba", "smb-ops-cart.conf", "smb-lan1", "ops-cart-lan1", "50-ops-cart-smb",
+                "testparm", "dispatcher.d", "smb.service.d"):
+        assert bad not in code, bad
 
 
 def test_no_samba_skips_smb_part(cart):
-    (cart["samba"] / "smb.conf").unlink()
+    (cart["tmp"] / "no-smb").write_text("")
     r = run(cart)
     assert r.returncode == 0, r.stderr
-    assert not dropin(cart).exists() and not hook(cart).exists()
-    assert "跳过 smb" in r.stdout
-    assert not any("smb.service" in l for l in calls(cart))
+    assert not any("smb.service" in l and not l.startswith("show") for l in calls(cart))
+    assert "没装 Samba" in r.stdout
 
 
-def test_smb_still_failed_is_reported(cart):
+def test_smb_left_enabled_is_reported(cart):
     sc = cart["bin"] / "systemctl"
-    sc.write_text(sc.read_text().replace("  reset-failed)", "  reset-failed) exit 0;;\n  reset-failed-orig)", 1))
+    sc.write_text(sc.read_text().replace("  disable)", "  disable) exit 0;;\n  disable-orig)", 1))
     r = run(cart)
     assert r.returncode == 0, r.stderr
-    assert "smb.service 还是 failed" in r.stdout
+    assert "smb.service 没停干净" in r.stdout
 
 
-def test_smb_not_restarted_when_disabled_and_inactive(cart):
-    (cart["tmp"] / "enabled").write_text("")
+def test_disable_failure_stops_with_rollback(cart):
+    sc = cart["bin"] / "systemctl"
+    sc.write_text(sc.read_text().replace("  disable)", "  disable) exit 1;;\n  disable-orig)", 1))
     r = run(cart)
-    assert r.returncode == 0, r.stderr
-    assert "restart smb.service" not in calls(cart)
+    assert r.returncode != 0
+    (b,) = backups(cart)
+    assert f"bash {b}/rollback.sh" in r.stderr
+
+
+@pytest.mark.parametrize("enabled, active", [(True, False), (True, True), (False, False), (False, True)])
+def test_rollback_restores_smb_as_it_was(cart, enabled, active):
+    """部署前 enabled 才 enable, active 才 start (推车上是 enabled + failed: 只 enable, 不拉起)."""
+    cart["enabled"].write_text("smb.service\n" if enabled else "")
+    act = [l for l in cart["active"].read_text().split() if l != "smb.service"] + (["smb.service"] if active else [])
+    cart["active"].write_text("\n".join(act) + "\n")
+    cart["fail"].write_text("kiosk\n")
+    run(cart)
+    (b,) = backups(cart)
+    cart["fail"].unlink()
+    before = len(calls(cart))
+    assert _rollback(cart, b).returncode == 0
+    after = calls(cart)[before:]
+    assert ("enable smb.service" in after) is enabled
+    assert ("start smb.service" in after) is active
+    assert ("smb.service" in cart["enabled"].read_text().split()) is enabled
 
 
 # ------------------------------------------------------------ 回滚
 
-def test_rollback_restores_code_unit_and_smb_but_keeps_new_logrotate(cart):
+def test_rollback_restores_code_unit_smb_state_but_keeps_new_logrotate(cart):
     cart["fail"].write_text("kiosk\n")
     r = run(cart)
     assert r.returncode != 0
@@ -376,31 +300,18 @@ def test_rollback_restores_code_unit_and_smb_but_keeps_new_logrotate(cart):
     assert (opt / "kiosk.py").read_text() == "old\n"
     assert (opt / "web" / "index.html").read_text() == "old\n"
     assert (cart["sys"] / "pxe-server.service").read_text().startswith("old unit")
-    assert (cart["samba"] / "smb.conf").read_text() == HAND_SMB
-    assert not dropin(cart).exists() and not hook(cart).exists()
     assert (cart["lrd"] / "ops-cart").read_text() == "/var/log/ops-cart/*.log {}\n"   # 新 logrotate 留着
     assert (cart["log"] / "pxeserver.log").exists()                                  # 挪过去的日志留着
     after = calls(cart)[before:]
     for s in ("kiosk", "cart-dash", "cart-mcp", "pxe-server"):
         assert f"restart {s}" in after
     assert "restart kvm-broker" not in after
-    assert "try-restart smb.service" in after
+    assert "enable smb.service" in after and "start smb.service" not in after   # 部署前 enabled + failed
     assert (b / "deploy.marker.rolled-back").exists()
 
 
-def test_rollback_restores_preexisting_hook(cart):
-    hook(cart).write_text("old hook\n")
-    cart["fail"].write_text("kiosk\n")
-    run(cart)
-    (b,) = backups(cart)
-    assert hook(cart).read_text() != "old hook\n"
-    cart["fail"].unlink()
-    assert _rollback(cart, b).returncode == 0
-    assert hook(cart).read_text() == "old hook\n"
-
-
 def test_rollback_without_samba_does_not_touch_smb(cart):
-    (cart["samba"] / "smb.conf").unlink()
+    (cart["tmp"] / "no-smb").write_text("")
     cart["fail"].write_text("kiosk\n")
     run(cart)
     (b,) = backups(cart)
@@ -408,7 +319,6 @@ def test_rollback_without_samba_does_not_touch_smb(cart):
     before = len(calls(cart))
     assert _rollback(cart, b).returncode == 0
     assert not any("smb" in l for l in calls(cart)[before:])
-    assert not (cart["samba"] / "smb.conf").exists()
 
 
 def test_die_after_backup_prints_rollback(cart):
@@ -495,8 +405,7 @@ def test_refuses_while_a_mac_is_armed(cart):
     assert "stop pxe-server" not in calls(cart)
 
 
-@pytest.mark.parametrize("missing", ["systemd/pxe-server.service", "etc/logrotate.d/ops-cart",
-                                     "smb/smb-lan1.conf", "smb/50-ops-cart-smb", "accept/cart_accept.py",
+@pytest.mark.parametrize("missing", ["systemd/pxe-server.service", "etc/logrotate.d/ops-cart", "accept/cart_accept.py",
                                      "opt/bigfish_core.py", "opt/observe_core.py"])
 def test_refuses_incomplete_package(cart, missing):
     (cart["pkg"] / missing).unlink()
@@ -533,19 +442,6 @@ def test_refuses_when_logrotate_config_not_in_manifest(cart):
     (cart["pkg"] / "accept" / "accept-manifest.json").write_text(json.dumps(m))
     r = run(cart)
     assert r.returncode != 0 and "manifest 没列 /etc/logrotate.d/ops-cart" in r.stderr
-
-
-def test_refuses_when_smb_file_differs_from_sums(cart):
-    (cart["pkg"] / "smb" / "smb-lan1.conf").write_text("tampered\n")
-    r = run(cart)
-    assert r.returncode != 0 and "smb/smb-lan1.conf" in r.stderr
-    assert backups(cart) == []
-
-
-def test_refuses_when_smb_sums_missing(cart):
-    (cart["pkg"] / "smb" / "SHA256SUMS").unlink()
-    r = run(cart)
-    assert r.returncode != 0 and "SHA256SUMS" in r.stderr
 
 
 def test_refuses_when_manifest_build_differs(cart):
@@ -616,7 +512,6 @@ def test_half_made_backup_without_rollback_is_removed(cart):
     assert r.returncode != 0
     assert backups(cart) == [] and "什么都没改" in r.stderr
     assert (cart["opt"] / "VERSION").read_text() == "1.16.00\n"
-    assert (cart["samba"] / "smb.conf").read_text() == HAND_SMB
     (cart["bin"] / "chmod").unlink()
     assert run(cart).returncode == 0
 
@@ -649,7 +544,7 @@ def test_install_hint_and_rollback_use_systemd_run(cart):
 
 def test_inline_python_runs_isolated():
     s = SCRIPT.read_text()
-    assert 'python3 -I - "$PKG"' in s and 'python3 -I - "$@"' in s
+    assert 'python3 -I - "$PKG"' in s
 
 
 def test_never_touches_bigfish_dirs():
@@ -664,11 +559,10 @@ def test_pack_script_only_ships_tracked_files_and_migration_parts():
     code = [l for l in PACK.read_text().splitlines() if not l.lstrip().startswith("#")]
     assert any("git ls-files" in l for l in code) and not any("*.py " in l and l.lstrip().startswith("cp") for l in code)
     text = "\n".join(code)
-    for part in ("deploy/systemd/pxe-server.service", "deploy/logrotate.d/ops-cart", "deploy/srv-data/smb-lan1.conf",
-                 "deploy/srv-data/50-ops-cart-smb", "SHA256SUMS", "tests/test_bigfish_panel.py",
+    for part in ("deploy/systemd/pxe-server.service", "deploy/logrotate.d/ops-cart", "tests/test_bigfish_panel.py",
                  "tests/test_confirm_panel.py", "scripts/install-1.16.01.sh"):
         assert part in text
-    assert "smb-ops-cart.conf" not in text
+    assert "srv-data" not in text                     # smb 这版直接停用, 不带 drop-in / 钩子
 
 
 def test_pack_ships_files_install_requires():
@@ -676,6 +570,6 @@ def test_pack_ships_files_install_requires():
     s = SCRIPT.read_text()
     p = PACK.read_text()
     assert "systemd/$u" in s and '"$P/systemd/"' in p
-    for need, made in (("etc/logrotate.d/ops-cart", '"$P/etc/logrotate.d/"'), ("smb/smb-lan1.conf", '"$P/smb/"'),
+    for need, made in (("etc/logrotate.d/ops-cart", '"$P/etc/logrotate.d/"'),
                        ("accept/accept-manifest.json", '"$P/accept/"')):
         assert need in s and made in p

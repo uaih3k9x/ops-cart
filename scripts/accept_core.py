@@ -403,12 +403,16 @@ def is_hand_smb_conf(text):
 
 
 def judge_smb(props, lan1_up, hand_conf=False):
-    """smb.conf 只绑 LAN1: 没地址时 smb.service.d/ops-cart-lan1.conf 让它跳过 (inactive), 这时 SKIP.
+    """已停用 (disabled + inactive, 推车不用 smb 时) = SKIP.
+    smb.conf 只绑 LAN1: 没地址时 smb.service.d/ops-cart-lan1.conf 让它跳过 (inactive), 这时 SKIP.
     failed 不管有没有链路都 FAIL —— 跳过不会留下 failed, 有就是又崩了 / drop-in 没装 / smb.conf 没带 lo.
     lan1 drop-in 只给手工配置装 (仓库生成的带 lo, 不装), 所以只对 hand_conf 提示."""
     if not props or props.get("LoadState") != "loaded":
         return SKIP, "没装 Samba"
     act = props.get("ActiveState")
+    if act == "inactive" and props.get("UnitFileState", "") not in _ENABLED:
+        return SKIP, (f"已停用 (自启={props.get('UnitFileState') or '-'}, inactive); "
+                      "要用时照 docs/MIGRATE_95.md 第 2 节恢复")
     if not lan1_up and act != "failed":
         return SKIP, f"LAN1 没地址 (没插线), smbd 等插线来地址再起 ({act}); 刚开机的话稍等再跑"
     st, why = judge_unit(SYSTEM_UNITS["smb.service"], props)

@@ -545,6 +545,19 @@ def test_judge_smb_lan1_up_must_run_when_enabled():
     assert ac.judge_smb(_props("active", "running"), lan1_up=True)[0] == P
 
 
+@pytest.mark.parametrize("lan1_up", [False, True])
+def test_judge_smb_disabled_and_inactive_is_skip_marked_stopped(lan1_up):
+    """推车不用 smb 时 disable --now 停掉 (1.16.01): 不算 FAIL, 写明已停用、怎么恢复."""
+    st, why = ac.judge_smb(_props(en="disabled"), lan1_up=lan1_up, hand_conf=True)
+    assert st == S and "已停用" in why and "MIGRATE_95" in why
+
+
+def test_judge_smb_disabled_but_failed_or_running_is_not_hidden():
+    assert ac.judge_smb(_props("failed", "failed", en="disabled", result="core-dump", status="6"), lan1_up=False)[0] == F
+    st, why = ac.judge_smb(_props("active", "running", en="disabled"), lan1_up=True)
+    assert "已停用" not in why
+
+
 def test_judge_smb_not_installed_is_skip():
     assert ac.judge_smb(_props(load="not-found", en=""), lan1_up=True)[0] == S
     assert ac.judge_smb(None, lan1_up=True)[0] == S
