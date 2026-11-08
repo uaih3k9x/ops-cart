@@ -13,6 +13,7 @@
 
 import os
 import queue
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -425,7 +426,8 @@ class SerialPanel(tk.Frame):
         if not name:
             self._con_write([("text", f"\n[巡检] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
             return
-        if not observe_core.claim(name, "survey"):          # #85: 同一路观察和巡检互斥, 命令不能互相插
+        token = "survey-" + secrets.token_hex(4)               # 每次巡检一个令牌, 不能重入
+        if not observe_core.claim(name, token):             # #85: 同一路观察和巡检互斥, 命令不能互相插
             self._con_write([("text", f"\n[巡检] {dev} 正在观察, 先退出观察再巡检\n")], "mark")
             return
         self._surveying = True
@@ -435,14 +437,16 @@ class SerialPanel(tk.Frame):
 
         def work():
             try:
-                r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head)
-            except Exception as e:                 # run_survey 本不抛; 兜住, 免得按钮一直锁着
-                r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
-            survey_core.record(r)
-            return r
+                try:
+                    r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head)
+                except Exception as e:             # run_survey 本不抛; 兜住, 免得按钮一直锁着
+                    r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
+                survey_core.record(r)
+                return r
+            finally:
+                observe_core.release(name, token)   # 线程一结束就放: 面板可能已经切走, done 不一定跑得到
 
         def done(r):
-            observe_core.release(name, "survey")
             self._surveying = False
             self._con_write([("text", "\n[巡检] " + r["summary"].replace("\n", "\n       ") + "\n")], "mark")
         self._async(work, done)
@@ -454,7 +458,7 @@ class SerialPanel(tk.Frame):
         if not name:
             self._con_write([("text", f"\n[观察] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
             return
-        if observe_core.holder(name) == "survey":
+        if (observe_core.holder(name) or "").startswith("survey-"):
             self._con_write([("text", f"\n[观察] {dev} 正在巡检, 等巡检跑完再观察\n")], "mark")
             return
         import observe_panel

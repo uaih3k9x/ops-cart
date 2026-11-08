@@ -195,7 +195,8 @@ class _FakeWin:
         import queue
         import threading
         self.ui, self.stop_evt, self.head = queue.Queue(), threading.Event(), "con-1"
-        self._logged_in = self._ended = None
+        self._logged_in = self._ended = self._console_back = None
+        self.token = "t"
 
 
 def test_password_box_emptied_when_taken(monkeypatch):
@@ -230,3 +231,111 @@ def test_snapshot_write_failure_reported(tmp_path, monkeypatch):
     w.obs = Obs()
     op.ObserveWindow._write_snap(w)
     assert w._snap_err
+
+
+# ------------------------------------------------------------ 第五轮: 车机控制台暂停 / 接回, 窗口生命周期
+
+class _Panel:
+    """串口面板替身: sock / port_var / _serves / _disconnect / _connect / winfo_exists."""
+
+    def __init__(self, dev="/dev/con-1", sock=True, alive=True, reconnect_ok=True):
+        class V:
+            def __init__(self, v):
+                self.v = v
+
+            def get(self):
+                return self.v
+        self.port_var, self._serves = V(dev), {"/dev/con-1": "9600", "/dev/con-2": "9600"}
+        self.sock, self.alive, self.ok, self.calls = (object() if sock else None), alive, reconnect_ok, []
+
+    def winfo_exists(self):
+        return self.alive
+
+    def _disconnect(self):
+        self.calls.append("disconnect")
+        self.sock = None
+
+    def _connect(self, wake=True):
+        self.calls.append(("connect", wake))
+        self.sock = object() if self.ok else None
+
+
+def test_console_hold_pauses_only_same_port_and_resumes_it():
+    p = _Panel()
+    h = op.ConsoleHold(p, "/dev/con-1")
+    assert h.pause() is True and p.calls == ["disconnect"]
+    assert h.resume() is None and p.calls[-1] == ("connect", False)
+
+
+def test_console_hold_ignores_other_port_or_unconnected():
+    p = _Panel(dev="/dev/con-2")
+    h = op.ConsoleHold(p, "/dev/con-1")
+    assert h.pause() is False and h.resume() is None and p.calls == []
+    p = _Panel(sock=False)
+    h = op.ConsoleHold(p, "/dev/con-1")
+    assert h.pause() is False and p.calls == []
+
+
+def test_console_hold_no_resume_if_panel_gone_or_switched():
+    p = _Panel()
+    h = op.ConsoleHold(p, "/dev/con-1")
+    h.pause()
+    p.alive = False
+    assert h.resume() is None and p.calls == ["disconnect"]
+    p = _Panel()
+    h = op.ConsoleHold(p, "/dev/con-1")
+    h.pause()
+    p.port_var.v = "/dev/con-2"                  # 人切到别的口了: 不抢回来
+    assert h.resume() is None and p.calls == ["disconnect"]
+
+
+def test_console_hold_reports_failed_resume():
+    p = _Panel(reconnect_ok=False)
+    h = op.ConsoleHold(p, "/dev/con-1")
+    h.pause()
+    msg = h.resume()
+    assert msg and "手动" in msg
+
+
+def test_only_one_window_logging_in_at_a_time():
+    op._LOGIN_SLOT.clear()
+    assert op.login_slot("a") is True
+    assert op.login_slot("b") is False
+    op.login_slot_done("b")
+    assert op.login_slot("b") is False
+    op.login_slot_done("a")
+    assert op.login_slot("b") is True
+    op._LOGIN_SLOT.clear()
+
+
+def test_life_releases_claim_only_when_window_and_worker_both_gone():
+    oc._CLAIMS.clear()
+    oc.claim("con-1", "t1")
+    life = op.Life("con-1", "t1")
+    life.worker_started()
+    life.window_gone()                           # 面板切走 / 窗口关了, worker 还在跑
+    assert oc.holder("con-1") == "t1"
+    life.worker_done()
+    assert oc.holder("con-1") is None
+    oc.claim("con-1", "t2")
+    life = op.Life("con-1", "t2")
+    life.window_gone()                           # 没起过 worker: 关窗就放
+    assert oc.holder("con-1") is None
+    oc._CLAIMS.clear()
+
+
+def test_open_for_hangs_window_on_root_not_panel(monkeypatch):
+    oc._CLAIMS.clear()
+    made = {}
+
+    class FakeWin:
+        def __init__(self, master, dev, name, vendor, ddir, token, panel=None):
+            made.update(master=master, panel=panel)
+    monkeypatch.setattr(op, "ObserveWindow", FakeWin)
+    p = _Panel()
+    root = object()
+    p.winfo_toplevel = lambda: root
+    p.winfo_children = lambda: []
+    op.open_for(p, "/dev/con-1", "/dev/con-1", "huawei", "/x")
+    assert made["master"] is root and made["panel"] is p
+    oc._CLAIMS.clear()

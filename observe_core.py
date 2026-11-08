@@ -162,16 +162,38 @@ class LogFile:
     def tail(self, n=16384):            # 够装下一屏异步日志 + 标记行, 往回找得到有效行
         return read_tail(self.path, n)
 
-    def humans(self, limit=8 << 20):
-        """现在 attach 着几个人. 只读最后 limit 字节: 没读到"服务启动"又不是从文件头读的 = 不知道, None."""
+    def humans(self, limit=256 << 20, chunk=1 << 20):
+        """现在 attach 着几个人: 从文件尾分块往回找最近一次"服务启动", 从那里往后数接入 / 断开.
+        往回读满 limit 还没找到 (又不是读到了文件头) = 不知道, None. 日志不归 logrotate 管, 会一直长."""
         size = self.size()
         if size is None:
             return None
-        start = max(0, size - limit)
-        text = self.read_from(start)
-        if text is None or (start > 0 and "服务启动" not in text):
+        mark = "服务启动".encode()
+        try:
+            with open(self.path, "rb") as f:
+                pos, start = size, None
+                while pos > 0 and size - pos < limit:
+                    lo = max(0, pos - chunk, size - limit)
+                    f.seek(lo)
+                    buf = f.read(pos - lo + len(mark))         # 多读一点, 跨块的标记也能找到
+                    i = buf.rfind(mark)
+                    if i >= 0:
+                        start = buf.rfind(b"\n", 0, i) + 1 + lo
+                        break
+                    pos = lo
+                if start is None:
+                    if pos > 0:
+                        return None
+                    start = 0
+                f.seek(start)
+                n = 0
+                for raw in f:                                   # 逐行数, 不把几百 MB 读进内存
+                    m = _HUMAN.match(clean(raw.decode("utf-8", "replace")).strip())
+                    if m:
+                        n = 0 if m.group(1) == "服务启动" else max(0, n + (1 if m.group(1) == "人 接入" else -1))
+                return n
+        except OSError:
             return None
-        return humans_attached(text)
 
     def read_from(self, off):
         """偏移 off 之后新增的内容; 文件变短 (轮转 / 截断) 或读不了 None, 调用方按"有变化"算."""
@@ -338,6 +360,9 @@ class Login:
             return Step("done")
         return self._stop(f"状态机在 {st} 收到输出")
 
+    def forget(self):
+        self._password = None
+
     def _pager(self):
         self.state, self._password = "screen", None
         return Step("send", "cmd", self._pager_off)
@@ -355,7 +380,15 @@ class Interrupted(Exception):
 
 
 def run_login(login, exchange, vendor, console="idle", device=None, max_steps=12):
-    """驱动 Login: exchange(step) -> 设备输出. cmd 步必须过 allowed(). 返回最后的 done / fail 步, 不抛."""
+    """驱动 Login: exchange(step) -> 设备输出. cmd 步必须过 allowed(). 返回最后的 done / fail 步, 不抛.
+    不管怎么结束 (成功 / 状态机失败 / 被打断 / 发送出错 / 步数超限), 出来时密码都已从 Login 里清掉."""
+    try:
+        return _drive_login(login, exchange, vendor, console, device, max_steps)
+    finally:
+        login.forget()
+
+
+def _drive_login(login, exchange, vendor, console, device, max_steps):
     step = login.start(console, device)
     for _ in range(max_steps):
         if step.kind != "send":
@@ -640,7 +673,7 @@ class Observer:
         self.login = None
         self.user_sent = False
         self._ports_id = None           # 登录后第一轮看到的物理口集合: sysname 一样的两台 (<HUAWEI>) 换了线靠它认
-        self._off = None
+        self._advance(None)              # 还没有基线
         self.cancelled = lambda: False
 
     @property
@@ -661,6 +694,21 @@ class Observer:
         new = self.log.read_from(self._off)
         return new is None or device_text(new) != ""
 
+    def _advance(self, to, out="", scan=True):
+        """唯一能挪基线 (_off) 的入口 (有测试用 AST 盯着). 挪之前先扫 [旧偏移, 末尾) 和这次命令的输出 out:
+        有登出 / 重新登录的迹象, 或日志读不了, 就判 lost 不挪 (会话可能已经不是我们的了, 退出不 quit).
+        scan=False 只给登录阶段的 _checkpoint 用: 那段里本来就有我们自己引出来的 Username: / Password:,
+        而登录每一步发之前已经要求"没有新增有效内容 + 现场正是期望状态", 比扫更严."""
+        old = getattr(self, "_off", None)
+        if scan and old is not None:
+            new = self.log.read_from(old)
+            if new is None or to is None or session_changed(new) or session_changed(out or ""):
+                return self._lost("会话可能已经不是我们的了 (日志里有登出 / 重新登录, 或读不了), 停止轮询, 退出时不 quit")
+        elif scan and session_changed(out or ""):
+            return self._lost("会话可能已经不是我们的了 (输出里有登出 / 重新登录), 停止轮询, 退出时不 quit")
+        self._off = to
+        return True
+
     def _checkpoint(self, span=0.5, step=0.1, cap=3.0):
         """一步发完: 等日志大小静止 span 秒 (conbroker 在服务端收到 EOF 后才写"断开"标记) 再记偏移."""
         last, still, waited = self.log.size(), 0.0, 0.0
@@ -669,7 +717,7 @@ class Observer:
             waited += step
             cur = self.log.size()
             still, last = (still + step, cur) if cur == last else (0.0, cur)
-        self._off = last
+        self._advance(last, scan=False)
 
     def _quiet(self):
         """静止 quiet_s 秒: 这段时间和上次确认以来都没有新增有效内容."""
@@ -702,7 +750,7 @@ class Observer:
         why = self.busy()
         if why:
             return self._refuse(f"没开始: {why}")
-        self._off = self.log.size()
+        self._advance(self.log.size())  # 第一次记基线 (之前没有, 不用扫)
         if self._off is None or self.log.tail() is None:
             return self._refuse("没开始: 读不到 conbroker 日志, 看不了现场")
         if not self._quiet():
@@ -730,11 +778,13 @@ class Observer:
         self.state, self.error = "polling", None
         ver = self.profile.get("version")
         if ver and self._scene_ok() is None:
+            out = ""
             try:
-                self.model = parse_model(self.send(self.port, ver, self.profile["timeout"]))
+                out = self.send(self.port, ver, self.profile["timeout"]) or ""
+                self.model = parse_model(out)
             except Exception:
                 self.model = None
-            self._off = self.log.size()
+            self._advance(self.log.size(), out)     # 排队期间会话易主: 判 lost, 调用方看 state
         return True                     # 日志基线留给第一次 tick: 登录那几步的断开标记不算人
 
     def _attached(self):
@@ -777,7 +827,7 @@ class Observer:
         if self.state != "polling":
             return False
         self.pacer.note_log(self.log.size(), now)
-        if self.pacer.paused(now) and not self._advance():  # 人在用: 他敲的先扫一遍, 再从这里接着看
+        if self.pacer.paused(now) and not self._advance(self.log.size()):  # 人在用: 他敲的先扫一遍, 再从这里接着看
             return False
         if not self.pacer.due(now):
             return False
@@ -791,15 +841,6 @@ class Observer:
     def _lost(self, msg):
         self.state, self.error = "lost", msg
         return False
-
-    def _advance(self):
-        """把基线挪到日志末尾. 跳过的部分不能直接算安全: 先扫, 有登出 / 重新登录的迹象 (或读不了) 就判 lost."""
-        end = self.log.size()
-        new = self.log.read_from(self._off)
-        if new is None or end is None or session_changed(new):
-            return self._lost("会话可能已经不是我们的了 (日志里有登出 / 重新登录, 或读不了), 停止轮询, 退出时不 quit")
-        self._off = end
-        return True
 
     def _scene_ok(self):
         """轮询 / 读型号前的白名单: 现场正是 <本设备> 用户视图, 且自上次确认以来没有新增有效内容.
@@ -816,7 +857,7 @@ class Observer:
             self.error = "这轮没发: 读不到 conbroker 日志"
             return "busy"
         if self._interjected():
-            if not self._advance():             # 扫过再挪基线; 人停手 quiet 秒后从这里接着看
+            if not self._advance(self.log.size()):   # 扫过再挪基线; 人停手 quiet 秒后从这里接着看
                 return "lost"
             self.error = "这轮没发: 有人在用这路串口"
             return "busy"
@@ -838,13 +879,13 @@ class Observer:
             if bad:
                 return False if bad == "lost" else "busy"
             try:
-                out = self.send(self.port, cmd, self.profile["timeout"])
+                out = self.send(self.port, cmd, self.profile["timeout"]) or ""
             except Exception as e:
                 self.error = str(e) or type(e).__name__
+                self._advance(self.log.size())          # 发没发出去都扫一遍再挪
                 return False
-            finally:
-                self._off = self.log.size()
-            out = out or ""
+            if not self._advance(self.log.size(), out):   # 排队期间有人登出 / 登回同名设备: 基线不能越过去
+                return False
             if out.startswith(_REFUSED_CRED) or classify(out) in ("username", "password", "idle"):
                 return self._lost("会话掉了 (设备回到登录提示), 需要重新登录")
             dev = prompt_name(last_line(out))
@@ -898,7 +939,7 @@ class Observer:
             else:
                 self.error = "密码可能已发出, 但登录后没见到提示符, 未退出登录, 请人到 console 上处理"
             return
-        why = ("有人在用" if self.pacer.paused(now) else None) or self.busy()
+        why = ("有人在用" if self.pacer.paused(now) else None) or self.busy() or self._attached()
         if not why and not self._quiet():
             why = "有人在用 (日志有新增)"
         if not why:

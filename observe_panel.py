@@ -20,6 +20,7 @@ import lamps_core
 import observe_core as oc
 import survey_core
 import theme as th
+from serial_core import match_service
 
 BG, CARD, FG, DIM, OFF = th.follow(globals(), BG="PANEL", CARD="BG", FG="FG", DIM="DIM", OFF="BOX")
 FONT, FONT_MONO = th.FONT_SMALL, th.FONT_MONO
@@ -28,6 +29,85 @@ WIN_W, WIN_H = 1100, 440
 CANVAS_W = WIN_W - 2 * PAD              # 画布左右各让出 PAD
 FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
 SNAP_S = 5                              # 多久给副屏写一次快照
+
+_LOGIN_SLOT = set()                     # 同一时间只许一个观察窗口处于登录阶段 (共用一个车机控制台, 不能互相暂停 / 接回)
+_SLOT_LOCK = threading.Lock()
+
+
+def login_slot(token):
+    with _SLOT_LOCK:
+        if _LOGIN_SLOT and token not in _LOGIN_SLOT:
+            return False
+        _LOGIN_SLOT.add(token)
+        return True
+
+
+def login_slot_done(token):
+    with _SLOT_LOCK:
+        _LOGIN_SLOT.discard(token)
+
+
+def _alive(w):
+    try:
+        return bool(w.winfo_exists())
+    except Exception:
+        return False
+
+
+class ConsoleHold:
+    """登录 / 退出时借走车机串口面板的控制台 (它本身就是一个 attach 着的"人").
+    只在面板确实连着被观察的这一路时才断开; 接回只接原来那一路, 面板没了 / 切到别的口 / 已经连上了就不动."""
+
+    def __init__(self, panel, name):
+        self.panel, self.name, self.dev = panel, name, None
+
+    def pause(self):
+        p = self.panel
+        if self.dev is not None or p is None or not _alive(p) or not getattr(p, "sock", None):
+            return False
+        dev = p.port_var.get()
+        if match_service(dev, p._serves) != self.name:
+            return False
+        self.dev = dev
+        p._disconnect()
+        return True
+
+    def resume(self):
+        """接回; 接不回返回给人看的一句."""
+        dev, self.dev = self.dev, None
+        p = self.panel
+        if dev is None or not _alive(p) or p.port_var.get() != dev or p.sock:
+            return None
+        try:
+            p._connect(wake=False)
+        except Exception:
+            pass
+        return None if p.sock else "车机控制台没接回来, 请在串口面板点 刷新 手动重连"
+
+
+class Life:
+    """观察窗口和它的后台线程谁后结束, 谁放 claim: 线程还在跑 (可能还要发 quit) 时, 同一路不许开新的观察或巡检."""
+
+    def __init__(self, name, token):
+        self.name, self.token, self._lock = name, token, threading.Lock()
+        self._worker, self._window = False, True
+
+    def worker_started(self):
+        with self._lock:
+            self._worker = True
+
+    def worker_done(self):
+        with self._lock:
+            self._worker = False
+            if not self._window:
+                oc.release(self.name, self.token)
+
+    def window_gone(self):
+        with self._lock:
+            self._window = False
+            if not self._worker:
+                oc.release(self.name, self.token)
+
 
 def _lit_color(state):
     return {"up": th.LAMP_OK, "admin": th.LAMP_WARN, "standby": th.DIM, "unknown": th.MARK}.get(state, OFF)
@@ -78,15 +158,16 @@ def port_info(p):
 
 
 class ObserveWindow(tk.Toplevel):
-    def __init__(self, master, dev, name, vendor, ddir, token, head=None, console=(None, None)):
+    def __init__(self, master, dev, name, vendor, ddir, token, panel=None, head=None):
         super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=th.PRIMARY, **th.DIALOG)
         self.dev, self.name, self.vendor, self.ddir, self.token = dev, name, vendor, ddir, token
         self.head = head or survey_core.safe_name(os.path.basename(dev))
         self.ui, self.stop_evt = queue.Queue(), threading.Event()
         self.obs, self.worker, self.hits, self._snap_at, self._hover = None, None, {}, 0, None
         self._closing = False
-        self._pause_console, self._resume_console = console      # 车机控制台本身是 attach 着的"人"
-        self._console_paused, self._snap_err = False, None
+        self.hold = ConsoleHold(panel, name)      # 车机控制台本身是 attach 着的"人"
+        self.life = Life(name, token)
+        self._snap_err = None
         self.overrideredirect(True)
         W, H = WIN_W, WIN_H
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
@@ -128,6 +209,9 @@ class ObserveWindow(tk.Toplevel):
         self.pass_var.set("")                       # 读完就清
         if self.worker or not user or not pw:
             return
+        if not login_slot(self.token):
+            self.status.config(text="另一个观察窗口正在登录, 等它登完再来", fg=th.WARN)
+            return
         self.login_btn.config(state="disabled")
         log = oc.LogFile(os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log"))
         self.obs = oc.Observer(self.name, self.vendor,
@@ -137,18 +221,21 @@ class ObserveWindow(tk.Toplevel):
         self.status.config(text="看现场、登录中…", fg=DIM)
         self._snap_at = 0
         self.stop_evt.clear()
-        if self._pause_console:             # 登录阶段不许有人 attach (#85 第四轮); 车机控制台先断开, 登录完再接回
-            self._pause_console()
-            self._console_paused = True
+        self.hold.pause()                   # 登录阶段不许有人 attach (#85); 车机控制台连着这一路就先断开, 登录完接回
         box = [pw]                          # 一次性容器: 线程取出后清空, 不在 Thread._args 里一直挂着
         del pw
         self.worker = threading.Thread(target=self._work, args=(self.obs, user, box), daemon=True)
+        self.life.worker_started()
         self.worker.start()
 
     def _work(self, obs, user, box):
         pw = box.pop() if box else ""
-        ok = obs.start(user, pw, cancelled=self.stop_evt.is_set)
-        del pw
+        try:
+            ok = obs.start(user, pw, cancelled=self.stop_evt.is_set)
+        finally:
+            del pw
+            login_slot_done(self.token)
+        self.ui.put(self._console_back)
         oc.record("start", head=self.head, device=obs.device, ok=ok, error=obs.error)
         if ok:
             self.ui.put(self._logged_in)
@@ -157,18 +244,18 @@ class ObserveWindow(tk.Toplevel):
             self.stop_evt.wait(0.5)
         obs.stop(time.monotonic())
         oc.record("stop", head=self.head, device=obs.device, state=obs.state, left=obs.left, error=obs.error)
+        life = getattr(self, "life", None)
+        if life:
+            life.worker_done()
         self.ui.put(self._ended)
 
     def _console_back(self):
-        if self._console_paused and self._resume_console:
-            self._console_paused = False
-            try:
-                self._resume_console()
-            except Exception:
-                pass
+        msg = self.hold.resume()
+        if msg and _alive(self):
+            self._snap_err = msg            # 借状态栏的提示位说一声
+            self.status.config(text=msg, fg=th.WARN)
 
     def _logged_in(self):
-        self._console_back()
         self.login_row.pack_forget()
         self.title_lbl.config(text=f"观察 {self.dev} · {self.obs.device}" + (f" · {self.obs.model}" if self.obs.model else ""))
 
@@ -240,6 +327,7 @@ class ObserveWindow(tk.Toplevel):
         """后台线程在跑: 让它停下并 (现场对的话) quit, 结束后自己关窗; 没在跑直接关."""
         self._closing = True
         if self.worker:
+            self.hold.pause()               # 退出时也要"没人 attach 着"才 quit; 结束后 _ended 接回
             self.stop_evt.set()
             self.close_btn.config(state="disabled")
             self.status.config(text="退出中…", fg=DIM)
@@ -248,25 +336,24 @@ class ObserveWindow(tk.Toplevel):
 
     def destroy(self):
         self.stop_evt.set()
-        self._console_back()
+        self.hold.resume()
         oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
-        oc.release(self.name, self.token)
+        self.life.window_gone()             # 后台线程还在跑就等它结束再放 claim
         super().destroy()
 
 
 def open_for(master, dev, name, vendor, ddir):
-    """每一路只开一个; 已经开着就提到前面."""
+    """每一路只开一个; 已经开着就提到前面. 窗口挂在 kiosk 根窗口下: 切走串口面板不会把观察窗口一起销毁."""
     token = secrets.token_hex(4)
+    root = master.winfo_toplevel()
     if not oc.claim(name, token):
-        for w in master.winfo_children():
+        for w in root.winfo_children():
             if isinstance(w, ObserveWindow) and w.name == name:
                 w.lift()
                 return w
         return None
     try:
-        pause = getattr(master, "_disconnect", None)
-        resume = (lambda: master._connect(wake=False)) if hasattr(master, "_connect") else None
-        return ObserveWindow(master, dev, name, vendor, ddir, token, console=(pause, resume))
+        return ObserveWindow(root, dev, name, vendor, ddir, token, panel=master)
     except Exception:
         oc.release(name, token)
         raise

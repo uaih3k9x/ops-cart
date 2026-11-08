@@ -1613,3 +1613,109 @@ def test_port_set_change_marks_lost():
     assert ob.tick(200) is False and ob.state == "lost"
     ob.stop(now=300)
     assert "quit" not in [t for _r, t in dev.sent]
+
+
+# ============================================================ 第五轮复审
+
+def test_baseline_only_moved_in_advance():
+    """结构约束: 基线 (_off) 只许在 _advance 里赋值 —— 挪之前必须先扫跳过的日志."""
+    import ast
+    src = open(oc.__file__, encoding="utf-8").read()
+    tree = ast.parse(src)
+    owners = []
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for n in ast.walk(fn):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+                for t in targets:
+                    for e in ast.walk(t):
+                        if isinstance(e, ast.Attribute) and e.attr == "_off":
+                            owners.append(fn.name)
+    total = sum(1 for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "_off"
+                and isinstance(getattr(n, "ctx", None), ast.Store))
+    assert owners and set(owners) == {"_advance"} and total == len(owners)
+
+
+TAKEOVER = ("\n[2026-11-07 10:01:00 人 接入]\n<SW-TEST>quit\n  Configuration console exit, please press any key to log on\n"
+            "\nUsername:root\nPassword:\n<SW-TEST>\n[2026-11-07 10:01:20 人 断开]\n")
+
+
+def test_session_taken_over_while_poll_queued_is_lost():
+    dev = FakeDev()
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret")
+    assert ob.tick(100) is True
+    orig = dev.send
+
+    def send(port, cmd, timeout):
+        dev.console += TAKEOVER
+        return orig(port, cmd, timeout)
+    dev.send = send
+    ob.send = send
+    assert ob.tick(200) is False and ob.state == "lost"
+    ob.stop(now=400)
+    assert "quit" not in [t for _r, t in dev.sent]
+
+
+def test_takeover_inside_poll_output_is_lost():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    dev.brief = "display interface brief\n" + TAKEOVER + BRIEF_S.split("\n", 1)[1]
+    assert ob.tick(100) is False and ob.state == "lost"
+
+
+def test_session_taken_over_while_reading_version_is_lost():
+    dev = FakeDev()
+    orig = dev.send
+
+    def send(port, cmd, timeout):
+        if cmd == "display version":
+            dev.console += TAKEOVER
+        return orig(port, cmd, timeout)
+    dev.send = send
+    ob = oc.Observer("con-1", "huawei", dev.exchange, send, log=dev, sleep=dev.sleep,
+                     pacer=oc.Pacer(duty=0.5, min_gap=1, max_gap=10, quiet=5), clock=iter(range(10000)).__next__)
+    ob.start("admin", "s3cret")
+    assert ob.state == "lost"
+    ob.stop(now=100)
+    assert "quit" not in [t for _r, t in dev.sent]
+
+
+def test_stop_skips_quit_while_someone_attached():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    dev.console += HUMAN_IN
+    ob.stop(now=300)
+    assert "quit" not in [t for _r, t in dev.sent] and ob.left == "skipped" and "attach" in ob.error
+
+
+@pytest.mark.parametrize("script", [{"wake": "\nPlease choose (1/2):"}, {"user": "admin\n<SW-TEST>"}])
+def test_password_cleared_whatever_way_login_fails(script):
+    dev = FakeDev()
+    dev.script.update(script)
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert "s3cret" not in repr(vars(ob.login))
+
+
+def test_run_login_clears_password_on_exchange_error():
+    lg = oc.Login("admin", "s3cret")
+
+    def exchange(step):
+        raise OSError("x")
+    oc.run_login(lg, exchange, "huawei")
+    assert "s3cret" not in repr(vars(lg))
+
+
+def test_humans_reads_back_until_service_start(tmp_path):
+    p = tmp_path / "con-1.log"
+    with open(p, "wb") as f:
+        f.write(SVC.encode() + HUMAN_IN.encode())
+        f.write(b"filler line\n" * 300000)                 # 约 3.6MB
+        f.write(b"<SW-TEST>\n")
+    lf = oc.LogFile(str(p))
+    assert lf.humans(limit=64 << 20, chunk=1 << 20) == 1
+    assert lf.humans(limit=1 << 20, chunk=1 << 18) is None             # 上限内没读到服务启动
