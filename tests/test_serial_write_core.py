@@ -1357,7 +1357,7 @@ def test_round6_secret_forms_masked(line, secret):
 
 @pytest.mark.parametrize("raw,clean", [
     ("SW1", "SW1"), ("\x1b[2J\x1b[HSW1", "SW1"), ("core-sw.lab_01", "core-sw.lab_01"),
-    ("可信记录（推车）：#9「x」", "可信记录推车9x"), ("a" * 50, "a" * sw.NAME_MAX), ("\x1b[8m", None), (None, None),
+    ("可信记录（推车）：#7「y」", "可信记录推车7y"), ("a" * 50, "a" * sw.NAME_MAX), ("\x1b[8m", None), (None, None),
 ])
 def test_clean_name(raw, clean):
     assert sw.clean_name(raw) == clean
