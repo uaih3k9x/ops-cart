@@ -80,14 +80,15 @@
 
 升级已有推车：照 [`docs/DEPLOY_1.11.00.md`](docs/DEPLOY_1.11.00.md) 整包拷（备份、落位、SELinux 模块、重启顺序、验证、回滚）。1.11 之后新增的部件没有单独的清单，按各自文档装：中文输入见 [`docs/IME_RIME.md`](docs/IME_RIME.md)，蓝牙打字见 [`docs/BLE_INPUT.md`](docs/BLE_INPUT.md)，MCP 只读档见 [`docs/DESIGN_agent_mcp.md`](docs/DESIGN_agent_mcp.md) 第十六节。装完跑只读验收 `scripts/cart_accept.py`，用法和人工部分见 [`docs/ACCEPT_1.11.md`](docs/ACCEPT_1.11.md)。
 
-系统包：python3-tkinter、xinit / X、mpv、ffmpeg、tesseract、poppler-utils（资产标签的 pdftoppm）、tailscale。串口 console 用的 conbroker 目前在仓库外，见 #89。
+系统包：python3-tkinter、xorg-x11-xinit、xorg-x11-server-Xorg、v4l-utils（`v4l2-ctl` 判断有没有信号）、libusbx（pyusb 要）、poppler-utils（资产标签的 pdftoppm）、tailscale；EPEL 里的 tesseract、ImageMagick（OCR 退回 Tesseract 时用 `convert` 预处理）；RPM Fusion 里的 mpv、ffmpeg。串口 console 用的 conbroker 目前在仓库外，见 #89。
 
 从零装的骨架：
 
 ```bash
 scripts/stamp-build.sh                                   # 生成 BUILD (提交数 + 短哈希)
-scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web icons fonts cart:/opt/pxe/
-scp -r deploy examples scripts cart:ops-cart/              # 下面的命令在推车的 ~/ops-cart 里跑
+scp -r *.py VERSION BUILD web icons fonts deploy examples scripts cart:ops-cart/
+# 以下在推车上 cd ~/ops-cart 后执行
+sudo install -d -m 755 /opt/pxe && sudo cp -r *.py VERSION BUILD web icons fonts /opt/pxe/
 sudo install -D -m 644 -t /usr/local/share/fonts/ops-cart/ /opt/pxe/fonts/unifont-18.0.01.otf && sudo fc-cache -f
 sudo install -D -m 644 deploy/pxe.env.example /etc/ops-cart/pxe.env      # 改成现场装机网段
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
@@ -95,22 +96,30 @@ sudo cp deploy/sysctl.d/* /etc/sysctl.d/ && sudo sysctl --system
 sudo cp deploy/tmpfiles.d/ops-cart.conf /etc/tmpfiles.d/ && sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf
 sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/
 sudo install -D -m 644 -t /etc/systemd/journald.conf.d/ deploy/journald.conf.d/ops-cart.conf && sudo systemctl restart systemd-journald
-sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk && sudo cp deploy/bin/kiosk-setpin deploy/bin/cart-fan-curve /usr/local/bin/
+sudo install -m 755 deploy/bin/kiosk-launcher /usr/local/bin/kiosk
+sudo install -m 755 -t /usr/local/bin/ deploy/bin/kiosk-setpin deploy/bin/cart-fan-curve
 sudo kiosk-setpin
-sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload   # LAN1 要在 pxe 区
+sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload
+sudo firewall-cmd --permanent --zone=pxe --change-interface=<装机网卡> && sudo firewall-cmd --reload   # LAN1 要在 pxe 区
 sudo python3 -m venv /opt/pxe/venv && sudo /opt/pxe/venv/bin/pip install pillow pyusb   # cart-dash 用这个 venv
-sudo scripts/setup-cart.sh      # 先把 Rocky minimal ISO 放到脚本里写的路径; 校验后铺 tftp 和 HTTP 仓库, 只写默认菜单
+sudo bash scripts/setup-cart.sh      # 先把 Rocky minimal ISO 放到脚本里写的路径; 校验后铺 tftp 和 HTTP 仓库, 只写默认菜单
+sudo install -m 644 examples/ks.cfg.example /opt/pxe/http/ks.cfg   # 改掉里面的密码 hash 和分区再用
+sudo systemctl enable --now kiosk.service cart-dash.service kvm-broker.service \
+    pxe-server.service pxe-http-boot.service pxe-http-repo.service \
+    cart-boot-success.timer wifi-prefer.timer campus-auth.timer
+sudo systemctl enable --now cart-fan-curve.service   # 认不出 it8625 时会失败, 可以先不开
 ```
 
 | 单元 | 作用 | 开不开 |
 |---|---|---|
 | `kiosk.service` · `cart-dash.service` · `kvm-broker.service` | 车机、副屏 + 快照、键鼠代理 | 开 |
 | `pxe-server` · `pxe-http-boot` · `pxe-http-repo` | 装机三件套 | 开 |
-| `cart-boot-success.timer` · `wifi-prefer.timer` · `campus-auth.timer` · `cart-fan-curve.service` | 开机成功标记、无线优先级、校园网认证、风扇曲线 | 开 |
+| `cart-boot-success.timer` · `wifi-prefer.timer` · `campus-auth.timer` | 开机成功标记、无线优先级、校园网认证 | 开 |
+| `cart-fan-curve.service` | 风扇曲线 | 开；依赖 hwmon 认出 it8625，内核驱动认不出时单元会失败，可以先不开 |
 | `cart-notify.timer` · `cart-dream.timer` | 手机推送（没配只记日志）、夜间小结 | 按需 |
-| `webkiosk.service` · `cart-serial-req.path` | 网页口，网页急停 / 拒绝 | 按需；先建 `ops-web` 用户、`web.conf`，装 SELinux 模块，见 DEPLOY_1.11.00 第 5 节 |
+| `webkiosk.service` · `cart-serial-req.path` | 网页口，网页急停 / 拒绝 | 按需；见 DEPLOY_1.06.00 第 7 步 + DEPLOY_1.11.00 第 5 节。建好 `ops-web` 用户后再跑一次 `sudo systemd-tmpfiles --create /etc/tmpfiles.d/ops-cart.conf` |
 | `cart-mcp.service` · `cart-mcp-ro.service` | MCP 的 HTTP 方式，动手档 / 只读档各一个进程、令牌分开。stdio 不用单元：`claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act`；只读档要专用身份 `agent-ro`，配法见 DESIGN_agent_mcp 第十六节 | 按需，先配 `/etc/ops-cart/mcp.json` |
-| `cart-ocr.service` | OCR 常驻服务；`sudo scripts/setup-ocr.sh deploy/ocr-requirements.txt` 建 `/opt/pxe/ocr-venv` | 可选 |
+| `cart-ocr.service` | OCR 常驻服务；`sudo bash scripts/setup-ocr.sh deploy/ocr-requirements.txt` 建 `/opt/pxe/ocr-venv` | 可选 |
 | `cart-revtunnel.service` | 备用远程通道 | 可选，见 [`docs/REMOTE_TUNNEL.md`](docs/REMOTE_TUNNEL.md) |
 | `cart-ble-input.service` | 蓝牙隔空打字 | 可选，默认不开，见 [`docs/BLE_INPUT.md`](docs/BLE_INPUT.md) |
 
@@ -124,7 +133,7 @@ sudo scripts/setup-cart.sh      # 先把 Rocky minimal ISO 放到脚本里写的
 python3 -m pytest -q                         # 离线全测; 代码要能在推车的 Python 3.9 上跑 (test_py39_compat 守着)
 python3 scripts/check_public_safe.py .       # 公开仓库安全检查, 本地词表放 .public-safe.local
 git fetch origin && python3 scripts/readme_due.py   # README 上次整理后 origin/main 合并了几个 PR, 到 10 个退出码 1
-scripts/smoke-kiosk.sh                       # Xvfb 无头冒烟
+bash scripts/smoke-kiosk.sh                  # Xvfb 无头冒烟
 
 python3 ch9329.py --port /dev/ttyACM0 type "hello"          # 键鼠代理在跑时经代理发
 python3 pxeserver.py serve --ip 192.0.2.1 --prefix 24 --pool 192.0.2.10,192.0.2.20 \
