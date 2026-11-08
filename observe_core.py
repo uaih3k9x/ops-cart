@@ -378,7 +378,7 @@ class Login:
                 self.state = "user"
                 return Step("send", "user", self._user)
             if kind == "password":              # 回车唤醒直接到 Password: = console 只认密码 (没有 Username:)
-                return self._stop("console 用的是纯密码认证, 暂不支持; 请人登录后再观察 (会借用那个会话)")
+                return self._stop("console 用的是纯密码认证, 暂不支持")
             if kind == "prompt":                # 从按任意键唤醒出来却是提示符: 现场判断错了 / 别人的会话, 不借用
                 return self._stop("唤醒出来是已登录的提示符 (不是推车登录的会话), 不借用; 请人 quit 后再观察")
             if self._wakes >= self.MAX_WAKE:
