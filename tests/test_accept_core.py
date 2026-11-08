@@ -444,6 +444,44 @@ def test_pxe_zone_firewalld_off_is_skip():
     assert ac.judge_pxe_zone(None, None)[0] == ac.SKIP
 
 
+@pytest.mark.parametrize("link", ["unavailable", "disconnected"])
+def test_pxe_zone_no_link_is_skip_and_says_profile_is_pxe(link):
+    """LAN1 没插线: 连接没激活, 接口不在任何区是正常的; 配置里写了 pxe 就说插线后生效 (#38)."""
+    st, why = ac.judge_pxe_zone("", "", link=link, profile_zones=["pxe"])
+    assert st == ac.SKIP and link in why and "配置已设 pxe，插线后生效" in why
+
+
+def test_pxe_zone_no_link_profile_without_pxe_fails():
+    """没链路但配置写的不是 pxe: 插线后照样落进默认区, 现在就报."""
+    st, why = ac.judge_pxe_zone("", "", link="unavailable", profile_zones=[""])
+    assert st == ac.FAIL and "插线后" in why and "nmcli" in why
+
+
+def test_pxe_zone_no_link_no_profile_is_skip():
+    st, why = ac.judge_pxe_zone("", "", link="unavailable", profile_zones=[])
+    assert st == ac.SKIP and "没找到" in why
+
+
+def test_pxe_zone_link_up_without_zone_still_fails():
+    assert ac.judge_pxe_zone("", "", link="connected", profile_zones=["pxe"])[0] == ac.FAIL
+
+
+def test_pxe_zone_no_link_but_zone_set_judged_as_before():
+    assert ac.judge_pxe_zone("pxe", PXE_PORTS, link="unavailable")[0] == ac.PASS
+    assert ac.judge_pxe_zone("public", "", link="unavailable")[0] == ac.FAIL
+
+
+def test_nm_device_state():
+    out = "wlp4s0:connected\ntailscale0:connected (externally)\neno1:unavailable\n"
+    assert ac.nm_device_state(out, "eno1") == "unavailable"
+    assert ac.nm_device_state(out, "tailscale0") == "connected"
+    assert ac.nm_device_state(out, "eno2") is None
+
+
+def test_nm_split_terse_unescapes():
+    assert ac.nm_split(r"my\:con:802-3-ethernet:") == ["my:con", "802-3-ethernet", ""]
+
+
 # ---- RapidOCR (#46): 可选, 没装不算错
 
 def test_judge_rapid():

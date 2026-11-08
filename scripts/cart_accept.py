@@ -451,7 +451,17 @@ def config_checks():
             return ac.judge_pxe_zone(None, None)
         zone = sh(["firewall-cmd", "--get-zone-of-interface=eno1"])[1].strip()
         ports = sh(["firewall-cmd", f"--zone={zone}", "--list-ports"])[1] if zone else ""
-        return ac.judge_pxe_zone(zone, ports)
+        link = ac.nm_device_state(sh(["nmcli", "-t", "-f", "DEVICE,STATE", "device"])[1], "eno1")
+        zones = []
+        if not zone and link in ac.LINK_DOWN:          # 没激活: 看绑 eno1 的配置里写的区
+            for line in sh(["nmcli", "-t", "-f", "NAME,TYPE", "con", "show"])[1].splitlines():
+                f = ac.nm_split(line)
+                if len(f) >= 2 and f[1] == "802-3-ethernet":
+                    got = sh(["nmcli", "-g", "connection.interface-name,connection.zone", "con", "show", f[0]])[1]
+                    v = got.split("\n")
+                    if v and v[0].strip() == "eno1":
+                        zones.append(v[1].strip() if len(v) > 1 else "")
+        return ac.judge_pxe_zone(zone, ports, link=link, profile_zones=zones)
 
     return [ac.Check("pxe.env", "#11", pxeenv),
             ac.Check("LAN1 防火墙区放行 PXE", "#38", pxe_zone),

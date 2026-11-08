@@ -619,20 +619,61 @@ def netmode_summary(doc):
     return "托管: " + (", ".join(parts) or "无")
 
 
+PXE_ZONE = "pxe"
 PXE_PORTS = ("67/udp", "68/udp", "69/udp", "4011/udp", "80/tcp", "8000/tcp")
 
 
-def judge_pxe_zone(zone, ports):
-    """LAN1 所在 firewalld 区放没放行 PXE (#38). zone=None = firewalld 没开; 没放行时 DHCP 请求到不了服务."""
+LINK_DOWN = ("unavailable", "disconnected")      # nmcli device 状态: 没插线 / 没激活, 接口不进任何区
+
+
+def judge_pxe_zone(zone, ports, link=None, profile_zones=None):
+    """LAN1 所在 firewalld 区放没放行 PXE (#38). zone=None = firewalld 没开; 没放行时 DHCP 请求到不了服务.
+    link = nmcli 里 eno1 的设备状态; profile_zones = 绑 eno1 的各个连接配置的 connection.zone.
+    没链路时连接没激活, 接口本来就不在任何区: 看配置里写没写 pxe, 写了就等插线."""
     if zone is None:
         return SKIP, "firewalld 没在跑"
     fix = "修: sudo nmcli con mod <LAN1 配置> connection.zone pxe 后重新 up"
+    if not zone and link in LINK_DOWN:
+        zones = list(profile_zones or [])
+        if not zones:
+            return SKIP, f"eno1 没链路 ({link}), 也没找到绑 eno1 的连接配置, 插线建好配置后再验"
+        if PXE_ZONE in zones:
+            return SKIP, f"eno1 没链路 ({link}), 现在不在任何区是正常的; 配置已设 pxe，插线后生效"
+        shown = "/".join(z or "空" for z in zones)
+        return FAIL, f"eno1 没链路 ({link}), 但连接配置的区是 {shown}, 插线后会落进默认区. {fix}"
     if not zone:
         return FAIL, f"eno1 不在任何防火墙区. {fix}"
     miss = [p for p in PXE_PORTS if p not in (ports or "").split()]
     if miss:
         return FAIL, f"eno1 在 {zone} 区, 没放行 {' '.join(miss)}, 新机器拿不到地址. {fix}"
     return PASS, f"eno1 在 {zone} 区, PXE 端口都放行"
+
+
+def nm_split(line):
+    """nmcli -t 一行: 字段用 ':' 分, 字段里的 ':' 和 '\\' 被转义成 '\\:' '\\\\'."""
+    out, cur, esc = [], [], False
+    for ch in line:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return out
+
+
+def nm_device_state(out, dev):
+    """`nmcli -t -f DEVICE,STATE device` 的输出 -> dev 的状态第一个词 (connected / unavailable ...); 没有这个设备 None."""
+    for line in (out or "").splitlines():
+        f = nm_split(line)
+        if len(f) >= 2 and f[0] == dev:
+            return (f[1].split() or [""])[0]
+    return None
 
 
 def judge_rapid(installed, rc, out):
