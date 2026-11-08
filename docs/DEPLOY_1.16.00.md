@@ -6,8 +6,14 @@
 这一版把第 3–7 步收进了一个脚本 `scripts/install-1.16.00.sh`（部署包里叫 `install.sh`），在推车上一条命令装完：
 
 ```bash
-sudo bash /tmp/deploy-1.16.00/install.sh
+sudo systemd-run --unit=ops-cart-deploy --collect bash /tmp/deploy-1.16.00/install.sh
+journalctl -fu ops-cart-deploy          # 看进度; Ctrl-C 只停看日志, 不停安装
 ```
+
+用 `systemd-run` 跑，安装进程不挂在 ssh 会话上，ssh 断了也照样跑完（推车上没有 tmux / screen；systemd 252 支持 `--collect`，已在推车上核对过）。
+脚本**没有任何交互**，全程不用敲键。万一还是被打断（`systemctl stop ops-cart-deploy`、直接 `sudo bash` 跑时 ssh 断线或按 Ctrl-C），它会打印回滚命令。
+再跑一次时，只要推车已经是 1.16.00，或者已经有这次的备份记录（`.bak-*/deploy.marker`），脚本就停下并给出那次的回滚命令，**不会叠着装**。
+跑完看结果：`journalctl -u ops-cart-deploy --no-pager | tail -40`（`--collect` 只卸掉单元，日志还在）。
 
 下面逐步写清楚脚本做了什么，脚本跑不了时照着手工做。
 
@@ -67,10 +73,11 @@ python3 scripts/cart_accept.py --make-manifest scripts/accept-manifest.json
 ```bash
 cat /opt/pxe/VERSION /opt/pxe/BUILD                 # 预期 1.15.01 / 304 f6541fd
 ls /opt/pxe/tftp/grub.cfg-* 2>/dev/null             # 应该没有; 有 = 有机器正解锁着, 先上锁 (脚本也会拦)
-systemctl is-active kiosk cart-dash cart-mcp webkiosk kvm-broker pxe-server
+systemctl is-active kiosk cart-dash cart-mcp webkiosk kvm-broker pxe-server pxe-http-boot pxe-http-repo
+ls /etc/systemd/system/cart-mcp-ro.service /etc/systemd/system/cart-ble-input.service 2>/dev/null   # 应该没有 (脚本也会拦)
 ```
 
-**执行前现场再确认一次**：推车屏幕没人在用、没有正在装的机器、串口会话没人在用、没有 Agent 拿着串口写租约或键鼠租约。
+**执行前现场再确认一次（人工，脚本不查）**：**没有正在装机或正在 PXE 的机器**（脚本只拦"有 MAC 解锁着"，查不出别的 PXE 访问）、推车屏幕没人在用、串口会话没人在用、没有 Agent 拿着串口写租约或键鼠租约。
 脚本会重启 kiosk（回到锁屏）、kvm-broker（键鼠租约丢）、pxe-server 和两个 HTTP 服务（正在 PXE 的机器会断）。
 
 ## 2. 备份（脚本第 1 段）
@@ -88,7 +95,11 @@ sudo cp -a /etc/systemd/system/cart-mcp.service $B/etc/systemd/
 sudo cp -a /etc/ops-cart $B/etc/ops-cart          # 配置原样留一份 (含 0600 的)
 ```
 
-脚本在备份前先记下第 7 步那几个服务里**当时开着的**，写进 `$B/rollback.sh`（第 9 步）。出错停下时（不管是命令失败还是脚本自己判的失败），都会打印这条回滚命令。
+脚本在备份前先记下第 7 步那几个服务里**当时开着的**，写进 `$B/rollback.sh`（第 9 步）。出错停下时（命令失败、脚本自己判的失败、被信号打断）都会打印这条回滚命令。
+同一目录里还写一个 `deploy.marker`（`from` / `to` / `build`），用来认出"上次装到一半"；回滚成功后它会被改名成 `deploy.marker.rolled-back`，之后可以再装。
+
+任何改动之前，脚本先按 `accept/accept-manifest.json` 核对包里每个文件的 sha256，再核对包里的 `BUILD` 和 manifest 的 `build` 是否一致。对不上就停。
+它还会检查 `cart-mcp-ro.service`、`cart-ble-input.service` 是否已经存在（1.15.01 上不该有），存在也停。
 
 备份前脚本还会检查部署包齐不齐：3 个单元、`accept/cart_accept.py` 等都要在，包里 `VERSION` 必须是 1.16.00。缺了就停，什么都不动。版本检查要跳过，用 `sudo FORCE=1 bash install.sh`。别用 `sudo -E`，它会把开发机上测试用的 `OPT` / `SYS` / `ETC` / `LOG` 变量带进 root 环境。
 
@@ -126,7 +137,7 @@ sudo systemctl daemon-reload
 ## 5. 重写 PXE 默认菜单（脚本第 5 段，#76）
 
 ```bash
-sudo python3 /opt/pxe/kiosk_core.py --write-rescue --root /opt/pxe/tftp
+sudo python3 /opt/pxe/kiosk_core.py --write-rescue --root /opt/pxe/tftp --state /opt/pxe/pxe-mode.json
 grep -n "Boot from local disk" /opt/pxe/tftp/grub.cfg     # 第 0 项是本地盘, 超时 10 秒
 ```
 
@@ -155,7 +166,7 @@ done
 - kvm-broker：键鼠闸门（#67）；pxe-server / pxe-http-*：`pxeserver.py`、`httpserve.py`；cart-mcp：MCP 档位（#60）。
 - 不用重启：cart-ocr（`cart_ocr.py` 没变）、cart-notify / cart-dream / cart-boot-success（timer 每次新起进程）、cart-serial-req（path 触发的 oneshot）。
 
-脚本重启完等 3 秒，开机自启的单元有没起来的就停下，打印回滚命令。
+脚本重启完等 3 秒。部署前开着的服务里有没起来的，就停下并打印回滚命令；部署前就没在跑的服务只提一句，不算失败。
 
 ## 8. 验证
 
@@ -196,8 +207,11 @@ sudo env DISPLAY=:0 XAUTHORITY=/root/.Xauthority PYTHONPATH=/opt/pxe python3 -m 
 ## 9. 回滚
 
 ```bash
-sudo bash /opt/pxe/.bak-<时间戳>/rollback.sh
+sudo systemd-run --unit=ops-cart-rollback --collect bash /opt/pxe/.bak-<时间戳>/rollback.sh
+journalctl -fu ops-cart-rollback
 ```
+
+脚本出错停下时，会把这条命令连同具体时间戳一起打印出来。回滚中途失败会打印"回滚第 N 行失败"；把问题修好后，直接再跑同一条命令即可。
 
 它做的事：
 
@@ -206,7 +220,9 @@ B=/opt/pxe/.bak-<时间戳>
 sudo cp -a $B/*.py $B/VERSION $B/BUILD /opt/pxe/
 sudo rm -rf /opt/pxe/web /opt/pxe/icons && sudo cp -a $B/web $B/icons /opt/pxe/
 sudo find /opt/pxe/tftp -name 'grub.cfg*' -type f -delete              # 菜单整批换回备份那一套
-( cd $B/tftp && find . -type f ) | while read -r f; do sudo cp -a "$B/tftp/$f" "/opt/pxe/tftp/$f"; done
+( cd $B/tftp && find . -type f ) | while read -r f; do
+    sudo mkdir -p "/opt/pxe/tftp/$(dirname "$f")" && sudo cp -a "$B/tftp/$f" "/opt/pxe/tftp/$f"
+done
 [ -f $B/pxe-mode.json ] && sudo cp -a $B/pxe-mode.json /opt/pxe/ || sudo rm -f /opt/pxe/pxe-mode.json
 sudo systemctl disable --now cart-mcp-ro cart-ble-input 2>/dev/null
 sudo rm -f /etc/systemd/system/cart-mcp-ro.service /etc/systemd/system/cart-ble-input.service

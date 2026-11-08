@@ -1,9 +1,13 @@
 """scripts/install-1.16.00.sh: 假推车目录 + 假 systemctl / python3 / id 跑一遍, 看备份、不碰配置、新单元不开、出错停下给回滚."""
+import hashlib
+import json
 import os
 import pathlib
+import signal
 import shutil
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -16,6 +20,19 @@ pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="要 bash")
 def _exe(path, body):
     path.write_text("#!/bin/bash\n" + body)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _write_manifest(pkg, build=None):
+    """照 cart_accept --make-manifest 的格式: /opt/pxe/<相对路径> 和装进去的单元."""
+    files = {}
+    for f in sorted((pkg / "opt").rglob("*")):
+        if f.is_file():
+            files["/opt/pxe/" + f.relative_to(pkg / "opt").as_posix()] = hashlib.sha256(f.read_bytes()).hexdigest()
+    for f in sorted((pkg / "systemd").iterdir()):
+        files["/etc/systemd/system/" + f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
+    files["/usr/local/bin/kiosk"] = "0" * 64          # 包里不带的系统件: 不核对
+    m = {"version": "1.16.00", "build": build or (pkg / "opt" / "BUILD").read_text().strip(), "files": files}
+    (pkg / "accept" / "accept-manifest.json").write_text(json.dumps(m))
 
 
 @pytest.fixture
@@ -46,8 +63,9 @@ def cart(tmp_path):
     (opt / "tftp" / "EFI" / "BOOT").mkdir(parents=True)
     (opt / "tftp" / "EFI" / "BOOT" / "grub.cfg").write_text("old efi menu\n")
     (opt / "pxe-mode.json").write_text('{"old": 1}\n')
-    for f in ("cart_accept.py", "accept_core.py", "accept-manifest.json"):
+    for f in ("cart_accept.py", "accept_core.py"):
         (pkg / "accept" / f).write_text("x\n")
+    _write_manifest(pkg)
 
     calls = tmp_path / "calls.log"
     fail = tmp_path / "fail-restart"      # 列在这里的服务: restart 返回非 0
@@ -67,11 +85,14 @@ case "$1" in
 esac
 exit 0
 """)
-    # 假 python3: kiosk_core --write-rescue 像 pxe_disarm 那样写新菜单、删 EFI/BOOT 菜单、写 pxe-mode.json; 验收只记一笔
+    # 假 python3: kiosk_core --write-rescue 像 pxe_disarm 那样写新菜单、删 EFI/BOOT 菜单、写 --state;
+    # 验收只记一笔; 别的 (脚本里内联的 manifest 核对) 交给真 python
     _exe(bin_ / "python3", f"""echo "python3 $*" >> {calls}
 case "$1" in
   */kiosk_core.py) printf "menuentry 'Boot from local disk' {{ exit }}\\n" > "$4/grub.cfg"
-                   rm -f "$4/EFI/BOOT/grub.cfg"; echo '{{"new": 1}}' > "$4/../pxe-mode.json";;
+                   rm -f "$4/EFI/BOOT/grub.cfg"; echo '{{"new": 1}}' > "$6";;
+  */cart_accept.py) ;;
+  *) exec {sys.executable} "$@";;
 esac
 exit 0
 """)
@@ -130,6 +151,7 @@ def test_refuses_wrong_version_without_touching_anything(cart):
 
 def test_refuses_dirty_build(cart):
     (cart["pkg"] / "opt" / "BUILD").write_text("320 abc1234-dirty\n")
+    _write_manifest(cart["pkg"])
     r = run(cart)
     assert r.returncode != 0 and "dirty" in r.stderr
     assert backups(cart) == []
@@ -147,7 +169,7 @@ def test_failure_stops_and_rollback_restores(cart):
     r = run(cart)
     assert r.returncode != 0
     (b,) = backups(cart)
-    assert f"sudo bash {b}/rollback.sh" in r.stderr
+    assert f"bash {b}/rollback.sh" in r.stderr
     assert "cart_accept.py" not in cart["calls"].read_text()       # 出错后不往下走
 
     cart["fail"].unlink()
@@ -174,7 +196,7 @@ def test_die_after_backup_prints_rollback(cart):
     assert r.returncode != 0
     (b,) = backups(cart)
     assert "kiosk" in r.stderr
-    assert f"sudo bash {b}/rollback.sh" in r.stderr
+    assert f"bash {b}/rollback.sh" in r.stderr
 
 
 def test_rollback_restarts_services_active_before_deploy_even_if_down_now(cart):
@@ -237,6 +259,7 @@ def test_refuses_incomplete_package(cart, missing):
 
 def test_refuses_package_with_wrong_target_version(cart):
     (cart["pkg"] / "opt" / "VERSION").write_text("1.16.01\n")
+    _write_manifest(cart["pkg"])
     r = run(cart)
     assert r.returncode != 0 and "1.16.01" in r.stderr
     assert backups(cart) == []
@@ -246,3 +269,105 @@ def test_force_hint_does_not_use_sudo_E(cart):
     (cart["opt"] / "VERSION").write_text("1.14.00\n")
     r = run(cart)
     assert "sudo FORCE=1 bash" in r.stderr and "sudo -E" not in r.stderr
+
+
+def test_install_hint_and_rollback_use_systemd_run(cart):
+    r = run(cart)
+    assert r.returncode == 0, r.stderr
+    (b,) = backups(cart)
+    assert f"sudo systemd-run --unit=ops-cart-rollback --collect bash {b}/rollback.sh" in r.stdout
+    head = (cart["pkg"] / "install.sh").read_text().splitlines()[:6]
+    assert any("systemd-run --unit=ops-cart-deploy --collect" in l for l in head)
+
+
+def test_rewrites_menu_with_state_path(cart):
+    run(cart)
+    assert f"--state {cart['opt']}/pxe-mode.json" in cart["calls"].read_text()
+    assert (cart["opt"] / "pxe-mode.json").read_text() == '{"new": 1}\n'
+
+
+def test_services_not_running_before_deploy_are_reported_not_failed(cart):
+    r = run(cart)
+    assert r.returncode == 0, r.stderr
+    assert "pxe-server 部署前就没在跑" in r.stdout
+
+
+def _hup_on_restart(cart, svc="kiosk"):
+    """假 systemctl 在 restart <svc> 时给安装脚本发 SIGHUP, 当作 ssh 断线."""
+    sc = cart["tmp"] / "bin" / "systemctl"
+    body = sc.read_text().replace("  restart)\n", f'  restart)\n    [ "$2" = {svc} ] && [ ! -f {cart["tmp"]}/hup-done ] && touch {cart["tmp"]}/hup-done && kill -HUP $PPID\n', 1)
+    sc.write_text(body)
+
+
+def test_sighup_prints_rollback_and_rerun_refuses(cart):
+    _hup_on_restart(cart)
+    r = run(cart)
+    assert r.returncode == 130
+    (b,) = backups(cart)
+    assert "信号" in r.stderr and f"bash {b}/rollback.sh" in r.stderr
+    # 重跑: 版本已经是 1.16.00, 指向上次的 rollback, 不再说"什么都没改"之外的假话, 也不再建备份
+    r2 = run(cart)
+    assert r2.returncode != 0
+    assert "上次可能没装完" in r2.stderr and f"bash {b}/rollback.sh" in r2.stderr
+    assert backups(cart) == [b]
+
+
+def test_rerun_refused_by_marker_even_if_version_not_yet_written(cart):
+    cart["fail"].write_text("kiosk\n")
+    run(cart)
+    (b,) = backups(cart)
+    (cart["opt"] / "VERSION").write_text("1.15.01\n")            # 假装断在拷 VERSION 之前
+    r = run(cart)
+    assert r.returncode != 0 and "上次可能没装完" in r.stderr and str(b) in r.stderr
+    assert backups(cart) == [b]
+
+
+def test_after_rollback_can_install_again(cart):
+    cart["fail"].write_text("cart-mcp\n")
+    run(cart)
+    (b,) = backups(cart)
+    cart["fail"].unlink()
+    assert _rollback(cart, b).returncode == 0
+    assert (b / "deploy.marker.rolled-back").exists()
+    import time; time.sleep(1.1)                                  # 备份目录按秒命名
+    r = run(cart)
+    assert r.returncode == 0, r.stderr
+    assert len(backups(cart)) == 2
+
+
+def test_refuses_when_already_target_version(cart):
+    (cart["opt"] / "VERSION").write_text("1.16.00\n")
+    r = run(cart, {"FORCE": "1"})
+    assert r.returncode != 0 and "上次可能没装完" in r.stderr
+    assert backups(cart) == []
+
+
+def test_refuses_when_package_differs_from_manifest(cart):
+    (cart["pkg"] / "opt" / "kiosk.py").write_text("tampered\n")
+    r = run(cart)
+    assert r.returncode != 0 and "kiosk.py" in r.stderr
+    assert backups(cart) == []
+
+
+def test_refuses_when_manifest_build_differs(cart):
+    _write_manifest(cart["pkg"], build="999 deadbee")
+    r = run(cart)
+    assert r.returncode != 0 and "999 deadbee" in r.stderr
+    assert backups(cart) == []
+
+
+@pytest.mark.parametrize("unit", ["cart-mcp-ro.service", "cart-ble-input.service"])
+def test_refuses_when_new_unit_already_present(cart, unit):
+    (cart["sys"] / unit).write_text("someone\n")
+    r = run(cart)
+    assert r.returncode != 0 and unit in r.stderr
+    assert backups(cart) == []
+
+
+def test_rollback_err_trap_says_rerunnable(cart):
+    cart["fail"].write_text("cart-mcp\n")
+    run(cart)
+    (b,) = backups(cart)
+    (b / "VERSION").unlink()
+    rr = _rollback(cart, b)
+    assert rr.returncode != 0 and "回滚第" in rr.stderr and "重跑" in rr.stderr
