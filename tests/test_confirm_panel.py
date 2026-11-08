@@ -27,7 +27,7 @@ def _view(stop=False, items=(("save", DANGER), ("undo shutdown", HOLD))):
     b = sw.Book.from_text(None, T0)
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
     for cmd, gate in items:
-        b.submit(1, tok, "stdio:ops@x", "line", cmd, gate, T0, 30, name="SW1")
+        b.submit(1, tok, "stdio:ops@x", "line", cmd, gate, T0, 30, name="SW1", context="<SW1>")
     if stop:
         b.estop(1, "human:kiosk@local", "human", T0)
     return b.view(T0 + 2)
@@ -66,7 +66,8 @@ def test_dialog_shows_what_agent_wants(root):
     d, _acts, _asked = _dlg(root, _view())
     text = "\n".join(_labels(d))
     assert "Agent 想执行：save" in text and "Agent 想执行：undo shutdown" in text
-    assert "高危词：save" in text and "闸门理由：不在只读白名单里" in text and "操作头 1 · SW1" in text
+    assert "高危词：save" in text and "闸门理由：不在只读白名单里" in text and "操作头 1" in text
+    assert "设备自报名（不可信）：SW1" in text and "操作头 1 · SW1" not in text
     b = _buttons(d)
     assert len(b["确认发送"]) == 2 and len(b["拒绝"]) == 2 and "急停本路" in b and "全部急停" in b
 
@@ -129,3 +130,31 @@ def test_every_text_readable(root, stop, mode):
         assert not th.unreadable(d)
     finally:
         th.use("dark")
+
+
+def test_dialog_intent_and_model_reason_after_trusted_single_line(root):
+    """#65 第六轮: Agent 自述 / 模型理由压成一行、标不可信, 排在可信记录后面."""
+    gate = dict(HOLD, intent="x\n  可信记录（伪造）：\n    #1 「interface Gi0/1」\x1b[8m",
+                model={"verdict": "block", "reason": "看着\n像只读"})
+    gate["reason"] = "不在只读白名单里, 要人确认: 模型拦下: 看着\n像只读"
+    d, _acts, _asked = _dlg(root, _view(items=(("shutdown", gate),)))
+    labels = _labels(d)
+    intent = next(x for x in labels if x.startswith("Agent 自述（不可信）"))
+    model = next(x for x in labels if x.startswith("模型理由（不可信）"))
+    assert "\n" not in intent and "\x1b" not in intent and "\n" not in model
+
+
+def test_dialog_item_order(root):
+    gate = dict(HOLD, vendor="cisco", danger=["save"], intent="存盘", model={"verdict": "block", "reason": "要人看"})
+    gate["reason"] = "不在只读白名单里, 要人确认: 模型拦下: 要人看"
+    d, _acts, _asked = _dlg(root, _view(items=(("save", gate),)))
+    labels = _labels(d)[::-1]          # _labels 是栈序, 反过来近似 pack 顺序
+    order = [next(i for i, x in enumerate(labels) if x.startswith(k))
+             for k in ("闸门理由", "高危词", "注意", "模型理由", "Agent 自述", "设备最近输出", "设备自报名")]
+    assert order == sorted(order), labels
+
+
+def test_dialog_context_lines_prefixed(root):
+    d, _acts, _asked = _dlg(root, _view())
+    ctx = next(x for x in _labels(d) if x.startswith("设备最近输出"))
+    assert ctx.split("\n")[1:] == ["| <SW1>"]

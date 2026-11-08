@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import stat
 import subprocess
 import threading
 import sys
@@ -996,7 +997,7 @@ class PinGate:
 
 
 # ---------------------------------------------------------------- 装机模式
-# 默认: tftp/grub.cfg 只有救援项 (inst.rescue, 不带 ks). 推车屏幕上输随机码解锁时,
+# 默认: tftp/grub.cfg 超时后从本地盘启动, 救援 (inst.rescue, 不带 ks) 只能手选 (#70). 推车屏幕上输随机码解锁时,
 # 只给选定 MAC 写 grub.cfg-01-<mac> (GRUB 先找按 MAC 命名的菜单); 30 分钟或该文件被取走即上锁.
 
 TFTP_ROOT = "/opt/pxe/tftp"
@@ -1006,7 +1007,7 @@ ARM_SECONDS = 30 * 60
 
 
 def grub_cfg_rescue(env_path=None):
-    return ("# 推车生成: 默认只进救援 shell, 不装系统 (装机要在推车上解锁)\n" +
+    return ("# 推车生成: 默认从本地盘启动, 救援 shell 要手选, 不装系统 (装机要在推车上解锁)\n" +
             pxeserver.grub_menu(pxe_env_read(env_path or PXE_ENV)["PXE_IP"]))
 
 
@@ -1086,6 +1087,16 @@ def clone_plan(purpose, mac=None, root=None, conf_path=None, batch_path=None, en
 ARM_PURPOSES = ("rocky", "winpe") + clone_core.CLONE_PURPOSES
 
 
+def _checked_menu(menu, mac):
+    """解锁菜单写之前自检: 服务端会当成救援默认 (rescue_default_menu) 或超长 (MENU_MAX) 而不发的, 直接报错不写.
+    比如克隆密码 / 镜像名里正好带 inst.sshd, 车机显示原因, 好过机器拿到默认菜单才发现."""
+    if len(menu.encode()) > pxeserver.MENU_MAX:
+        raise ValueError(f"{mac} 的菜单超过 {pxeserver.MENU_MAX} 字节, 不写")
+    if pxeserver.rescue_default_menu(menu):
+        raise ValueError(f"{mac} 的菜单会被当成救援默认菜单 (参数里带 inst.rescue / inst.sshd?), 不写")
+    return menu
+
+
 def _arm_clone(mac, now, root, path, seconds, purpose, confirm, conf_path, batch_path, env_path):
     """克隆用途: 重新算一遍清单, 和车机上人确认的 (confirm = 当时的 digest) 一致才写; 只给放行的 MAC 写菜单."""
     p = clone_plan(purpose, mac=mac, root=root, conf_path=conf_path, batch_path=batch_path, env_path=env_path)
@@ -1096,10 +1107,11 @@ def _arm_clone(mac, now, root, path, seconds, purpose, confirm, conf_path, batch
     ok = [r for r in p["rows"] if r["params"]]
     ip = pxe_env_read(env_path or PXE_ENV)["PXE_IP"]
     head = f"# 推车生成: Clonezilla {purpose}, 只下发给解锁时确认过的机器\n"
+    menus = {r["mac"]: _checked_menu(head + pxeserver.grub_menu_clone(ip, purpose, r["params"]), r["mac"])
+             for r in ok}                                   # 先全部生成、自检, 有一份不行就什么都不写
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue(env_path))
-    for r in ok:
-        _write_atomic(os.path.join(root, mac_cfg_name(r["mac"])),
-                      head + pxeserver.grub_menu_clone(ip, purpose, r["params"]))
+    for m, menu in menus.items():
+        _write_atomic(os.path.join(root, mac_cfg_name(m)), menu)
     state = {"mac": ok[0]["mac"], "since": now, "until": now + seconds}
     if purpose == "clone-restore":
         state["macs"] = [r["mac"] for r in ok]
@@ -1126,50 +1138,73 @@ def pxe_arm(mac, now=None, root=TFTP_ROOT, path=PXE_MODE, seconds=ARM_SECONDS, p
         missing = winpe_missing(root)
         if missing:
             raise ValueError(f"WinPE 文件不齐, 缺 {', '.join(missing)}")
+        menu, what = _checked_menu(grub_cfg_winpe(), mac), "winpe (进 WinPE, 不装机)"
         _write_atomic(os.path.join(root, pxeserver.IPXE_SCRIPT), pxeserver.ipxe_script())
-        menu, what = grub_cfg_winpe(), "winpe (进 WinPE, 不装机)"
     else:
-        menu, what = grub_cfg_install(), "rocky (自动装机)"
+        menu, what = _checked_menu(grub_cfg_install(), mac), "rocky (自动装机)"
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
     _write_atomic(os.path.join(root, mac_cfg_name(mac)), menu)
     _write_atomic(path, json.dumps({"mac": mac, "since": now, "until": now + seconds}))
     _pxe_event(f"装机模式解锁 mac={mac} {seconds // 60} 分钟; 用途 {what}")
 
 
+def _stale_menu(full, always=False, unreadable=None):
+    """上锁时该删的菜单: 只看普通文件 (含指向普通文件的符号链接; FIFO/设备跳过, 免得卡在 open 上).
+    always 的直接删; 别的读至多 MENU_MAX+1 字节: 超长、解锁专用、默认项可能是救援的都删."""
+    try:
+        if not stat.S_ISREG(os.stat(full).st_mode):
+            return False
+        if always:
+            return True
+        with open(full, "rb") as f:
+            raw = f.read(pxeserver.MENU_MAX + 1)
+    except OSError as e:
+        if unreadable is not None:
+            unreadable.append(f"{full} (读不了: {e.strerror or e})")
+        return False
+    if len(raw) > pxeserver.MENU_MAX:
+        return True
+    text = raw.decode("utf-8", "replace")
+    return pxeserver.unlock_only_menu(text) or pxeserver.rescue_default_menu(text)
+
+
 def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
-    """删掉所有按 MAC 的装机菜单, 主菜单写回救援. 开机时也调一次, 保证默认安全.
+    """删掉所有按 MAC 的装机菜单, 主菜单写回默认 (超时本地盘). 开机时也调一次, 保证默认安全.
     整棵 tftp 树里 GRUB 会自己去取的菜单 (grub.cfg / grub.cfg-*: EFI/BOOT 下的、按 IP 命名的)
-    只要带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu) 也一并删掉. clonezilla/ 和 win/ 一样不删. grub.cfg.bak-* 这类
+    只要带 inst.ks=、WinPE 项或克隆项 (pxeserver.unlock_only_menu), 或默认/fallback 项是救援
+    (pxeserver.rescue_default_menu, #70 之前的老菜单) 也一并删掉; EFI/BOOT/grub.cfg 一律删 (同 setup-cart.sh). clonezilla/ 和 win/ 一样不删. grub.cfg.bak-* 这类
     手工备份 GRUB 不会去取, 不动. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
     再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
     root = str(root)
-    removed = []
+    try:
+        os.remove(path)                     # 先撤状态: 后面哪步出错, 服务端也已经当没解锁
+    except FileNotFoundError:
+        pass
+    removed, failed = [], []
     for d, _dirs, files in os.walk(root):
         for name in files:
             full = os.path.join(d, name)
             fetched = name == "grub.cfg" or name.startswith("grub.cfg-")
             if not fetched or full == os.path.join(root, "grub.cfg"):
                 continue
-            if not (name.startswith("grub.cfg-01-") and d == root):
+            bad = []
+            stale = _stale_menu(full, always=(name.startswith("grub.cfg-01-") and d == root) or
+                                full == os.path.join(root, "EFI", "BOOT", "grub.cfg"), unreadable=bad)
+            failed += [b.replace(full, os.path.relpath(full, root), 1) for b in bad]
+            if stale:
                 try:
-                    with open(full, errors="replace") as f:
-                        if not pxeserver.unlock_only_menu(f.read()):
-                            continue
-                except OSError:
-                    continue
-            os.remove(full)
-            removed.append(os.path.relpath(full, root))
+                    os.remove(full)
+                    removed.append(os.path.relpath(full, root))
+                except OSError as e:
+                    failed.append(f"{os.path.relpath(full, root)} ({e.strerror or e})")
     _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-    _pxe_event("装机模式上锁, 只剩救援菜单" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else ""))
+    _pxe_event("装机模式上锁, 只剩默认菜单 (超时本地盘)" + (f"; 删掉 {', '.join(sorted(removed))}" if removed else "")
+               + (f"; 删不掉 {', '.join(sorted(failed))}" if failed else ""))
 
 
 def pxe_retire(macs, root=TFTP_ROOT):
     """一批里已经取走菜单的那几台: 先删它们的 MAC 菜单 (别的还在等, 不整体上锁).
-    做完关机后再 PXE 就只拿得到救援菜单, 不会再写一遍盘."""
+    做完关机后再 PXE 就只拿得到默认菜单 (超时本地盘), 不会再写一遍盘."""
     gone = []
     for mac in macs:
         try:
@@ -1380,10 +1415,10 @@ def video_size(dev):
 # ---------------------------------------------------------------- 命令行 (部署脚本用)
 
 def main(argv=None):
-    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留救援菜单 (setup-cart.sh 调).
+    """python3 kiosk_core.py --write-rescue: 扫干净 tftp 树, 只留默认菜单 (超时本地盘, 救援要手选; setup-cart.sh 调). 命令名沿用, 不改.
     菜单只从这里 (pxeserver.grub_menu) 生成, 部署脚本不再自己写 grub.cfg."""
     ap = argparse.ArgumentParser(prog="kiosk_core.py")
-    ap.add_argument("--write-rescue", action="store_true", help="写救援菜单并删掉所有自动装机菜单")
+    ap.add_argument("--write-rescue", action="store_true", help="写默认菜单 (超时本地盘, 救援要手选) 并删掉所有自动装机菜单和老的救援默认菜单")
     ap.add_argument("--root", default=TFTP_ROOT)
     ap.add_argument("--state", default=PXE_MODE)
     a = ap.parse_args(sys.argv[1:] if argv is None else argv)
@@ -1391,7 +1426,7 @@ def main(argv=None):
         ap.print_usage(sys.stderr)
         return 2
     pxe_disarm(root=a.root, path=a.state)
-    print(f"救援菜单已写入 {os.path.join(a.root, 'grub.cfg')}")
+    print(f"默认菜单 (超时本地盘) 已写入 {os.path.join(a.root, 'grub.cfg')}")
     return 0
 
 
