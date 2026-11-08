@@ -48,16 +48,30 @@ def _btn(parent, text, cmd, bg=None):
                      activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=10)
 
 
+def _held_here(panel):
+    """面板当前选中的这一路是不是正在被观察 (#85)."""
+    held = getattr(panel, "_held", None) or ()
+    return bool(held) and match_service(panel.port_var.get(), panel._serves) in held
+
+
 class SerialPanel(tk.Frame):
     """kiosk 里的 '串口会话' 页. 左控制台 (宽) | 右聊天 (窄), F2 切换焦点."""
 
-    _held = None        # #85 观察窗口登录 / 退出时借走控制台: 这期间不自动接回, 也不发唤醒回车
+    _held = frozenset()     # #85 正在观察的串口服务名 (observe_panel.ConsoleHold 登记): 这些口不连、不发唤醒回车
+
+    def _held_here(self):
+        return _held_here(self)
 
     def _auto_connect_ok(self):
-        return not getattr(self, "_held", None)
+        return not _held_here(self)
 
     def _wake_ok(self, wake):
-        return bool(wake) and not getattr(self, "_held", None)
+        return bool(wake) and not _held_here(self)
+
+    def _show_held(self):
+        if _held_here(self):
+            self.con_title.config(text=f"控制台 · {self.port_var.get()} 观察中 (观察窗口占着这一路, 退出观察后接回)",
+                                  fg=th.NOTICE)
 
     def __init__(self, master, want=None):
         super().__init__(master, bg=BG)
@@ -195,6 +209,10 @@ class SerialPanel(tk.Frame):
             self._disconnect()
 
     def _connect(self, wake=True):
+        if _held_here(self):               # 这一路正在观察: 车机控制台不接 (接上就是 attach 着的人, 观察会一直停)
+            self._disconnect()
+            self._show_held()
+            return
         self._disconnect()
         dev = self.port_var.get()
         name = match_service(dev, self._serves)

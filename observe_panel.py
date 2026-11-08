@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """串口观察模式的车机窗口 (#85): 输一次密码, 画设备前面板, 灯跟着真机亮灭闪. 逻辑在 observe_core.py.
 
-串口面板选中一路点"观察"打开; 每一路同时只开一个窗口, 和巡检互斥 (observe_core.claim). 线程纪律同 serial_panel: 后台线程 (登录 / 轮询 / quit)
-只往 self.ui 放东西, 界面只在 _tick 里改. 密码框读完立刻清空, 密码只经 Observer.start 传给登录状态机,
-不落盘不进日志. 会话掉了 / 登录失败 / 退出时没敢 quit, 窗口留着, 写明原因, 登录行回来可以再登.
+串口面板选中一路点"观察"打开; 每一路同时只开一个窗口, 和巡检互斥 (observe_core.claim). 线程纪律同 serial_panel:
+后台线程 (登录 / 轮询) 只往 self.ui 放东西, 界面只在 _tick 里改. 密码框读完立刻清空, 密码只经 Observer.start
+传给登录状态机, 不落盘不进日志. 观察全程占着车机串口面板对这一路的连接 (面板上显示"观察中"), 结束后接回.
+会话掉了 / 登录失败 / 退出后 console 还登录着, 窗口留着写明, 登录行回来可以再登. 不自动 quit.
 """
 
 import functools
@@ -55,30 +56,46 @@ def _alive(w):
 
 
 class ConsoleHold:
-    """登录 / 退出时借走车机串口面板的控制台 (它本身就是一个 attach 着的"人").
-    只在面板确实连着被观察的这一路时才断开; 接回只接原来那一路, 面板没了 / 切到别的口 / 已经连上了就不动."""
+    """观察全程借走车机串口面板对这一路的控制台 (它本身就是一个 attach 着的"人", 连着就永远不轮询).
+    不管面板当时连着哪一路, 都在面板上登记"这一路观察中" (_held 集合): 观察中途切回这一路也不自动接、不发唤醒回车.
+    面板当时正连着这一路才断开; 接回只接原来那一路, 面板没了 / 切到别的口 / 已经连上了就不动."""
 
     def __init__(self, panel, name):
-        self.panel, self.name, self.dev = panel, name, None
+        self.panel, self.name, self.dev, self.active = panel, name, None, False
 
     def pause(self):
+        """登记并 (连着这一路的话) 断开; 返回断没断开."""
         p = self.panel
-        if self.dev is not None or p is None or not _alive(p) or not getattr(p, "sock", None):
+        if self.active or p is None or not _alive(p):
             return False
-        dev = p.port_var.get()
-        if match_service(dev, p._serves) != self.name:
-            return False
-        self.dev = dev
-        p._held = self.name                 # 面板这期间不自动接回、不发唤醒回车
-        p._disconnect()
-        return True
+        self.active = True
+        held = getattr(p, "_held", None)
+        if not isinstance(held, set):
+            held = p._held = set()
+        held.add(self.name)
+        cut = False
+        if getattr(p, "sock", None) and match_service(p.port_var.get(), p._serves) == self.name:
+            self.dev = p.port_var.get()
+            p._disconnect()
+            cut = True
+        show = getattr(p, "_show_held", None)
+        if show:
+            try:
+                show()
+            except Exception:
+                pass
+        return cut
 
     def resume(self):
-        """接回; 接不回返回给人看的一句."""
+        """撤销登记, 原来连着就接回; 接不回返回给人看的一句."""
+        if not self.active:
+            return None
+        self.active = False
         dev, self.dev = self.dev, None
         p = self.panel
-        if dev is not None and p is not None:
-            p._held = None
+        held = getattr(p, "_held", None)
+        if isinstance(held, set):
+            held.discard(self.name)
         if dev is None or not _alive(p) or p.port_var.get() != dev or p.sock:
             return None
         try:
@@ -89,7 +106,7 @@ class ConsoleHold:
 
 
 class Life:
-    """观察窗口和它的后台线程谁后结束, 谁放 claim: 线程还在跑 (可能还要发 quit) 时, 同一路不许开新的观察或巡检."""
+    """观察窗口和它的后台线程谁后结束, 谁放 claim: 线程还在跑 (可能还在一条 conbroker 交互里) 时, 同一路不许开新的观察或巡检."""
 
     def __init__(self, name, token):
         self.name, self.token, self._lock = name, token, threading.Lock()
@@ -215,6 +232,8 @@ class ObserveWindow(tk.Toplevel):
             return
         if self.worker or not user or not pw:
             return
+        self._closing = False               # 上次点过退出观察、留着窗口再登录: 按钮恢复
+        self.close_btn.config(state="normal", text="退出观察", command=self.close)
         if not login_slot(self.token):
             self.status.config(text="另一个观察窗口正在登录, 等它登完再来", fg=th.WARN)
             return
@@ -227,7 +246,7 @@ class ObserveWindow(tk.Toplevel):
         self.status.config(text="看现场、登录中…", fg=DIM)
         self._snap_at = 0
         self.stop_evt.clear()
-        self.hold.pause()                   # 登录阶段不许有人 attach (#85); 车机控制台连着这一路就先断开, 登录完接回
+        self.hold.pause()                   # 观察全程占着车机控制台对这一路的连接 (有人 attach 就不轮询); 结束时接回
         box = [pw]                          # 一次性容器: 线程取出后清空, 不在 Thread._args 里一直挂着
         del pw
         self.worker = threading.Thread(target=self._work, args=(self.obs, user, box), daemon=True)
@@ -237,23 +256,24 @@ class ObserveWindow(tk.Toplevel):
     def _work(self, obs, user, box):
         pw = box.pop() if box else ""
         try:
-            ok = obs.start(user, pw, cancelled=self.stop_evt.is_set)
-        finally:
-            del pw
-            login_slot_done(self.token)
-        self.ui.put(self._console_back)
-        oc.record("start", head=self.head, device=obs.device, ok=ok, error=obs.error)
-        if ok:
-            self.ui.put(self._logged_in)
-        while ok and not self.stop_evt.is_set() and obs.state == "polling":
-            obs.tick(time.monotonic())
-            self.stop_evt.wait(0.5)
-        obs.stop(time.monotonic())
-        oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error, note=obs.note)
-        life = getattr(self, "life", None)
-        if life:
-            life.worker_done()
-        self.ui.put(self._ended)
+            try:
+                ok = obs.start(user, pw, cancelled=self.stop_evt.is_set)
+            finally:
+                del pw
+                login_slot_done(self.token)
+            oc.record("start", head=self.head, device=obs.device, ok=ok, error=obs.error)
+            if ok:
+                self.ui.put(self._logged_in)
+            while ok and not self.stop_evt.is_set() and obs.state == "polling":
+                obs.tick(time.monotonic())
+                self.stop_evt.wait(0.5)
+            obs.stop(time.monotonic())
+            oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error, note=obs.note)
+        finally:                            # 不管怎么结束: 放占用 (窗口已关的话) 并通知界面 (接回控制台在 _ended 里)
+            life = getattr(self, "life", None)
+            if life:
+                life.worker_done()
+            self.ui.put(self._ended)
 
     def _console_back(self):
         msg = self.hold.resume()
@@ -348,8 +368,7 @@ class ObserveWindow(tk.Toplevel):
         worker = self.worker
         if worker is None or not worker.is_alive():
             return
-        oc.record("interrupted", head=self.head,
-                  note="观察被 kiosk 退出打断, console 可能仍在登录状态或停在 Password:, " + oc.IDLE_LOGOUT)
+        oc.record("interrupted", head=self.head, note=interrupt_note(getattr(self, "obs", None)))
         worker.join(timeout)
 
     def destroy(self):
@@ -358,6 +377,22 @@ class ObserveWindow(tk.Toplevel):
         oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
         self.life.window_gone()             # 后台线程还在跑就等它结束再放 claim
         super().destroy()
+
+
+def interrupt_note(obs):
+    """kiosk 退出打断观察时记的那句: 按走到哪一步写, 轮询阶段不写"停在 Password:"."""
+    lg = getattr(obs, "login", None)
+    if obs is None:
+        state = "看不出走到哪一步, console 可能仍在登录状态或停在 Password:"
+    elif obs.state == "polling":
+        state = "console 仍处于推车登录的状态"
+    elif lg is not None and getattr(lg, "pw_sent", False):
+        state = "密码可能已发出, console 可能仍在登录状态"
+    elif getattr(obs, "user_sent", False):
+        state = "用户名已发出, console 可能停在 Password:"
+    else:
+        return "观察被 kiosk 退出打断 (还没往 console 发过凭据)"
+    return f"观察被 kiosk 退出打断, {state}, {oc.IDLE_LOGOUT}"
 
 
 def open_for(master, dev, name, vendor, ddir):

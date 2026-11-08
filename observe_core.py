@@ -19,7 +19,9 @@ sudo 的日志里. 轮询仍走 survey_core.conbroker_send (等提示符、自�
 先看现场再发 (conbroker 排队等人停手后照样写出去, 我们超时走了也收不回): 登录前读 conbroker 日志尾
 (往回找有效行, 跳过 conbroker 标记行和设备异步日志; 认不出现场就不开始),
 别人停在密码 / [Y/N] / 系统视图 / 半行命令 / 翻页上, 或 Agent 持有写租约, 一律不开始; 已经停在 <提示符> 上
-就借用这个会话. 发密码前日志尾要静止 QUIET_S 秒并且正停在 Password:.
+只从"空闲" (按任意键 / Please Press ENTER / console exit) 开始: 停在 Username: 或提示符上都可能是 telnet 到了
+别的设备, 认不出是谁的, 一律不开始, 也不借用. 唤醒后要看到新的 Username:, 而且唤醒以来的输出里不能有
+telnet / stelnet / ssh / Connected to / Trying (嵌套会话). 发密码前日志尾要静止 QUIET_S 秒并且正停在 Password:.
 
 不自动 quit (9x 定, #85): 要百分之百确认会话归属才能安全地 quit, 六轮审查都没收敛; 设备的 console 空闲超时
 (华为默认 10 分钟) 足够兜底. 退出观察只停轮询, console 留在登录状态, 界面和 cartlog 写明, 要立刻登出请人去敲 quit.
@@ -50,7 +52,7 @@ IDLE_LOGOUT = "交给设备的空闲超时登出 (华为 console 默认 10 分�
 
 
 def allowed(cmd, vendor):
-    """观察模式能发的命令: 只读白名单, 或会话命令 (关翻页 / 退出登录). 厂商得有内置只读规则."""
+    """观察模式能发的命令: 只读白名单, 或会话命令 (只有关翻页). 厂商得有内置只读规则."""
     if not isinstance(cmd, str) or vendor not in survey_core._RULES:
         return False
     return cmd in SESSION_COMMANDS or survey_core.is_readonly(cmd, vendor)
@@ -120,7 +122,8 @@ _BUSY = {"password": "有人正在登录 (停在 Password:)", "yn": "设备在�
 
 
 _SESSION_GONE = [re.compile(p) for p in (
-    IDLE_RE, r"(?i)user ?name\s*[:：]", r"(?i)password\s*[:：]", r"^\s*(<[^<>\r\n]+>)?\s*quit\s*$",
+    # 用户名 / 密码只认行尾的登录提示 (display users 输出里的 "Username : admin" 不算)
+    IDLE_RE, r"(?i)user ?name\s*[:：]\s*$", r"(?i)password\s*[:：]\s*$", r"^\s*(<[^<>\r\n]+>)?\s*quit\s*$",
     r"(?i)login authentication|the current login time|user last login|max number of vty users|console exit")]
 
 
@@ -138,6 +141,9 @@ _JOIN = re.compile(r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d 人 接入\]", re.M)
 def human_joined(text):
     """这段日志里有没有人 attach 进来过 (哪怕之后又断开了: 他可能在 Password: 上敲了不回显的键)."""
     return bool(_JOIN.search(clean(text or "")))
+
+
+NESTED_RE = re.compile(r"(?i)\b(s?telnet|ssh)\b|connected to|\btrying\b")   # 在 console 上又连去了别的设备
 
 
 def bad_credential(s):
@@ -190,43 +196,61 @@ class LogFile:
 
     def humans(self, limit=256 << 20, chunk=1 << 20):
         """现在 attach 着几个人: 从文件尾分块往回找最近一次"服务启动", 从那里往后数接入 / 断开.
-        往回读满 limit 还没找到 (又不是读到了文件头) = 不知道, None. 日志不归 logrotate 管, 会一直长."""
+        往回读满 limit 还没找到 (又不是读到了文件头) = 不知道, None. 日志不归 logrotate 管, 会一直长.
+        轮询阶段每轮都要问: 记住数到哪了 (_hcache), 下次只往回找到那里、只数新增的部分."""
         size = self.size()
         if size is None:
             return None
-        mark = "服务启动".encode()
-        pre = 21                                            # "[YYYY-MM-DD HH:MM:SS " 的长度
+        cache = getattr(self, "_hcache", None)
+        if cache and cache[0] > size:               # 文件变短了 (截断 / 轮转): 从头来
+            cache = None
         try:
             with open(self.path, "rb") as f:
-                pos, start = size, None
-                while pos > 0 and size - pos < limit and start is None:
-                    lo = max(0, pos - chunk, size - limit)
-                    rs = max(0, lo - pre - 1)                   # 往前多读一点, 标记前缀跨块也能校验
-                    f.seek(rs)
-                    buf = f.read(pos - rs + len(mark))
-                    j = len(buf)
-                    while True:
-                        i = buf.rfind(mark, 0, j)
-                        if i < 0 or rs + i < lo:                # 落在前一块的留给下一轮
-                            break
-                        if _service_start_at(buf, i, pre, at_file_start=(rs + i - pre == 0)):
-                            start = rs + i - pre
-                            break
-                        j = i                                   # 设备回显 / 命令里的"服务启动"四个字: 继续往前找
-                    pos = lo
-                if start is None:
-                    if pos > 0:
-                        return None
-                    start = 0
-                f.seek(start)
-                n = 0
-                for raw in f:                                   # 逐行数, 不把几百 MB 读进内存
+                floor = cache[0] if cache else 0
+                start, pos = self._find_start(f, size, limit, chunk, floor)
+                if start is not None:
+                    begin, n = start, 0
+                elif cache:
+                    begin, n = cache                    # 之后没有新的服务启动: 接着上次数
+                elif pos > 0:
+                    return None
+                else:
+                    begin, n = 0, 0
+                f.seek(begin)
+                at = begin
+                for raw in f:                           # 逐行数, 不把几百 MB 读进内存
+                    if not raw.endswith(b"\n"):
+                        break                           # 半行留到下次
+                    at += len(raw)
                     m = _HUMAN.match(clean(raw.decode("utf-8", "replace")).strip())
                     if m:
                         n = 0 if m.group(1) == "服务启动" else max(0, n + (1 if m.group(1) == "人 接入" else -1))
+                self._hcache = (at, n)
                 return n
         except OSError:
             return None
+
+    @staticmethod
+    def _find_start(f, size, limit, chunk, floor):
+        """在 [floor, size) 里从后往前找 conbroker 的"服务启动"标记行 -> (行首偏移 或 None, 停在哪)."""
+        mark = "服务启动".encode()
+        pre = 21                                            # "[YYYY-MM-DD HH:MM:SS " 的长度
+        pos = size
+        while pos > floor and size - pos < limit:
+            lo = max(floor, pos - chunk, size - limit)
+            rs = max(0, lo - pre - 1)                       # 往前多读一点, 标记前缀跨块也能校验
+            f.seek(rs)
+            buf = f.read(pos - rs + len(mark))
+            j = len(buf)
+            while True:
+                i = buf.rfind(mark, 0, j)
+                if i < 0 or rs + i < lo:                    # 落在前一块的留给下一轮
+                    break
+                if _service_start_at(buf, i, pre, at_file_start=(rs + i - pre == 0)):
+                    return rs + i - pre, lo
+                j = i                                       # 设备回显 / 命令里的"服务启动"四个字: 继续往前找
+            pos = lo
+        return None, pos
 
     def read_from(self, off):
         """偏移 off 之后新增的内容; 文件变短 (轮转 / 截断) 或读不了 None, 调用方按"有变化"算."""
@@ -313,11 +337,10 @@ class Login:
     """华为 console 登录. start(日志尾分类) 给第一步, 之后每拿到一次设备输出就 feed(), 直到 done / fail.
 
     老坑: quit 之后 console 停在"按任意键", 第一下按键只是唤醒. 唤醒只发一个回车 (打码; 落在已登录的提示符上
-    只会重印提示符, 唤醒出来是提示符就当借用别人的会话),
+    只会重印提示符; 唤醒出来是提示符说明不是推车的会话, 停下),
     之后只有亲眼看到 Username: 才发用户名, 看到 Password: 才发密码. 唤醒后直接是 Password: = 纯密码认证的
     console, 不支持, 停下. [Y/N] 一律 N. 认证失败不重试 (防锁账号), 看不懂的提示停下等人.
 
-    日志尾已经停在 <提示符> 上: 不唤醒, 借用这个会话 (borrowed, 只影响退出时的提示); 停在 Username: 上: 直接发用户名.
     authed: 见过登录后的提示符 (device 记下它的名字); pw_sent: 密码确实发出去了 (由调用方在 exchange 返回后置).
     """
     MAX_WAKE, MAX_ANSWER = 3, 3
@@ -325,7 +348,7 @@ class Login:
     def __init__(self, username, password, pager_off="screen-length 0 temporary"):
         self._user, self._password, self._pager_off = username, password, pager_off
         self.state, self.device = "wake", None
-        self.borrowed = self.authed = self.pw_sent = False
+        self.authed = self.pw_sent = False
         self.pager_ok = None
         self._wakes = self._answers = 0
 
@@ -334,13 +357,7 @@ class Login:
         self.state = "wake"
         return Step("send", "wake", "", secret=True)     # 单个回车: 落在已登录的提示符上只重印一行提示符
 
-    def start(self, console="idle", device=None):
-        if console == "prompt":
-            self.borrowed, self.authed, self.device = True, True, device
-            return self._pager()
-        if console == "username":
-            self.state = "user"
-            return Step("send", "user", self._user)
+    def start(self):
         return self._wake()
 
     def _stop(self, note):
@@ -362,9 +379,8 @@ class Login:
                 return Step("send", "user", self._user)
             if kind == "password":              # 回车唤醒直接到 Password: = console 只认密码 (没有 Username:)
                 return self._stop("console 用的是纯密码认证, 暂不支持; 请人登录后再观察 (会借用那个会话)")
-            if kind == "prompt":                # 唤醒出来是提示符 = 本来就登录着 (别人的会话), 借用
-                self.authed = self.borrowed = True
-                return self._pager()
+            if kind == "prompt":                # 从按任意键唤醒出来却是提示符: 现场判断错了 / 别人的会话, 不借用
+                return self._stop("唤醒出来是已登录的提示符 (不是推车登录的会话), 不借用; 请人 quit 后再观察")
             if self._wakes >= self.MAX_WAKE:
                 return self._stop(f"唤醒 {self._wakes} 次没等到 Username:, 最后一行: {last_line(output)[:40]!r}")
             return self._wake()
@@ -412,17 +428,17 @@ class Interrupted(Exception):
     """登录中途有人插话 / 被取消: 不再往下发."""
 
 
-def run_login(login, exchange, vendor, console="idle", device=None, max_steps=12):
+def run_login(login, exchange, vendor, max_steps=12):
     """驱动 Login: exchange(step) -> 设备输出. cmd 步必须过 allowed(). 返回最后的 done / fail 步, 不抛.
     不管怎么结束 (成功 / 状态机失败 / 被打断 / 发送出错 / 步数超限), 出来时密码都已从 Login 里清掉."""
     try:
-        return _drive_login(login, exchange, vendor, console, device, max_steps)
+        return _drive_login(login, exchange, vendor, max_steps)
     finally:
         login.forget()
 
 
-def _drive_login(login, exchange, vendor, console, device, max_steps):
-    step = login.start(console, device)
+def _drive_login(login, exchange, vendor, max_steps):
+    step = login.start()
     for _ in range(max_steps):
         if step.kind != "send":
             return step
@@ -704,15 +720,12 @@ class Observer:
         self.note = None
         self.ports, self.panel, self.polled_at = {}, [], None
         self.login = None
-        self.user_sent = False
+        self.user_sent = self._gone = False
+        self._login_from = None
         self._ports_id = None           # 登录后第一轮看到的物理口集合: sysname 一样的两台 (<HUAWEI>) 换了线靠它认
         self._based = False
         self._advance(None)              # 还没有基线
         self.cancelled = lambda: False
-
-    @property
-    def borrowed(self):
-        return bool(self.login and self.login.borrowed)
 
     @property
     def pager_ok(self):
@@ -800,15 +813,19 @@ class Observer:
         why = self._attached()
         if why:
             return self._refuse(f"没开始: {why}")
-        kind, name = self._scene()
+        kind, _name = self._scene()
         if kind in _BUSY:
             return self._refuse(f"没开始: {_BUSY[kind]}")
-        if kind not in ("idle", "username", "prompt"):   # 往回找也认不出现场: 不唤醒
-            return self._refuse("没开始: 看不出设备停在哪, 先在控制台按一下回车再来")
+        if kind in ("username", "prompt"):              # 可能是 telnet 到别的设备的: 认不出归属, 不碰
+            return self._refuse("没开始: console 不在空闲状态: 已登录请先 quit, 停在 Username: 请先回车放弃, "
+                                "让 console 回到\"按任意键\"再观察")
+        if kind != "idle":                              # 往回找也认不出现场: 不唤醒
+            return self._refuse("没开始: 看不出设备停在哪, console 不在空闲状态; 先在控制台上回车看看, 让它回到\"按任意键\"再来")
         self.cancelled = cancelled
+        self._login_from = self._off                    # 唤醒以来的输出都要查嵌套会话
         self.login = Login(username, password, self.profile.get("pager_off"))
         del password
-        res = run_login(self.login, functools.partial(self._guarded, cancelled), self.vendor, console=kind, device=name)
+        res = run_login(self.login, functools.partial(self._guarded, cancelled), self.vendor)
         self.device = self.login.device
         if res.kind != "done":
             note = res.note
@@ -847,6 +864,8 @@ class Observer:
             raise Interrupted("中止: 登录中途有人插话 (日志有新增)")
         if human_joined(self.log.read_from(self._off)):
             raise Interrupted("中止: 登录中途有人 attach 过这路串口 (可能在 Password: 上敲过不回显的键)")
+        if step.role != "wake" and NESTED_RE.search(device_text(self.log.read_from(self._login_from) or "")):
+            raise Interrupted("中止: 唤醒以来的输出里有 telnet / ssh / Connected to 之类, 像是嵌套到别的设备的会话")
         why = self._attached()
         if why:
             raise Interrupted(f"中止: {why}")
@@ -875,6 +894,13 @@ class Observer:
             return False
         if not self.pacer.due(now):
             return False
+        if self.log.size() is None:         # 建立基线之后读不到日志: 跳过的部分没法检查, lost
+            return self._advance(None)
+        why = self._attached()              # 有人 attach 着就一直不轮询 (conbroker 会把命令接在他的半行后面并按回车)
+        if why:
+            self.error = f"这轮没发: {why}"
+            self.pacer.poke(now)
+            return False
         t0 = self.clock()
         ok = self._poll()
         self.pacer.done(now, now + (self.clock() - t0), size=self.log.size())
@@ -882,8 +908,9 @@ class Observer:
             self.pacer.poke(now)
         return ok is True
 
-    def _lost(self, msg):
-        self.state, self.error = "lost", msg
+    def _lost(self, msg, gone=False):
+        """gone: 亲眼看到 console 回到按任意键 / Username: (推车的会话确实没了); 否则退出时照样提示可能还登录着."""
+        self.state, self.error, self._gone = "lost", msg, gone
         return False
 
     def _scene_ok(self):
@@ -895,7 +922,7 @@ class Observer:
             return "busy"
         kind, name = self._scene()
         if kind in ("idle", "username"):
-            self._lost("会话掉了 (console 回到登录提示), 需要重新登录")
+            self._lost("会话掉了 (console 回到登录提示), 需要重新登录", gone=True)
             return "lost"
         if kind is None:
             self.error = "这轮没发: 读不到 conbroker 日志"
@@ -928,10 +955,10 @@ class Observer:
                 self.error = str(e) or type(e).__name__
                 self._advance(self.log.size())          # 发没发出去都扫一遍再挪
                 return False
+            if out.startswith(_REFUSED_CRED) or classify(out) in ("username", "password", "idle"):
+                return self._lost("会话掉了 (设备回到登录提示), 需要重新登录", gone=True)
             if not self._advance(self.log.size(), out):   # 排队期间有人登出 / 登回同名设备: 基线不能越过去
                 return False
-            if out.startswith(_REFUSED_CRED) or classify(out) in ("username", "password", "idle"):
-                return self._lost("会话掉了 (设备回到登录提示), 需要重新登录")
             dev = prompt_name(last_line(out))
             if not dev:
                 self.error = f"没回提示符 (设备停在 {classify(out)})"
@@ -966,10 +993,10 @@ class Observer:
 
     def exit_note(self):
         lg = self.login
-        if not lg or self.state == "lost":          # 没登录过 / 会话已经不是推车的了: 没什么要交代的
+        if not lg or (self.state == "lost" and self._gone):   # 没登录过 / 亲眼看到 console 回到登录提示
             return None
-        if lg.borrowed:
-            return f"console 仍处于登录状态 (借用的会话, 推车没有登出), {IDLE_LOGOUT}"
+        if self.state == "lost" and (lg.authed or lg.pw_sent):
+            return f"推车登录的会话可能仍处于登录状态, {IDLE_LOGOUT}"
         if lg.authed:
             return f"console 仍处于登录状态 (推车登录的会话), {IDLE_LOGOUT}"
         if lg.pw_sent:

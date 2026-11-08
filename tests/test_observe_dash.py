@@ -247,6 +247,7 @@ class _Panel:
                 return self.v
         self.port_var, self._serves = V(dev), {"/dev/con-1": "9600", "/dev/con-2": "9600"}
         self.sock, self.alive, self.ok, self.calls = (object() if sock else None), alive, reconnect_ok, []
+        self._held = set()
 
     def winfo_exists(self):
         return self.alive
@@ -270,7 +271,8 @@ def test_console_hold_pauses_only_same_port_and_resumes_it():
 def test_console_hold_ignores_other_port_or_unconnected():
     p = _Panel(dev="/dev/con-2")
     h = op.ConsoleHold(p, "/dev/con-1")
-    assert h.pause() is False and h.resume() is None and p.calls == []
+    assert h.pause() is False and p.calls == [] and p._held == {"/dev/con-1"}   # 没断开别的口, 但照样标记占着
+    assert h.resume() is None and p.calls == [] and p._held == set()
     p = _Panel(sock=False)
     h = op.ConsoleHold(p, "/dev/con-1")
     assert h.pause() is False and p.calls == []
@@ -345,22 +347,39 @@ def test_open_for_hangs_window_on_root_not_panel(monkeypatch):
 
 def test_console_hold_marks_panel_held():
     p = _Panel()
-    p._held = None
     h = op.ConsoleHold(p, "/dev/con-1")
     h.pause()
-    assert p._held
+    assert p._held == {"/dev/con-1"}
     h.resume()
-    assert not p._held
+    assert p._held == set()
 
 
-def test_serial_panel_no_autoconnect_or_wake_while_held():
+def test_two_holds_on_one_panel_do_not_clear_each_other():
+    p = _Panel()
+    a, b = op.ConsoleHold(p, "/dev/con-1"), op.ConsoleHold(p, "/dev/con-2")
+    a.pause()
+    b.pause()
+    b.resume()
+    assert p._held == {"/dev/con-1"}
+
+
+def test_serial_panel_held_check_uses_selected_port():
     import serial_panel as sp
 
+    class V:
+        def __init__(self, v):
+            self.v = v
+
+        def get(self):
+            return self.v
+
     class P:
-        _held = "/dev/con-1"
+        _held = {"/dev/con-1"}
+        _serves = {"/dev/con-1": "9600", "/dev/con-2": "9600"}
+        port_var = V("/dev/con-1")
     assert sp.SerialPanel._auto_connect_ok(P()) is False
-    assert sp.SerialPanel._wake_ok(P(), True) is False
-    P._held = None
+    assert sp.SerialPanel._wake_ok(P(), True) is False           # 观察中途切到这一路: 不发唤醒回车
+    P.port_var = V("/dev/con-2")                                  # 别的口不受影响
     assert sp.SerialPanel._auto_connect_ok(P()) is True
     assert sp.SerialPanel._wake_ok(P(), True) is True and sp.SerialPanel._wake_ok(P(), False) is False
 
@@ -401,3 +420,135 @@ def test_shutdown_without_worker_logs_nothing(monkeypatch):
     w.worker = None
     op.ObserveWindow._shutdown(w)
     assert got == []
+
+
+
+# ---- 第七轮: 观察全程持有控制台; _work 收尾; kiosk 退出提示按阶段写
+
+def test_work_always_finishes_life_and_posts_ended(monkeypatch):
+    monkeypatch.setattr(oc, "record", lambda *a, **k: None)
+    w = _FakeWin()
+    w.life = op.Life("con-1", "t")
+    oc._CLAIMS.clear()
+    oc.claim("con-1", "t")
+    w.life.worker_started()
+    w.life.window_gone()
+
+    class Obs:
+        device = error = note = None
+        state = "polling"
+
+        def start(self, user, pw, cancelled=None):
+            return True
+
+        def tick(self, now):
+            raise RuntimeError("炸了")
+
+        def stop(self, now=None):
+            pass
+    with pytest.raises(RuntimeError):
+        op.ObserveWindow._work(w, Obs(), "admin", ["pw"])
+    assert oc.holder("con-1") is None
+    assert not w.ui.empty()
+    oc._CLAIMS.clear()
+
+
+def test_work_does_not_resume_console_after_login():
+    w = _FakeWin()
+    resumed = []
+    w._console_back = lambda: resumed.append(1)
+
+    class Obs:
+        device = error = note = None
+        state = "failed"
+
+        def start(self, user, pw, cancelled=None):
+            return True
+
+        def stop(self, now=None):
+            pass
+    import observe_core
+    orig = observe_core.record
+    observe_core.record = lambda *a, **k: None
+    try:
+        op.ObserveWindow._work(w, Obs(), "admin", ["pw"])
+    finally:
+        observe_core.record = orig
+    queued = []
+    while not w.ui.empty():
+        queued.append(w.ui.get())
+    assert w._console_back not in queued                 # 登录完不接回, 观察全程占着; _ended 时才接回
+
+
+@pytest.mark.parametrize("state,user_sent,pw_sent,want,not_want", [
+    ("polling", True, True, "推车登录", "Password:"),
+    ("idle", True, False, "Password:", None),
+    ("idle", True, True, "可能仍在登录状态", None),
+    ("idle", False, False, None, None),
+])
+def test_shutdown_note_by_phase(monkeypatch, state, user_sent, pw_sent, want, not_want):
+    import threading
+    got = []
+    monkeypatch.setattr(oc, "record", lambda action, **kw: got.append(kw.get("note")))
+    w = _FakeWin()
+
+    class Lg:
+        pass
+    lg = Lg()
+    lg.pw_sent = pw_sent
+
+    class Obs:
+        pass
+    w.obs = Obs()
+    w.obs.state, w.obs.user_sent, w.obs.login = state, user_sent, lg
+    w.worker = threading.Thread(target=lambda: w.stop_evt.wait(5), daemon=True)
+    w.worker.start()
+    op.ObserveWindow._shutdown(w, timeout=2)
+    note = got[0]
+    if want:
+        assert want in note
+    if not_want:
+        assert not_want not in note
+
+
+def test_serial_panel_connect_refused_while_observing():
+    import serial_panel as sp
+
+    class V:
+        def get(self):
+            return "/dev/con-1"
+
+    class T:
+        def __init__(self):
+            self.kw = {}
+
+        def config(self, **kw):
+            self.kw.update(kw)
+
+    class P:
+        _held = {"/dev/con-1"}
+        _serves = {"/dev/con-1": "9600"}
+        port_var = V()
+        sock = None
+
+        def __init__(self):
+            self.con_title, self.disconnects = T(), 0
+
+        def _disconnect(self):
+            self.disconnects += 1
+    p = P()
+    p._show_held = lambda: sp.SerialPanel._show_held(p)
+    sp.SerialPanel._connect(p)
+    assert p.sock is None and "观察中" in p.con_title.kw["text"]
+
+
+def test_console_hold_for_whole_observation_until_ended():
+    p = _Panel()
+    h = op.ConsoleHold(p, "/dev/con-1")
+    h.pause()
+    assert p.sock is None and p._held == {"/dev/con-1"}
+    p.port_var.v = "/dev/con-2"                  # 观察中途人切走又切回来
+    p.port_var.v = "/dev/con-1"
+    assert "/dev/con-1" in p._held               # 仍然登记着, 面板不会自动接 / 发唤醒
+    h.resume()
+    assert p.calls[-1] == ("connect", False) and p._held == set()

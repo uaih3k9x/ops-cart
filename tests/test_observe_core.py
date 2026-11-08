@@ -96,11 +96,12 @@ def test_wake_landing_on_password_means_password_only_console():
     assert st.kind == "fail" and "纯密码" in st.note
 
 
-def test_already_logged_in_skips_credentials():
+def test_wake_landing_on_prompt_refuses():
+    # 第七轮: 不再借用会话. 唤醒 (从按任意键) 出来直接是提示符 = 现场判断错了 / 别人的会话, 停下
     lg = oc.Login("admin", "s3cret")
     lg.start()
     st = lg.feed("\n<SW-TEST>")
-    assert (st.role, st.text) == ("cmd", "screen-length 0 temporary")
+    assert st.kind == "fail" and not hasattr(lg, "borrowed")
 
 
 def test_change_password_prompt_answered_no():
@@ -653,22 +654,13 @@ def test_step_has_no_force_field():
 
 # ---- 中3: 登录前看现场
 
-def test_borrowed_session_not_woken_and_not_quit():
-    dev = FakeDev(console="\nInfo: something\n<SW-TEST>")
+@pytest.mark.parametrize("console", ["\nInfo: something\n<SW-TEST>", USER, "<SW-TEST>\n" + "x" * 3 + "\n<SW-TEST>"])
+def test_start_only_from_idle(console):
+    # 第七轮: 从 Username: / 已登录的提示符开始都拒绝 (可能是 telnet 到别的设备的), 一个字节都不发
+    dev = FakeDev(console=console)
     ob = _obs(dev)
-    assert ob.start("admin", "s3cret") is True
-    assert _roles(dev) == ["cmd"] and dev.sent[0][1] == "screen-length 0 temporary"
-    assert ob.borrowed and ob.device == "SW-TEST"
-    ob.tick(100)
-    ob.stop(now=200)
-    assert "quit" not in [t for _r, t in dev.sent] and "借用" in ob.note
-
-
-def test_console_already_at_username_skips_wake():
-    dev = FakeDev(console=USER)
-    ob = _obs(dev)
-    assert ob.start("admin", "s3cret") is True
-    assert _roles(dev)[:2] == ["user", "pass"]
+    assert ob.start("admin", "s3cret") is False and dev.sent == []
+    assert "空闲" in ob.error
 
 
 @pytest.mark.parametrize("console", [
@@ -994,11 +986,7 @@ def test_wake_is_bare_return():
     assert st.role == "wake" and st.text == ""
 
 
-def test_wake_landing_on_prompt_is_borrowed():
-    lg = oc.Login("admin", "s3cret")
-    lg.start()
-    st = lg.feed("\n<SW-TEST>")
-    assert st.role == "cmd" and lg.borrowed
+
 
 
 @pytest.mark.parametrize("line", [ASYNC, ASYNC8, "#" + ASYNC])
@@ -1008,15 +996,10 @@ def test_effective_line_skips_async_log_and_marks(line):
     assert oc.classify(text) == "prompt"
 
 
-def test_async_log_after_prompt_borrows_without_wake_and_no_quit():
+def test_async_log_after_prompt_still_not_idle_refuses():
     dev = FakeDev(console="<SW-TEST>\n" + ASYNC + "\n")
-    dev.script["wake"] = "Error: Unrecognized command\n<SW-TEST>"
     ob = _obs(dev)
-    assert ob.start("admin", "s3cret") is True
-    assert "wake" not in _roles(dev) and ob.borrowed
-    ob.tick(100)
-    ob.stop(now=200)
-    assert "借用" in ob.note and "quit" not in [t for _r, t in dev.sent]
+    assert ob.start("admin", "s3cret") is False and dev.sent == []
 
 
 def test_async_log_after_sysview_refuses():
@@ -1663,7 +1646,7 @@ def test_humans_reads_back_until_service_start(tmp_path):
         f.write(b"<SW-TEST>\n")
     lf = oc.LogFile(str(p))
     assert lf.humans(limit=64 << 20, chunk=1 << 20) == 1
-    assert lf.humans(limit=1 << 20, chunk=1 << 18) is None             # 上限内没读到服务启动
+    assert oc.LogFile(str(p)).humans(limit=1 << 20, chunk=1 << 18) is None   # 新实例 (没缓存): 上限内没读到服务启动
 
 
 # ============================================================ 第六轮复审 (不涉及自动 quit 的部分)
@@ -1804,9 +1787,7 @@ def test_no_quit_literal_in_observe_modules():
 
 def _scenario(name):
     dev = FakeDev()
-    if name == "borrowed":
-        dev.console = "\n<SW-TEST>"
-    elif name == "half_output_after_password":
+    if name == "half_output_after_password":
         dev.script["pass"] = "\n"
     elif name == "exchange_error_after_password":
         def boom(d):
@@ -1827,7 +1808,7 @@ def _scenario(name):
     return dev, ob
 
 
-@pytest.mark.parametrize("name", ["normal", "borrowed", "half_output_after_password", "exchange_error_after_password",
+@pytest.mark.parametrize("name", ["normal", "half_output_after_password", "exchange_error_after_password",
                                   "auth_failed", "lost", "takeover"])
 def test_stop_never_sends_anything(name):
     dev, ob = _scenario(name)
@@ -1839,8 +1820,8 @@ def test_stop_never_sends_anything(name):
 
 
 @pytest.mark.parametrize("name,want", [
-    ("normal", "推车登录"), ("borrowed", "借用"), ("half_output_after_password", "密码可能已发出"),
-    ("exchange_error_after_password", "推车登录"), ("lost", None), ("takeover", None),
+    ("normal", "推车登录"), ("half_output_after_password", "密码可能已发出"),
+    ("exchange_error_after_password", "推车登录"), ("lost", None), ("takeover", "可能仍处于登录状态"),
 ])
 def test_exit_note_says_what_console_is_left_in(name, want):
     _dev, ob = _scenario(name)
@@ -1849,3 +1830,120 @@ def test_exit_note_says_what_console_is_left_in(name, want):
         assert ob.note is None
     else:
         assert want in ob.note and "空闲超时" in ob.note and "quit" in ob.note
+
+
+
+# ============================================================ 第七轮复审
+
+TEL_USER = ("\n<SW-TEST>telnet 192.0.2.2\n  Trying 192.0.2.2 ...\n  Press CTRL+K to abort\n  Connected to 192.0.2.2 ...\n"
+            "\nLogin authentication\n\nUsername:")
+TEL_PROMPT = "\n<SW-TEST>telnet 192.0.2.2\n  Connected to 192.0.2.2 ...\n<CORE-1>"
+
+
+@pytest.mark.parametrize("console", [TEL_USER, TEL_PROMPT])
+def test_nested_telnet_sessions_refused(console):
+    dev = FakeDev(console=console)
+    dev.script["pass"] = "\nInfo: The max number of VTY users is 5\n<CORE-1>"
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False and dev.sent == []
+
+
+@pytest.mark.parametrize("line", ["  Trying 192.0.2.2 ...", "  Connected to 192.0.2.2 ...", "<SW-TEST>stelnet 192.0.2.2",
+                                  "<SW-TEST>ssh client first-time enable"])
+def test_wake_output_with_nested_session_signs_aborts(line):
+    dev = FakeDev()
+    dev.script["wake"] = "\n" + line + "\n" + USER
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert _roles(dev) == ["wake"] and "嵌套" in ob.error
+
+
+# ---- 中2: lost 之后照样提示可能还登录着; display users 不误判
+
+def test_lost_by_port_change_still_notes_logged_in():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    dev.brief = dev.brief.replace("GigabitEthernet0/0/6", "GigabitEthernet0/0/66")
+    ob.tick(200)
+    assert ob.state == "lost"
+    ob.stop(now=300)
+    assert ob.note and "可能仍处于登录状态" in ob.note
+
+
+def test_lost_by_unreadable_log_still_notes_logged_in():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.tick(100)
+    dev.unreadable = True
+    ob.tick(200)
+    dev.unreadable = False
+    ob.stop(now=300)
+    assert ob.state == "lost" and ob.note and "可能仍处于登录状态" in ob.note
+
+
+def test_lost_back_at_login_prompt_no_note():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    dev.console += IDLE
+    ob.tick(100)
+    ob.stop(now=200)
+    assert ob.state == "lost" and ob.note is None
+
+
+DISPLAY_USERS = ("<SW-TEST>display users\n  User-Intf    Delay    Type   Network Address     AuthenStatus    AuthorcmdFlag\n"
+                 "+ 0   CON 0   00:00:00                                  pass           no\n  Username : admin\n\n<SW-TEST>")
+
+
+def test_display_users_output_not_session_change():
+    assert oc.session_changed(DISPLAY_USERS) is False
+    assert oc.session_changed("\nUsername:") is True and oc.session_changed("\nUsername : ") is True
+
+
+# ---- 中3: 有人 attach 着就一直不轮询, 断开后才恢复
+
+def test_no_poll_while_human_attached_until_detached():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    assert ob.tick(100) is True
+    n = len(dev.polls)
+    dev.console += HUMAN_IN
+    for t in (200, 300, 400, 500):
+        assert ob.tick(t) is False
+    assert len(dev.polls) == n and ob.state == "polling" and "attach" in ob.error
+    dev.console += HUMAN_OUT
+    ob.tick(600)
+    assert ob.tick(700) is True
+
+
+def test_human_attached_counts_cached_incrementally(tmp_path):
+    p = tmp_path / "con-1.log"
+    p.write_bytes(SVC.encode() + HUMAN_IN.encode())
+    lf = oc.LogFile(str(p))
+    assert lf.humans() == 1
+    with open(p, "ab") as f:
+        f.write(HUMAN_OUT.encode())
+    assert lf.humans() == 0
+    with open(p, "ab") as f:
+        f.write(SVC.encode() + HUMAN_IN.encode() + HUMAN_IN.encode())
+    assert lf.humans() == 2
+
+
+# ---- 存疑: 日志被截短 (copytruncate) 一律 lost
+
+def test_log_truncated_below_baseline_is_lost(tmp_path):
+    p = tmp_path / "con-1.log"
+    p.write_bytes(b"x" * 100 + IDLE.encode())
+    lf = oc.LogFile(str(p))
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    ob.log = lf
+    ob._advance(lf.size())
+    p.write_bytes(b"<SW-TEST>")                 # 被截短
+    ob.tick(100)
+    assert ob.state == "lost"
