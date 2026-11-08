@@ -15,6 +15,7 @@ import tkinter as tk
 from subprocess import DEVNULL, Popen       # 只给 mpv 用
 from tkinter import messagebox, simpledialog
 
+import bigfish_core as bfc
 import cartlog
 import clone_core as cc
 import confirm_core as cfc
@@ -35,6 +36,7 @@ from ks_panel import KsPanel
 from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
+from bigfish_panel import BigfishPanel
 from confirm_panel import ConfirmDialog, KvmDialog
 from pxe_req_panel import PxeRequestDialog
 import theme as th
@@ -94,6 +96,7 @@ class Kiosk(tk.Tk):
         # Agent PXE 解锁申请 (#24): 采样线程 peek 来的视图 (带确认码), 申请框, 弹过的编号 (人关掉了不再弹)
         self._pxe_view, self._pxe_req_win, self._pxe_seen, self._pxe_store = None, None, set(), mcp_pxe.Store()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
+        self._bf_watch, self._bf_note = None, ""   # 大肥鱼急停 (#53): 等它确认的看门, 面板上的一句进展
 
         kc.kp_enter_as_return(self)
         kui.kp_digits_as_digits(self)
@@ -560,9 +563,14 @@ class Kiosk(tk.Tk):
         """确认框和全部急停的按钮: 先按最近的视图看一眼 (不行就说为什么), 再到后台经 Store 执行.
         车机进程就是本机人, 确认 / 解除在这里允许; 确认会等到 conbroker 发完, 所以一定在后台."""
         why = cfc.check(self._sw_view if self._sw_view is not None else cfc.stopped_view(), op, arg)
+        if why and op == "resume" and arg is None and bfc.estop_active():
+            self._bigfish_resume()          # 串口那边已经没急停, 只剩大肥鱼的 estop.json (#97 审查中1): 同一道门放行
+            return
         if why:
             self._serial_say(why, ok=False)
             return
+        if op == "estop" and arg is None:   # 全部急停也停大肥鱼 (#53); 不等串口那边, 也不受它忙不忙影响
+            self._bigfish_ctl("estop")
         store = self._sw_store
 
         def work():
@@ -572,6 +580,8 @@ class Kiosk(tk.Tk):
         def done(res):
             ok = not isinstance(res, Exception)
             self._serial_say(str(res) if ok else f"不行: {res}", ok)
+            if ok and op == "resume" and arg is None:
+                self._bigfish_ctl("resume")
         if not self.ui.run_bg(work, done, key="serial-write"):
             self._serial_say("上一个操作还在处理中…", ok=False)
             return
@@ -615,6 +625,93 @@ class Kiosk(tk.Tk):
             self._kvm_say("上一个操作还在处理中…", ok=False)
             return
         self._kvm_say("处理中…")
+
+    # ------------------------------------------------------------ 大肥鱼面板 (#53): 不另起审批, 用现有确认框和急停
+
+    def _agent_states(self):
+        """(串口每槽位状态, 键鼠摘要); 还没采到串口按全部急停, 没采到键鼠 None."""
+        sw_view = self._sw_view if self._sw_view is not None else cfc.stopped_view()
+        return cfc.slot_states(sw_view), cfc.kvm_summary(self._kvm_view) if self._kvm_view is not None else None
+
+    def _bigfish_pending(self):
+        return bfc.pending_count(*self._agent_states())
+
+    def _bigfish_confirm(self):
+        target = bfc.pending_target(*self._agent_states())
+        if target is None:
+            self.banner.config(text="没有待确认的")
+        elif target[0] == "serial":
+            self._open_confirm(target[1])
+        else:
+            self._open_kvm()
+
+    def _bigfish_estop(self):
+        """就是执行器条上的"Agent 全部急停" (写大肥鱼急停信号挂在它上面)."""
+        self._serial_action("estop", None)
+
+    def _bigfish_resume_ok(self):
+        """解除大肥鱼急停的门 (#97 L1/L2): 设了 PIN 验 PIN; 没设 PIN 也要人点一次"是"."""
+        if self.gate.required:
+            return self._confirm_pin("解除大肥鱼急停")
+        return messagebox.askyesno("解除大肥鱼急停", "删掉大肥鱼的急停信号, 让它重新接任务?", parent=self)
+
+    def _bigfish_resume(self):
+        """面板上的"解除大肥鱼急停"和只剩 estop.json 时的"解除全部急停": 过门后只删 estop.json, 不动串口."""
+        if not self._bigfish_resume_ok():
+            return
+        self._bigfish_ctl("resume")
+        self._serial_say("已解除大肥鱼急停")
+
+    def _bigfish_ctl(self, op):
+        """全部急停 -> 写 estop.json 并看它 10 秒内确认没有; 通道不在 / 写不了直接硬停. 解除全部急停 -> 删掉."""
+        if op == "resume":
+            self._bf_watch, self._bf_note = None, ""
+            try:
+                bfc.estop_clear()
+            except OSError as e:
+                self.banner.config(text=f"大肥鱼急停文件删不掉: {e}")
+            return
+        now = time.time()
+        if not bfc.channel_ready():
+            self._bf_watch = None
+            self._bigfish_hard("急停通道未就绪")
+            return
+        try:
+            seq = bfc.estop_write(now)
+        except OSError as e:
+            self._bf_watch = None
+            self._bigfish_hard(f"写不了急停文件: {e}")
+            return
+        self._bf_watch, self._bf_note = bfc.EstopWatch(now, seq=seq), "等大肥鱼确认急停…"
+        self.after(1000, self._bigfish_watch_tick)
+
+    def _bigfish_watch_tick(self):
+        w = self._bf_watch
+        if w is None:
+            return
+        now = time.time()
+        r = w.step(now, bfc.load(now))
+        if r == "seen":
+            self._bf_watch, self._bf_note = None, "大肥鱼已急停"
+        elif r == "hard":
+            self._bf_watch = None
+            self._bigfish_hard(f"{bfc.HARD_AFTER_S} 秒内没确认急停")
+        else:
+            self.after(1000, self._bigfish_watch_tick)
+
+    def _bigfish_hard(self, why):
+        """硬急停在后台跑 (systemctl stop 可能要等几秒); 恢复不归车机管."""
+        self._bf_note = "正在硬停…"
+
+        def work():
+            return bfc.hard_stop(lambda cmd: kc.run(cmd, timeout=30), bfc.bigfish_uid(), why)
+
+        def done(res):
+            ok = not isinstance(res, Exception) and res[0]
+            self._bf_note = "已硬停，需人工恢复" if ok else f"硬停失败: {res if isinstance(res, Exception) else res[1]}"
+            self.banner.config(text=f"大肥鱼{self._bf_note} ({why})")
+        if not self.ui.run_bg(work, done, key="bigfish-hard"):
+            self._bf_note = "硬停已在进行"
 
     # ------------------------------------------------------------ Agent PXE 解锁申请 (#24)
 
@@ -736,7 +833,11 @@ class Kiosk(tk.Tk):
             return
         try:
             # 串口面板: 打开时就指定要选的那一路, 列表回来后落位 (issue #5); 网口模式面板: 选中那个口 (#12)
-            if select and name in ("serial", "netmode"):
+            if name == "bigfish":           # #53: 确认 / 拒绝 / 急停都走现有入口
+                w = BigfishPanel(self.body, pending=self._bigfish_pending, on_confirm=self._bigfish_confirm,
+                                 on_estop=self._bigfish_estop, note=lambda: self._bf_note,
+                                 on_resume=self._bigfish_resume)
+            elif select and name in ("serial", "netmode"):
                 w = PANE_CLASSES[name](self.body, want=select)
             else:
                 w = PANE_CLASSES[name](self.body)
@@ -1230,6 +1331,9 @@ class Kiosk(tk.Tk):
         self._lock_ups = tk.Label(w, text=uc.label(self._ups), font=FONT, bg=th.BG,
                                   fg=self._ups_fg(uc.health(self._ups)))
         self._lock_ups.place(relx=0.985, rely=0.065, anchor="ne")
+        # 右上角第三行: 大肥鱼一行 (#53), 只有枚举出来的字, 不显示它说的话
+        self._lock_bigfish = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.DIM)
+        self._lock_bigfish.place(relx=0.985, rely=0.11, anchor="ne")
         # 底部一行: 昨夜整理 (cart_dream.py) 的标题
         self._lock_dream = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.FAINT)
         self._lock_dream.place(relx=0.5, rely=0.97, anchor="s")
@@ -1272,6 +1376,7 @@ class Kiosk(tk.Tk):
         if text != self._lock_notice.cget("text"):     # 字号自适应: 时钟和 PIN 之间那块塞满
             px = kc.notice_font_px(text, self.winfo_screenwidth() * 0.9, self.winfo_screenheight() * 0.36)
             self._lock_notice.config(text=text, font=th.font(-px, bold=True))
+        self._lock_bigfish.config(text=bfc.lock_line(bfc.load(time.time())))
         dream = kc.dream_line()
         if dream != self._lock_dream.cget("text"):
             self._lock_dream.config(text=dream)

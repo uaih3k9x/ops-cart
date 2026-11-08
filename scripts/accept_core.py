@@ -250,7 +250,7 @@ def _not_stdlib(names):
 
 # ---- 以下常量由 `python3 scripts/cart_accept.py --print-manifest` 生成, 测试比对仓库 ----
 REQUIRED_PY = (
-    "atomicfile", "ble_input", "ble_input_core", "cart_dream", "cart_label", "cart_mcp",
+    "atomicfile", "bigfish_core", "bigfish_panel", "ble_input", "ble_input_core", "cart_dream", "cart_label", "cart_mcp",
     "cart_ocr", "cart_snap", "cartlog", "ch9329", "clone_core", "confirm_core",
     "confirm_panel", "dash_core", "dash_render", "dash_service", "hidpdc", "httpserve",
     "ime_core", "ime_proc", "ime_rime", "ime_tk", "ime_worker", "kiosk",

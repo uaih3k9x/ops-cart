@@ -249,7 +249,7 @@ def test_leftpane_close_and_unknown():
 
 
 def test_panes_include_preview():
-    assert {"preview", "serial", "ks", "wifi", "netmode", "wol"} == set(ui.PANES)
+    assert {"preview", "serial", "ks", "wifi", "netmode", "wol", "bigfish"} == set(ui.PANES)
 
 
 # ------------------------------------------------------------ B4 菜单
