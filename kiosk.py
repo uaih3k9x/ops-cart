@@ -114,7 +114,7 @@ class Kiosk(tk.Tk):
         self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
         self.after(50, self._boot_selftest)
         self._last_input = time.time()
-        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
+        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>", "<<OpsCartImeInput>>"):   # 最后一个: 中文输入吃掉的键 (#54)
             self.bind_all(seq, self._note_input, add="+")
         # 透传的键盘走全局: Tk 把按键投给有焦点的窗口, 不是嵌着 mpv 的那个 Frame
         self.bind_all("<KeyPress>", lambda e: self.passthrough and self._on_key(e, True), add="+")
@@ -1239,6 +1239,7 @@ class Kiosk(tk.Tk):
         e = tk.Entry(box, textvariable=self._pin_var, show="*", font=th.font(22, mono=True),
                      width=14, justify="center", bg=th.BG, fg=th.FG,
                      insertbackground=th.FG, **th.SUNKEN)
+        e.no_ime = True                     # 要人亲手敲, 不接中文输入 (中文输入的 NO_IME 约定)
         e.pack(ipady=8)
         e.bind("<Return>", lambda _e: self._try_unlock())
         self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg=th.BG, fg=th.DIM)
@@ -1434,8 +1435,10 @@ class Kiosk(tk.Tk):
             lb.selection_set(0)
         lb.pack(fill="x", padx=24)
         mac_var = tk.StringVar()
-        tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg=th.BG, fg=th.FG,
-                 insertbackground=th.FG, **th.SUNKEN).pack(fill="x", padx=24, pady=(6, 6), ipady=4)
+        mac_e = tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg=th.BG, fg=th.FG,
+                         insertbackground=th.FG, **th.SUNKEN)
+        mac_e.no_ime = True
+        mac_e.pack(fill="x", padx=24, pady=(6, 6), ipady=4)
         # 克隆用途: 这一批放不放行的清单 (#18). 人看的就是要写的: 解锁时 pxe_arm 重算, digest 不同就拒绝
         plan_lb = tk.Listbox(w, font=FONT_MONO, height=4, bg=th.BG, fg=th.WARN, **th.SUNKEN,
                              exportselection=False)
@@ -1466,6 +1469,7 @@ class Kiosk(tk.Tk):
         code_var = tk.StringVar()
         e = tk.Entry(w, textvariable=code_var, font=th.font(22, mono=True), width=10,
                      justify="center", bg=th.BG, fg=th.FG, insertbackground=th.FG, **th.SUNKEN)
+        e.no_ime = True
         e.pack(pady=8, ipady=6)
         msg = tk.Label(w, text="", font=FONT, bg=th.PANEL, fg=th.BAD)
         msg.pack()
