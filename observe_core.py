@@ -129,6 +129,19 @@ def session_changed(text):
 _HUMAN = re.compile(r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d (服务启动|人 接入|人 断开)")
 
 
+_JOIN = re.compile(r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d 人 接入\]", re.M)
+
+
+def human_joined(text):
+    """这段日志里有没有人 attach 进来过 (哪怕之后又断开了: 他可能在 Password: 上敲了不回显的键)."""
+    return bool(_JOIN.search(clean(text or "")))
+
+
+def bad_credential(s):
+    """用户名 / 密码里带控制字符 (回车换行、\\x00-\\x1f、DEL) 就不收: 会被设备当成按键."""
+    return any(ord(c) < 0x20 or ord(c) == 0x7f for c in s or "")
+
+
 def humans_attached(text):
     """conbroker 日志 (从某次服务启动之后) 里现在 attach 着几个人: 接入 - 断开; 服务启动清零."""
     n = 0
@@ -150,6 +163,16 @@ def read_tail(path, n=4096):
         return None
 
 
+_START_PREFIX = re.compile(rb"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ")
+
+
+def _service_start_at(buf, i, pre, at_file_start):
+    """buf[i:] 的"服务启动"是不是 conbroker 自己的标记行: 前面紧挨着 "[时间 ", 再往前是行首."""
+    if i < pre or not _START_PREFIX.fullmatch(buf[i - pre:i]):
+        return False
+    return at_file_start or buf[i - pre - 1:i - pre] in (b"\n", b"\r")
+
+
 class LogFile:
     """conbroker 的日志文件. 判断"有没有人插话"按字节偏移只读新增部分 (尾巴滑动窗口的第一行会被截半, 不能整段比)."""
 
@@ -169,17 +192,24 @@ class LogFile:
         if size is None:
             return None
         mark = "服务启动".encode()
+        pre = 21                                            # "[YYYY-MM-DD HH:MM:SS " 的长度
         try:
             with open(self.path, "rb") as f:
                 pos, start = size, None
-                while pos > 0 and size - pos < limit:
+                while pos > 0 and size - pos < limit and start is None:
                     lo = max(0, pos - chunk, size - limit)
-                    f.seek(lo)
-                    buf = f.read(pos - lo + len(mark))         # 多读一点, 跨块的标记也能找到
-                    i = buf.rfind(mark)
-                    if i >= 0:
-                        start = buf.rfind(b"\n", 0, i) + 1 + lo
-                        break
+                    rs = max(0, lo - pre - 1)                   # 往前多读一点, 标记前缀跨块也能校验
+                    f.seek(rs)
+                    buf = f.read(pos - rs + len(mark))
+                    j = len(buf)
+                    while True:
+                        i = buf.rfind(mark, 0, j)
+                        if i < 0 or rs + i < lo:                # 落在前一块的留给下一轮
+                            break
+                        if _service_start_at(buf, i, pre, at_file_start=(rs + i - pre == 0)):
+                            start = rs + i - pre
+                            break
+                        j = i                                   # 设备回显 / 命令里的"服务启动"四个字: 继续往前找
                     pos = lo
                 if start is None:
                     if pos > 0:
@@ -673,6 +703,7 @@ class Observer:
         self.login = None
         self.user_sent = False
         self._ports_id = None           # 登录后第一轮看到的物理口集合: sysname 一样的两台 (<HUAWEI>) 换了线靠它认
+        self._based = False
         self._advance(None)              # 还没有基线
         self.cancelled = lambda: False
 
@@ -699,14 +730,17 @@ class Observer:
         有登出 / 重新登录的迹象, 或日志读不了, 就判 lost 不挪 (会话可能已经不是我们的了, 退出不 quit).
         scan=False 只给登录阶段的 _checkpoint 用: 那段里本来就有我们自己引出来的 Username: / Password:,
         而登录每一步发之前已经要求"没有新增有效内容 + 现场正是期望状态", 比扫更严."""
-        old = getattr(self, "_off", None)
-        if scan and old is not None:
+        old = self._off if self._based else None
+        if self._based and to is None:          # 建立基线之后再读不到大小: 不挪, 一律 lost
+            return self._lost("读不到 conbroker 日志, 跳过的部分没法检查, 停止轮询, 退出时不 quit")
+        if scan and self._based:
             new = self.log.read_from(old)
             if new is None or to is None or session_changed(new) or session_changed(out or ""):
                 return self._lost("会话可能已经不是我们的了 (日志里有登出 / 重新登录, 或读不了), 停止轮询, 退出时不 quit")
         elif scan and session_changed(out or ""):
             return self._lost("会话可能已经不是我们的了 (输出里有登出 / 重新登录), 停止轮询, 退出时不 quit")
         self._off = to
+        self._based = to is not None
         return True
 
     def _checkpoint(self, span=0.5, step=0.1, cap=3.0):
@@ -717,6 +751,11 @@ class Observer:
             waited += step
             cur = self.log.size()
             still, last = (still + step, cur) if cur == last else (0.0, cur)
+        new = self.log.read_from(self._off) if last is not None else None
+        if new is None:
+            raise Interrupted("中止: 读不到 conbroker 日志, 登录停在这里")
+        if human_joined(new):
+            raise Interrupted("中止: 登录中途有人 attach 过这路串口")
         self._advance(last, scan=False)
 
     def _quiet(self):
@@ -803,6 +842,8 @@ class Observer:
             raise Interrupted("中止: 发密码前有人插话 (日志有新增), 密码没发")
         if self._interjected():
             raise Interrupted("中止: 登录中途有人插话 (日志有新增)")
+        if human_joined(self.log.read_from(self._off)):
+            raise Interrupted("中止: 登录中途有人 attach 过这路串口 (可能在 Password: 上敲过不回显的键)")
         why = self._attached()
         if why:
             raise Interrupted(f"中止: {why}")

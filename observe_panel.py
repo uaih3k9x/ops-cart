@@ -69,6 +69,7 @@ class ConsoleHold:
         if match_service(dev, p._serves) != self.name:
             return False
         self.dev = dev
+        p._held = self.name                 # 面板这期间不自动接回、不发唤醒回车
         p._disconnect()
         return True
 
@@ -76,6 +77,8 @@ class ConsoleHold:
         """接回; 接不回返回给人看的一句."""
         dev, self.dev = self.dev, None
         p = self.panel
+        if dev is not None and p is not None:
+            p._held = None
         if dev is None or not _alive(p) or p.port_var.get() != dev or p.sock:
             return None
         try:
@@ -207,6 +210,9 @@ class ObserveWindow(tk.Toplevel):
     def login(self):
         user, pw = self.user_var.get().strip(), self.pass_var.get()
         self.pass_var.set("")                       # 读完就清
+        if oc.bad_credential(user) or oc.bad_credential(pw):
+            self.status.config(text="用户名或密码里有控制字符 (回车 / 换行等), 请重新输入", fg=th.WARN)
+            return
         if self.worker or not user or not pw:
             return
         if not login_slot(self.token):

@@ -339,3 +339,27 @@ def test_open_for_hangs_window_on_root_not_panel(monkeypatch):
     op.open_for(p, "/dev/con-1", "/dev/con-1", "huawei", "/x")
     assert made["master"] is root and made["panel"] is p
     oc._CLAIMS.clear()
+
+
+# ---- 第六轮 低7: 借走控制台期间, 串口面板不许自动接回 / 发唤醒回车
+
+def test_console_hold_marks_panel_held():
+    p = _Panel()
+    p._held = None
+    h = op.ConsoleHold(p, "/dev/con-1")
+    h.pause()
+    assert p._held
+    h.resume()
+    assert not p._held
+
+
+def test_serial_panel_no_autoconnect_or_wake_while_held():
+    import serial_panel as sp
+
+    class P:
+        _held = "/dev/con-1"
+    assert sp.SerialPanel._auto_connect_ok(P()) is False
+    assert sp.SerialPanel._wake_ok(P(), True) is False
+    P._held = None
+    assert sp.SerialPanel._auto_connect_ok(P()) is True
+    assert sp.SerialPanel._wake_ok(P(), True) is True and sp.SerialPanel._wake_ok(P(), False) is False

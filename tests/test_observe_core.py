@@ -1617,23 +1617,53 @@ def test_port_set_change_marks_lost():
 
 # ============================================================ 第五轮复审
 
-def test_baseline_only_moved_in_advance():
-    """结构约束: 基线 (_off) 只许在 _advance 里赋值 —— 挪之前必须先扫跳过的日志."""
+def _off_writes(tree):
+    """(所在函数, 写法) : 赋值 / 增量 / 删除 ._off, setattr / delattr(.., "_off"), __dict__ 访问, "_off" 字符串."""
     import ast
-    src = open(oc.__file__, encoding="utf-8").read()
-    tree = ast.parse(src)
-    owners = []
-    for fn in ast.walk(tree):
-        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for n in ast.walk(fn):
-                targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
-                for t in targets:
-                    for e in ast.walk(t):
-                        if isinstance(e, ast.Attribute) and e.attr == "_off":
-                            owners.append(fn.name)
-    total = sum(1 for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "_off"
-                and isinstance(getattr(n, "ctx", None), ast.Store))
-    assert owners and set(owners) == {"_advance"} and total == len(owners)
+    hits = []
+
+    def scan(node, fn):
+        for n in ast.iter_child_nodes(node):
+            name = n.name if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+            if isinstance(n, ast.Attribute) and n.attr == "_off" and isinstance(n.ctx, (ast.Store, ast.Del)):
+                hits.append((name, type(n.ctx).__name__))
+            if isinstance(n, ast.Attribute) and n.attr == "__dict__":
+                hits.append((name, "__dict__"))
+            if isinstance(n, ast.Constant) and n.value == "_off":
+                hits.append((name, "字符串"))
+            scan(n, name)
+    scan(tree, None)
+    return hits
+
+
+def test_baseline_only_moved_in_advance():
+    """结构约束: 基线 (_off) 只许在 _advance 里赋值 —— 挪之前必须先扫跳过的日志.
+    setattr / delattr / __dict__ / del / "_off" 字符串这些绕法也挡住."""
+    import ast
+    hits = _off_writes(ast.parse(open(oc.__file__, encoding="utf-8").read()))
+    assert hits and all(h == ("_advance", "Store") for h in hits), hits
+
+
+def test_no_other_module_writes_observer_baseline():
+    import ast
+    import glob
+    root = os.path.dirname(oc.__file__)
+    files = glob.glob(os.path.join(root, "*.py")) + glob.glob(os.path.join(root, "scripts", "*.py"))
+    for f in files:
+        if os.path.basename(f) == "observe_core.py":
+            continue
+        hits = [h for h in _off_writes(ast.parse(open(f, encoding="utf-8").read())) if h[1] != "__dict__"]
+        assert not hits, (f, hits)
+
+
+def test_off_write_scanner_catches_tricks():
+    import ast
+    src = ("def f(o):\n    o._off = 1\n"
+           "def g(o):\n    setattr(o, '_off', 1)\n"
+           "def h(o):\n    o.__dict__['x'] = 1\n"
+           "def k(o):\n    del o._off\n")
+    kinds = {k for _f, k in _off_writes(ast.parse(src))}
+    assert kinds == {"Store", "字符串", "__dict__", "Del"}
 
 
 TAKEOVER = ("\n[2026-11-07 10:01:00 人 接入]\n<SW-TEST>quit\n  Configuration console exit, please press any key to log on\n"
@@ -1719,3 +1749,123 @@ def test_humans_reads_back_until_service_start(tmp_path):
     lf = oc.LogFile(str(p))
     assert lf.humans(limit=64 << 20, chunk=1 << 20) == 1
     assert lf.humans(limit=1 << 20, chunk=1 << 18) is None             # 上限内没读到服务启动
+
+
+# ============================================================ 第六轮复审 (不涉及自动 quit 的部分)
+
+# ---- 中2: 登录阶段跳过的日志里出现过"人 接入"就中止 (哪怕检查那一刻已经断开)
+
+def test_attach_flash_during_password_quiet_aborts():
+    dev = FakeDev()
+
+    def flash(d):
+        if "user" in _roles(d) and not getattr(d, "_done", False):
+            d._done = True
+            d.console += HUMAN_IN + HUMAN_OUT
+    dev.on_sleep = flash
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert "pass" not in _roles(dev) and "attach" in ob.error
+
+
+def test_attach_flash_inside_checkpoint_aborts():
+    dev = FakeDev()
+
+    def nap(d):                             # 用户名那步刚发完、等日志静止的时候, 有人接入又断开
+        if _roles(d)[-1:] == ["user"] and not getattr(d, "_done", False):
+            d._done = True
+            d.console += HUMAN_IN + HUMAN_OUT
+    dev.on_nap = nap
+    ob = _obs(dev)
+    assert ob.start("admin", "s3cret") is False
+    assert "pass" not in _roles(dev) and "attach" in ob.error
+
+
+def test_attach_marks_from_claude_do_not_abort():
+    dev = FakeDev()                          # FakeDev 每步都写 "Claude 接入 / 断开"
+    assert _obs(dev).start("admin", "s3cret") is True
+
+
+# ---- 中1 (部分): 读不到日志大小时不挪基线; 建立基线之后再遇到 None 一律 lost
+
+def test_checkpoint_unreadable_size_aborts_without_moving_baseline():
+    dev = FakeDev()
+    orig = dev.size
+    st = {"bad": False}
+
+    def size():
+        return None if st["bad"] else orig()
+    dev.size = size
+
+    def nap(d):
+        if _roles(d)[-1:] == ["user"]:
+            st["bad"] = True
+    dev.on_nap = nap
+    ob = _obs(dev)
+    off_before = []
+    real = ob._advance
+
+    def spy(to, *a, **k):
+        off_before.append(to)
+        return real(to, *a, **k)
+    ob._advance = spy
+    assert ob.start("admin", "s3cret") is False
+    assert None not in off_before[1:] and "pass" not in _roles(dev)
+
+
+def test_advance_to_none_after_baseline_is_lost():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    assert ob._advance(None) is False and ob.state == "lost"
+    assert ob._off is not None
+
+
+def test_poll_with_unreadable_size_is_lost_not_rebased():
+    dev = FakeDev()
+    ob = _obs(dev)
+    ob.start("admin", "s3cret")
+    off = ob._off
+    orig = dev.size
+    dev.size = lambda: None
+    ob.tick(100)
+    dev.size = orig
+    assert ob._off == off and ob.state == "lost"
+
+
+# ---- 低5: humans() 只认 conbroker 自己的"服务启动"标记行
+
+def _logf(tmp_path, data):
+    p = tmp_path / "con-1.log"
+    p.write_bytes(data)
+    return oc.LogFile(str(p))
+
+
+M = staticmethod(lambda t: f"\r\n[2026-11-07 10:00:00 {t}]\r\n".encode()).__func__
+
+
+def test_humans_ignores_echoed_service_start_text(tmp_path):
+    data = (M("服务启动 loop:// 9600") + M("人 接入")
+            + "<SW>display current | include 服务启动\r\n<SW>\r\n".encode())
+    assert _logf(tmp_path, data).humans() == 1
+    assert _logf(tmp_path, data).humans(chunk=7) == 1
+
+
+def test_humans_fake_mark_mid_line_not_taken(tmp_path):
+    data = M("服务启动 x") + M("人 接入") + "abc[2026-11-07 10:00:00 服务启动 y]\r\n".encode()
+    assert _logf(tmp_path, data).humans(chunk=9) == 1
+
+
+@pytest.mark.parametrize("pad", [0, 1, 5, 23])
+@pytest.mark.parametrize("chunk", [4, 11, 22, 23, 40])
+def test_humans_boundaries(tmp_path, pad, chunk):
+    data = b"z" * pad + M("服务启动 loop:// 9600") + b"x" * 50 + M("人 接入") + b"y" * 30
+    assert _logf(tmp_path, data).humans(chunk=chunk) == 1
+
+
+# ---- 存疑: 用户名 / 密码不许带控制字符
+
+@pytest.mark.parametrize("s,bad", [("admin", False), ("p@ss word!", False), ("ad\rmin", True), ("a\nb", True),
+                                   ("x\x00", True), ("x\x1b", True), ("x\x7f", True), ("", False)])
+def test_bad_credential(s, bad):
+    assert oc.bad_credential(s) is bad

@@ -51,6 +51,14 @@ def _btn(parent, text, cmd, bg=None):
 class SerialPanel(tk.Frame):
     """kiosk 里的 '串口会话' 页. 左控制台 (宽) | 右聊天 (窄), F2 切换焦点."""
 
+    _held = None        # #85 观察窗口登录 / 退出时借走控制台: 这期间不自动接回, 也不发唤醒回车
+
+    def _auto_connect_ok(self):
+        return not getattr(self, "_held", None)
+
+    def _wake_ok(self, wake):
+        return bool(wake) and not getattr(self, "_held", None)
+
     def __init__(self, master, want=None):
         super().__init__(master, bg=BG)
         self.cfg = serial_conf_read()
@@ -206,7 +214,7 @@ class SerialPanel(tk.Frame):
         self.con_title.config(text=f"控制台 · {dev} @ {self._serves.get(name, '?')} · 键盘直通串口",
                               fg=th.OK)
         threading.Thread(target=self._reader, args=(s,), daemon=True).start()
-        if wake:
+        if self._wake_ok(wake):
             self._tx(b"\r")
 
     def _reader(self, s):
@@ -369,7 +377,7 @@ class SerialPanel(tk.Frame):
                 self.port_var.set((free or ports)[0])
             shown = [f"{os.path.basename(n)} @ {b}" for n, b in self._serves.items()]
             self.serve_label.config(text=f"服务: {', '.join(shown) or '未开'}")
-            if not self.sock and match_service(self.port_var.get(), self._serves):
+            if not self.sock and self._auto_connect_ok() and match_service(self.port_var.get(), self._serves):
                 self._connect(wake=wake)
         self._async(fetch, done)
 
