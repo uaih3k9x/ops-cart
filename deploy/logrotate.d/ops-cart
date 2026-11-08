@@ -1,6 +1,7 @@
 # 推车机器日志轮转 (人读的 /opt/pxe/CART-LOG.md 不在这里, 它只收一行摘要)
+# pxeserver.log 也在这个目录 (#95: 原来在 /opt/pxe, usr_t 标签 logrotate_t 打不开, 整个 logrotate 失败)
 # 写日志的进程都开着文件不关, 用 copytruncate 免得重启服务
-/var/log/ops-cart/*.log /opt/pxe/pxeserver.log {
+/var/log/ops-cart/*.log {
     weekly
     maxsize 10M
     rotate 8

@@ -506,3 +506,58 @@ def test_judge_rapid():
     assert ac.judge_rapid(True, 0, "1.4.4")[0] == ac.PASS
     st, why = ac.judge_rapid(True, 1, "ImportError: libGL")
     assert st == ac.FAIL and "libGL" in why
+
+
+# ------------------------------------------------------------ 系统自带单元 (#95)
+
+def _props(act="inactive", sub="dead", en="enabled", result="success", status="0", load="loaded"):
+    return {"LoadState": load, "ActiveState": act, "SubState": sub, "UnitFileState": en,
+            "Result": result, "ExecMainStatus": status}
+
+
+def test_judge_smb_no_lan1_address_is_skip():
+    st, why = ac.judge_smb(_props(), lan1_up=False)
+    assert st == S and "LAN1" in why and "稍等" in why
+
+
+def test_judge_smb_failed_hints_missing_lan1_dropin_only_for_hand_conf():
+    crashed = _props("failed", "failed", result="core-dump", status="6")
+    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False, hand_conf=True)
+    assert st == F and "ops-cart-lan1.conf" in why and " lo" in why
+    st, why = ac.judge_smb(dict(crashed, DropInPaths="/etc/systemd/system/smb.service.d/ops-cart-lan1.conf"),
+                           lan1_up=False, hand_conf=True)
+    assert st == F and "没装" not in why
+    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False, hand_conf=False)    # 仓库配置不该装它
+    assert st == F and "ops-cart-lan1.conf" not in why
+
+
+@pytest.mark.parametrize("text,want", [
+    ("# /etc/samba/smb.conf —— setup-samba.sh 按 ... 生成\n[global]\n", False),
+    ("# 手工写的\n[global]\n   interfaces = 192.0.2.1/24\n", True),
+    (None, False),                                                  # 读不到: 不下结论, 不提示
+])
+def test_is_hand_smb_conf(text, want):
+    assert ac.is_hand_smb_conf(text) is want
+
+
+def test_judge_smb_lan1_up_must_run_when_enabled():
+    assert ac.judge_smb(_props(), lan1_up=True)[0] == F
+    assert ac.judge_smb(_props("active", "running"), lan1_up=True)[0] == P
+
+
+def test_judge_smb_not_installed_is_skip():
+    assert ac.judge_smb(_props(load="not-found", en=""), lan1_up=True)[0] == S
+    assert ac.judge_smb(None, lan1_up=True)[0] == S
+
+
+def test_logrotate_last_run_must_succeed():
+    st, why = ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"],
+                            _props("failed", "failed", en="static", result="exit-code", status="1"))
+    assert st == F
+    assert ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"], _props(en="static"))[0] == P
+
+
+def test_judge_logrotate_failed_points_to_journal():
+    st, why = ac.judge_logrotate(_props("failed", "failed", en="static", result="exit-code", status="1"))
+    assert st == F and "journalctl -u logrotate" in why
+    assert ac.judge_logrotate(_props(en="static"))[0] == P

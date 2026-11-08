@@ -161,3 +161,18 @@ def test_mcp_http_units_cap_tasks():
     """#60: 慢连接一个占一个线程, 单元把线程数封顶."""
     for name in ("cart-mcp.service", "cart-mcp-ro.service"):
         assert "TasksMax=64" in unit(name), name
+
+
+def test_pxeserver_log_lives_in_cart_log_dir():
+    """#95 pxeserver.log 挪到 /var/log/ops-cart: /opt/pxe 是 usr_t, logrotate_t 读不了, 每天 0 点 logrotate 失败.
+    单元的 --log、车机 / 副屏读的路径、验收看的路径是同一个; logrotate 不再单列 /opt/pxe 下的文件."""
+    import re
+    import cartlog
+    import kiosk_core
+    import lamps_core
+    m = re.search(r"--log (\S+)", unit("pxe-server.service"))
+    assert m and m.group(1) == kiosk_core.PXE_LOG == lamps_core.PXE_LOG == cartlog.LOG_DIR + "/pxeserver.log"
+    rot = (UNITS.parent / "logrotate.d" / "ops-cart").read_text()
+    assert "/opt/pxe" not in "\n".join(l for l in rot.splitlines() if not l.lstrip().startswith("#"))
+    acc = (UNITS.parent.parent / "scripts" / "cart_accept.py").read_text()
+    assert 'OPT + "/pxeserver.log"' not in acc and 'LOG + "/pxeserver.log"' in acc
