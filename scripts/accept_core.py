@@ -628,19 +628,21 @@ LINK_DOWN = ("unavailable", "disconnected")      # nmcli device 状态: 没插�
 
 def judge_pxe_zone(zone, ports, link=None, profile_zones=None):
     """LAN1 所在 firewalld 区放没放行 PXE (#38). zone=None = firewalld 没开; 没放行时 DHCP 请求到不了服务.
-    link = nmcli 里 eno1 的设备状态; profile_zones = 绑 eno1 的各个连接配置的 connection.zone.
-    没链路时连接没激活, 接口本来就不在任何区: 看配置里写没写 pxe, 写了就等插线."""
+    link = nmcli 里 eno1 的设备状态; profile_zones = 绑 eno1 的各个连接配置 [(名字, connection.zone)].
+    没链路时连接没激活, 接口本来就不在任何区: 绑 eno1 的配置全写了 pxe 才等插线, 有一个不是就报 (插线后哪个先起来不一定)."""
     if zone is None:
         return SKIP, "firewalld 没在跑"
     fix = "修: sudo nmcli con mod <LAN1 配置> connection.zone pxe 后重新 up"
     if not zone and link in LINK_DOWN:
-        zones = list(profile_zones or [])
-        if not zones:
-            return SKIP, f"eno1 没链路 ({link}), 也没找到绑 eno1 的连接配置, 插线建好配置后再验"
-        if PXE_ZONE in zones:
+        profiles = list(profile_zones or [])
+        if not profiles:
+            return SKIP, (f"eno1 没链路 ({link}), 也没找到写了 ifname=eno1 的连接配置, 插线建好配置后再验; "
+                          "如果有不写 ifname、只按 MAC 匹配的配置, 要手动核对它的 connection.zone")
+        bad = [(n, z) for n, z in profiles if z != PXE_ZONE]
+        if not bad:
             return SKIP, f"eno1 没链路 ({link}), 现在不在任何区是正常的; 配置已设 pxe，插线后生效"
-        shown = "/".join(z or "空" for z in zones)
-        return FAIL, f"eno1 没链路 ({link}), 但连接配置的区是 {shown}, 插线后会落进默认区. {fix}"
+        shown = ", ".join(f"{n} (区: {z or '空'})" for n, z in bad)
+        return FAIL, f"eno1 没链路 ({link}), 但绑 eno1 的配置 {shown} 不是 pxe, 插线后可能落进别的区. {fix}"
     if not zone:
         return FAIL, f"eno1 不在任何防火墙区. {fix}"
     miss = [p for p in PXE_PORTS if p not in (ports or "").split()]
@@ -665,6 +667,15 @@ def nm_split(line):
             cur.append(ch)
     out.append("".join(cur))
     return out
+
+
+def nm_field(dump, key):
+    """`nmcli -t con show uuid <u>` 的输出里取一个字段 (key:value 一行一个); 没这个字段 None."""
+    for line in (dump or "").splitlines():
+        k, sep, v = line.partition(":")
+        if sep and k == key:
+            return v.strip()
+    return None
 
 
 def nm_device_state(out, dev):
