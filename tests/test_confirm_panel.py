@@ -154,7 +154,38 @@ def test_dialog_item_order(root):
     assert order == sorted(order), labels
 
 
+def test_dialog_last_line_block_after_agent_text(root):
+    """#74 设备最后一行 (不可信) 单独一块: 在模型理由 / Agent 自述之后、设备最近输出之前, 不在闸门理由里."""
+    gate = dict(HOLD, intent="存盘", line="Router#")
+    d, _acts, _asked = _dlg(root, _view(items=(("save", gate),)))
+    labels = _labels(d)[::-1]
+    order = [next(i for i, x in enumerate(labels) if x.startswith(k))
+             for k in ("闸门理由", "Agent 自述", "设备最后一行（不可信）", "设备最近输出")]
+    assert order == sorted(order), labels
+    assert not any(x.startswith("闸门理由") and "最后一行" in x for x in labels)
+
+
 def test_dialog_context_lines_prefixed(root):
     d, _acts, _asked = _dlg(root, _view())
     ctx = next(x for x in _labels(d) if x.startswith("设备最近输出"))
     assert ctx.split("\n")[1:] == ["| <SW1>"]
+
+
+def test_dialog_shows_live_last_line(root):
+    """#74 第三轮: 确认框附设备当前最后一行 (live 回调), 刷新时跟着变."""
+    lines = {"v": "Router#"}
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=lambda n: lines["v"])
+    d.update_idletasks()
+    assert any("当前最后一行：Router#" in t for t in _labels(d))
+    lines["v"] = "Proceed with reload? [confirm]"
+    d.refresh(_view())
+    d.update_idletasks()
+    assert any("当前最后一行：Proceed with reload? [confirm]" in t for t in _labels(d))
+
+
+def test_dialog_live_failure_is_ignored(root):
+    def boom(n):
+        raise OSError("x")
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=boom)
+    d.update_idletasks()
+    assert not any("当前最后一行" in t for t in _labels(d))

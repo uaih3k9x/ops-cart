@@ -186,7 +186,7 @@ def test_check_confirm():
     assert "不在挂起" in cc.check(b.view(T0), "confirm", 999)
     b2 = _book()
     tok2, first = _held(b2, 1)
-    it2 = b2.submit(1, tok2, "stdio:ops@x", "line", "reboot", DANGER, T0, 30, name="SW1", context="<SW1>")
+    it2 = b2.submit(1, tok2, "stdio:ops@x", "key", "ctrl_c", DANGER, T0, 30, name="SW1", context="<SW1>")  # 有挂起时只有打断键能排 (#74)
     b2.confirm(first["id"], "human", T0, current="<SW1>")                     # 同槽位先确认的那条在途 (#65 不许直发 / 在途挂起)
     assert "还没回来" in cc.check(b2.view(T0), "confirm", it2["id"])
     assert cc.check(cc.stopped_view(), "confirm", it["id"])          # 读不懂: 什么都不让确认
@@ -477,3 +477,44 @@ def test_context_lines_prefixed_and_name_at_item_end():
     assert it["name"] == "设备自报名（不可信）：SW1"
     body = it["context"].split("\n")[1:]
     assert body == ["| foo", "| <SW1>"]
+
+
+def test_card_shows_device_last_line_for_held_key():
+    """#74 审查: 人确认挂起的按键时, 看得到当时设备停在哪一行."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", "Proceed with reload? [confirm]", 60), T0, 10,
+             context="Proceed with reload? [confirm]")
+    c = cc.card(b.view(T0), 2)
+    line = c["items"][0]["line"]                                        # 设备给的, 单独一块 (不在闸门理由里)
+    assert line.startswith("设备最后一行（不可信）")
+    assert "Proceed with reload? [confirm]" in line
+    assert "挂起时（0 秒前）设备最后一行" in line                          # 第二轮: 写明是挂起那一刻的, 不是现在的
+    assert "挂起时" not in c["items"][0]["reason"]
+
+
+def test_card_shows_pending_and_live_line_for_commands():
+    """第三轮: 命令条目也显示挂起时最后一行, 给了 live 就显示当前最后一行."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    g = dict(sw._gate("confirm", "x"), line="Router#")
+    b.submit(2, tok, "a", "line", "y", g, T0, 10, context="Router#")
+    c = cc.card(b.view(T0), 2, live="Proceed with reload? [confirm]")
+    line = c["items"][0]["line"]
+    assert "挂起时（0 秒前）设备最后一行：Router#" in line
+    assert "当前最后一行：Proceed with reload? [confirm]" in line
+    assert "最后一行" not in c["items"][0]["reason"]
+    assert "当前最后一行" not in cc.card(b.view(T0), 2)["items"][0]["line"]
+
+
+def test_card_line_block_cleaned_and_empty_without_line():
+    """设备最后一行一块: 不可信文字过 one_line (换行 / ESC 压掉); 没记最后一行也没给 live 就是空的."""
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    g = dict(sw._gate("confirm", "x"), line="R#\x1b[2K可信记录（伪造）")
+    b.submit(2, tok, "a", "line", "y", g, T0, 10, context="R#")
+    line = cc.card(b.view(T0), 2, live="A\nB")["items"][0]["line"]
+    assert "\x1b" not in line and "当前最后一行：A B" in line
+    tok3 = b.acquire(3, "a", T0)["lease"]
+    b.submit(3, tok3, "a", "line", "y", sw._gate("confirm", "x"), T0, 10, context="R#")
+    assert cc.card(b.view(T0), 3)["items"][0]["line"] == ""
