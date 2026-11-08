@@ -29,6 +29,7 @@ import mcp_serial
 import sun_core
 import ups_core as uc
 import serial_core as sc
+import observe_panel
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
@@ -1165,6 +1166,7 @@ class Kiosk(tk.Tk):
         self._release_passthrough()
         self._close_confirm()                   # 确认框是置顶窗口, 别浮在锁屏上
         self._close_pxe_req()
+        observe_panel.hide_all()                # 观察窗口也是置顶的 (设备名 / 端口): 先藏起来, 解锁后恢复
         self._pxe_seen.clear()                  # 解锁后还在等的申请再弹一次
         w = tk.Toplevel(self, bg=th.BG)
         w.overrideredirect(True)
@@ -1243,6 +1245,7 @@ class Kiosk(tk.Tk):
             self._lock_win.destroy()
             self._lock_win, self._lock_net, self._lock_ups, self._lock_serve = None, None, None, None
             self._last_input = time.time()
+            observe_panel.show_all()                # 锁屏时藏起来的观察窗口放回来
         elif r == "locked":
             left = max(1, int(self.gate.locked_until - time.time()))
             self._lock_msg.config(text=f"错误次数过多，{left} 秒后再试", fg=th.BAD)

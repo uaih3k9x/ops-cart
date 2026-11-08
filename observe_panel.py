@@ -12,6 +12,7 @@ import queue
 from secrets import token_hex
 import threading
 import time
+import weakref
 
 import tkinter as tk
 from tkinter import messagebox
@@ -31,6 +32,22 @@ CANVAS_W = WIN_W - 2 * PAD              # 画布左右各让出 PAD
 FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
 SNAP_S = 5                              # 多久给副屏写一次快照
 
+_WINDOWS = weakref.WeakSet()            # 开着的观察窗口: 锁屏时隐藏 (置顶窗口别浮在锁屏上), 解锁后恢复
+
+
+def hide_all():
+    for w in list(_WINDOWS):
+        if _alive(w):
+            w.withdraw()
+
+
+def show_all():
+    for w in list(_WINDOWS):
+        if _alive(w):
+            w.deiconify()
+            w.lift()
+
+
 def _alive(w):
     try:
         return bool(w.winfo_exists())
@@ -40,52 +57,54 @@ def _alive(w):
 
 class ConsoleHold:
     """观察全程借走车机串口面板对这一路的控制台 (它本身就是一个 attach 着的"人", 连着就永远不轮询).
-    不管面板当时连着哪一路, 都在面板上登记"这一路观察中" (_held 集合): 观察中途切回这一路也不自动接、不发唤醒回车.
-    面板当时正连着这一路才断开; 接回只接原来那一路, 面板没了 / 切到别的口 / 已经连上了就不动."""
+    "观察中"登记在模块级 (observe_core.observing_*): kiosk 切页新建的面板也看得到, 不连、不发唤醒回车.
+    pause: 登记, 并断开当前连着这一路的面板; resume: 撤销登记, 找当前活着、选着这一路又没连上的面板接回
+    (不用 pause 时存下的旧面板: 它可能已经被 kiosk 销毁了)."""
 
-    def __init__(self, panel, name):
-        self.panel, self.name, self.dev, self.active = panel, name, None, False
+    def __init__(self, name, panels=None):
+        self.name, self.panels, self.active = name, panels or oc.live_panels, False
+
+    def _mine(self, p):
+        return _alive(p) and match_service(p.port_var.get(), p._serves) == self.name
 
     def pause(self):
-        """登记并 (连着这一路的话) 断开; 返回断没断开."""
-        p = self.panel
-        if self.active or p is None or not _alive(p):
+        """登记并断开连着这一路的面板; 返回断没断开."""
+        if self.active:
             return False
         self.active = True
-        held = getattr(p, "_held", None)
-        if not isinstance(held, set):
-            held = p._held = set()
-        held.add(self.name)
+        oc.observing_add(self.name)
         cut = False
-        if getattr(p, "sock", None) and match_service(p.port_var.get(), p._serves) == self.name:
-            self.dev = p.port_var.get()
-            p._disconnect()
-            cut = True
-        show = getattr(p, "_show_held", None)
-        if show:
-            try:
-                show()
-            except Exception:
-                pass
+        for p in self.panels():
+            if not self._mine(p):
+                continue
+            if getattr(p, "sock", None):
+                p._disconnect()
+                cut = True
+            show = getattr(p, "_show_held", None)
+            if show:
+                try:
+                    show()
+                except Exception:
+                    pass
         return cut
 
     def resume(self):
-        """撤销登记, 原来连着就接回; 接不回返回给人看的一句."""
+        """撤销登记; 选着这一路又没连上的面板接回 (标题跟着刷新). 接不回返回给人看的一句."""
         if not self.active:
             return None
         self.active = False
-        dev, self.dev = self.dev, None
-        p = self.panel
-        held = getattr(p, "_held", None)
-        if isinstance(held, set):
-            held.discard(self.name)
-        if dev is None or not _alive(p) or p.port_var.get() != dev or p.sock:
-            return None
-        try:
-            p._connect(wake=False)
-        except Exception:
-            pass
-        return None if p.sock else "车机控制台没接回来, 请在串口面板点 刷新 手动重连"
+        oc.observing_discard(self.name)
+        msg = None
+        for p in self.panels():
+            if not self._mine(p) or getattr(p, "sock", None):
+                continue
+            try:
+                p._connect(wake=False)
+            except Exception:
+                pass
+            if not getattr(p, "sock", None):
+                msg = "车机控制台没接回来, 请在串口面板点 刷新 手动重连"
+        return msg
 
 
 class Life:
@@ -168,7 +187,7 @@ class ObserveWindow(tk.Toplevel):
         self.ui, self.stop_evt = queue.Queue(), threading.Event()
         self.obs, self.worker, self.hits, self._snap_at, self._hover = None, None, {}, 0, None
         self._closing = False
-        self.hold = ConsoleHold(panel, name)      # 车机控制台本身是 attach 着的"人"
+        self.hold = ConsoleHold(name)             # 车机控制台本身是 attach 着的"人"
         self.life = Life(name, token)
         self._snap_err = None
         self.ask = lambda title, msg: messagebox.askyesno(title, msg, parent=self)   # 人确认设备名
@@ -177,6 +196,7 @@ class ObserveWindow(tk.Toplevel):
         self.geometry(f"{W}x{H}+{(self.winfo_screenwidth() - W) // 2}+{(self.winfo_screenheight() - H) // 2}")
         self.attributes("-topmost", True)
         self._build()
+        _WINDOWS.add(self)
         self.after(FRAME_MS, self._tick)
 
     def _build(self):
@@ -203,7 +223,7 @@ class ObserveWindow(tk.Toplevel):
     def _new_observer(self):
         log = oc.LogFile(os.path.join(self.ddir, "logs", f"{lamps_core._safe(self.name)}.log"))
         return oc.Observer(self.name, self.vendor, send=functools.partial(survey_core.conbroker_send, grace=oc.POLL_GRACE_S),
-                           log=log, busy=lambda: oc.agent_busy(self.head))
+                           log=log, busy=lambda: oc.agent_busy(self.dev))
 
     def begin(self):
         """开始观察: 看现场 (只认用户视图提示符) -> 人确认设备名 -> 后台线程开始轮询. 这一步不往 console 发任何字节."""
@@ -238,7 +258,7 @@ class ObserveWindow(tk.Toplevel):
             while ok and not self.stop_evt.is_set() and obs.state == "polling":
                 obs.tick(time.monotonic())
                 self.stop_evt.wait(0.5)
-            obs.stop(time.monotonic())
+            obs.stop()
             oc.record("stop", head=self.head, device=obs.device, state=obs.state, error=obs.error)
         finally:                            # 不管怎么结束: 放占用 (窗口已关的话) 并通知界面 (接回控制台在 _ended 里)
             life = getattr(self, "life", None)
@@ -340,6 +360,7 @@ class ObserveWindow(tk.Toplevel):
         self.hold.resume()
         oc.remove_snapshot(self.token, oc.snapshot_path(self.head))
         self.life.window_gone()             # 后台线程还在跑就等它结束再放 claim
+        _WINDOWS.discard(self)
         super().destroy()
 
 

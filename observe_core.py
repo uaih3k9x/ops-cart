@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """串口观察模式 (#85): 人在 console 上登录好, 推车只发只读命令, 把端口状态画成前面板. 纯逻辑, 不碰 Tk.
 
-半自动 (9x 定): 推车完全不碰登录 (不发用户名 / 密码 / 唤醒键 / screen-length / quit). 人自己登录好之后点
+半自动 (9x 定): 推车完全不碰登录, 往 console 发的只有只读白名单里的命令. 人自己登录好之后点
 "开始观察": probe() 读 conbroker 日志尾, 现场正是用户视图提示符 <xxx> 才给人确认设备名, 人确认后 start(xxx).
 
   parse_brief  display interface brief (华为 S / AR / VRP8); PARSERS 按厂商留位置给 H3C / 锐捷.
@@ -24,6 +24,7 @@ import os
 import re
 import threading
 import time
+import weakref
 
 import cartlog
 import lamps_core
@@ -90,8 +91,8 @@ def classify(text):
     return "other"
 
 
-# 登录前日志尾停在这些上 = 别人正在操作, 不唤醒不开始
-_BUSY = {"password": "有人正在登录 (停在 Password:)", "yn": "设备在等别人回答 [Y/N]",
+# 轮询前日志尾停在这些上 = 有人正在操作 / 设备在等回答, 这一轮不发
+_BUSY = {"password": "console 停在 Password: 上", "yn": "设备在等别人回答 [Y/N]",
          "sysview": "有人停在系统视图里", "typing": "提示符后面有半行命令, 有人在敲", "pager": "有人在翻页看输出"}
 
 
@@ -107,6 +108,14 @@ def session_changed(text):
 
 
 _HUMAN = re.compile(r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d (服务启动|人 接入|人 断开)")
+
+
+_JOIN = re.compile(r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d 人 接入\]", re.M)
+
+
+def human_joined(text):
+    """这段日志里有没有人 attach 进来过 (哪怕之后又断开了)."""
+    return bool(_JOIN.search(clean(text or "")))
 
 
 def humans_attached(text):
@@ -229,7 +238,7 @@ _CLAIMS_LOCK = threading.Lock()
 
 
 def claim(name, who):
-    """同一路串口同时只许一个用户: 一个观察窗口, 或者一次巡检. 两个 Observer 的登录会交错, 巡检的命令会插进观察."""
+    """同一路串口同时只许一个用户: 一个观察窗口, 或者一次巡检. 两个观察的命令会交错, 巡检的命令会插进观察."""
     with _CLAIMS_LOCK:
         if _CLAIMS.get(name, who) != who:
             return False
@@ -247,11 +256,25 @@ def holder(name):
     return _CLAIMS.get(name)
 
 
-def agent_busy(head, states=None):
-    """Agent 写串口 (#21/#23) 占着这一路: 有写租约 / 在发 / 急停中 -> 原因; 没有 None. 读不懂按占着算."""
-    m = re.fullmatch(r"con-(\d+)", head or "")
-    if not m:
-        return None
+def slot_of(dev, realpath=os.path.realpath, slots=None):
+    """设备路径 (/dev/con-N 别名、ttyUSB、by-id 都行) -> 推车操作头号 N; 对不上任何一路 None."""
+    slots = slots or lamps_core.SLOTS
+    try:
+        target = realpath(dev)
+        for path in slots:
+            if dev == path or realpath(path) == target:
+                return int(path.rsplit("-", 1)[1])
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def agent_busy(dev, states=None, realpath=os.path.realpath):
+    """Agent 写串口 (#21/#23) 占着这一路: 有写租约 / 在发 / 有命令等确认 / 急停中 -> 原因; 没有 None.
+    先把设备路径解析到 con-N 操作头; 解析不出来 / 状态读不懂都按占着算 (看不清就不轮询)."""
+    n = slot_of(dev, realpath)
+    if n is None:
+        return "看不清这一路对应哪个操作头 (con-N), 查不了 Agent 占用, 按占用算"
     try:
         if states is None:
             import confirm_core
@@ -259,7 +282,7 @@ def agent_busy(head, states=None):
             st = confirm_core.slot_states(mcp_serial.peek())
         else:
             st = states()
-        s = st.get(int(m.group(1))) or {}
+        s = st.get(n) or {}
     except Exception:
         return "读不懂 Agent 写串口的状态, 按占用算"
     if s.get("estop"):
@@ -269,6 +292,34 @@ def agent_busy(head, states=None):
     if s.get("pending"):
         return "这一路有 Agent 的命令在等人确认"
     return None
+
+
+_OBSERVING = set()                      # 正在观察的串口服务名: 串口面板 (哪怕是新建的) 不连这些口、不发唤醒回车
+_OBSERVING_LOCK = threading.Lock()
+_PANELS = weakref.WeakSet()             # 活着的串口面板 (kiosk 切页会新建): 接回控制台时找当前那个
+
+
+def observing_add(name):
+    with _OBSERVING_LOCK:
+        _OBSERVING.add(name)
+
+
+def observing_discard(name):
+    with _OBSERVING_LOCK:
+        _OBSERVING.discard(name)
+
+
+def is_observing(name):
+    with _OBSERVING_LOCK:
+        return name in _OBSERVING
+
+
+def register_panel(panel):
+    _PANELS.add(panel)
+
+
+def live_panels():
+    return list(_PANELS)
 
 
 # ------------------------------------------------------------ display interface brief
@@ -470,13 +521,13 @@ class Pacer:
 # ------------------------------------------------------------ 会话编排
 
 DEFAULT_PROFILES = {"huawei": {"poll": ["display interface brief"], "version": "display version",
-                               "pager_off": "screen-length 0 temporary", "timeout": 20}}
+                               "timeout": 20}}
 POLL_GRACE_S = 10       # conbroker send 子进程在 -t 之外多给的秒数 (巡检是 60); 退出观察最多等一轮 = 20 + 10 秒
 
 
 def load_profile(vendor, path=PROFILES_PATH):
     """内置 profile, JSON 只能改 poll / version / timeout (关翻页命令写死, 反正也要过闸门)."""
-    prof = dict(DEFAULT_PROFILES.get(vendor) or {"poll": [], "version": None, "pager_off": None, "timeout": 20})
+    prof = dict(DEFAULT_PROFILES.get(vendor) or {"poll": [], "version": None, "timeout": 20})
     try:
         with open(path, encoding="utf-8") as f:
             over = json.load(f).get(vendor)
@@ -536,6 +587,8 @@ class Observer:
         self.state, self.error, self.warning, self.device, self.model = "idle", None, None, None, None
         self.ports, self.panel, self.polled_at = {}, [], None
         self._ports_id = None           # 第一轮看到的物理口集合: sysname 一样的两台 (<HUAWEI>) 换了线靠它认
+        self._ports_odd = False         # 上一轮口集合对不上 (可疑); 连续两轮对不上才判 lost
+        self._joined = False            # 上次挪基线跳过的那段里有人 attach 过
         self._ver_done = False
         self._based = False
         self._advance(None)              # 还没有基线
@@ -559,6 +612,8 @@ class Observer:
             return self._lost("读不到 conbroker 日志, 跳过的部分没法检查, 停止轮询")
         if self._based:
             new = self.log.read_from(old)
+            if new is not None and human_joined(new):
+                self._joined = True             # 下一条命令前要让出来
             if new is None or session_changed(new) or session_changed(out or ""):
                 return self._lost("会话可能已经变了 (日志里有登出 / 重新登录, 或日志读不了 / 变短), 停止轮询")
         elif session_changed(out or ""):
@@ -646,9 +701,13 @@ class Observer:
     def _scene_ok(self):
         """每条命令发之前的白名单: 现场正是 <本设备> 用户视图, 且自上次确认以来没有新增有效内容.
         返回 None = 可以发; 否则 "lost" / "busy" (error 已写好)."""
-        why = self.busy()
+        why = self.busy() or self._attached()   # 每条命令前都查: 上一条命令期间可能有人 attach 进来
         if why:
-            self.error = f"这轮没发: {why}"
+            self.error = why if "attach" in why else f"这轮没发: {why}"
+            return "busy"
+        if self._joined:                        # 上一条命令期间有人 attach 过 (哪怕又断开了): 这轮让出来
+            self._joined = False
+            self.error = "这轮没发: 刚才有人 attach 过这路串口"
             return "busy"
         kind, name = self._scene()
         if kind in ("idle", "username"):
@@ -715,8 +774,13 @@ class Observer:
         ident = sorted(p["name"] for p in found if port_kind(p["name"]))
         if self._ports_id is None:
             self._ports_id = ident
-        elif ident != self._ports_id:           # 提示符名一样但口不一样: 换了线 / 换了设备
-            return self._lost("端口和开始时的不一样, 可能换了设备 (提示符名相同), 停止轮询")
+        elif ident != self._ports_id:           # 提示符名一样但口不一样: 换了线 / 换了设备, 或者异步日志打断了一行
+            if self._ports_odd:
+                return self._lost("连续两轮端口和开始时的不一样, 可能换了设备 (提示符名相同), 停止轮询")
+            self._ports_odd = True
+            self.warning = "这轮端口和开始时的不一样 (可疑), 下一轮再看"
+            return False
+        self._ports_odd = False
         odd = [p["name"] for p in found if p["state"] == "unknown"]
         self.warning = f"{len(odd)} 个口的状态没认出来: {', '.join(odd[:4])}" if odd else None
         names = [p["name"] for p in found]
@@ -728,10 +792,11 @@ class Observer:
 
     # ---- 退出
 
-    def stop(self, now=None):
-        """退出观察: 只停轮询, 不往 console 发任何字节 (会话是人的, 人自己处理). 不抛."""
+    def stop(self):
+        """退出观察: 只停轮询, 不往 console 发任何字节 (会话是人的, 人自己处理). 不抛.
+        暂时性的提示 (这轮没发 / 有人 attach) 清掉; 没开始 / 掉线的原因留着."""
         if self.state not in ("failed", "lost"):
-            self.state = "stopped"
+            self.state, self.error = "stopped", None
 
     def snapshot(self, head, now=None, owner=None):
         """给副屏的快照: 端口位置 + 状态. ts = 写入时间, polled_at = 上次轮询成功的时间."""
@@ -750,7 +815,7 @@ _STATE_NOTE = {"idle": "准备开始", "failed": "没开始", "lost": "会话掉
 
 def front_view(doc, now, stale_s=FRONT_STALE_S):
     """快照 -> 副屏前面板区块 {title, stale, note, ports: [{x, y, shape, label, state, lit}]}; 没有 / 车机没在写 None.
-    登录中 / 失败 / 掉线 / 很久没轮询成功 / 出错: 灯全灰 (stale), note 写原因; 还没有端口也照样给标题和原因."""
+    准备中 / 没开始 / 掉线 / 很久没轮询成功 / 出错: 灯全灰 (stale), note 写原因; 还没有端口也照样给标题和原因."""
     if not isinstance(doc, dict) or not isinstance(doc.get("ts"), (int, float)) or now - doc["ts"] > WRITE_STALE_S:
         return None
     ports, state, polled = doc.get("ports") or [], doc.get("state"), doc.get("polled_at")

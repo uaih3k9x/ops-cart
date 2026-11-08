@@ -298,16 +298,16 @@ def test_agent_busy_from_write_state():
     states = {1: {"writer": "agent", "estop": False, "sending": False},
               2: {"writer": None, "estop": True, "sending": False},
               3: {"writer": None, "estop": False, "sending": False}}
-    assert "租约" in oc.agent_busy("con-1", states=lambda: states)
-    assert "急停" in oc.agent_busy("con-2", states=lambda: states)
-    assert oc.agent_busy("con-3", states=lambda: states) is None
-    assert oc.agent_busy("ttyUSB0", states=lambda: states) is None
+    same = lambda p: p          # noqa: E731  不解析软链接
+    assert "租约" in oc.agent_busy("/dev/con-1", states=lambda: states, realpath=same)
+    assert "急停" in oc.agent_busy("/dev/con-2", states=lambda: states, realpath=same)
+    assert oc.agent_busy("/dev/con-3", states=lambda: states, realpath=same) is None
 
 
 def test_agent_busy_unreadable_state_refuses():
     def boom():
         raise ValueError("坏了")
-    assert oc.agent_busy("con-1", states=boom)
+    assert oc.agent_busy("/dev/con-1", states=boom, realpath=lambda p: p)
 
 
 def test_classify_ignores_conbroker_markers():
@@ -431,7 +431,7 @@ def test_log_file_read_from_offset(tmp_path):
 
 def test_agent_busy_counts_pending():
     states = {1: {"writer": None, "estop": False, "sending": False, "pending": 2}}
-    assert oc.agent_busy("con-1", states=lambda: states)
+    assert oc.agent_busy("/dev/con-1", states=lambda: states, realpath=lambda p: p)
 
 
 def test_claim_shared_by_survey_and_observe():
@@ -800,11 +800,21 @@ def test_display_users_output_does_not_lose_session():
     assert ob.state == "polling"
 
 
-def test_port_set_change_marks_lost():
+def test_port_set_change_marks_lost_after_two_rounds():
     dev, ob = _started()
     assert ob.tick(100) is True
     dev.brief = BRIEF_AR.replace("<AR-TEST>", "<SW-TEST>")
-    assert ob.tick(200) is False and ob.state == "lost"
+    assert ob.tick(200) is False and ob.state == "polling" and "可疑" in ob.warning
+    assert ob.tick(300) is False and ob.state == "lost"
+
+
+def test_port_set_blip_one_round_recovers():
+    dev, ob = _started()
+    ob.tick(100)
+    dev.brief = BRIEF_S.replace("GigabitEthernet0/0/5        ^down down         0%     0%          0          0\n", "")
+    assert ob.tick(200) is False and ob.state == "polling"
+    dev.brief = BRIEF_S
+    assert ob.tick(300) is True and ob.state == "polling" and not ob.warning
 
 
 def test_prompt_change_in_output_marks_lost():
@@ -966,3 +976,107 @@ def test_no_credential_or_secret_code_in_observe_modules():
         hits = sorted(x for x in names if bad.search(x) and x != "PASS_PROMPT_RE")
         assert not hits, (mod, hits)
         assert 'show="•"' not in src and "HELLO claude" not in src, mod
+
+
+
+# ============================================================ 半自动版复审
+
+# ---- 中1: 每条命令前都查 attach; 上一条命令期间有人 attach 过 (哪怕又断开) 也不发
+
+def test_attach_during_previous_command_blocks_next():
+    dev, ob = _started()
+    orig = dev.send
+
+    def send(port, cmd, timeout):
+        out = orig(port, cmd, timeout)
+        if cmd == "display version":
+            dev.console += HUMAN_IN
+        return out
+    ob.send = send
+    assert ob.tick(100) is False
+    assert dev.polls == ["display version"] and "attach" in ob.error
+
+
+def test_attach_flash_during_previous_command_blocks_next():
+    dev, ob = _started()
+    orig = dev.send
+
+    def send(port, cmd, timeout):
+        out = orig(port, cmd, timeout)
+        if cmd == "display version":
+            dev.console += HUMAN_IN + HUMAN_OUT
+        return out
+    ob.send = send
+    assert ob.tick(100) is False and dev.polls == ["display version"]
+    ob.send = orig
+    ob.tick(200)                             # 这一轮让出 (刚才有人来过)
+    assert ob.tick(300) is True              # 之后没人再来, 接着轮询
+
+
+# ---- 低3: 退出时清掉暂时性的错误
+
+def test_stop_clears_transient_error_keeps_lost():
+    dev = FakeDev(console=SVC + HUMAN_IN + PROMPT)
+    ob = _obs(dev)
+    ob.start(ob.probe()[0])
+    ob.tick(100)
+    assert "attach" in ob.error
+    ob.stop()
+    assert ob.state == "stopped" and ob.error is None
+    v = oc.front_view(ob.snapshot("con-1", now=0), 0)
+    assert v["note"] == "已退出"
+    dev, ob = _started()
+    dev.console += IDLE
+    ob.tick(100)
+    msg = ob.error
+    ob.stop()
+    assert ob.state == "lost" and ob.error == msg
+
+
+def test_stop_takes_no_arguments():
+    import inspect
+    assert list(inspect.signature(oc.Observer.stop).parameters) == ["self"]
+
+
+# ---- 存疑 b: 设备路径解析到 con-N 槽位再查租约
+
+def test_slot_of_resolves_alias_byid_and_ttyusb():
+    real = {"/dev/con-2": "/dev/ttyUSB1", "/dev/serial/by-id/usb-X-if00": "/dev/ttyUSB1", "/dev/ttyUSB1": "/dev/ttyUSB1",
+            "/dev/con-1": "/dev/ttyUSB0", "/dev/con-3": "/dev/con-3", "/dev/con-4": "/dev/con-4"}
+    rp = lambda p: real.get(p, p)          # noqa: E731
+    assert oc.slot_of("/dev/con-2", realpath=rp) == 2
+    assert oc.slot_of("/dev/ttyUSB1", realpath=rp) == 2
+    assert oc.slot_of("/dev/serial/by-id/usb-X-if00", realpath=rp) == 2
+    assert oc.slot_of("/dev/ttyUSB9", realpath=rp) is None
+
+
+def test_agent_busy_unresolvable_slot_refuses():
+    states = {1: {"writer": None, "estop": False, "sending": False, "pending": 0}}
+    why = oc.agent_busy("/dev/ttyUSB9", states=lambda: states, realpath=lambda p: p)
+    assert why and "看不清" in why
+
+
+def test_agent_busy_by_ttyusb_path_finds_lease():
+    states = {n: {"writer": None, "estop": False, "sending": False, "pending": 0} for n in (1, 2, 3, 4)}
+    states[2]["writer"] = "agent"
+    real = {"/dev/con-2": "/dev/ttyUSB1"}
+    assert "租约" in oc.agent_busy("/dev/ttyUSB1", states=lambda: states, realpath=lambda p: real.get(p, p))
+
+
+# ---- 中2: "观察中"登记在模块级, 新建的面板也看得到
+
+def test_observing_registry():
+    oc._OBSERVING.clear()
+    oc.observing_add("/dev/con-1")
+    oc.observing_add("/dev/con-1")
+    assert oc.is_observing("/dev/con-1") and not oc.is_observing("/dev/con-2")
+    oc.observing_discard("/dev/con-1")
+    assert not oc.is_observing("/dev/con-1")
+
+
+# ---- 低5: 残留清理
+
+def test_no_pager_off_left():
+    assert "pager_off" not in oc.DEFAULT_PROFILES["huawei"]
+    src = open(oc.__file__, encoding="utf-8").read()
+    assert "screen-length" not in src and "pager_off" not in src

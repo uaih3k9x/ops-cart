@@ -1,11 +1,23 @@
 """#85 观察模式的副屏区块 / 车机前面板: 用快照和假画布测, 不起 Tk、不碰串口."""
 
+import os
+
 import pytest
 
 import dash_core as dc
 import observe_core as oc
 import observe_panel as op
 import theme as th
+
+
+@pytest.fixture(autouse=True)
+def _clean_registries():
+    """观察中 / 占用登记都在模块级, 每条用例前后清掉."""
+    oc._OBSERVING.clear()
+    oc._CLAIMS.clear()
+    yield
+    oc._OBSERVING.clear()
+    oc._CLAIMS.clear()
 
 
 def _snap(now, ports=None):
@@ -161,7 +173,7 @@ def test_layout_view_picks_newest_fresh_of_several():
     assert v["front"]["title"].startswith("con-1")
 
 
-def test_layout_view_shows_logging_in_without_ports():
+def test_layout_view_shows_not_started_without_ports():
     doc = dict(_snap(100, ports=[]), state="idle", polled_at=None)
     v = dc.layout_view({"ts": 100, "observe": [doc]}, now=101)
     assert v["front"]["note"] == "准备开始" and v["front"]["ports"] == []
@@ -228,7 +240,6 @@ class _Panel:
                 return self.v
         self.port_var, self._serves = V(dev), {"/dev/con-1": "9600", "/dev/con-2": "9600"}
         self.sock, self.alive, self.ok, self.calls = (object() if sock else None), alive, reconnect_ok, []
-        self._held = set()
 
     def winfo_exists(self):
         return self.alive
@@ -244,29 +255,29 @@ class _Panel:
 
 def test_console_hold_pauses_only_same_port_and_resumes_it():
     p = _Panel()
-    h = op.ConsoleHold(p, "/dev/con-1")
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     assert h.pause() is True and p.calls == ["disconnect"]
     assert h.resume() is None and p.calls[-1] == ("connect", False)
 
 
 def test_console_hold_ignores_other_port_or_unconnected():
     p = _Panel(dev="/dev/con-2")
-    h = op.ConsoleHold(p, "/dev/con-1")
-    assert h.pause() is False and p.calls == [] and p._held == {"/dev/con-1"}   # 没断开别的口, 但照样标记占着
-    assert h.resume() is None and p.calls == [] and p._held == set()
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
+    assert h.pause() is False and p.calls == [] and oc.is_observing("/dev/con-1")   # 没断开别的口, 但照样登记观察中
+    assert h.resume() is None and p.calls == [] and not oc.is_observing("/dev/con-1")
     p = _Panel(sock=False)
-    h = op.ConsoleHold(p, "/dev/con-1")
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     assert h.pause() is False and p.calls == []
 
 
 def test_console_hold_no_resume_if_panel_gone_or_switched():
     p = _Panel()
-    h = op.ConsoleHold(p, "/dev/con-1")
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     h.pause()
     p.alive = False
     assert h.resume() is None and p.calls == ["disconnect"]
     p = _Panel()
-    h = op.ConsoleHold(p, "/dev/con-1")
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     h.pause()
     p.port_var.v = "/dev/con-2"                  # 人切到别的口了: 不抢回来
     assert h.resume() is None and p.calls == ["disconnect"]
@@ -274,7 +285,7 @@ def test_console_hold_no_resume_if_panel_gone_or_switched():
 
 def test_console_hold_reports_failed_resume():
     p = _Panel(reconnect_ok=False)
-    h = op.ConsoleHold(p, "/dev/con-1")
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     h.pause()
     msg = h.resume()
     assert msg and "手动" in msg
@@ -317,20 +328,20 @@ def test_open_for_hangs_window_on_root_not_panel(monkeypatch):
 
 def test_console_hold_marks_panel_held():
     p = _Panel()
-    h = op.ConsoleHold(p, "/dev/con-1")
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     h.pause()
-    assert p._held == {"/dev/con-1"}
+    assert oc.is_observing("/dev/con-1")
     h.resume()
-    assert p._held == set()
+    assert not oc.is_observing("/dev/con-1")
 
 
 def test_two_holds_on_one_panel_do_not_clear_each_other():
     p = _Panel()
-    a, b = op.ConsoleHold(p, "/dev/con-1"), op.ConsoleHold(p, "/dev/con-2")
+    a, b = op.ConsoleHold("/dev/con-1", panels=lambda: [p]), op.ConsoleHold("/dev/con-2", panels=lambda: [p])
     a.pause()
     b.pause()
     b.resume()
-    assert p._held == {"/dev/con-1"}
+    assert oc.is_observing("/dev/con-1") and not oc.is_observing("/dev/con-2")
 
 
 def test_serial_panel_held_check_uses_selected_port():
@@ -343,8 +354,9 @@ def test_serial_panel_held_check_uses_selected_port():
         def get(self):
             return self.v
 
+    oc.observing_add("/dev/con-1")
+
     class P:
-        _held = {"/dev/con-1"}
         _serves = {"/dev/con-1": "9600", "/dev/con-2": "9600"}
         port_var = V("/dev/con-1")
     assert sp.SerialPanel._auto_connect_ok(P()) is False
@@ -437,8 +449,9 @@ def test_serial_panel_connect_refused_while_observing():
         def config(self, **kw):
             self.kw.update(kw)
 
+    oc.observing_add("/dev/con-1")
+
     class P:
-        _held = {"/dev/con-1"}
         _serves = {"/dev/con-1": "9600"}
         port_var = V()
         sock = None
@@ -456,14 +469,14 @@ def test_serial_panel_connect_refused_while_observing():
 
 def test_console_hold_for_whole_observation_until_ended():
     p = _Panel()
-    h = op.ConsoleHold(p, "/dev/con-1")
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     h.pause()
-    assert p.sock is None and p._held == {"/dev/con-1"}
+    assert p.sock is None and oc.is_observing("/dev/con-1")
     p.port_var.v = "/dev/con-2"                  # 观察中途人切走又切回来
     p.port_var.v = "/dev/con-1"
-    assert "/dev/con-1" in p._held               # 仍然登记着, 面板不会自动接 / 发唤醒
+    assert oc.is_observing("/dev/con-1")         # 仍然登记着, 面板不会自动接 / 发唤醒
     h.resume()
-    assert p.calls[-1] == ("connect", False) and p._held == set()
+    assert p.calls[-1] == ("connect", False) and not oc.is_observing("/dev/con-1")
 
 
 
@@ -484,7 +497,7 @@ class _BeginWin:
         self.worker, self.obs, self._closing, self.asked, self.spawned = None, None, True, [], []
         self.status, self.close_btn, self.start_btn = _Lbl(), _Lbl(), _Lbl()
         self.stop_evt = __import__("threading").Event()
-        self.hold = op.ConsoleHold(None, "/dev/con-1")
+        self.hold = op.ConsoleHold("/dev/con-1", panels=lambda: [None])
         self._probe, self._answer, self.close = probe, answer, None
 
     def _new_observer(self):
@@ -521,6 +534,104 @@ def test_begin_asks_to_confirm_device_name():
 def test_begin_holds_panel_console_for_whole_observation():
     p = _Panel()
     w = _BeginWin(("SW-TEST", None))
-    w.hold = op.ConsoleHold(p, "/dev/con-1")
+    w.hold = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
     op.ObserveWindow.begin(w)
-    assert p.calls == ["disconnect"] and p._held == {"/dev/con-1"}       # 人用面板登录的: 观察期间借走
+    assert p.calls == ["disconnect"] and oc.is_observing("/dev/con-1")   # 人用面板登录的: 观察期间借走
+
+
+
+# ============================================================ 半自动版复审: 面板 / kiosk
+
+def test_new_serial_panel_sees_observing_port():
+    import serial_panel as sp
+
+    class V:
+        def get(self):
+            return "/dev/con-1"
+
+    class P:
+        _serves = {"/dev/con-1": "9600"}
+        port_var = V()
+    oc._OBSERVING.clear()
+    oc.observing_add("/dev/con-1")
+    try:
+        assert sp.SerialPanel._auto_connect_ok(P()) is False
+        assert sp.SerialPanel._wake_ok(P(), True) is False
+    finally:
+        oc._OBSERVING.clear()
+    assert sp.SerialPanel._auto_connect_ok(P()) is True
+
+
+def test_console_hold_resume_finds_current_live_panel():
+    oc._OBSERVING.clear()
+    old = _Panel()
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [old])
+    h.pause()
+    assert old.calls == ["disconnect"] and oc.is_observing("/dev/con-1")
+    old.alive = False                           # kiosk 切页: 旧面板没了, 新建了一个
+    new = _Panel(sock=False)
+    h.panels = lambda: [old, new]
+    assert h.resume() is None
+    assert new.calls == [("connect", False)] and old.calls == ["disconnect"]
+    assert not oc.is_observing("/dev/con-1")
+
+
+def test_console_hold_resume_skips_panel_on_other_port():
+    oc._OBSERVING.clear()
+    p = _Panel(dev="/dev/con-2", sock=False)
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
+    h.pause()
+    h.resume()
+    assert p.calls == []
+
+
+def test_console_hold_resume_reports_failure():
+    oc._OBSERVING.clear()
+    p = _Panel(reconnect_ok=False)
+    h = op.ConsoleHold("/dev/con-1", panels=lambda: [p])
+    h.pause()
+    assert "手动" in h.resume()
+
+
+def test_serial_panel_registers_itself_live():
+    class P:
+        pass
+    p = P()
+    oc.register_panel(p)
+    assert p in list(oc.live_panels())
+
+
+class _Win:
+    def __init__(self):
+        self.calls = []
+
+    def withdraw(self):
+        self.calls.append("withdraw")
+
+    def deiconify(self):
+        self.calls.append("deiconify")
+
+    def lift(self):
+        self.calls.append("lift")
+
+    def winfo_exists(self):
+        return True
+
+
+def test_lock_hides_and_unlock_restores_observe_windows():
+    op._WINDOWS.clear()
+    a, b = _Win(), _Win()
+    op._WINDOWS.update({a, b})
+    op.hide_all()
+    assert a.calls == ["withdraw"] and b.calls == ["withdraw"]
+    op.show_all()
+    assert a.calls[-2:] == ["deiconify", "lift"]
+    op._WINDOWS.clear()
+
+
+def test_kiosk_lock_and_unlock_call_observe_hide_show():
+    import ast
+    src = open(os.path.join(os.path.dirname(op.__file__), "kiosk.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+    fns = {n.name: ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert "hide_all" in fns["lock"] and "show_all" in fns["_try_unlock"]

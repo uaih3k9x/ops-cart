@@ -49,15 +49,13 @@ def _btn(parent, text, cmd, bg=None):
 
 
 def _held_here(panel):
-    """面板当前选中的这一路是不是正在被观察 (#85)."""
-    held = getattr(panel, "_held", None) or ()
-    return bool(held) and match_service(panel.port_var.get(), panel._serves) in held
+    """面板当前选中的这一路是不是正在被观察 (#85; 登记在模块级, kiosk 切页新建的面板也看得到)."""
+    name = match_service(panel.port_var.get(), panel._serves)
+    return bool(name) and observe_core.is_observing(name)
 
 
 class SerialPanel(tk.Frame):
     """kiosk 里的 '串口会话' 页. 左控制台 (宽) | 右聊天 (窄), F2 切换焦点."""
-
-    _held = frozenset()     # #85 正在观察的串口服务名 (observe_panel.ConsoleHold 登记): 这些口不连、不发唤醒回车
 
     def _held_here(self):
         return _held_here(self)
@@ -75,6 +73,7 @@ class SerialPanel(tk.Frame):
 
     def __init__(self, master, want=None):
         super().__init__(master, bg=BG)
+        observe_core.register_panel(self)   # #85: 观察结束接回控制台时找当前活着的面板
         self.cfg = serial_conf_read()
         self.ddir = data_dir(self.cfg)
         self.sock = None
