@@ -18,7 +18,7 @@
 ## 能干什么
 
 - **装机**:自研 PXE 服务端(DHCP + proxyDHCP + TFTP),目标机器网线直插即全自动装 Rocky 9;
-  按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器只能进救援。
+  按 MAC 下发,只有"装机模式"倒计时内的那台会被装,其他机器超时后从本地硬盘启动,救援环境不是默认项、只能手动选择(带 sshd,见 [PUBLIC_SAFETY](docs/PUBLIC_SAFETY.md))。只支持 UEFI(GRUB),BIOS/pxelinux 菜单不支持,不要手放。
   服务端自己也守规矩:租约到期回收、池满不发、不是自己的租约不吭声;装机口上看见别人的 DHCP 就转代理模式(不发地址、只给引导),
   网口上没有自己的地址就不回包;TFTP / HTTP 发装机菜单和 ks 前再核一遍装机模式和 MAC
 - **KVM**:HDMI 采集低延迟预览,CH9329 透传键鼠(绝对鼠标,VMware 式 Ctrl+Alt 释放);
@@ -52,7 +52,7 @@
 | [`httpserve.py`](httpserve.py) | PXE 用的静态 HTTP(引导文件 :80、仓库与 ks :8000);ks 和装机菜单只给报出解锁 MAC 的请求(防误装,MAC 是客户端自报的,不是访问控制),`.bak` 一律 404;LAN1 没插线就等地址出现,不退出 |
 | [`kiosk.py`](kiosk.py) | 车机 GUI(Tkinter);深浅按快照里的 `theme`(#32):开机那一刻定主界面和自检页用哪套,之后模式变了等锁屏且没人碰时整个重建,开着面板 / 对话框 / 透传时不换;「画面设置」里「界面:自动 / 深 / 浅」写 `/etc/ops-cart/theme.json` 的档位并记 events.log |
 | [`kiosk_ui_core.py`](kiosk_ui_core.py) | GUI 的界面逻辑:`UiBridge`(后台结果回主线程)、左侧面板状态机、右侧菜单定义、装机定时器判定、CH9329 发送线程与鼠标位移拆分 |
-| [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、状态采集、nmcli 命令、装机模式与装机网段(读 `pxe.env`)、PIN 闸门;`python3 kiosk_core.py --write-rescue` 给部署脚本写救援菜单 |
+| [`kiosk_core.py`](kiosk_core.py) | GUI 的可测核心:自检计划表与检查函数、状态采集、nmcli 命令、装机模式与装机网段(读 `pxe.env`)、PIN 闸门;`python3 kiosk_core.py --write-rescue` 给部署脚本写默认菜单(超时本地盘) |
 | [`ks_panel.py`](ks_panel.py) | Kickstart 编辑:表单化改主机名/密码,自动备份,破坏性指令校验 |
 | [`wifi_panel.py`](wifi_panel.py) · [`wifi_core.py`](wifi_core.py) | 无线管理:扫描、连接、显示密码、优先级排序;面板底部改校园网认证账号、立即认证、看最近结果 |
 | [`wifi_prefer.py`](wifi_prefer.py) | 定时让优先级真正生效:看得见更高优先级的已保存网络就切过去,失败冷却 30 分钟 |
@@ -102,7 +102,7 @@
 | [`icons/`](icons/) | 顶栏网络标(通外网 / 连上但出不去 / 未连接),部署到 `/opt/pxe/icons/` |
 | [`fonts/`](fonts/) | 车机和副屏的界面字体 Unifont 16px 点阵(OTF + 授权原文),部署装到 `/usr/local/share/fonts/ops-cart/`;取不到车机退回 Noto,自检 `UI FONT` 一行变 WARN |
 | [`deploy/`](deploy/) | systemd 单元(含 PXE 三件套)、sysctl(含防断电脏页设置)、journald 日志落盘、logrotate / tmpfiles 配置、`kiosk` / `kiosk-setpin` 命令 |
-| [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写救援菜单),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查,`cart_accept.py` 推车只读验收(逐项 PASS / FAIL / SKIP / 人工,纯逻辑在 `accept_core.py`);`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
+| [`scripts/`](scripts/) | `setup-cart.sh` 铺 PXE 引导文件与仓库(只写默认菜单,超时本地盘),`stamp-build.sh` 生成构建号,`smoke-kiosk.sh` 无头冒烟,`check_public_safe.py` 公开仓库脱敏检查,`cart_accept.py` 推车只读验收(逐项 PASS / FAIL / SKIP / 人工,纯逻辑在 `accept_core.py`);`beeper/` 主板蜂鸣器放旋律(`midi2arp.py` 在开发机上把 MIDI 转曲谱,要 mido) |
 | [`docs/`](docs/) | 优化方案、版本部署清单、[1.11 人工验收单](docs/ACCEPT_1.11.md)、[副屏协议](docs/udisp-protocol.md)、[公开仓库脱敏约定](docs/PUBLIC_SAFETY.md)、[Windows PE 引导](docs/WINPE.md)、[整盘克隆](docs/CLONE.md)、[数据盘和装机库](docs/DATA_DISK.md)、[网口模式](docs/NETMODE.md)、[备用远程通道](docs/REMOTE_TUNNEL.md) |
 | [`examples/`](examples/) | 自检计划表、Kickstart、换皮素材样例、标签缩写对照表(只放通用缩写,真实资产名映射留在推车本地) |
 | [`plymouth/`](plymouth/) | 开机画面主题 |
@@ -180,7 +180,7 @@ sudo systemctl enable --now kvm-broker.service   # 键鼠代理; 不开也行, �
 #   sudo systemctl enable --now cart-serial-req.path
 ```
 
-tftp 树由 `scripts/setup-cart.sh` 铺,它只写救援菜单(调 `kiosk_core.py --write-rescue`)。
+tftp 树由 `scripts/setup-cart.sh` 铺,它只写默认菜单(调 `kiosk_core.py --write-rescue`):超时后从本地盘启动,救援项要手选。
 装机菜单只在车机上解锁装机模式时按 MAC 生成,TFTP / HTTP 两头都会核对装机模式;
 所以 Windows 脚本和手工放进 tftp 的自动装机菜单都装不了机,这是故意的。
 

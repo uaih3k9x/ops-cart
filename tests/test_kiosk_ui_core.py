@@ -191,7 +191,7 @@ def test_pxe_tick_decide_left_never_negative():
 def test_pxe_button_texts_have_no_symbols():
     a, b = ui.pxe_button_texts({"mode": "install", "mac": MAC, "left": 125})
     assert "02:05" in a and "00:0a" in a and "02:05" in b
-    assert ui.pxe_button_texts({"mode": "rescue"}) == ("装机模式:  救援 (安全)", "装机")
+    assert ui.pxe_button_texts({"mode": "rescue"}) == ("装机模式:  本地盘 (安全)", "装机")
     for s in a + b:
         assert not ui.is_symbol_char(s)
 
