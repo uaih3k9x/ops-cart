@@ -564,8 +564,7 @@ class Kiosk(tk.Tk):
         车机进程就是本机人, 确认 / 解除在这里允许; 确认会等到 conbroker 发完, 所以一定在后台."""
         why = cfc.check(self._sw_view if self._sw_view is not None else cfc.stopped_view(), op, arg)
         if why and op == "resume" and arg is None and bfc.estop_active():
-            self._bigfish_ctl("resume")     # 串口那边已经没急停, 只剩大肥鱼的 estop.json (#97 审查中1): 照样放行
-            self._serial_say("已解除大肥鱼急停")
+            self._bigfish_resume()          # 串口那边已经没急停, 只剩大肥鱼的 estop.json (#97 审查中1): 同一道门放行
             return
         if why:
             self._serial_say(why, ok=False)
@@ -650,12 +649,18 @@ class Kiosk(tk.Tk):
         """就是执行器条上的"Agent 全部急停" (写大肥鱼急停信号挂在它上面)."""
         self._serial_action("estop", None)
 
+    def _bigfish_resume_ok(self):
+        """解除大肥鱼急停的门 (#97 L1/L2): 设了 PIN 验 PIN; 没设 PIN 也要人点一次"是"."""
+        if self.gate.required:
+            return self._confirm_pin("解除大肥鱼急停")
+        return messagebox.askyesno("解除大肥鱼急停", "删掉大肥鱼的急停信号, 让它重新接任务?", parent=self)
+
     def _bigfish_resume(self):
-        """面板上的"解除大肥鱼急停": 只删 estop.json, 不动串口; 要 PIN (没设 PIN 时直接过, 同 _confirm_pin)."""
-        if not self._confirm_pin("解除大肥鱼急停"):
+        """面板上的"解除大肥鱼急停"和只剩 estop.json 时的"解除全部急停": 过门后只删 estop.json, 不动串口."""
+        if not self._bigfish_resume_ok():
             return
         self._bigfish_ctl("resume")
-        self.banner.config(text="已解除大肥鱼急停")
+        self._serial_say("已解除大肥鱼急停")
 
     def _bigfish_ctl(self, op):
         """全部急停 -> 写 estop.json 并看它 10 秒内确认没有; 通道不在 / 写不了直接硬停. 解除全部急停 -> 删掉."""

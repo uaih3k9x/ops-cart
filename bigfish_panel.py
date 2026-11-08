@@ -62,7 +62,7 @@ class BigfishPanel(tk.Frame):
         except Exception:                   # noqa: BLE001
             on = False
         if on and not self.btn_resume.winfo_manager():
-            self.btn_resume.pack(side="left", padx=6)
+            self.btn_resume.pack(side="right", padx=6)      # 和急停隔开, 放另一头
         elif not on and self.btn_resume.winfo_manager():
             self.btn_resume.pack_forget()
         self._job = self.after(REFRESH_MS, self.refresh)

@@ -181,15 +181,6 @@ def test_estop_without_channel_goes_hard_immediately(monkeypatch, tmp_path):
 
 # ------------------------------------------------------------ estop.json 残留: 解除大肥鱼急停 (中1)
 
-def test_resume_all_allowed_when_only_estop_file_left():
-    """串口那边已经没有急停 (终端解除 / 按路解除 / human_action 失败), 只剩 estop.json: 解除全部急停照样删它."""
-    calls, fake = _ctl_fake()
-    bf.estop_write(1.0)
-    fake._sw_view = _view(None)                              # 没有一路在急停
-    fake._serial_action("resume", None)
-    assert not os.path.exists(bf.ESTOP_PATH) and not _bg(calls, "serial-write")
-
-
 def test_resume_all_with_nothing_to_resume_still_refused():
     calls, fake = _ctl_fake()
     fake._sw_view = _view(None)
@@ -197,25 +188,50 @@ def test_resume_all_with_nothing_to_resume_still_refused():
     assert calls["say"][-1][1] is False and not _bg(calls, "serial-write")
 
 
-def _resume_fake(pin_ok):
+def _resume_fake(pin_ok=True, required=True, yes=True, monkeypatch=None):
+    """两个解除入口共用一道门 (#97 L1/L2): 设了 PIN 验 PIN, 没设 PIN 先 askyesno."""
     calls, fake = _ctl_fake()
-    fake._confirm_pin = lambda what: calls.setdefault("pin", []).append(what) or pin_ok
-    fake._bigfish_resume = kiosk.Kiosk._bigfish_resume.__get__(fake)
+    calls["pin"], calls["ask"] = [], []
+    fake.gate = SimpleNamespace(required=required)
+    fake._confirm_pin = lambda what: calls["pin"].append(what) or pin_ok
+    monkeypatch.setattr(kiosk.messagebox, "askyesno", lambda *a, **k: calls["ask"].append(a) or yes)
+    for name in ("_bigfish_resume", "_bigfish_resume_ok"):
+        setattr(fake, name, getattr(kiosk.Kiosk, name).__get__(fake))
     return calls, fake
 
 
-def test_bigfish_resume_needs_pin_and_deletes_file():
-    calls, fake = _resume_fake(True)
+def test_bigfish_resume_needs_pin_and_deletes_file(monkeypatch):
+    calls, fake = _resume_fake(monkeypatch=monkeypatch)
     bf.estop_write(1.0)
     fake._bigfish_resume()
-    assert calls["pin"] and not os.path.exists(bf.ESTOP_PATH) and fake._bf_watch is None
+    assert calls["pin"] and not calls["ask"] and not os.path.exists(bf.ESTOP_PATH) and fake._bf_watch is None
 
 
-def test_bigfish_resume_wrong_pin_keeps_file():
-    calls, fake = _resume_fake(False)
+def test_bigfish_resume_wrong_pin_keeps_file(monkeypatch):
+    calls, fake = _resume_fake(pin_ok=False, monkeypatch=monkeypatch)
     bf.estop_write(1.0)
     fake._bigfish_resume()
     assert os.path.exists(bf.ESTOP_PATH)
+
+
+@pytest.mark.parametrize("yes", [True, False])
+def test_bigfish_resume_without_pin_asks_yes_no(monkeypatch, yes):
+    calls, fake = _resume_fake(required=False, yes=yes, monkeypatch=monkeypatch)
+    bf.estop_write(1.0)
+    fake._bigfish_resume()
+    assert calls["ask"] and not calls["pin"] and os.path.exists(bf.ESTOP_PATH) is (not yes)
+
+
+@pytest.mark.parametrize("required, pin_ok, yes, gone", [(True, True, True, True), (True, False, True, False),
+                                                         (False, True, True, True), (False, True, False, False)])
+def test_resume_all_with_only_estop_file_uses_same_gate(monkeypatch, required, pin_ok, yes, gone):
+    """串口那边已经没有急停, 只剩 estop.json: 解除全部急停去删它, 门槛和「解除大肥鱼急停」一样."""
+    calls, fake = _resume_fake(pin_ok=pin_ok, required=required, yes=yes, monkeypatch=monkeypatch)
+    bf.estop_write(1.0)
+    fake._sw_view = _view(None)                              # 没有一路在急停
+    fake._serial_action("resume", None)
+    assert (calls["pin"] if required else calls["ask"])
+    assert os.path.exists(bf.ESTOP_PATH) is (not gone) and not _bg(calls, "serial-write")
 
 
 def test_watch_requires_echo_of_this_seq(monkeypatch):

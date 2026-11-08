@@ -77,7 +77,7 @@ def test_panel_resume_button_only_when_estop_file_exists(root):
     on, calls = [True], []
     w = bp.BigfishPanel(root, load=lambda now: _running(), clock=lambda: NOW, estop_on=lambda: on[0],
                         on_resume=lambda: calls.append("r"))
-    assert w.btn_resume.winfo_manager() == "pack"
+    assert w.btn_resume.winfo_manager() == "pack" and w.btn_resume.pack_info()["side"] == "right"   # 和急停隔开
     w.btn_resume.invoke()
     assert calls == ["r"]
     on[0] = False
