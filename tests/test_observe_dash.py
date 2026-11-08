@@ -38,8 +38,27 @@ def test_layout_view_has_front_when_observing():
     assert [p["state"] for p in v["front"]["ports"]] == ["up", "admin", "down"]
 
 
-def test_layout_view_no_front_when_locked_stale_or_missing():
-    assert dc.layout_view({"ts": 100, "observe": _snap(100)}, locked=True, now=101)["front"] is None
+def test_layout_view_locked_front_hides_device_identity():
+    # 闲置锁屏不停观察 (9x 定): 副屏照常画端口灯和端口号, 但不露设备名 / 型号 / 接口全名
+    snap = dict(_snap(100), model="S5735-L24T4S-A1", ends_at=100 + 600)
+    v = dc.layout_view({"ts": 100, "observe": snap}, locked=True, now=101)
+    f = v["front"]
+    assert f is not None and [p["state"] for p in f["ports"]] == ["up", "admin", "down"]
+    assert f["title"].startswith("串口观察中 · con-1") and "剩余 10 分钟" in f["title"]
+    text = repr(f)
+    assert "SW-TEST" not in text and "S5735" not in text and "GigabitEthernet" not in text
+
+
+def test_locked_front_shows_stop_reason_without_device_names():
+    snap = dict(_snap(100), state="stopped", reason="已到时长上限 (30 分钟), 需要继续请重新开始观察", ends_at=100)
+    f = dc.layout_view({"ts": 100, "observe": snap}, locked=True, now=101)["front"]
+    assert "时长上限" in f["note"] and "剩余" not in f["title"]
+    snap = dict(_snap(100), state="lost", error="提示符从 SW-TEST 变成了 OTHER-SW, 停止轮询")
+    f = dc.layout_view({"ts": 100, "observe": snap}, locked=True, now=101)["front"]
+    assert f["note"] and "SW-TEST" not in repr(f) and "OTHER-SW" not in repr(f)
+
+
+def test_layout_view_no_front_when_stale_or_missing():
     assert dc.layout_view({"ts": 100, "observe": _snap(0)}, now=oc.WRITE_STALE_S + 1)["front"] is None
     assert dc.layout_view({"ts": 100}, now=101)["front"] is None
 
@@ -963,3 +982,65 @@ def test_manual_lock_during_first_command_integration(monkeypatch):
     w.life.window_gone()
     assert oc.holder(w.name) is None
     op._WINDOWS.clear()
+
+
+
+# ============================================================ 第十二轮
+
+def test_render_locked_draws_front_and_notice():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    snap = dict(_snap(100), ends_at=700)
+    v = dc.layout_view({"ts": 100, "observe": snap, "notice": "欢迎"}, locked=True, now=101)
+    img = r.render(v)
+    (x0, y0, x1, y1), port = r.front_boxes(v["front"], y0=r.LOCKED_FRONT_Y)[0]
+    assert port["state"] == "up" and img.getpixel(((x0 + x1) // 2, y0 + 3)) == _rgb(th.LAMP_OK)
+    size, lh, lines, top = r._locked_lines(v, r.PANEL_W, r.PANEL_H)
+    assert top >= r.LOCKED_FRONT_Y + 2 * (r.FRONT_ROW + r.FRONT_GAP)         # 公告不压前面板
+
+
+def test_observe_shows_message_when_open_for_refused(monkeypatch):
+    import serial_panel as sp
+
+    class V:
+        def get(self):
+            return "/dev/con-1"
+
+    class P:
+        _serves = {"/dev/con-1": "9600"}
+        port_var, cfg, ddir = V(), {}, "/x"
+
+        def __init__(self):
+            self.written = []
+
+        def _con_write(self, ops, tag=None):
+            self.written.append("".join(v for op, v in ops if op == "text"))
+    monkeypatch.setattr(op, "open_for", lambda *a, **k: None)
+    p = P()
+    sp.SerialPanel.observe(p)
+    assert "收尾" in p.written[-1]
+
+
+@pytest.mark.parametrize("holder,word", [("observe-tk", "正在观察"), ("survey-abcd", "正在巡检")])
+def test_survey_refusal_names_who_holds(monkeypatch, holder, word):
+    import serial_panel as sp
+    import survey_core
+    monkeypatch.setattr(survey_core, "run_survey", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该跑")))
+
+    class V:
+        def get(self):
+            return "/dev/con-1"
+
+    class P:
+        _serves, _surveying, cfg = {"/dev/con-1": "9600"}, False, {}
+        port_var = V()
+
+        def __init__(self):
+            self.written = []
+
+        def _con_write(self, ops, tag=None):
+            self.written.append("".join(v for op, v in ops if op == "text"))
+    oc.claim("/dev/con-1", holder)
+    p = P()
+    sp.SerialPanel.survey(p)
+    assert word in p.written[-1]

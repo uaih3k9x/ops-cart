@@ -307,10 +307,10 @@ def _serve(guard, now):
     return {"text": n["text"], "level": "bad"}
 
 
-def _front(docs, now):
-    """每一路一份观察快照 (新写的在前), 取第一份车机还在写的."""
+def _front(docs, now, locked=False):
+    """每一路一份观察快照 (新写的在前), 取第一份车机还在写的. 锁屏时照样画, 但不露设备名 (#85)."""
     docs = [docs] if isinstance(docs, dict) else docs if isinstance(docs, list) else []
-    return next((v for v in (observe_core.front_view(d, now) for d in docs) if v), None)
+    return next((v for v in (observe_core.front_view(d, now, locked=locked) for d in docs) if v), None)
 
 
 def layout_view(snap, locked=False, active=(), now=None):
@@ -350,7 +350,7 @@ def layout_view(snap, locked=False, active=(), now=None):
         "peers": [] if locked else peers(snap),      # 锁屏是教室引导牌, 不露交换机名
         "serve": _serve(snap.get("pxe"), now),       # 锁屏也显示: 发地址影响整个网段
         "stale": stale(snap, now),
-        "front": None if locked else _front(snap.get("observe"), now),   # 观察中的设备前面板 (#85)
+        "front": _front(snap.get("observe"), now, locked),   # 观察中的设备前面板 (#85); 锁屏时不露设备名
     }
     return view
 

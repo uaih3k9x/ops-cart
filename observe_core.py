@@ -594,6 +594,7 @@ class Observer:
         self.state, self.error, self.warning, self.device, self.model = "idle", None, None, None, None
         self.reason = None              # 自己停下的原因 (到时长上限), stop() 不清
         self._t0 = None                 # 第一次 tick 的时间, 算总时长
+        self._ends_at = None            # 墙钟上的到点时间, 副屏锁屏时显示剩余几分钟
         self.ports, self.panel, self.polled_at = {}, [], None
         self._ports_id = None           # 第一轮看到的物理口集合: sysname 一样的两台 (<HUAWEI>) 换了线靠它认
         self._ports_odd = False         # 上一轮口集合对不上 (可疑); 连续两轮对不上才判 lost
@@ -650,7 +651,7 @@ class Observer:
 
     def probe(self):
         """点"开始观察"时看现场 -> (设备名, None) 或 (None, 原因). 只读, 不发任何字节."""
-        bad = [c for c in self._cmds() if not survey_core.is_readonly(c, self.vendor)]
+        bad = [c for c in self._cmds() if not observe_cmd_ok(c, self.vendor)]
         if not self.profile.get("poll") or bad or not parser_for(self.vendor):
             return None, (("白名单不放, 一条都不发: " + "; ".join(map(str, bad))) if bad else
                           f"厂商 {self.vendor} 没有轮询命令或解析器")
@@ -686,9 +687,9 @@ class Observer:
         """到点就轮询一轮. 发了且成功 True; 没到点 / 人在用 / 失败 False."""
         if self.state != "polling":
             return False
-        if self._t0 is None:
-            self._t0 = now
         limit = self.profile.get("max_s") or 1800
+        if self._t0 is None:
+            self._t0, self._ends_at = now, self.wall() + limit
         if now - self._t0 >= limit:         # 轮询会替人给 console 保活: 到点就停, 要继续请人重新开始
             self.state = "stopped"
             span = f"{limit:g} 秒" if limit < 60 else f"{int(limit // 60)} 分钟"
@@ -749,7 +750,7 @@ class Observer:
         """过白名单 + 现场检查后发一条 -> 输出; 没发 / 出错返回 (None, 结果)."""
         if self.cancelled():                                        # 点了退出: 不等这轮剩下的命令
             return None, False
-        if not survey_core.is_readonly(cmd, self.vendor):          # 发前再过一次
+        if not observe_cmd_ok(cmd, self.vendor):                   # 发前再过一次
             self.error = f"白名单不放: {cmd}"
             return None, False
         bad = self._scene_ok()
@@ -834,28 +835,39 @@ class Observer:
             ports.append(dict(cell, state=p.get("state", "unknown"), in_uti=p.get("in_uti"), out_uti=p.get("out_uti")))
         return {"ts": self.wall() if now is None else now, "polled_at": self.polled_at, "owner": owner,
                 "head": head, "device": self.device, "model": self.model, "state": self.state, "error": self.error,
-                "reason": self.reason, "ports": ports}
+                "reason": self.reason, "ends_at": self._ends_at, "ports": ports}
 
 
 WRITE_STALE_S = 30      # 车机每 5 秒写一次快照; 这么久没写 = 车机窗口没了, 副屏不画
 _STATE_NOTE = {"idle": "准备开始", "failed": "没开始", "lost": "会话掉了", "stopped": "已退出"}
 
 
-def front_view(doc, now, stale_s=FRONT_STALE_S):
+def front_view(doc, now, stale_s=FRONT_STALE_S, locked=False):
     """快照 -> 副屏前面板区块 {title, stale, note, ports: [{x, y, shape, label, state, lit}]}; 没有 / 车机没在写 None.
-    准备中 / 没开始 / 掉线 / 很久没轮询成功 / 出错: 灯全灰 (stale), note 写原因; 还没有端口也照样给标题和原因."""
+    准备中 / 没开始 / 掉线 / 很久没轮询成功 / 出错: 灯全灰 (stale), note 写原因; 还没有端口也照样给标题和原因.
+    locked: 车机锁着屏 (闲置锁屏不停观察, 9x 定): 照常画端口灯和端口号, 但不露设备名 / 型号 / 接口全名 /
+    设备原文, 标题只写"串口观察中 · con-N · 剩余 xx 分钟", 停止原因只给不带设备名的说法."""
     if not isinstance(doc, dict) or not isinstance(doc.get("ts"), (int, float)) or now - doc["ts"] > WRITE_STALE_S:
         return None
     ports, state, polled = doc.get("ports") or [], doc.get("state"), doc.get("polled_at")
     note = doc.get("error") or doc.get("reason") or _STATE_NOTE.get(state)     # 停止原因和车机显示的一致
     if not note and (not isinstance(polled, (int, float)) or now - polled > stale_s):
         note = "旧数据" if polled else "等第一轮轮询"
+    if locked and note:                     # 锁屏时不露设备原文 / 设备名
+        note = doc.get("reason") or (f"观察已停止 ({_STATE_NOTE[state]})" if state in ("lost", "failed", "stopped")
+                                     else "这轮没取到数据" if doc.get("error") else note)
     out = []
     for p in ports:
         st, lit = ("unknown", False) if note else lamp(p, now)
         out.append({"x": p.get("x", 0), "y": p.get("y", 0), "shape": p.get("shape", "rj45"),
                     "label": p.get("label", ""), "state": st, "lit": lit})
-    title = " · ".join(str(x) for x in (doc.get("head"), doc.get("device") or doc.get("model")) if x)
+    if locked:
+        title = " · ".join(x for x in ("串口观察中", str(doc.get("head") or "")) if x)
+        ends = doc.get("ends_at")
+        if state == "polling" and isinstance(ends, (int, float)):
+            title += f" · 剩余 {max(0, math.ceil((ends - now) / 60))} 分钟"
+    else:
+        title = " · ".join(str(x) for x in (doc.get("head"), doc.get("device") or doc.get("model")) if x)
     return {"title": title, "state": state, "stale": bool(note), "note": note, "ports": out}
 
 
@@ -894,6 +906,21 @@ def remove_snapshot(owner, path):
         return True
     except OSError:
         return False
+
+
+def _session_sentences(vendor):
+    try:
+        import serial_allowlist
+        return {e.text for e in serial_allowlist.ALLOW.get(vendor, ()) if e.session}
+    except Exception:
+        return set()
+
+
+def observe_cmd_ok(cmd, vendor):
+    """观察模式能发的命令: 过 survey_core.is_readonly, 而且只许 display 开头, 不许 allowlist 里的会话级整句
+    (关分页那种): profile 的 poll / version 能被 JSON 换掉, 白名单又放行关分页, 这里再收一道."""
+    return (isinstance(cmd, str) and cmd.startswith("display ") and survey_core.is_readonly(cmd, vendor)
+            and cmd not in _session_sentences(vendor))
 
 
 def shadow_record(cmd, vendor, disabled=(), event=None):

@@ -469,7 +469,9 @@ class SerialPanel(tk.Frame):
             return
         token = "survey-" + secrets.token_hex(4)               # 每次巡检一个令牌, 不能重入
         if not observe_core.claim(name, token):             # #85: 同一路观察和巡检互斥, 命令不能互相插
-            self._con_write([("text", f"\n[巡检] {dev} 正在观察, 先退出观察再巡检\n")], "mark")
+            busy = "正在巡检, 等这次巡检跑完" if (observe_core.holder(name) or "").startswith("survey-") \
+                else "正在观察, 先退出观察再巡检"
+            self._con_write([("text", f"\n[巡检] {dev} {busy}\n")], "mark")
             return
         self._surveying = True
         vendor = self.cfg.get("survey_vendor", "auto")
@@ -505,7 +507,8 @@ class SerialPanel(tk.Frame):
             self._con_write([("text", f"\n[观察] {dev} 正在巡检, 等巡检跑完再观察\n")], "mark")
             return
         import observe_panel
-        observe_panel.open_for(self, dev, name, observe_vendor(self.cfg), self.ddir)
+        if observe_panel.open_for(self, dev, name, observe_vendor(self.cfg), self.ddir) is None:
+            self._con_write([("text", f"\n[观察] {dev} 上一次观察还在收尾, 稍后再试\n")], "mark")
 
     def destroy(self):
         self._disconnect()

@@ -1201,3 +1201,35 @@ def test_profile_without_version_command_refused():
     ob = _obs(dev, profile={"version": None})
     name, why = ob.probe()
     assert name is None and "display version" in why and dev.polls == []
+
+
+
+# ============================================================ 第十二轮
+
+def test_snapshot_has_end_time_for_locked_countdown():
+    dev, ob = _started(profile={"max_s": 600}, wall=lambda: 5000)
+    ob.tick(100)
+    assert ob.snapshot("con-1", now=5000)["ends_at"] == 5600
+
+
+@pytest.mark.parametrize("over", [
+    {"poll": ["screen-length 0 temporary", "display interface brief"]},
+    {"poll": ["display interface brief"], "version": "screen-length 0 temporary"},
+    {"poll": ["show interfaces status"]},
+])
+def test_profile_json_cannot_sneak_session_or_non_display_commands(tmp_path, monkeypatch, over):
+    p = tmp_path / "prof.json"
+    p.write_text(json.dumps({"huawei": over}))
+    monkeypatch.setattr(oc, "PROFILES_PATH", str(p))
+    dev = FakeDev()
+    ob = oc.Observer("con-1", "huawei", dev.send, profile=oc.load_profile("huawei", str(p)), log=dev,
+                     pacer=oc.Pacer(duty=0.5, min_gap=1, max_gap=10, quiet=5))
+    name, why = ob.probe()
+    assert name is None and why and dev.polls == []
+
+
+def test_observe_cmd_ok():
+    assert oc.observe_cmd_ok("display interface brief", "huawei")
+    assert not oc.observe_cmd_ok("screen-length 0 temporary", "huawei")
+    assert not oc.observe_cmd_ok("show version", "cisco")
+    assert not oc.observe_cmd_ok("display current-configuration | save x", "huawei")

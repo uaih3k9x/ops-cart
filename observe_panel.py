@@ -37,7 +37,8 @@ _WINDOWS = weakref.WeakSet()            # 开着的观察窗口: 锁屏时隐藏
 def hide_all(stop=False):
     """锁屏: 窗口藏起来, 等待中的设备确认作废 (解锁后让人重新点).
     stop: 人主动锁屏 -> 正在跑的观察也停掉, 解锁后不自动恢复. 闲置自动锁屏 (9x 定) 不停: 轮询照跑,
-    副屏照常显示, 靠观察总时长上限兜底 (轮询会替人给 console 保活)."""
+    副屏锁屏页照常画端口灯和端口号 (不露设备名 / 型号 / 接口全名, 标题写"串口观察中 · con-N · 剩余 xx 分钟"),
+    靠观察总时长上限兜底 (轮询会替人给 console 保活)."""
     for w in list(_WINDOWS):
         if _alive(w):
             if getattr(w, "_confirming", None):
