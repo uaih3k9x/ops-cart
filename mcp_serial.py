@@ -750,7 +750,7 @@ CLI_CMDS = ("pending", "confirm", "reject", "estop", "resume", "requests")
 
 def _untrusted_tail(shown):
     """一条挂起项在设备输出之前要显示的几行, 三处显示面同一个顺序 (#65 第七 / 八轮):
-    闸门理由 -> 高危词 -> 提示 -> 模型理由 -> Agent 自述 (后面是设备输出、设备自报名)."""
+    闸门理由 -> 高危词 -> 提示 -> 模型理由 -> Agent 自述 (后面是设备最后一行 (#74)、设备输出、设备自报名)."""
     return shown["reason"], shown["danger"], shown.get("note"), shown["model"], shown["intent"]
 
 
@@ -781,7 +781,7 @@ def _print_view(v, out, live=lambda slot: None, rules=lambda: {}):
     for p in v["pending"]:              # 可信记录已在上面; 顺序同车机 / 网页: 理由 -> 高危词 -> 提示 -> 模型 -> 自述 -> 设备
         shown = next(x for x in cc.card(v, p["slot"], live(p["slot"]), (rules().get("slots") or {}).get(p["slot"]))["items"] if x["id"] == p["id"])
         extra = "".join("\n      " + x.replace("\n", "\n        ")
-                        for x in (*_untrusted_tail(shown), shown["context"], shown["name"]) if x)
+                        for x in (*_untrusted_tail(shown), shown["line"], shown["context"], shown["name"]) if x)
         print(f"  #{p['id']} 槽位 {p['slot']} {p['kind']} {p['cmd']!r} 来自 {p['who']} ({p['age_s']}s 前)"
               f"{extra}", file=out)
     for h in v["history"][-5:]:
@@ -858,7 +858,7 @@ def cli(argv, store=None, send=None, slots=None, local=None, stdin=None, out=Non
     shown = next(x for x in card["items"] if x["id"] == a.id)
     ctx = shown.get("context")          # 卡片里设备输出每行已带 "| " (#65 第八轮, 三处一致)
     # 顺序 (#65 第六轮): 推车自己的 (可信记录、提示、闸门理由) 在前, Agent / 模型 / 设备给的 (都不可信) 在后
-    for extra in (card["trusted"], *_untrusted_tail(shown), ctx, shown["name"]):
+    for extra in (card["trusted"], *_untrusted_tail(shown), shown["line"], ctx, shown["name"]):
         if extra:
             warn += "\n  " + ("!!! " if extra == shown["danger"] else "") + extra.replace("\n", "\n    ")
     print(f"槽位 {item['slot']} 来自 {item['who']}:\n  {item['kind']} {item['cmd']!r}"

@@ -71,11 +71,12 @@ class ConfirmDialog(tk.Toplevel):
             for it in c["items"]:
                 self._meta[it["id"]].config(text=it["meta"])
                 self._reason[it["id"]].config(text=it["reason"])
+                self._line[it["id"]].config(text=it.get("line") or "")      # 当前最后一行跟着刷新 (#74)
             return
         self._key = key
         for w in list(self.body.winfo_children()) + list(self.foot.winfo_children()):
             w.destroy()
-        self._meta, self._reason = {}, {}
+        self._meta, self._reason, self._line = {}, {}, {}
         if not c["items"]:
             tk.Label(self.body, text="没有等确认的命令", font=FONT, bg=BG, fg=DIM).pack(pady=20)
         if c.get("trusted"):                                # 可信记录 (#65): 推车自己记的, 正常字色, 和设备输出分开
@@ -113,6 +114,10 @@ class ConfirmDialog(tk.Toplevel):
             if it.get(key):
                 tk.Label(f, text=it[key], font=FONT, bg=CARD, fg=DIM, anchor="w", justify="left",
                          wraplength=680).pack(fill="x")
+        # 设备最后一行 (#74): 不可信, 灰字; 排在 Agent 自述后、设备最近输出前. 空的也建, 刷新时可能有内容
+        self._line[it["id"]] = tk.Label(f, text=it.get("line") or "", font=FONT, bg=CARD, fg=DIM, anchor="w",
+                                        justify="left", wraplength=680)
+        self._line[it["id"]].pack(fill="x")
         if it.get("context"):                               # 设备最近输出 (#65): 不可信, 灰字等宽, 只作参考
             tk.Label(f, text=it["context"], font=th.font(14, mono=True), bg=CARD, fg=DIM, anchor="w",
                      justify="left", wraplength=680).pack(fill="x")

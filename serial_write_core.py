@@ -574,6 +574,16 @@ def _tail_hash(text):
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
+def _log_gate(gate):
+    """进执行绪日志的闸门结果: 去掉 #74 的 line (设备最后一行, 设备输出按 #65 不进日志), 只记长度和哈希.
+    挂起项 / 审批界面里的 gate 不动 (确认时比对、卡片显示要用)."""
+    g = dict(gate)
+    line = str(g.pop("line") or "")
+    g["line_len"] = len(line)
+    g["line_sha"] = hashlib.sha256(line.encode("utf-8")).hexdigest()[:16]
+    return g
+
+
 def device_lines(text):
     """设备输出 (回显等) -> 给终端 / 界面看的行: 每行删 ANSI/OSC、控制字符换成 ?, 并照常打码 (私钥块跨行).
     命令行打印设备回显前必须过这里 (#65 第八轮: 否则 ESC[2A ESC[2K 能擦掉推车自己的结果行)."""
@@ -693,6 +703,8 @@ class Book:
     def _ev(self, ev, slot, now, src="agent", **kw):
         rec = {"t": stamp(now), "slot": slot, "ev": ev, "src": src}
         rec.update({k: v for k, v in kw.items() if v is not None})
+        if isinstance(rec.get("gate"), dict) and "line" in rec["gate"]:
+            rec["gate"] = _log_gate(rec["gate"])
         self.events.append(rec)
         return rec
 

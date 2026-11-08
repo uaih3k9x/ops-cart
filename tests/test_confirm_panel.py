@@ -154,6 +154,17 @@ def test_dialog_item_order(root):
     assert order == sorted(order), labels
 
 
+def test_dialog_last_line_block_after_agent_text(root):
+    """#74 设备最后一行 (不可信) 单独一块: 在模型理由 / Agent 自述之后、设备最近输出之前, 不在闸门理由里."""
+    gate = dict(HOLD, intent="存盘", line="Router#")
+    d, _acts, _asked = _dlg(root, _view(items=(("save", gate),)))
+    labels = _labels(d)[::-1]
+    order = [next(i for i, x in enumerate(labels) if x.startswith(k))
+             for k in ("闸门理由", "Agent 自述", "设备最后一行（不可信）", "设备最近输出")]
+    assert order == sorted(order), labels
+    assert not any(x.startswith("闸门理由") and "最后一行" in x for x in labels)
+
+
 def test_dialog_context_lines_prefixed(root):
     d, _acts, _asked = _dlg(root, _view())
     ctx = next(x for x in _labels(d) if x.startswith("设备最近输出"))

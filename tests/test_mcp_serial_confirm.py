@@ -485,8 +485,8 @@ def test_card_flags_answer_to_confirm_prompt():
     tok = b.acquire(1, "a", 1000.0)["lease"]
     b.submit(1, tok, "a", "line", "y", dict(sw_._gate("confirm", "x"), line="Continue? [Y/N]:"), 1000.0, 10,
              context="Continue? [Y/N]:")
-    reason = cc.card(b.view(1000.0), 1)["items"][0]["reason"]
-    assert "这条会回答设备的确认提示" in reason
+    shown = cc.card(b.view(1000.0), 1)["items"][0]
+    assert "这条会回答设备的确认提示" in shown["line"] and "确认提示" not in shown["reason"]
 
 
 # ------------------------------------------------------------ 审查 #74 第五轮

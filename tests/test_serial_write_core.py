@@ -1859,3 +1859,25 @@ def test_finish_touch_only():
     with pytest.raises(sw.Refused) as e:
         b.begin(1, tok, "a", "key", "enter", sw._gate("pass", "x"), 1002.0, 10, snap=snap)
     assert e.value.code == "changed"
+
+
+# ------------------------------------------------------------ 合并 #65 后: gate.line 不进执行绪日志
+
+def test_gate_line_not_in_event_log():
+    """#74 的 gate["line"] 是设备输出, 按 #65 不进执行绪日志: 只记长度和哈希; 挂起项 / 审批界面照常有原文."""
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    raw = "Router(config)#snmp-server community s3cr3t-line RO"
+    g = dict(_gate_confirm(), line=raw)
+    p = b.submit(1, "tokA", "agentA", "line", "y", g, T0, timeout=30, context=raw)
+    assert b.view(T0)["pending"][0]["gate"]["line"] == raw                  # 审批界面要用
+    b.confirm(p["id"], "human", T0 + 1, current=raw)
+    b.finish(p["id"], {"status": "sent", "echo": ""}, T0 + 2)
+    b.begin(1, "tokA", "agentA", "key", "enter", dict(_gate_pass(), line=raw), T0 + 3, timeout=30)
+    logged = json.dumps(b.events, ensure_ascii=False)
+    assert "s3cr3t" not in logged and raw not in logged
+    for e in b.events:
+        g = e.get("gate")
+        if g:
+            assert "line" not in g and g["line_len"] == len(raw) and len(g["line_sha"]) == 16
+    assert any(e.get("gate") for e in b.events if e["ev"] == "pending")
