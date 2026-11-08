@@ -371,6 +371,40 @@ MENU = {
 }
 
 
+TOGGLES = (("btn_video", "UVC 预览"), ("btn_serial", "串口会话"), ("btn_pxe", "PXE 装机服务"))
+
+
+def toggle_texts(pane, rows):
+    """三颗开关按钮显示当前状态. pane = 左侧开着的面板; rows = 自检结果 (PXE 服务看 "PXE SERVER" 那行).
+    自检还没出结果 (rows is None) 写 "读取中"; 有结果时只有在跑 (OK) 算开, "--" (没自启没在跑) / 没这行都算关."""
+    pxe = None if rows is None else any(r.get("label") == "PXE SERVER" and r.get("state") == "OK" for r in rows)
+    on = {"btn_video": pane == "preview", "btn_serial": pane == "serial", "btn_pxe": pxe}
+    return {attr: "%s:  %s" % (label, {True: "开", False: "关", None: "读取中"}[on[attr]])
+            for attr, label in TOGGLES}
+
+
+def pxe_toggle_text(on):
+    """PXE 启停成功后先按结果写按钮, 自检回来再校正."""
+    return toggle_texts(None, pxe_rows_set([], on))["btn_pxe"]
+
+
+def pxe_rows_set(rows, on):
+    """启停成功后把自检结果里 PXE SERVER 那行改成 OK / "--" (没有就补一行), 别的行原样. 返回新列表."""
+    row = {"label": "PXE SERVER", "state": "OK" if on else "--", "detail": "RUNNING" if on else "OFF"}
+    out = [dict(r, state=row["state"], detail=row["detail"]) if r.get("label") == "PXE SERVER" else r
+           for r in rows or []]
+    return out if any(r.get("label") == "PXE SERVER" for r in out) else out + [row]
+
+
+def preview_exit_note(returncode):
+    return "UVC 预览已退出 (rc=%s)" % returncode
+
+
+def preview_died(pane, returncode):
+    """预览面板开着但 mpv 已经退出 (起不来 / 采集卡拔了): 该关面板."""
+    return pane == "preview" and returncode is not None
+
+
 # ---------------------------------------------------------------- 键鼠透传
 
 REL_MAX = 127

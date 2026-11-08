@@ -98,7 +98,7 @@ def test_load_rules_reads_slots_verbs_danger(tmp_path):
 
 def test_example_rules_file_loads():
     r = sw.load_rules("examples/serial_gate.example.json")
-    assert "ping" in r["vendors"]["huawei"]["extra_verbs"]
+    assert all(r["vendors"][v]["extra_verbs"] == [] for v in r["vendors"])   # #56 第四轮: 样例不再开 ping 类
     assert set(r["vendors"]) >= {"huawei", "cisco", "ruijie", "linux"}
     assert r["model"]["enabled"] is False               # 样例默认不开模型: 装上不会凭空多出一层判断
     assert r["vendors"]["linux"]["model"] is False      # root shell 开了模型也先不交它判
@@ -228,11 +228,13 @@ def test_classify_unknown_vendor_or_not_at_prompt_confirms():
     assert g["verdict"] == "confirm" and "提示符" in g["reason"]
 
 
-def test_classify_extra_verbs_from_rules():
-    rules = sw.load_rules("examples/serial_gate.example.json")
+def test_classify_extra_verbs_from_rules(tmp_path):
+    p = tmp_path / "g.json"                                 # 样例不再开 ping (#56 第四轮), 这里自己配
+    p.write_text(json.dumps({"vendors": {"huawei": {"extra_verbs": ["ping"]}}}))
+    rules = sw.load_rules(str(p))
     assert sw.classify("ping 192.0.2.1", "huawei", True, RULES)["verdict"] == "confirm"
-    assert sw.classify("ping 192.0.2.1", "huawei", True, rules)["verdict"] == "pass"
-    assert sw.classify("ping 192.0.2.1 ; reboot", "huawei", True, rules)["verdict"] == "confirm"
+    assert sw.classify("ping 192.0.2.1", "huawei", True, rules, user_view=True)["verdict"] == "pass"
+    assert sw.classify("ping 192.0.2.1 ; reboot", "huawei", True, rules, user_view=True)["verdict"] == "confirm"
 
 
 def test_classify_wrong_vendor_verb():
@@ -668,3 +670,160 @@ def test_events_have_timestamps_and_slot():
     b.acquire(2, "agentA", T0, token="tokA")
     e = b.events[0]
     assert e["slot"] == 2 and e["t"].startswith("20") and e["src"] == "agent"
+
+
+def test_ruijie_gets_layer1_whitelist_from_survey_rules():
+    """#56: survey_core 给锐捷加了只读规则, 登记成锐捷的槽位 show 命令第 1 层放行; 写命令照旧要人确认."""
+    assert sw.classify("show version", "ruijie", True, RULES)["verdict"] == "pass"
+    assert sw.classify("terminal length 0", "ruijie", True, RULES)["verdict"] == "pass"
+    for cmd in ("configure terminal", "write memory", "reload", "terminal length 0 ; reload"):
+        assert sw.classify(cmd, "ruijie", True, RULES)["verdict"] == "confirm", cmd
+
+
+
+@pytest.mark.parametrize("vendor,ok,bad", [
+    ("huawei", "screen-length 0 temporary", ["screen-length 0", "screen-length 0 temporary ; save",
+                                              "screen-length  0 temporary", "Screen-length 0 temporary"]),
+    ("cisco", "terminal length 0", ["terminal length 0 x", "terminal length 24", "TERMINAL length 0",
+                                    "terminal monitor"]),
+])
+def test_paging_layer1_exact_only(vendor, ok, bad):
+    assert sw.classify(ok, vendor, True, RULES)["verdict"] == "pass"
+    for cmd in bad:
+        assert sw.classify(cmd, vendor, True, RULES)["verdict"] == "confirm", cmd
+
+
+def test_ruijie_extra_verbs_take_effect(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"vendors": {"ruijie": {"extra_verbs": ["ping"]}}}))
+    r = sw.load_rules(str(p))
+    assert r["vendors"]["ruijie"]["extra_verbs"] == ["ping"]
+    assert sw.classify("ping 192.0.2.1", "ruijie", True, r, user_view=True)["verdict"] == "pass"
+    assert sw.classify("ping 192.0.2.1", "ruijie", True, RULES)["verdict"] == "confirm"
+
+
+
+@pytest.mark.parametrize("vendor,cmd", [
+    ("cisco", "show tech-support"), ("cisco", "show tech"), ("ruijie", "show tech-support"),
+    ("cisco", "show ?"), ("ruijie", "show ?"), ("cisco", "show run ?"),
+    ("huawei", 'display "diagnostic-information" flash:/a.txt'), ("huawei", "display ?"),
+])
+def test_gate_confirms_tech_support_question_and_quotes(vendor, cmd):
+    assert sw.classify(cmd, vendor, True, RULES)["verdict"] == "confirm"
+
+
+
+@pytest.mark.parametrize("cmd", ["show version [exec reload]", "show version [exec {write memory}]",
+                                 "show version [exec {wr}]", "show version [ios_config {hostname X}]",
+                                 "show version | include [exec reload]"])
+def test_gate_tcl_substitution_needs_human(cmd):
+    g = sw.classify(cmd, "cisco", True, RULES)
+    assert g["verdict"] == "confirm"
+
+
+@pytest.mark.parametrize("cmd,word", [("show version [exec reload]", "reload"), ("x [exec {wr}]", "write"),
+                                      ("show version {save}", "save")])
+def test_danger_words_split_on_tcl_brackets(cmd, word):
+    assert word in sw.danger_words(cmd)
+
+
+def test_gate_brackets_not_sent_to_model():
+    seen = []
+    judge = lambda cmd, vendor: seen.append(cmd) or {"allow": True, "reason": "x", "model": {}}   # noqa: E731
+    rules = dict(RULES, model=dict(RULES["model"], enabled=True))
+    g = sw.classify("show ip bgp regexp [0-9]", "cisco", True, rules, judge=judge)
+    assert g["verdict"] == "confirm" and seen == []
+
+
+@pytest.mark.parametrize("text", ["Router(tcl)#", "switch-tcl#", "[startup-config]", "[Y/N]", "[confirm]",
+                                  "[running-config]"])
+def test_slot_vendor_tcl_and_confirm_not_at_prompt(text):
+    assert sw.slot_vendor(1, RULES, text) == (None, False)                         # 华为自动认也不认
+    for v in ("cisco", "ruijie", "huawei"):
+        assert sw.slot_vendor(1, dict(RULES, slots={1: v}), text) == (v, False), (v, text)
+
+
+def test_h3c_prompt_auto_recognized_as_huawei_rules():
+    """写闸门不单独认 H3C: <名> / [名] 按华为处理 (display 系规则一样); 文档里写明."""
+    assert sw.slot_vendor(1, RULES, "<H3C>") == ("huawei", True)
+
+
+
+@pytest.mark.parametrize("verb", ["terminal", "debugging", "debug", "undo", "no", "clear", "test", "telnet", "ssh",
+                                  "system-view", "reload", "reboot", "copy", "write", "save", "configure", "delete",
+                                  "format", "reset", "erase", "wr", "conf", "deb", "tclsh", "enable", "request"])
+def test_extra_verbs_hard_denylist(tmp_path, verb):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"vendors": {"cisco": {"extra_verbs": [verb, "ping"]}}}))
+    assert sw.load_rules(str(p))["vendors"]["cisco"]["extra_verbs"] == ["ping"]
+
+
+@pytest.mark.parametrize("text", ["[Y/N/C]", "[yes]", "[OK]", "[cancel]", "[Enter]", "[BootROM]", "[More]",
+                                  "<BootLoad>", "rommon 1 >", "loader>", "switch(boot)#", "grub>", "busybox#",
+                                  "root#"])
+def test_gate_round4_not_prompts(text):
+    assert sw.slot_vendor(1, RULES, text) == (None, False)
+    for v in ("cisco", "ruijie", "huawei"):
+        assert sw.slot_vendor(1, dict(RULES, slots={1: v}), text) == (v, False), (v, text)
+
+
+def test_gate_still_allows_config_and_system_view_prompts():
+    """写闸门 (不是巡检) 照旧认配置视图: 那里的命令本来就走人确认."""
+    assert sw.slot_vendor(1, RULES, "[SW-A]") == ("huawei", True)
+    assert sw.slot_vendor(1, dict(RULES, slots={1: "cisco"}), "SW-A(config)#") == ("cisco", True)
+
+
+def test_gate_clear_needs_human():
+    assert sw.classify("show platform hardware qfp active statistics drop clear", "cisco", True, RULES)["verdict"] \
+        == "confirm"
+
+
+def test_interface_view_with_slash_still_huawei_prompt():
+    assert sw.slot_vendor(1, RULES, "[SW1-GigabitEthernet0/0/1]") == ("huawei", True)
+
+
+
+@pytest.mark.parametrize("verb", ["screen-length", "super", "ssh2", "user-interface", "line", "local-user",
+                                  "guestshell", "python", "event", "free", "kill", "quit", "logout", "lock", "send",
+                                  "monitor", "mount", "umount", "tar", "gunzip", "squeeze", "fixdisk", "undelete"])
+def test_extra_verbs_denylist_round5(tmp_path, verb):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"vendors": {"huawei": {"extra_verbs": [verb, "ping"]}}}))
+    assert sw.load_rules(str(p))["vendors"]["huawei"]["extra_verbs"] == ["ping"]
+
+
+@pytest.mark.parametrize("vendor,text,ok", [
+    ("huawei", "<SW-A>", True), ("huawei", "[SW-A]", False), ("huawei", "[SW-A-GigabitEthernet0/0/1]", False),
+    ("cisco", "R1#", True), ("cisco", "R1>", True), ("cisco", "R1(config)#", False),
+    ("ruijie", "Ruijie#", True), ("ruijie", "Ruijie(config-if)#", False), ("linux", "bash-4.4#", False),
+])
+def test_user_view(vendor, text, ok):
+    assert sw.user_view(vendor, "x\n" + text) is ok
+
+
+def test_extra_verbs_only_in_user_view(tmp_path):
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps({"vendors": {"huawei": {"extra_verbs": ["ping"]}}}))
+    r = sw.load_rules(str(p))
+    assert sw.classify("ping 192.0.2.1", "huawei", True, r, user_view=True)["verdict"] == "pass"
+    assert sw.classify("ping 192.0.2.1", "huawei", True, r, user_view=False)["verdict"] == "confirm"
+    assert sw.classify("ping 192.0.2.1", "huawei", True, r)["verdict"] == "confirm"         # 默认不算用户视图
+    assert sw.classify("display version", "huawei", True, r, user_view=False)["verdict"] == "pass"
+
+
+@pytest.mark.parametrize("name", ["SH#", "SH-01#", "ZJSH-3#", "Mesh-2#", "Flash#"])
+def test_gate_hostnames_like_shells(name):
+    for v in ("cisco", "ruijie"):
+        assert sw.slot_vendor(1, dict(RULES, slots={1: v}), name) == (v, True)
+
+
+def test_gate_linux_slot_shell_prompt_still_ok():
+    assert sw.slot_vendor(1, dict(RULES, slots={1: "linux"}), "bash-4.4#") == ("linux", True)
+    assert sw.slot_vendor(1, dict(RULES, slots={1: "cisco"}), "bash-4.4#") == ("cisco", False)
+
+
+def test_mcp_serial_passes_user_view():
+    import os
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mcp_serial.py"),
+               encoding="utf-8").read()
+    assert "user_view=sw.user_view(vendor, text)" in src

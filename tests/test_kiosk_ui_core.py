@@ -285,6 +285,76 @@ def test_menu_main_keeps_hot_buttons():
     assert ("toggle_pane", "preview") in main and ("toggle_pane", "serial") in main and ("lock_now", None) in main
 
 
+# ---- 开关按钮跟随真实状态: 不再写死 "开 / 关"
+
+def test_toggle_texts_follow_pane_and_pxe_service():
+    rows = [{"label": "PXE SERVER", "state": "OK", "detail": "RUNNING"}]
+    t = ui.toggle_texts("preview", rows)
+    assert t == {"btn_video": "UVC 预览:  开", "btn_serial": "串口会话:  关", "btn_pxe": "PXE 装机服务:  开"}
+    t = ui.toggle_texts("serial", [{"label": "PXE SERVER", "state": "WARN", "detail": "NOT RUNNING"}])
+    assert t == {"btn_video": "UVC 预览:  关", "btn_serial": "串口会话:  开", "btn_pxe": "PXE 装机服务:  关"}
+    assert ui.toggle_texts(None, [{"label": "PXE SERVER", "state": "FAIL"}])["btn_pxe"] == "PXE 装机服务:  关"
+
+
+def test_toggle_texts_pxe_reading_only_before_first_check():
+    # 自检还没出结果 (rows is None) 才写 "读取中"
+    assert ui.toggle_texts(None, None)["btn_pxe"] == "PXE 装机服务:  读取中"
+
+
+@pytest.mark.parametrize("rows", [[], [{"label": "PXE SERVER", "state": "--", "detail": "OFF"}],
+                                  [{"label": "OCR", "state": "OK"}]])
+def test_toggle_texts_pxe_off_when_not_running_or_missing(rows):
+    # 没设自启又没在跑 = "--"; 自检计划里没这一行: 都按 "关", 不能一直 "读取中"
+    assert ui.toggle_texts(None, rows)["btn_pxe"] == "PXE 装机服务:  关"
+
+
+def test_pxe_toggle_text_matches_toggle_texts():
+    assert ui.pxe_toggle_text(True) == "PXE 装机服务:  开"
+    assert ui.pxe_toggle_text(False) == "PXE 装机服务:  关"
+
+
+def test_pxe_rows_set_patches_or_appends_and_keeps_others():
+    rows = [{"label": "OCR", "state": "OK"}, {"label": "PXE SERVER", "state": "OK", "detail": "RUNNING"}]
+    out = ui.pxe_rows_set(rows, False)
+    assert out[0] == rows[0] and out[1]["state"] == "--" and rows[1]["state"] == "OK"   # 不改原列表
+    assert ui.pxe_rows_set(None, True) == [{"label": "PXE SERVER", "state": "OK", "detail": "RUNNING"}]
+    assert ui.pxe_rows_set([rows[0]], True)[-1]["state"] == "OK"
+
+
+def test_preview_exit_note_is_neutral():
+    assert ui.preview_exit_note(1) == "UVC 预览已退出 (rc=1)"
+
+
+@pytest.mark.parametrize("pane, rc, gone", [("preview", None, False), ("preview", 1, True),
+                                            ("preview", 0, True), ("serial", 1, False), (None, None, False)])
+def test_preview_died(pane, rc, gone):
+    # mpv 起不来 / 设备拔掉自己退出: 预览面板要关掉, 按钮回 "关"
+    assert ui.preview_died(pane, rc) is gone
+
+
+def test_toggle_buttons_exist_in_menu_with_same_attrs():
+    attrs = {it.get("attr"): it["text"] for items in ui.MENU.values() for it in items}
+    for attr, text in ui.toggle_texts(None, None).items():
+        assert attr in attrs
+        assert text.split(":")[0] == attrs[attr].split(":")[0]
+
+
+def test_kiosk_syncs_toggle_texts_on_pane_change_and_check_result():
+    src = _src("kiosk.py")
+    tree = ast.parse(src)
+    calls = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef):
+            calls.setdefault(fn.name, set()).update(
+                ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call))
+    for name in ("_show_status", "_pane_open", "_checks_done", "_build_menu"):
+        assert "self._sync_toggles" in calls[name], name
+    assert "kui.toggle_texts" in calls["_sync_toggles"]
+    assert "self._pxe_toggle_done" in calls["asked"]           # 启停回来走具名方法 (test_kiosk_toggles 测它)
+    assert "self._close_pane" in calls["_start_preview"]        # mpv 起不来就关面板
+    assert "self._reap_preview" in calls["refresh"] and "self._checks_done" in calls["checks_done"]
+
+
 # ------------------------------------------------------------ B6 键鼠
 
 def test_rel_split_clamps_and_keeps_remainder():
