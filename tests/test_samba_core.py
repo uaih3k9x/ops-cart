@@ -214,6 +214,9 @@ def test_nm_dispatcher_starts_smb_on_lan1_up():
     assert '"eno1"' in s and "try-restart" not in s
     assert ("{ systemctl is-enabled -q smb.service || systemctl is-active -q smb.service; } "
             "&& systemctl restart smb.service") in s
+    r = subprocess.run(["bash", "-n", str(ROOT / "deploy" / "srv-data" / "50-ops-cart-smb")],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
 
 
 @pytest.mark.parametrize("enabled,active,want_restart", [
@@ -229,9 +232,6 @@ def test_nm_dispatcher_restart_decision(tmp_path, enabled, active, want_restart)
     r = subprocess.run(["bash", str(hook), "eno1", "up"], env={"PATH": f"{tmp_path}:/usr/bin:/bin"})
     assert r.returncode == 0
     assert ("restart smb.service" in log.read_text()) == want_restart
-    r = subprocess.run(["bash", "-n", str(ROOT / "deploy" / "srv-data" / "50-ops-cart-smb")],
-                       capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
 
 
 # ---------------------------------------------------------------- CLI
@@ -289,5 +289,7 @@ def test_cli_clone_password_twice_for_smbpasswd(tmp_path):
 def test_setup_samba_does_not_install_lan1_dropin():
     """仓库生成的 smb.conf 带 lo, LAN1 没地址时 smbd 也有 127.0.0.1 可绑, 不会崩; 再装 lan1 drop-in 反而没插线时整个跳过.
     lan1 drop-in 只给手工配置的推车 (docs/MIGRATE_95.md)."""
-    assert "srv-data/smb-lan1.conf" not in (ROOT / "scripts" / "setup-samba.sh").read_text()
+    sh = (ROOT / "scripts" / "setup-samba.sh").read_text()
+    assert "srv-data/smb-lan1.conf" not in sh
+    assert "rm -f /etc/systemd/system/smb.service.d/ops-cart-lan1.conf" in sh      # 以前手工装过的也撤掉
     assert sections(sb.smb_conf(IP, PREFIX, None))["global"]["interfaces"].split()[0] == "lo"

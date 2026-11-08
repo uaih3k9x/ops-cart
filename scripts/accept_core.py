@@ -397,16 +397,22 @@ def judge_unit(spec, props):
 LAN1_DROPIN = "ops-cart-lan1.conf"
 
 
-def judge_smb(props, lan1_up):
+def is_hand_smb_conf(text):
+    """smb.conf 不是 setup-samba.sh 生成的 (头注释没写它) = 手工配置; 读不到 (None) 不算."""
+    return text is not None and "setup-samba.sh" not in text
+
+
+def judge_smb(props, lan1_up, hand_conf=False):
     """smb.conf 只绑 LAN1: 没地址时 smb.service.d/ops-cart-lan1.conf 让它跳过 (inactive), 这时 SKIP.
-    failed 不管有没有链路都 FAIL —— 跳过不会留下 failed, 有就是又崩了 / drop-in 没装 / smb.conf 没带 lo."""
+    failed 不管有没有链路都 FAIL —— 跳过不会留下 failed, 有就是又崩了 / drop-in 没装 / smb.conf 没带 lo.
+    lan1 drop-in 只给手工配置装 (仓库生成的带 lo, 不装), 所以只对 hand_conf 提示."""
     if not props or props.get("LoadState") != "loaded":
         return SKIP, "没装 Samba"
     act = props.get("ActiveState")
     if not lan1_up and act != "failed":
         return SKIP, f"LAN1 没地址 (没插线), smbd 等插线来地址再起 ({act}); 刚开机的话稍等再跑"
     st, why = judge_unit(SYSTEM_UNITS["smb.service"], props)
-    if act == "failed" and LAN1_DROPIN not in props.get("DropInPaths", ""):
+    if act == "failed" and hand_conf and LAN1_DROPIN not in props.get("DropInPaths", ""):
         why += f"; 没装 smb.service.d/{LAN1_DROPIN}, smb.conf 的 interfaces 也该带 lo (docs/MIGRATE_95.md)"
     return st, why
 

@@ -465,19 +465,24 @@ def test_judge_smb_no_lan1_address_is_skip():
     assert st == S and "LAN1" in why and "稍等" in why
 
 
-def test_judge_smb_failed_hints_missing_lan1_dropin():
+def test_judge_smb_failed_hints_missing_lan1_dropin_only_for_hand_conf():
     crashed = _props("failed", "failed", result="core-dump", status="6")
-    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False)
+    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False, hand_conf=True)
     assert st == F and "ops-cart-lan1.conf" in why and " lo" in why
     st, why = ac.judge_smb(dict(crashed, DropInPaths="/etc/systemd/system/smb.service.d/ops-cart-lan1.conf"),
-                           lan1_up=False)
+                           lan1_up=False, hand_conf=True)
     assert st == F and "没装" not in why
+    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False, hand_conf=False)    # 仓库配置不该装它
+    assert st == F and "ops-cart-lan1.conf" not in why
 
 
-def test_judge_smb_crashed_is_fail_even_without_link():
-    """没链路时也不该有 failed (#95 之后 ExecCondition 只会跳过); 有 failed 就是又崩了 / 钩子没装."""
-    st, why = ac.judge_smb(_props("failed", "failed", result="core-dump", status="6"), lan1_up=False)
-    assert st == F and "core-dump" in why
+@pytest.mark.parametrize("text,want", [
+    ("# /etc/samba/smb.conf —— setup-samba.sh 按 ... 生成\n[global]\n", False),
+    ("# 手工写的\n[global]\n   interfaces = 192.0.2.1/24\n", True),
+    (None, False),                                                  # 读不到: 不下结论, 不提示
+])
+def test_is_hand_smb_conf(text, want):
+    assert ac.is_hand_smb_conf(text) is want
 
 
 def test_judge_smb_lan1_up_must_run_when_enabled():

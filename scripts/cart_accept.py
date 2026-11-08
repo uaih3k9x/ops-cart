@@ -265,7 +265,7 @@ def system_unit_checks():
         if d is None:
             return ac.SKIP, "没有 systemctl (不是推车)"
         lan1_up = " inet " in sh(["ip", "-4", "-o", "addr", "show", "dev", "eno1"])[1]
-        return ac.judge_smb(d.get("smb.service"), lan1_up)
+        return ac.judge_smb(d.get("smb.service"), lan1_up, ac.is_hand_smb_conf(read("/etc/samba/smb.conf")))
 
     def logrotate():
         d = show()

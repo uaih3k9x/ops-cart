@@ -69,10 +69,11 @@ sudo systemctl start logrotate.service && systemctl is-failed logrotate.service 
 ### 2.1 smb.conf 的 interfaces 加 lo（手工配置的推车）
 
 ```bash
-sudo cp -a /etc/samba/smb.conf /etc/samba/smb.conf.bak-95
-grep -n '^ *interfaces' /etc/samba/smb.conf        # 现在是 interfaces = <装机口地址>/<前缀>
+[ -e /etc/samba/smb.conf.bak-95 ] || sudo cp -a /etc/samba/smb.conf /etc/samba/smb.conf.bak-95    # 重跑不覆盖已有备份
+grep -nE '^\s*interfaces' /etc/samba/smb.conf       # 现在是 interfaces = <装机口地址>/<前缀>
 sudoedit /etc/samba/smb.conf                        # 改成  interfaces = lo <装机口地址>/<前缀>   (地址照原样, 只在前面加 lo)
-testparm -s 2>/dev/null | grep -E '^\s*(interfaces|bind interfaces only)'   # interfaces = lo <装机口地址>/<前缀>, bind interfaces only = Yes
+sudo testparm -s >/dev/null && echo OK                  # 报错原样打出来
+testparm -s | grep -E '^\s*(interfaces|bind interfaces only)'   # interfaces = lo <装机口地址>/<前缀>, bind interfaces only = Yes
 ```
 
 `testparm` 报错就 `sudo cp -a /etc/samba/smb.conf.bak-95 /etc/samba/smb.conf` 换回去再看。
@@ -86,12 +87,24 @@ sudo install -m 755 <包>/deploy/srv-data/50-ops-cart-smb /etc/NetworkManager/di
 sudo restorecon -v /etc/NetworkManager/dispatcher.d/50-ops-cart-smb
 sudo systemctl daemon-reload
 sudo systemctl reset-failed smb.service
-sudo systemctl start smb.service
+sudo systemctl restart smb.service              # 正在跑的也要重启, 才用上新的 interfaces
 systemctl status smb.service --no-pager -n 0      # 没插线: inactive (dead), 日志里 "Skipped due to 'exec-condition'"; 插着线: active (running)
 systemctl show -p DropInPaths smb.service         # 里面有 ops-cart-lan1.conf
 ```
 
-### 2.3 验证
+### 2.3 回滚
+
+可以不动：加了 `lo`、装了 drop-in 和钩子，旧版本照样能用。要撤的话：
+
+```bash
+sudo rm -f /etc/systemd/system/smb.service.d/ops-cart-lan1.conf /etc/NetworkManager/dispatcher.d/50-ops-cart-smb
+sudo cp -a /etc/samba/smb.conf.bak-95 /etc/samba/smb.conf
+sudo systemctl daemon-reload && sudo systemctl restart smb.service
+```
+
+撤回以后 LAN1 没地址时 smbd 又会崩（回到 #95 之前）。
+
+### 2.4 验证
 
 - 拔着 LAN1 重启推车：`systemctl --failed` 里没有 smb，`coredumpctl list smbd` 没有新的。
 - 插上 LAN1，等地址出来（`ip -4 addr show dev eno1`）：

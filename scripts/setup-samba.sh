@@ -62,6 +62,7 @@ done
 echo "==> systemd: smbd 等数据盘; LAN1 来地址时 (重) 启 smbd 绑上"
 install -d -m 755 /etc/systemd/system/smb.service.d
 install -m 644 "$SRC/deploy/srv-data/smb-ops-cart.conf" /etc/systemd/system/smb.service.d/ops-cart.conf
+rm -f /etc/systemd/system/smb.service.d/ops-cart-lan1.conf      # 手工配置时期装过的撤掉 (见 docs/MIGRATE_95.md)
 install -m 755 "$SRC/deploy/srv-data/50-ops-cart-smb" /etc/NetworkManager/dispatcher.d/50-ops-cart-smb
 command -v restorecon >/dev/null && restorecon /etc/NetworkManager/dispatcher.d/50-ops-cart-smb || true
 
