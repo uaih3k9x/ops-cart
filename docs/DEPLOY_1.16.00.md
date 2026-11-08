@@ -18,7 +18,7 @@ journalctl -fu ops-cart-deploy          # 看进度; Ctrl-C 只停看日志, 不
 下面逐步写清楚脚本做了什么，脚本跑不了时照着手工做。
 
 > 怎么得出的：`git diff --name-status f6541fd..<release/1.16.00 的提交>`。部署前对过推车：`/opt/pxe` 下 66 个文件（`*.py` 和 `VERSION`）的 sha256 和 `f6541fd` 完全一致，没有现场手改。
-> 推车如果不是 1.15.01，脚本会停下（`FORCE=1` 才跳过检查）。代码是整包拷的，旧版本也不会漏文件，但单元和配置的变化只按 1.15.01 → 1.16.00 写。
+> 推车如果不是 1.15.01，脚本会停下。要跳过这道检查，用 `sudo systemd-run --setenv=FORCE=1 --unit=ops-cart-deploy --collect bash /tmp/deploy-1.16.00/install.sh`。代码是整包拷的，旧版本也不会漏文件，但单元和配置的变化只按 1.15.01 → 1.16.00 写。
 
 ## 0. 这一版改了什么（相对 1.15.01）
 
@@ -99,24 +99,29 @@ sudo cp -a /etc/ops-cart $B/etc/ops-cart          # 配置原样留一份 (含 0
 同一目录里还写一个 `deploy.marker`（`from` / `to` / `build`），用来认出"上次装到一半"；回滚成功后它会被改名成 `deploy.marker.rolled-back`，之后可以再装。
 
 任何改动之前，脚本先按 `accept/accept-manifest.json` 核对包里每个文件的 sha256，再核对包里的 `BUILD` 和 manifest 的 `build` 是否一致。对不上就停。
+- 它还会检查 manifest 的 `files` 不能为空，`/opt/pxe` 条目不能少于 60 个，包里的 3 个单元都得列在 manifest 里。
+- 核对时先打印 manifest 自己的 sha256。
+- 包里有、manifest 没列的文件会列成警告，照样装，不核对。这一版会看到 `approval_core.py`、`approval_channel.py`、`totp_core.py`（#77 还没接线，不在验收清单里），属于正常。
+- 内联的 python 用 `python3 -I` 跑，不受包目录和环境变量影响。
+
+`deploy.marker` 在 `rollback.sh` 写好之后才落，所以有 marker 就一定有能用的回滚。备份做到一半（`rollback.sh` 还没写好）就出错的话，推车上的文件还没动，半截备份会被删掉。
+装完（重启检查通过）后，marker 里会追加 `done=1`。之后再被打断，就只是验收没跑完，脚本会提示"已经装完，只是验收被打断"，不用回滚。重跑会提示"已经装完了"。
 它还会检查 `cart-mcp-ro.service`、`cart-ble-input.service` 是否已经存在（1.15.01 上不该有），存在也停。
 
-备份前脚本还会检查部署包齐不齐：3 个单元、`accept/cart_accept.py` 等都要在，包里 `VERSION` 必须是 1.16.00。缺了就停，什么都不动。版本检查要跳过，用 `sudo FORCE=1 bash install.sh`。别用 `sudo -E`，它会把开发机上测试用的 `OPT` / `SYS` / `ETC` / `LOG` 变量带进 root 环境。
+备份前脚本还会检查部署包齐不齐：3 个单元、`accept/cart_accept.py` 等都要在，包里 `VERSION` 必须是 1.16.00。缺了就停，什么都不动。版本检查要跳过，用 `sudo systemd-run --setenv=FORCE=1 --unit=ops-cart-deploy --collect bash /tmp/deploy-1.16.00/install.sh`（FORCE 只跳过 from 版本检查，跳不过"上次装到一半"那道）。别用 `sudo -E`，它会把开发机上测试用的 `OPT` / `SYS` / `ETC` / `LOG` 变量带进 root 环境。
 
 ## 3. 部署包（开发机上打，传到推车 `/tmp`）
 
 推车没有 rsync，用 tar 管道。
 
 ```bash
-P=$(mktemp -d)/deploy-1.16.00
-mkdir -p $P/opt $P/systemd $P/accept
-cp *.py VERSION BUILD $P/opt/ && cp -r web icons $P/opt/
-cp deploy/systemd/cart-mcp.service deploy/systemd/cart-mcp-ro.service deploy/systemd/cart-ble-input.service $P/systemd/
-cp scripts/cart_accept.py scripts/accept_core.py scripts/accept-manifest.json $P/accept/
-cp scripts/install-1.16.00.sh $P/install.sh
-mkdir -p $P/tk-test && cp tests/conftest.py tests/test_confirm_panel.py $P/tk-test/   # 第 8 步车机真屏跑
-tar -C $(dirname $P) -cf - deploy-1.16.00 | ssh <推车> 'rm -rf /tmp/deploy-1.16.00 && tar -C /tmp -xf -'
+OUT=$(mktemp -d)
+scripts/pack-1.16.00.sh $OUT          # 工作区不干净就拒绝; 生成 BUILD 和 manifest; 只打 git ls-files 里的文件
+ssh <推车> 'test -e /tmp/deploy-1.16.00 && mv /tmp/deploy-1.16.00 /tmp/deploy-1.16.00.old-$(cut -d" " -f2 /tmp/deploy-1.16.00/opt/BUILD) || true'
+COPYFILE_DISABLE=1 tar -C $OUT -cf - deploy-1.16.00 | ssh <推车> 'tar -C /tmp -xf -'
 ```
+
+旧包挪走保留，不删。`opt/` 里只有 git 跟踪的顶层 `*.py`、`VERSION`、`web/`、`icons/`，再加生成的 `BUILD`。
 
 包的布局：`opt/`（落到 `/opt/pxe`）、`systemd/`、`accept/`（单放，别混进 `/opt/pxe`）、`tk-test/`、`install.sh`。
 

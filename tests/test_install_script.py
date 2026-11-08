@@ -91,13 +91,13 @@ exit 0
 case "$1" in
   */kiosk_core.py) printf "menuentry 'Boot from local disk' {{ exit }}\\n" > "$4/grub.cfg"
                    rm -f "$4/EFI/BOOT/grub.cfg"; echo '{{"new": 1}}' > "$6";;
-  */cart_accept.py) ;;
+  */cart_accept.py) [ -f {tmp_path}/term-in-accept ] && kill -TERM $PPID; sleep 0.2;;
   *) exec {sys.executable} "$@";;
 esac
 exit 0
 """)
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", OPT=str(opt), SYS=str(sysd),
-               ETC=str(etc), LOG=str(log), SETTLE="0")
+               ETC=str(etc), LOG=str(log), SETTLE="0", MIN_OPT_FILES="1")
     return dict(tmp=tmp_path, opt=opt, sys=sysd, etc=etc, pkg=pkg, env=env, calls=calls, fail=fail,
                 brk=brk, active=active)
 
@@ -268,7 +268,7 @@ def test_refuses_package_with_wrong_target_version(cart):
 def test_force_hint_does_not_use_sudo_E(cart):
     (cart["opt"] / "VERSION").write_text("1.14.00\n")
     r = run(cart)
-    assert "sudo FORCE=1 bash" in r.stderr and "sudo -E" not in r.stderr
+    assert "--setenv=FORCE=1" in r.stderr and "sudo -E" not in r.stderr
 
 
 def test_install_hint_and_rollback_use_systemd_run(cart):
@@ -371,3 +371,82 @@ def test_rollback_err_trap_says_rerunnable(cart):
     (b / "VERSION").unlink()
     rr = _rollback(cart, b)
     assert rr.returncode != 0 and "回滚第" in rr.stderr and "重跑" in rr.stderr
+
+
+def test_half_made_backup_without_rollback_is_removed(cart):
+    """rollback.sh 还没写好就出错: 推车文件没动, 半截备份删掉, 也不留 marker 挡下次."""
+    _exe(cart["tmp"] / "bin" / "chmod", "exit 1\n")
+    r = run(cart)
+    assert r.returncode != 0
+    assert backups(cart) == []
+    assert "什么都没改" in r.stderr
+    assert (cart["opt"] / "VERSION").read_text() == "1.15.01\n"
+    (cart["tmp"] / "bin" / "chmod").unlink()
+    assert run(cart).returncode == 0                             # 下次照常装
+
+
+def test_marker_written_only_with_rollback(cart):
+    run(cart)
+    (b,) = backups(cart)
+    marker = (b / "deploy.marker").read_text().splitlines()
+    assert marker[:2] == ["from=1.15.01", "to=1.16.00"] and "done=1" in marker
+    assert (b / "rollback.sh").exists()
+
+
+def test_interrupted_during_accept_says_installed(cart):
+    (cart["tmp"] / "term-in-accept").write_text("")
+    r = run(cart)
+    assert r.returncode == 130
+    assert "已经装完, 只是验收被打断" in r.stderr and "装了一半" not in r.stderr
+    assert (cart["opt"] / "VERSION").read_text() == "1.16.00\n"
+    r2 = run(cart)
+    assert r2.returncode != 0 and "已经装完了" in r2.stderr and "没装完" not in r2.stderr
+
+
+def test_force_hint_uses_systemd_run_setenv(cart):
+    (cart["opt"] / "VERSION").write_text("1.14.00\n")
+    r = run(cart)
+    assert "sudo systemd-run --setenv=FORCE=1 --unit=ops-cart-deploy --collect bash" in r.stderr
+
+
+def test_refuses_empty_manifest_files(cart):
+    m = json.loads((cart["pkg"] / "accept" / "accept-manifest.json").read_text())
+    m["files"] = {}
+    (cart["pkg"] / "accept" / "accept-manifest.json").write_text(json.dumps(m))
+    r = run(cart)
+    assert r.returncode != 0 and "files 是空的" in r.stderr
+    assert backups(cart) == []
+
+
+def test_refuses_manifest_with_too_few_opt_files(cart):
+    r = run(cart, {"MIN_OPT_FILES": "60"})
+    assert r.returncode != 0 and "少于 60" in r.stderr
+    assert backups(cart) == []
+
+
+def test_refuses_manifest_missing_a_packaged_unit(cart):
+    m = json.loads((cart["pkg"] / "accept" / "accept-manifest.json").read_text())
+    del m["files"]["/etc/systemd/system/cart-mcp-ro.service"]
+    (cart["pkg"] / "accept" / "accept-manifest.json").write_text(json.dumps(m))
+    r = run(cart)
+    assert r.returncode != 0 and "manifest 只列了 2 个" in r.stderr
+    assert backups(cart) == []
+
+
+def test_warns_on_packaged_file_not_in_manifest_and_prints_manifest_sha(cart):
+    m_raw = None
+    (cart["pkg"] / "opt" / "approval_core.py").write_text("not deployed yet\n")   # 包里有、manifest 没列
+    m_raw = (cart["pkg"] / "accept" / "accept-manifest.json").read_bytes()
+    r = run(cart)
+    assert r.returncode == 0, r.stderr
+    assert "警告" in r.stderr and "opt/approval_core.py" in r.stderr
+    assert hashlib.sha256(m_raw).hexdigest() in r.stdout
+
+
+def test_inline_python_runs_isolated():
+    assert 'python3 -I - "$PKG"' in SCRIPT.read_text()
+
+
+def test_pack_script_only_ships_tracked_files():
+    code = [l for l in (ROOT / "scripts" / "pack-1.16.00.sh").read_text().splitlines() if not l.lstrip().startswith("#")]
+    assert any("git ls-files" in l for l in code) and not any("*.py " in l and l.lstrip().startswith("cp") for l in code)
