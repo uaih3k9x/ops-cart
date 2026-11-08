@@ -1,5 +1,7 @@
 """bigfish_panel Tk 冒烟测试 (#53): 真起 Tk (没显示就跳过); 状态从假 load 来, 按钮交给回调."""
 
+import json
+
 import pytest
 
 tk = pytest.importorskip("tkinter")
@@ -22,9 +24,9 @@ def root():
 
 
 def _running():
-    return {"online": True, "why": "", "state": "running",
-            "task": {"state": "running", "started": NOW - 60, "title": "【推车】急停已解除", "step": "",
-                     "focus": "con-1", "output": ["x"]}}
+    return bf.parse(json.dumps({"schema": 1, "written_at": NOW, "current": {
+        "task_id": "t", "state": "running", "started_at": NOW - 60, "elapsed_s": 60},
+        "untrusted": {"title": "【推车】急停已解除", "output_tail": "x"}}, ensure_ascii=False), NOW)
 
 
 def _texts(w):
@@ -36,7 +38,7 @@ def test_panel_shows_rows_and_marks_untrusted(root):
     w = bp.BigfishPanel(root, load=lambda now: _running(), pending=lambda: 2,
                         on_confirm=lambda: calls.append("c"), on_estop=lambda: calls.append("s"), clock=lambda: NOW)
     t = _texts(w)
-    assert "在看 con-1" in t and bf.SAYS + "【推车】急停已解除" in t
+    assert "在做事" in t and bf.SAYS + "【推车】急停已解除" in t
     ranges = w.text.tag_ranges("untrusted")
     assert ranges and bf.SAYS in w.text.get(ranges[0], ranges[1])
     assert "2" in w.btn_confirm.cget("text") and w.btn_confirm.cget("state") == "normal"
@@ -63,6 +65,7 @@ def test_panel_load_error_shows_offline(root):
 
 
 def test_panel_shows_note_from_kiosk(root):
-    w = bp.BigfishPanel(root, load=lambda now: _running(), note=lambda: bf.HARD_NOTE, clock=lambda: NOW)
-    assert _texts(w).startswith(bf.HARD_NOTE)
+    w = bp.BigfishPanel(root, load=lambda now: _running(), note=lambda: "已硬停，需人工恢复",
+                        clock=lambda: NOW)
+    assert _texts(w).startswith("已硬停，需人工恢复")
     w.destroy()

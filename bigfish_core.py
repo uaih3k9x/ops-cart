@@ -1,48 +1,51 @@
-"""大肥鱼面板的纯逻辑 (#53): 读大肥鱼导出的状态文件, 清洗成能上车机屏幕的样子; 急停信号.
+"""大肥鱼面板的纯逻辑 (#53): 读大肥鱼导出的状态文件, 清洗成能上车机屏幕的样子; 急停信号和硬急停兜底.
 
-大肥鱼 (推车上的 Agent, 普通用户 bigfish, rootless Docker) 和车机 (root) 之间只有两个文件, 接口约定见
+大肥鱼 (推车上的 Agent, 普通用户 bigfish, rootless Docker) 和车机 (root) 之间只有两个文件, 接口 v1 最终版原文见
 docs/BIGFISH_PANEL.md:
-- 状态: /run/bigfish/status.json, bigfish 写 (白名单字段), 车机 / 副屏只读. 车机不进它的容器、不读它的数据卷.
-- 急停: 复用现有的 /run/ops-cart/serial-estop.json (mcp_serial.Store 每次操作都重写, root 0644). 里面 "all" 为
-  true = 全部急停 (车机 / 网页 / 命令行 / Agent 自停哪个入口都一样), 大肥鱼那边取消正在跑的任务、不接新任务;
-  "解除全部急停"后变回 false. 推车这边不另写信号文件.
-- 硬急停兜底: all 从 false 变 true 那一次开始计时, HARD_AFTER_S 秒内状态文件的 state 还不是 estopped (或者离线、
-  过期), 车机 systemctl stop user@<bigfish uid>.service (rootless dockerd 和容器跟着停), 记 cartlog. 只停一次.
+- 状态: /home/bigfish/status/bigfish.json, bigfish 写, 车机 / 副屏只读. 车机不进它的容器、不读它的数据卷.
+- 急停: /run/bigfish-ctl/estop.json, 车机写 (root:bigfish 0640, seq 递增), 大肥鱼读; 解除全部急停时删掉.
+  写完 HARD_AFTER_S 秒内状态文件的 estop.seen 没变 true (或者离线), 车机 systemctl stop user@<bigfish uid>.service.
+  两个目录都由大肥鱼那边的 setup-root.sh 建, 本仓库不加 tmpfiles.
+- 权限 (docs 有详细依据): estop.json 先 fchown 成 bigfish 组 + fchmod 0640 再改名, 不看 umask, bigfish 经属组可读
+  (/run/bigfish-ctl 是 root:bigfish 0750). bigfish.json 由 root (kiosk / cart-dash, 单元无 ProtectHome) 读, 不靠
+  /home/bigfish/status 的 0711 和文件的 0644. 解除急停删文件, 下次急停 seq 从 1 重来.
 
 规矩:
-- 状态文件是 bigfish 写的, 当不可信输入: 不跟链接、只认普通文件、属主必须是 bigfish、最多读 MAX_BYTES,
-  非阻塞打开 (放个 FIFO 卡不住车机).
-- 大肥鱼的话 (title / step / output) 一律过 confirm_core.one_line (删 ANSI、控制 / 格式字符、换行压成一行、截短),
-  显示时前面加 SAYS, 和推车自己的字分开. 锁屏一行只用枚举字段, 不露原文.
+- 状态文件是 bigfish 写的, 当不可信输入: 不跟链接、非阻塞打开 (FIFO 卡不住车机)、fstat 核对普通文件 / 属主 bigfish /
+  不超过 MAX_BYTES, 任何一条不满足当没有数据.
+- 可信字段 (wrapper 写的) 也做类型和取值白名单校验, 不合格的丢掉. untrusted 里的 (title / output_tail / steps)
+  一律过 confirm_core.one_line (删 ANSI、控制 / 格式字符、压成一行、截短), 显示时前面加 SAYS. 锁屏一行只用可信字段.
 - 不存在 / 读不懂 / 过期 = 不在线, 不抛.
 """
 
 import json
 import os
 import pwd
-import re
+import grp
 import stat
+import time
 
 import cartlog
-
 import confirm_core as cfc
 
-STATUS_PATH = "/run/bigfish/status.json"
-FLAG_PATH = "/run/ops-cart/serial-estop.json"   # = mcp_serial 的 STATE_PATH 同目录 + ESTOP_FLAG (测试钉住)
-HARD_AFTER_S = 10
-HARD_NOTE = "大肥鱼已硬停，需人工恢复"
+STATUS_PATH = "/home/bigfish/status/bigfish.json"
+ESTOP_DIR = "/run/bigfish-ctl"
+ESTOP_PATH = ESTOP_DIR + "/estop.json"
 USER = "bigfish"
 MAX_BYTES = 64 * 1024
-STALE_S = 30                # 写入方至少每 10 秒刷一次 updated; 超过 30 秒没动 = 过期
+STALE_S = 20                # 空闲也每 5 秒心跳; 20 秒没动 = 离线
 FUTURE_S = 5
-TEXT_MAX = 200
+HARD_AFTER_S = 10           # 写了急停这么久大肥鱼还没确认 -> 硬停
+TITLE_MAX, STEP_TITLE_MAX, STEP_STATUS_MAX, TRUSTED_STR_MAX = 200, 120, 20, 40
+OUTPUT_TAIL = 2048
 OUTPUT_LINES = 5
+STEPS_MAX = 10
+STEP_MAX = 10000            # steps_total / step_current 的合理上限
 SAYS = "大肥鱼说："
 
-STATES = {"idle": "空闲", "running": "在做事", "estopped": "急停中"}
-TASK_STATES = ("starting", "running", "completed", "cancelled", "failed")
-FOCUS = re.compile(r"(con-[1-4]|kvm)\Z")
-FOCUS_NAME = {"kvm": "键鼠"}      # 中文名前不加空格; con-N 前加
+TASK_STATES = {"starting": "启动中", "running": "在做事", "done": "做完了", "failed": "失败",
+               "cancelled": "已取消", "estopped": "急停中"}
+cartlog_event = cartlog.event
 
 
 # ------------------------------------------------------------ 读文件
@@ -54,17 +57,24 @@ def bigfish_uid(user=USER):
         return None
 
 
-def read_status(path=STATUS_PATH, uid=None):
-    """-> 文件内容 (str) 或 None. 链接 / 非普通文件 / 属主不是 uid / 没有 uid 都 None. 多读一个字节好让 parse 认出超长."""
+def bigfish_gid(group=USER):
+    try:
+        return grp.getgrnam(group).gr_gid
+    except KeyError:
+        return None
+
+
+def read_status(path=None, uid=None):
+    """-> 文件内容 (str) 或 None. 链接 / 非普通文件 / 属主不是 uid / 超过 MAX_BYTES / 没有 uid 都 None."""
     if uid is None:
         return None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path or STATUS_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_size > MAX_BYTES:
             return None
         return os.read(fd, MAX_BYTES + 1).decode("utf-8", "replace")
     except OSError:
@@ -73,41 +83,56 @@ def read_status(path=STATUS_PATH, uid=None):
         os.close(fd)
 
 
-def load(now, path=None, uid=False):
-    """读 + 解析. uid=False 时查 bigfish 用户."""
-    return parse(read_status(path or STATUS_PATH, bigfish_uid() if uid is False else uid), now)
+def load(now, path=None):
+    """读 + 解析 (按用户名查 bigfish 的 uid)."""
+    return parse(read_status(path, bigfish_uid()), now)
 
 
 # ------------------------------------------------------------ 解析 / 清洗
 
-def clean(text, limit=TEXT_MAX):
+def clean(text, limit=TITLE_MAX):
     """大肥鱼的话 -> 一行可显示的字 (不可信)."""
     return cfc.one_line(text if isinstance(text, str) else "", limit)
 
 
-def _num(v):
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+def _num(v, lo=None):
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and (lo is None or v >= lo)
+    return v if ok else None
+
+
+def _int(v, hi=STEP_MAX):
+    return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= hi else None
 
 
 def _offline(why):
-    return {"online": False, "why": why, "state": None, "task": None}
+    return {"online": False, "why": why, "estop_seen": False, "current": None, "running_count": 0,
+            "said": {"title": "", "output": [], "steps": []}}
 
 
-def _task(t):
-    if not isinstance(t, dict):
+def _current(c):
+    if not isinstance(c, dict) or c.get("state") not in TASK_STATES:
         return None
-    out = t.get("output")
-    lines = [clean(x) for x in out if isinstance(x, str)][-OUTPUT_LINES:] if isinstance(out, list) else []
-    focus = t.get("focus")
-    return {"state": t.get("state") if t.get("state") in TASK_STATES else None,
-            "started": _num(t.get("started")),
-            "title": clean(t.get("title")), "step": clean(t.get("step")),
-            "focus": focus if isinstance(focus, str) and FOCUS.match(focus) else None,
-            "output": [x for x in lines if x]}
+    total = _int(c.get("steps_total"))
+    cur = _int(c.get("step_current"), total) if total is not None else None
+    return {"state": c["state"], "started_at": _num(c.get("started_at")), "elapsed_s": _num(c.get("elapsed_s"), 0),
+            "steps_total": total, "step_current": cur,
+            "stop_reason": clean(c.get("stop_reason"), TRUSTED_STR_MAX), "source": clean(c.get("source"), TRUSTED_STR_MAX)}
+
+
+def _said(u):
+    if not isinstance(u, dict):
+        u = {}
+    tail = u.get("output_tail")
+    tail = tail[-OUTPUT_TAIL:] if isinstance(tail, str) else ""
+    lines = [x for x in (clean(ln) for ln in tail.splitlines()) if x][-OUTPUT_LINES:]
+    steps = u.get("steps") if isinstance(u.get("steps"), list) else []
+    steps = [(clean(st.get("status"), STEP_STATUS_MAX), clean(st.get("title"), STEP_TITLE_MAX))
+             for st in steps if isinstance(st, dict)][:STEPS_MAX]
+    return {"title": clean(u.get("title")), "output": lines, "steps": [p for p in steps if p[1]]}
 
 
 def parse(text, now):
-    """状态文件内容 -> {online, why, state, task}. 不抛."""
+    """状态文件内容 -> {online, why, estop_seen, current, running_count, said}. 不抛."""
     if text is None:
         return _offline("不在线")
     if len(text) > MAX_BYTES:
@@ -116,21 +141,29 @@ def parse(text, now):
         d = json.loads(text)
     except ValueError:
         return _offline("状态读不懂")
-    if not isinstance(d, dict) or d.get("v") != 1 or d.get("state") not in STATES or _num(d.get("updated")) is None:
+    if not isinstance(d, dict) or d.get("schema") != 1 or _num(d.get("written_at")) is None:
         return _offline("状态读不懂")
-    if now - d["updated"] > STALE_S or d["updated"] - now > FUTURE_S:
-        return _offline("状态过期")
-    return {"online": True, "why": "", "state": d["state"], "task": _task(d.get("task"))}
+    if now - d["written_at"] > STALE_S or d["written_at"] - now > FUTURE_S:
+        return _offline("离线")
+    es = d.get("estop")
+    return {"online": True, "why": "", "estop_seen": isinstance(es, dict) and es.get("seen") is True,
+            "current": _current(d.get("current")), "running_count": _int(d.get("running_count")) or 0,
+            "said": _said(d.get("untrusted"))}
 
 
 # ------------------------------------------------------------ 显示
 
 def _doing(view):
-    """推车自己的一句 (只用枚举字段): 空闲 / 在做事 / 在看 con-1 / 急停中."""
-    task = view["task"]
-    if view["state"] == "running" and task and task["focus"]:
-        return "在看" + FOCUS_NAME.get(task["focus"], " " + task["focus"])
-    return STATES[view["state"]]
+    """推车自己的一句 (只用可信字段): 空闲 / 在做事 · 第 2/5 步 / 急停中 ..."""
+    cur = view["current"]
+    if view["estop_seen"]:
+        return "急停中"
+    if cur is None:
+        return "空闲"
+    text = TASK_STATES[cur["state"]]
+    if cur["state"] == "running" and cur["steps_total"] and cur["step_current"] is not None:
+        text += f" · 第 {cur['step_current']}/{cur['steps_total']} 步"
+    return text
 
 
 def lock_line(view):
@@ -149,22 +182,23 @@ def elapsed(s):
     return f"{s // 3600} 小时 {s % 3600 // 60} 分"
 
 
-def panel_rows(view, now, note=""):
-    """面板上的行 -> [(文字, 标签)]. 标签: own (推车自己的) / dim / bad / untrusted (大肥鱼说的, 带 SAYS 前缀).
-    note: 车机这边急停兜底的进展, 放第一行."""
-    top = [(note, "bad")] if note else []
+def panel_rows(view, now, note="", ready=True):
+    """面板上的行 -> [(文字, 标签)]. 标签: own / dim / bad / untrusted (大肥鱼说的, 带 SAYS 前缀).
+    note: 车机这边急停的进展 (等确认 / 已硬停); ready=False: 急停通道目录不在."""
+    top = [(note, "bad")] if note else [] if ready else [("急停通道未就绪", "bad")]
     if not view["online"]:
         return top + [("大肥鱼" + view["why"], "bad")]
-    task = view["task"]
-    if view["state"] == "idle" and not task:
+    cur, said = view["current"], view["said"]
+    if cur is None and not view["estop_seen"]:
         return top + [("空闲", "dim")]
     head = _doing(view)
-    if task and task["started"] is not None and view["state"] == "running":
-        head += " · " + elapsed(now - task["started"])
-    rows = top + [(head, "bad" if view["state"] == "estopped" else "own")]
-    if task:
-        rows += [(SAYS + x, "untrusted") for x in (task["title"], task["step"], *task["output"]) if x]
-    return rows
+    if cur and cur["state"] == "running" and cur["elapsed_s"] is not None:
+        head += " · " + elapsed(cur["elapsed_s"])
+    if cur and cur["state"] in ("failed", "cancelled") and cur["stop_reason"]:
+        head += " · " + cur["stop_reason"]
+    rows = top + [(head, "bad" if head == "急停中" or (cur and cur["state"] == "estopped") else "own")]
+    lines = [said["title"]] + [f"[{st}] {t}" if st else t for st, t in said["steps"]] + said["output"]
+    return rows + [(SAYS + x, "untrusted") for x in lines if x]
 
 
 # ------------------------------------------------------------ 确认 / 拒绝: 复用现有确认框
@@ -181,53 +215,81 @@ def pending_target(slot_states, kvm):
     return ("kvm", None) if (kvm or {}).get("pending") else None
 
 
-# ------------------------------------------------------------ 硬急停兜底
+# ------------------------------------------------------------ 急停 (车机写, 大肥鱼读)
 
-def flag_all(path=None):
-    """serial-estop.json 的 all 是不是 true. 没文件 / 读不懂都算 false: 车机只在真急停时计时 (大肥鱼那边读不懂按急停)."""
+def channel_ready(d=None):
+    return os.path.isdir(d or ESTOP_DIR)
+
+
+def _old_seq(path):
     try:
-        with open(path or FLAG_PATH, encoding="utf-8") as f:
-            doc = json.load(f)
-    except (OSError, ValueError):
-        return False
-    return isinstance(doc, dict) and doc.get("all") is True
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return 0
+    try:
+        seq = json.loads(os.read(fd, 4096)).get("seq")
+        return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0 else 0
+    except (OSError, ValueError, AttributeError):
+        return 0
+    finally:
+        os.close(fd)
 
 
-class HardStopGuard:
-    """车机每秒喂一次 (all, 状态视图). phase: idle -> waiting (all 刚变 true) -> seen (大肥鱼报 estopped) / hard (超时).
-    step 只在该硬停的那一刻返回 "hard", 同一次急停里只一次. hard 一直留着 (面板上要看得见),
-    直到急停解除且大肥鱼重新在线 (有人恢复了它)."""
+def estop_write(now, by="kiosk", path=None, gid=None):
+    """原子写 estop.json -> 新 seq (旧值 + 1, 没有 / 读不懂从 1 起). root:bigfish 0640: 临时文件先改好属组和权限再改名,
+    大肥鱼不会看到半个文件或一个它读不了的文件. 目录不在抛 FileNotFoundError."""
+    path = path or ESTOP_PATH
+    seq = _old_seq(path) + 1
+    gid = bigfish_gid() if gid is None else gid
+    tmp = f"{path}.tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        if gid is not None:
+            os.fchown(fd, -1, gid)
+        os.fchmod(fd, 0o640)
+        os.write(fd, json.dumps({"seq": seq, "at": now, "by": by}).encode())
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        os.unlink(tmp)
+        raise
+    os.close(fd)
+    os.replace(tmp, path)
+    return seq
 
-    NOTES = {"idle": "", "waiting": "等大肥鱼确认急停…", "seen": "大肥鱼已急停", "hard": HARD_NOTE}
 
-    def __init__(self, wait=HARD_AFTER_S):
-        self.wait, self.phase, self.t0, self._prev = wait, "idle", None, False
+def estop_clear(path=None):
+    try:
+        os.unlink(path or ESTOP_PATH)
+    except FileNotFoundError:
+        pass
 
-    def step(self, now, all_on, view):
-        rising, self._prev = all_on and not self._prev, all_on
-        if rising:
-            self.phase, self.t0 = "waiting", now
-        if self.phase == "waiting":
-            if not all_on:
-                self.phase = "idle"
-            elif view["online"] and view["state"] == "estopped":
-                self.phase = "seen"
-            elif now - self.t0 >= self.wait:
-                self.phase = "hard"
-                return "hard"
-        elif self.phase == "seen" and not all_on:
-            self.phase = "idle"
-        elif self.phase == "hard" and not all_on and view["online"]:
-            self.phase = "idle"
-        return None
 
-    def note(self):
-        return self.NOTES[self.phase]
+class EstopWatch:
+    """写了急停之后每秒看一眼状态文件: estop.seen 为 true -> "seen"; 到了 HARD_AFTER_S 还没 (或者离线) -> "hard"."""
+
+    def __init__(self, t0, wait=HARD_AFTER_S):
+        self.t0, self.wait = t0, wait
+
+    def step(self, now, view):
+        if view["online"] and view["estop_seen"]:
+            return "seen"
+        return "hard" if now - self.t0 >= self.wait else None
 
 
 def hard_stop(run, uid, why, event=None):
-    """systemctl stop user@<uid>.service, 记一条 cartlog -> (成功没有, 一句话). 恢复不归车机管."""
+    """硬急停: systemctl stop user@<uid>.service (bigfish 的整个用户管理器, rootless dockerd 跟着停), 记一条 cartlog.
+    -> (成功没有, 一句话). 恢复不归车机管."""
+    event = event or cartlog_event
+    if uid is None:
+        msg = "找不到 bigfish 用户, 没法硬停"
+        event("bigfish", f"硬急停失败: {msg} ({why})")
+        return False, msg
     unit = f"user@{uid}.service"
     rc, _out = run(["systemctl", "stop", unit])
-    (event or cartlog.event)("bigfish", f"硬急停: systemctl stop {unit} rc={rc} ({why})")
+    event("bigfish", f"硬急停: systemctl stop {unit} rc={rc} ({why})")
     return rc == 0, f"systemctl stop {unit} rc={rc}"

@@ -1,4 +1,4 @@
-"""车机大肥鱼面板 (#53): 只读看它在做什么; 确认 / 拒绝打开现有确认框, 急停就是全部急停.
+"""车机大肥鱼面板 (#53): 只读看它在做什么; 确认 / 拒绝打开现有确认框, 急停就是全部急停 (顺带写大肥鱼的急停信号).
 
 数据只来自 bigfish_core.load (大肥鱼导出的白名单状态文件). 大肥鱼说的话用单独的颜色、等宽字、SAYS 前缀,
 Text 只插纯文字 (不认链接、不执行). 这里不审批、不写任何文件.
@@ -17,9 +17,9 @@ TAGS = {"own": "FG", "dim": "DIM", "bad": "BAD", "untrusted": "AGENT"}
 
 class BigfishPanel(tk.Frame):
     def __init__(self, master, load=bf.load, pending=lambda: 0, on_confirm=None, on_estop=None, clock=time.time,
-                 note=lambda: ""):
+                 note=lambda: "", ready=bf.channel_ready):
         super().__init__(master, bg=BG)
-        self.load, self.pending, self.clock, self.note = load, pending, clock, note
+        self.load, self.pending, self.clock, self.note, self.ready = load, pending, clock, note, ready
         self.text = tk.Text(self, font=th.FONT_BIG, bg=BG, fg=th.FG, **th.FLAT, wrap="word",
                             state="disabled", padx=16, pady=12, cursor="arrow")
         self.text.pack(fill="both", expand=True)
@@ -47,7 +47,7 @@ class BigfishPanel(tk.Frame):
             view = bf.parse(None, now)
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
-        for line, tag in bf.panel_rows(view, now, note=self.note()):
+        for line, tag in bf.panel_rows(view, now, note=self.note(), ready=self.ready()):
             self.text.insert("end", line + "\n", tag)
         self.text.config(state="disabled")
         n = self.pending()

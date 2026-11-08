@@ -96,7 +96,7 @@ class Kiosk(tk.Tk):
         # Agent PXE 解锁申请 (#24): 采样线程 peek 来的视图 (带确认码), 申请框, 弹过的编号 (人关掉了不再弹)
         self._pxe_view, self._pxe_req_win, self._pxe_seen, self._pxe_store = None, None, set(), mcp_pxe.Store()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
-        self._bf_guard, self._bf_note = bfc.HardStopGuard(), ""   # 大肥鱼硬急停兜底 (#53) 和面板上的一句进展
+        self._bf_watch, self._bf_note = None, ""   # 大肥鱼急停 (#53): 等它确认的看门, 面板上的一句进展
 
         kc.kp_enter_as_return(self)
         kui.kp_digits_as_digits(self)
@@ -131,7 +131,6 @@ class Kiosk(tk.Tk):
         self.ui.repeat_bg(self._ups_sample, self._ups_sampled, every=1.0)
         self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
         self.after(CH_REAP_MS, self._ch_reap_tick)
-        self.after(1000, self._bigfish_tick)
 
     def _fill_screen(self):
         self.update_idletasks()
@@ -567,6 +566,8 @@ class Kiosk(tk.Tk):
         if why:
             self._serial_say(why, ok=False)
             return
+        if op == "estop" and arg is None:   # 全部急停也停大肥鱼 (#53); 不等串口那边, 也不受它忙不忙影响
+            self._bigfish_ctl("estop")
         store = self._sw_store
 
         def work():
@@ -576,6 +577,8 @@ class Kiosk(tk.Tk):
         def done(res):
             ok = not isinstance(res, Exception)
             self._serial_say(str(res) if ok else f"不行: {res}", ok)
+            if ok and op == "resume" and arg is None:
+                self._bigfish_ctl("resume")
         if not self.ui.run_bg(work, done, key="serial-write"):
             self._serial_say("上一个操作还在处理中…", ok=False)
             return
@@ -640,37 +643,59 @@ class Kiosk(tk.Tk):
             self._open_kvm()
 
     def _bigfish_estop(self):
-        """就是执行器条上的"Agent 全部急停": 大肥鱼那边看 serial-estop.json 的 all 停手."""
+        """就是执行器条上的"Agent 全部急停" (写大肥鱼急停信号挂在它上面)."""
         self._serial_action("estop", None)
 
-    def _bigfish_tick(self):
-        """每秒: serial-estop.json 的 all 变 true 后 10 秒内大肥鱼没报 estopped (或者离线 / 过期) 就硬停, 一次急停只停一次.
-        读的都是 /run 下的小文件, 在主线程读; systemctl 放后台."""
-        now = time.time()
-        try:
-            if self._bf_guard.step(now, bfc.flag_all(), bfc.load(now)) == "hard":
-                self._bigfish_hard()
-            elif self._bf_guard.phase != "hard":
-                self._bf_note = self._bf_guard.note()
-        finally:
-            self.after(1000, self._bigfish_tick)
-
-    def _bigfish_hard(self):
-        uid = bfc.bigfish_uid()
-        if uid is None:                     # 没有 bigfish 用户: 什么都不做, 面板上说一句
-            self._bf_note = "找不到 bigfish 用户，没有硬停"
+    def _bigfish_ctl(self, op):
+        """全部急停 -> 写 estop.json 并看它 10 秒内确认没有; 通道不在 / 写不了直接硬停. 解除全部急停 -> 删掉."""
+        if op == "resume":
+            self._bf_watch, self._bf_note = None, ""
+            try:
+                bfc.estop_clear()
+            except OSError as e:
+                self.banner.config(text=f"大肥鱼急停文件删不掉: {e}")
             return
-        why = f"全部急停 {bfc.HARD_AFTER_S} 秒内大肥鱼没确认"
-        self._bf_note = "正在硬停大肥鱼…"
+        now = time.time()
+        if not bfc.channel_ready():
+            self._bf_watch = None
+            self._bigfish_hard("急停通道未就绪")
+            return
+        try:
+            bfc.estop_write(now)
+        except OSError as e:
+            self._bf_watch = None
+            self._bigfish_hard(f"写不了急停文件: {e}")
+            return
+        self._bf_watch, self._bf_note = bfc.EstopWatch(now), "等大肥鱼确认急停…"
+        self.after(1000, self._bigfish_watch_tick)
+
+    def _bigfish_watch_tick(self):
+        w = self._bf_watch
+        if w is None:
+            return
+        now = time.time()
+        r = w.step(now, bfc.load(now))
+        if r == "seen":
+            self._bf_watch, self._bf_note = None, "大肥鱼已急停"
+        elif r == "hard":
+            self._bf_watch = None
+            self._bigfish_hard(f"{bfc.HARD_AFTER_S} 秒内没确认急停")
+        else:
+            self.after(1000, self._bigfish_watch_tick)
+
+    def _bigfish_hard(self, why):
+        """硬急停在后台跑 (systemctl stop 可能要等几秒); 恢复不归车机管."""
+        self._bf_note = "正在硬停…"
 
         def work():
-            return bfc.hard_stop(lambda cmd: kc.run(cmd, timeout=30), uid, why)
+            return bfc.hard_stop(lambda cmd: kc.run(cmd, timeout=30), bfc.bigfish_uid(), why)
 
         def done(res):
             ok = not isinstance(res, Exception) and res[0]
-            self._bf_note = bfc.HARD_NOTE if ok else f"大肥鱼硬停失败: {res if isinstance(res, Exception) else res[1]}"
-            self.banner.config(text=self._bf_note)
-        self.ui.run_bg(work, done, key="bigfish-hard")
+            self._bf_note = "已硬停，需人工恢复" if ok else f"硬停失败: {res if isinstance(res, Exception) else res[1]}"
+            self.banner.config(text=f"大肥鱼{self._bf_note} ({why})")
+        if not self.ui.run_bg(work, done, key="bigfish-hard"):
+            self._bf_note = "硬停已在进行"
 
     # ------------------------------------------------------------ Agent PXE 解锁申请 (#24)
 
