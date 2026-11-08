@@ -101,7 +101,7 @@ sudo cp -a /etc/ops-cart $B/etc/ops-cart          # 配置原样留一份 (含 0
 任何改动之前，脚本先按 `accept/accept-manifest.json` 核对包里每个文件的 sha256，再核对包里的 `BUILD` 和 manifest 的 `build` 是否一致。对不上就停。
 - 它还会检查 manifest 的 `files` 不能为空，`/opt/pxe` 条目不能少于 60 个，包里的 3 个单元都得列在 manifest 里。
 - 核对时先打印 manifest 自己的 sha256。
-- 包里有、manifest 没列的文件会列成警告，照样装，不核对。这一版会看到 `approval_core.py`、`approval_channel.py`、`totp_core.py`（#77 还没接线，不在验收清单里），属于正常。
+- 包里有、manifest 没列的文件会列成警告，照样装，不核对。这一版会看到 5 个，都属于正常：`approval_core.py`、`approval_channel.py`、`totp_core.py`（#77 还没接线）和 `samba_core.py`、`srv_data_core.py`（数据盘那套，不在验收的必带模块里）。
 - 内联的 python 用 `python3 -I` 跑，不受包目录和环境变量影响。
 
 `deploy.marker` 在 `rollback.sh` 写好之后才落，所以有 marker 就一定有能用的回滚。备份做到一半（`rollback.sh` 还没写好）就出错的话，推车上的文件还没动，半截备份会被删掉。

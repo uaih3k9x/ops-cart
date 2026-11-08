@@ -26,7 +26,7 @@ def _write_manifest(pkg, build=None):
     """照 cart_accept --make-manifest 的格式: /opt/pxe/<相对路径> 和装进去的单元."""
     files = {}
     for f in sorted((pkg / "opt").rglob("*")):
-        if f.is_file():
+        if f.is_file() and f.name != "BUILD":                # 真 manifest 不列 BUILD, 单独记在 build 字段
             files["/opt/pxe/" + f.relative_to(pkg / "opt").as_posix()] = hashlib.sha256(f.read_bytes()).hexdigest()
     for f in sorted((pkg / "systemd").iterdir()):
         files["/etc/systemd/system/" + f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
@@ -440,6 +440,7 @@ def test_warns_on_packaged_file_not_in_manifest_and_prints_manifest_sha(cart):
     r = run(cart)
     assert r.returncode == 0, r.stderr
     assert "警告" in r.stderr and "opt/approval_core.py" in r.stderr
+    assert "opt/BUILD" not in r.stderr
     assert hashlib.sha256(m_raw).hexdigest() in r.stdout
 
 

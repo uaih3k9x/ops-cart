@@ -91,7 +91,7 @@ extra = []
 for root, _, names in os.walk(os.path.join(pkg, "opt")):
     for n in names:
         rel = os.path.relpath(os.path.join(root, n), os.path.join(pkg, "opt")).replace(os.sep, "/")
-        if "/opt/pxe/" + rel not in listed:
+        if rel != "BUILD" and "/opt/pxe/" + rel not in listed:     # BUILD 上面单独比过 manifest 的 build
             extra.append("opt/" + rel)
 extra += ["systemd/" + u for u in sorted(units) if "/etc/systemd/system/" + u not in listed]
 for e in sorted(extra):
