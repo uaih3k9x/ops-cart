@@ -27,8 +27,8 @@ import socket
 import sys
 import time
 
-from pxeserver import (PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
-                       unlock_only_menu)
+from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
+                       rescue_default_menu, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -79,14 +79,28 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(403, "Install mode is locked")
                 return None
             self.event(f"ks 被取走 {base} mac={mac} from {self.client_address[0]}")
-        elif base.startswith("grub.cfg") and os.path.isfile(path):
+        elif base.startswith("grub.cfg") and os.path.lexists(path):
+            # 跟 TFTP 的差别: TFTP 只查 grub.cfg / grub.cfg-* (grub.cfg.* GRUB 不取, 原样发);
+            # HTTP 这里连 grub.cfg.* 一起查 (.bak 上面已经 404), 宁严. 不是普通文件的一律 403 (不打开 FIFO).
+            if not os.path.isfile(path):
+                self.send_error(403, "Not a regular file")
+                return None
             try:
                 with open(path, "rb") as f:
-                    armed = unlock_only_menu(f.read(64 * 1024).decode("utf-8", "replace"))
+                    raw = f.read(MENU_MAX + 1)
             except OSError:
-                armed = False
-            if armed and not install_allowed(menu_mac(base), pxe_mode(self.pxe_mode_path, self.now())):
+                raw = b""
+            if len(raw) > MENU_MAX:                         # 超长不当菜单发, 同 TFTP
+                self.send_error(403, "Menu too large")
+                return None
+            text = raw.decode("utf-8", "replace")
+            if unlock_only_menu(text) and not install_allowed(menu_mac(base),
+                                                              pxe_mode(self.pxe_mode_path, self.now())):
                 self.send_error(403, "Install mode is locked")
+                return None
+            if rescue_default_menu(text):                   # #70: 默认项可能是救援 (root + sshd), 同 TFTP 不发
+                log.warning("拒绝 %s 取 %s: 默认项是救援", self.client_address[0], base)
+                self.send_error(403, "Rescue default menu refused")
                 return None
         return super().send_head()
 

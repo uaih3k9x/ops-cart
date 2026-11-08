@@ -202,6 +202,7 @@ class Arbiter:
         self.lease = lease or (lambda who, dev, now: True)
         self.prio, self.agent = {}, {}          # dev -> deque[Job]
         self.last_human = {}                    # dev -> 人最后一次有效输入的时刻
+        self.human_n = {}                       # dev -> 人有效输入的次数 (键鼠闸门拿来判断租约期间人动没动过, #64)
         self.last_who = {}                      # dev -> 最后一个真发出去的来源
         self.stopped = set()                    # 急停中的 dev; 含 ALL = 全部
 
@@ -221,6 +222,7 @@ class Arbiter:
         if job.priority:
             if job.src == "human" and job.active:
                 self.last_human[dev] = now
+                self.human_n[dev] = self.human_n.get(dev, 0) + 1
             self.prio.setdefault(dev, deque()).append(job)
             return
         if self.is_stopped(dev):
@@ -320,7 +322,8 @@ class Arbiter:
         devs = set(self.prio) | set(self.agent) | set(self.last_human) | set(self.last_who)
         devs |= self.stopped - {self.ALL}
         return {d: {"human": self.human_active(d, now), "queued": len(self.agent.get(d, ())),
-                    "stopped": self.is_stopped(d), "last": self.last_who.get(d)} for d in sorted(devs)}
+                    "stopped": self.is_stopped(d), "last": self.last_who.get(d), "human_n": self.human_n.get(d, 0)}
+                for d in sorted(devs)}
 
 
 class HumanBursts:

@@ -89,3 +89,23 @@ def test_no_readme_commit_is_error(tmp_path, capsys):
     git(tmp_path, "config", "user.name", "t")
     commit(tmp_path, "初始 (#1)")
     assert rd.main(["--repo", str(tmp_path), "--ref", "main"]) == 2
+
+
+def test_missing_ref_is_error(repo, capsys):
+    assert rd.main(["--repo", str(repo), "--ref", "no-such-ref"]) == 2
+
+
+def test_shallow_clone_is_error_with_hint(repo, tmp_path, capsys):
+    for i in range(3):
+        commit(repo, "功能 (#%d)" % (i + 10))
+    shallow = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "file://%s" % repo, str(shallow)], check=True)
+    assert rd.main(["--repo", str(shallow), "--ref", "HEAD"]) == 2
+    assert "git fetch --unshallow" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_threshold_must_be_at_least_1(repo, bad):
+    with pytest.raises(SystemExit) as e:
+        rd.main(["--repo", str(repo), "--ref", "main", "--threshold", bad])
+    assert e.value.code == 2

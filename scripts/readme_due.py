@@ -19,8 +19,17 @@ def _git(repo, *args):
                           text=True).stdout.strip()
 
 
+def _at_least_1(v):
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("阈值至少是 1")
+    return n
+
+
 def status(repo, ref):
-    """-> (短哈希, 日期, PR 数). README.md 从没改过时抛 LookupError."""
+    """-> (短哈希, 日期, PR 数). 浅克隆或 README.md 从没改过时抛 LookupError."""
+    if _git(repo, "rev-parse", "--is-shallow-repository") == "true":
+        raise LookupError("浅克隆数不准, 先 git fetch --unshallow")
     last = _git(repo, "log", "-1", "--format=%h %ad", "--date=short", ref, "--", "README.md")
     if not last:
         raise LookupError("%s 上找不到改过 README.md 的提交" % ref)
@@ -33,7 +42,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="README 上次整理之后合并了几个 PR")
     ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--ref", default="origin/main")
-    ap.add_argument("--threshold", type=int, default=10, help="到这么多个就提示整理 (默认 10)")
+    ap.add_argument("--threshold", type=_at_least_1, default=10, help="到这么多个就提示整理 (默认 10)")
     a = ap.parse_args(argv)
     try:
         h, date, n = status(a.repo, a.ref)

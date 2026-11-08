@@ -55,7 +55,12 @@ VENDOR_NOTES = {
 
 
 class BadReply(ValueError):
-    """模型输出不合格 (外壳或里面的 JSON)."""
+    """模型输出不合格 (外壳或里面的 JSON). str(e) 是推车自己的话 (进闸门理由); detail 是模型 / 外壳原文
+    (只进 model.detail 和日志, 不进理由, #65 第七轮)."""
+
+    def __init__(self, msg, detail=""):
+        super().__init__(msg)
+        self.detail = str(detail)[:300]
 
 
 # ------------------------------------------------------------ 提示词
@@ -89,7 +94,9 @@ def parse_reply(stdout):
     if not isinstance(env, dict):
         raise BadReply("claude 输出外壳不对")
     if env.get("is_error") is True or env.get("subtype") != "success":
-        raise BadReply(f"模型调用没成功 ({env.get('subtype')})")
+        sub = env.get("subtype")
+        sub = sub if isinstance(sub, str) and re.fullmatch(r"[a-z_]{1,40}", sub) else "?"
+        raise BadReply(f"模型调用没成功 ({sub})", detail=env.get("subtype"))
     text = env.get("result")
     if not isinstance(text, str):
         raise BadReply("claude 输出缺 result")
@@ -100,12 +107,12 @@ def parse_reply(stdout):
     try:
         doc = json.loads(text)
     except ValueError:
-        raise BadReply(f"模型回的不是 JSON: {text[:80]!r}") from None
+        raise BadReply("模型回的不是 JSON", detail=text) from None
     if not isinstance(doc, dict):
         raise BadReply("模型回的不是 JSON 对象")
     v, reason = doc.get("verdict"), doc.get("reason")
     if v not in ("allow", "block") or not isinstance(v, str):
-        raise BadReply(f"verdict 只能是 allow / block, 模型回的是 {v!r}")
+        raise BadReply("verdict 只能是 allow / block", detail=repr(v))
     if not isinstance(reason, str) or not reason.strip():
         raise BadReply("模型没给理由")
     reason = reason.strip()
@@ -142,14 +149,15 @@ def judge(cmd, vendor, recent, intent, rules, llm, clock=time.monotonic):
         why = f"模型超时 ({conf.get('timeout_s')} 秒)"
         return _no(why, error=why, ms=int((clock() - t0) * 1000))
     except Exception as e:              # noqa: BLE001  模型不可用 / 没配好 / 非零退出: 一律人确认
-        why = f"模型调用失败: {type(e).__name__}: {e}"[:300]
-        return _no(why, error=why, ms=int((clock() - t0) * 1000))
+        rc = re.search(r"\brc=(-?\d+)", str(e)) if isinstance(e, RuntimeError) else None
+        why = f"模型调用失败 ({f'rc={rc.group(1)}' if rc else type(e).__name__})"   # stderr / stdout 原文只进 detail
+        return _no(why, error=why, detail=str(e)[:300], ms=int((clock() - t0) * 1000))
     ms = int((clock() - t0) * 1000)
     try:
         allow, reason, cost = parse_reply(out)
     except BadReply as e:
-        why = f"模型返回格式不对: {e}"
-        return _no(why, error=why, ms=ms)
+        why = f"模型返回格式不对 ({e})"
+        return _no(why, error=why, detail=e.detail, ms=ms)
     model = {"verdict": "allow" if allow else "block", "reason": reason, "cost_usd": cost, "ms": ms}
     return {"allow": allow, "reason": reason if allow else f"模型拦下: {reason}", "model": model}
 

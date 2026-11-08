@@ -19,14 +19,15 @@
 
 | 功能 | 说明 |
 |---|---|
-| 装机 | 自研 PXE 服务端（DHCP + proxyDHCP + TFTP + HTTP），网线直插自动装 Rocky 9。只有车机上解锁、在倒计时内的那个 MAC 能装，其他机器只进救援。装机口上有别人的 DHCP 就转代理模式；自己发地址时限时，默认 30 分钟 |
+| 装机 | 自研 PXE 服务端（DHCP + proxyDHCP + TFTP + HTTP），网线直插自动装 Rocky 9，只支持 UEFI。只有车机上解锁、在倒计时内的那个 MAC 能装；其他机器的菜单超时后从本地盘启动，救援只能手选。装机口上有别人的 DHCP 就转代理模式；自己发地址时限时，默认 30 分钟 |
 | KVM | HDMI 采集预览，CH9329 透传键鼠，开机自动选有信号的画面源。键鼠统一经常驻代理 `kvm-broker`，人优先 |
-| 串口 | conbroker 串口 console 面板，一键只读巡检，并和上一份比对配置漂移 |
-| 车机 | 无 WM 全屏 Kiosk：开机自检、状态板、PIN 锁屏、CDE 深浅两套配色（按日出日落自动切），屏幕底下一排虚拟指示灯 |
+| 串口 | conbroker 串口 console 面板；一键只读巡检（华为 / H3C / 思科 / 锐捷，自动认厂商），比对配置漂移，可 `--export-topo` 导出 |
+| 车机 | 无 WM 全屏 Kiosk：开机自检、状态板、PIN 锁屏、CDE 深浅两套配色（按日出日落自动切），屏幕底下一排虚拟指示灯；中文输入（librime，目前只接网络唤醒的名字框） |
 | 网页口 | 同一套状态、画面、键鼠、串口经浏览器访问，另有只读的 PXE 日志页。tailnet 放行，局域网要开关 + PIN |
 | 副屏 / UPS | USB 副屏常驻状态板和像素猫桌宠；APC UPS 直读 hidraw，低电量先预告，再倒计时关机 |
 | 联网 | 有线优先，无线兜底；锐捷 ePortal 自动认证；LAN1 / LAN2 按口选模式，每次切换都能撤回 |
-| Agent 接入 | MCP 服务开放串口、截屏、OCR、键鼠、WOL、PXE 申请、标签打印。写操作要拿有期限的租约，高危操作挂起，等人在车机上确认；全部急停，解除只能在本机 |
+| Agent 接入 | MCP 服务开放串口、截屏、OCR、键鼠、WOL、PXE 申请、标签打印，分只读档和动手档（`--profile readonly / act`）。写操作要拿有期限的租约，键鼠和串口都过闸门，高危的挂起等人在车机上确认，挂起期间同一槽位不许直发；全部急停，解除只能在本机。远程审批目前只有服务端核心，还没接上 |
+| 蓝牙打字 | 手机经 BLE 把文字发到推车排队，不执行命令；安卓 App 在 `android/`，单元默认不开 |
 | 机房辅助 | LLDP 看对端交换机口、TSC 线缆 / 资产标签、关键事件推到手机、Clonezilla 整盘克隆、屏幕配方（如 `boot-pxe`）、夜间日志小结 |
 
 ## 部件
@@ -36,22 +37,25 @@
 | 模块 | 职责 |
 |---|---|
 | `pxeserver.py` · `httpserve.py` | PXE 服务端和装机口守卫 `PxeGuard`；引导和仓库的静态 HTTP，ks 和装机菜单只给解锁的 MAC |
-| `kiosk.py` · `kiosk_core.py` · `kiosk_ui_core.py` | 车机界面；自检计划表、状态采集、装机模式、PIN 闸门；界面状态机 |
+| `kiosk.py` · `kiosk_core.py` · `kiosk_ui_core.py` | 车机界面；自检计划表、状态采集、装机模式、PIN 闸门、默认菜单（`--write-rescue`）；界面状态机 |
+| `ime_tk.py` · `ime_core.py` · `ime_proc.py` · `ime_worker.py` · `ime_rime.py` | 车机中文输入：Tk 候选栏，librime 放在沙箱子进程里 |
 | `theme.py` · `sun_core.py` · `lamps_core.py` | 配色、字体、斜边（`DARK` / `LIGHT`）；日出日落定深浅；底部指示灯 |
 | `ks_panel.py` | Kickstart 表单编辑，带备份和破坏性指令校验 |
 | `wifi_panel.py` · `wifi_core.py` · `wifi_prefer.py` · `ruijie_portal.py` | 无线管理、优先级生效、校园网认证 |
 | `netmode_panel.py` · `netmode_core.py` · `netprof_core.py` | 网口模式（关闭 / DHCP / 静态），可撤回 |
 | `wol_panel.py` · `wol_core.py` | 网络唤醒 |
 | `ch9329.py` · `kvm_core.py` · `kvm_broker.py` · `kvm_broker_core.py` | CH9329 协议栈和命令行；画面源与键鼠绑定；键鼠代理（`/run/ops-kvm/kvm.sock`） |
-| `serial_panel.py` · `serial_core.py` · `survey_core.py` | 串口面板、conbroker 接口、只读巡检 |
+| `serial_panel.py` · `serial_core.py` · `survey_core.py` | 串口面板、conbroker 接口、多厂商只读巡检 |
 | `cart_snap.py` · `cart_ocr.py` · `ocr_rapid_worker.py` | 截一帧；OCR（优先 `cart-ocr` 服务，没开退回 Tesseract）；OCR 服务进程 |
 | `recipe.py` · `recipe_core.py` | 屏幕配方：截图 + OCR + 发键 |
-| `cart_mcp.py` · `mcp_core.py` | MCP 服务（stdio / HTTP），审计日志；车机上 `pending / confirm / reject / estop / resume` |
+| `cart_mcp.py` · `mcp_core.py` | MCP 服务（stdio / HTTP，`--profile readonly` 只注册只看的工具，默认 `act`），审计日志；车机上 `pending / confirm / reject / estop / resume` |
 | `mcp_serial.py` · `serial_write_core.py` · `serial_gate_model.py` | 串口写：租约、闸门（白名单 + 可选决策模型）、挂起、急停 |
-| `mcp_kvm.py` | MCP 键鼠 `kvm_*`、`screen_ocr`、`wol_send` |
+| `mcp_kvm.py` | MCP 键鼠 `kvm_*`（租约 + 闸门，逐行逐键查高危）、`screen_ocr`、`wol_send` |
 | `mcp_pxe.py` · `pxe_req_core.py` · `pxe_req_panel.py` · `pxe_log_core.py` | Agent 申请 PXE 解锁（人照抄确认码才生效）、`pxe_clients`；网页 PXE 日志页 |
 | `mcp_label.py` · `cart_label.py` · `tspl_preview.py` | MCP 标签工具；TSPL 生成；开发机上预览 |
 | `confirm_core.py` · `confirm_panel.py` | 串口 / 键鼠写操作的确认框和急停 UI |
+| `approval_core.py` · `totp_core.py` · `approval_channel.py` | 远程审批第一阶段：分级、digest、TOTP、通道接口；还没接进推车 |
+| `ble_input.py` · `ble_input_core.py` | 蓝牙隔空打字：BlueZ GATT 服务，收文字排进 `/run/ops-cart/ble-input/in/` |
 | `webkiosk.py` · `web_core.py` · `web/` | 网页口（专用用户 `ops-web`，默认不自启） |
 | `dash_service.py` · `dash_core.py` · `dash_render.py` | `cart-dash`：采集状态快照 `/run/ops-cart/state.json`，画副屏 |
 | `pet_core.py` · `pet_render.py` · `pet_sprites.py` | 副屏桌宠 |
@@ -68,6 +72,7 @@
 | `examples/` | 各配置文件的样例（自检、ks、MCP、闸门、推送、主题、换皮、标签缩写等） |
 | `fonts/` · `icons/` · `plymouth/` | 界面字体 Unifont、顶栏网络图标、开机画面 |
 | `windows/` | 在 Windows 上跑 PXE 服务端 |
+| `android/` | 蓝牙打字的安卓 App |
 | `tests/` | 离线单测，不接硬件 |
 
 ## 部署
@@ -79,8 +84,8 @@
 ```bash
 scripts/stamp-build.sh                                   # 生成 BUILD (提交数 + 短哈希)
 scp *.py VERSION BUILD cart:/opt/pxe/ && scp -r web icons fonts cart:/opt/pxe/
-# 以下在推车上
-sudo install -D -m 644 /opt/pxe/fonts/unifont-18.0.01.otf /usr/local/share/fonts/ops-cart/ && sudo fc-cache -f
+scp -r deploy examples scripts cart:ops-cart/              # 下面的命令在推车的 ~/ops-cart 里跑
+sudo install -D -m 644 -t /usr/local/share/fonts/ops-cart/ /opt/pxe/fonts/unifont-18.0.01.otf && sudo fc-cache -f
 sudo install -D -m 644 deploy/pxe.env.example /etc/ops-cart/pxe.env      # 改成现场装机网段
 sudo cp deploy/systemd/* /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo cp deploy/sysctl.d/* /etc/sysctl.d/ && sudo sysctl --system
@@ -89,6 +94,7 @@ sudo cp deploy/logrotate.d/ops-cart /etc/logrotate.d/
 sudo cp deploy/bin/kiosk-launcher /usr/local/bin/kiosk && sudo cp deploy/bin/kiosk-setpin deploy/bin/cart-fan-curve /usr/local/bin/
 sudo kiosk-setpin
 sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firewall-cmd --reload   # LAN1 要在 pxe 区
+sudo scripts/setup-cart.sh      # 先把 Rocky minimal ISO 放到脚本里写的路径; 校验后铺 tftp 和 HTTP 仓库, 只写默认菜单
 ```
 
 | 单元 | 作用 | 开不开 |
@@ -98,9 +104,10 @@ sudo install -m 644 deploy/firewalld/pxe.xml /etc/firewalld/zones/ && sudo firew
 | `cart-boot-success.timer` · `wifi-prefer.timer` · `campus-auth.timer` · `cart-fan-curve.service` | 开机成功标记、无线优先级、校园网认证、风扇曲线 | 开 |
 | `cart-notify.timer` · `cart-dream.timer` | 手机推送（没配只记日志）、夜间小结 | 按需 |
 | `webkiosk.service` · `cart-serial-req.path` | 网页口，网页急停 / 拒绝 | 按需，先建 `ops-web` 用户 |
-| `cart-mcp.service` | MCP 的 HTTP 方式（stdio 不用单元：`claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio`） | 按需，先配 `/etc/ops-cart/mcp.json` |
+| `cart-mcp.service` · `cart-mcp-ro.service` | MCP 的 HTTP 方式，动手档 / 只读档各一个进程、令牌分开。stdio 不用单元：`claude mcp add cart -- ssh cart sudo python3 /opt/pxe/cart_mcp.py stdio --profile act`；只读档要专用身份 `agent-ro`，配法见 DESIGN_agent_mcp 第十六节 | 按需，先配 `/etc/ops-cart/mcp.json` |
 | `cart-ocr.service` | OCR 常驻服务，`scripts/setup-ocr.sh` 装 | 可选 |
 | `cart-revtunnel.service` | 备用远程通道 | 可选，见 [`docs/REMOTE_TUNNEL.md`](docs/REMOTE_TUNNEL.md) |
+| `cart-ble-input.service` | 蓝牙隔空打字 | 可选，默认不开，见 [`docs/BLE_INPUT.md`](docs/BLE_INPUT.md) |
 
 配置都在 `/etc/ops-cart/`（照 `examples/` 改），运行时状态在 `/run/ops-cart/`（重启清空），要跨重启的在 `/var/lib/ops-cart/`，日志在 `/var/log/ops-cart/`。
 
@@ -134,7 +141,10 @@ macOS 上默认不开 Tk 窗口，相关用例跳过；`OPS_TK_TESTS=1` 才真�
 | [CLONE](docs/CLONE.md) | 整盘克隆 |
 | [DATA_DISK](docs/DATA_DISK.md) | 数据盘和装机库 |
 | [WINPE](docs/WINPE.md) | Windows PE 引导 |
-| [DESIGN_agent_mcp](docs/DESIGN_agent_mcp.md) | Agent / MCP 接入设计 |
+| [IME_RIME](docs/IME_RIME.md) | 车机中文输入，装 librime 和词库 |
+| [BLE_INPUT](docs/BLE_INPUT.md) | 蓝牙隔空打字：协议、配对、单元 |
+| [REMOTE_APPROVAL](docs/REMOTE_APPROVAL.md) | 远程审批第一阶段 |
+| [DESIGN_agent_mcp](docs/DESIGN_agent_mcp.md) | Agent / MCP 接入设计，含只读档 / 动手档 |
 | [REMOTE_TUNNEL](docs/REMOTE_TUNNEL.md) | 备用远程通道 |
 | [udisp-protocol](docs/udisp-protocol.md) | USB 副屏协议 |
 | [PUBLIC_SAFETY](docs/PUBLIC_SAFETY.md) | 公开仓库安全约定 |
