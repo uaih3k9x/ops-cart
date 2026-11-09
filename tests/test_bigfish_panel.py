@@ -85,3 +85,51 @@ def test_panel_resume_button_only_when_estop_file_exists(root):
     w.refresh()
     assert w.btn_resume.winfo_manager() == ""
     w.destroy()
+
+
+# ------------------------------------------------------------ #99 输入行 (真控件, 待真屏验证)
+
+def _desk_panel(root, **kw):
+    import bigfish_task_core as tc
+    jobs = []
+    args = dict(load=lambda now: bf.parse('{"schema": 1, "written_at": %f}' % NOW, NOW), pending=lambda: 0,
+                on_confirm=lambda: None, on_estop=lambda: None, clock=lambda: NOW, estop_on=lambda: False,
+                desk=tc.Desk(), run_bg=lambda w, d, key=None: jobs.append((w, d)) or True,
+                locked=lambda: False, agents_stopped=lambda: False,
+                submit=lambda p: {"task_id": "t-1", "state": "starting"})
+    args.update(kw)
+    return bp.BigfishPanel(root, **args), jobs
+
+
+def test_input_row_sends_and_clears(root):
+    w, jobs = _desk_panel(root)
+    w.entry.insert(0, "看下状态")
+    w.btn_send.invoke()
+    work, done = jobs[0]
+    done(work())
+    assert w.entry.get() == "" and "派的任务" in _texts(w)
+    w.destroy()
+
+
+def test_input_row_ime_attached(root):
+    w, _ = _desk_panel(root)
+    assert w.task_ime is not None and w.task_ime.entry is w.entry and not getattr(w.entry, "no_ime", False)
+    w.destroy()
+
+
+def test_input_row_greyed_when_locked_keeps_text(root):
+    w, jobs = _desk_panel(root, locked=lambda: True)
+    w.entry.config(state="normal")
+    w.entry.insert(0, "别丢")
+    w.refresh()
+    assert w.entry.cget("state") == "disabled" and w.entry.get() == "别丢" and "锁屏" in w.hint.cget("text")
+    w.btn_send.invoke()
+    assert jobs == []
+    w.destroy()
+
+
+def test_panel_without_desk_has_no_input_row(root):
+    w = bp.BigfishPanel(root, load=lambda now: bf.parse(None, now), pending=lambda: 0,
+                        on_confirm=lambda: None, on_estop=lambda: None, clock=lambda: NOW)
+    assert w.entry is None
+    w.destroy()

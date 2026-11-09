@@ -16,6 +16,7 @@ from subprocess import DEVNULL, Popen       # 只给 mpv 用
 from tkinter import messagebox, simpledialog
 
 import bigfish_core as bfc
+import bigfish_task_core as bft
 import cartlog
 import clone_core as cc
 import confirm_core as cfc
@@ -97,6 +98,7 @@ class Kiosk(tk.Tk):
         self._pxe_view, self._pxe_req_win, self._pxe_seen, self._pxe_store = None, None, set(), mcp_pxe.Store()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
         self._bf_watch, self._bf_note = None, ""   # 大肥鱼急停 (#53): 等它确认的看门, 面板上的一句进展
+        self._bf_desk = bft.Desk()                 # 车机派的任务 (#99): 放这里, 关面板 / 换主题不丢
 
         kc.kp_enter_as_return(self)
         kui.kp_digits_as_digits(self)
@@ -645,6 +647,10 @@ class Kiosk(tk.Tk):
         else:
             self._open_kvm()
 
+    def _bigfish_all_stopped(self):
+        """执行器全部急停 (含不写 estop.json 的终端急停) 也不让派任务 (#99); 还没采到按急停."""
+        return all(s["estop"] for s in self._agent_states()[0].values())
+
     def _bigfish_estop(self):
         """就是执行器条上的"Agent 全部急停" (写大肥鱼急停信号挂在它上面)."""
         self._serial_action("estop", None)
@@ -836,7 +842,8 @@ class Kiosk(tk.Tk):
             if name == "bigfish":           # #53: 确认 / 拒绝 / 急停都走现有入口
                 w = BigfishPanel(self.body, pending=self._bigfish_pending, on_confirm=self._bigfish_confirm,
                                  on_estop=self._bigfish_estop, note=lambda: self._bf_note,
-                                 on_resume=self._bigfish_resume)
+                                 on_resume=self._bigfish_resume, desk=self._bf_desk, run_bg=self.ui.run_bg,
+                                 locked=lambda: self._lock_win is not None, agents_stopped=self._bigfish_all_stopped)
             elif select and name in ("serial", "netmode"):
                 w = PANE_CLASSES[name](self.body, want=select)
             else:

@@ -89,7 +89,12 @@ class UiBridge:
             except Exception as ex:          # noqa: BLE001  交给 done 显示, 不让线程静默死掉
                 res = ex
             self.post(finish, res)
-        self._spawn(wrap)
+        try:
+            self._spawn(wrap)
+        except Exception as ex:              # noqa: BLE001  线程起不来 (资源耗尽): 放掉 key, 否则永远"上一次没回来"
+            self._busy.discard(key)
+            self._on_error(ex)
+            return False
         return True
 
     def repeat_bg(self, work, done, every, sleep=time.sleep):
