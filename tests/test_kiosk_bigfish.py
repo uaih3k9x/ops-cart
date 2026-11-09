@@ -46,6 +46,32 @@ def _fake(sw_view, kvm_view=None):
     return calls, fake
 
 
+def _stopped_fake(sw_view):
+    fake = SimpleNamespace(_sw_view=sw_view, _kvm_view=None)
+    fake._agent_states = kiosk.Kiosk._agent_states.__get__(fake)
+    return kiosk.Kiosk._bigfish_all_stopped.__get__(fake)
+
+
+def test_task_send_gate_all_clear():
+    assert _stopped_fake(_view(None))() is False
+
+
+def test_task_send_gate_not_sampled_yet_counts_as_stopped():
+    assert _stopped_fake(None)() is True
+
+
+def test_task_send_gate_all_stopped():
+    b = sw.Book.from_text(None, T0)
+    b.estop(None, "t", "test", T0)
+    assert _stopped_fake(b.view(T0))() is True
+
+
+def test_task_send_gate_open_when_only_some_slots_stopped():
+    b = sw.Book.from_text(None, T0)
+    b.estop(sorted(sw.SLOTS)[0], "t", "test", T0)
+    assert _stopped_fake(b.view(T0))() is False
+
+
 def test_confirm_opens_existing_dialog_for_pending_slot():
     calls, fake = _fake(_view(3))
     assert fake._bigfish_pending() == 1

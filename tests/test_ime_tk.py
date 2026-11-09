@@ -177,7 +177,7 @@ def test_attach_never_raises():
 
 
 # (文件, 用途) 白名单: 候选上屏等于替人打字, 只接普通文字输入框. 新接一处要改这里, 逼着看一眼是不是 PIN / 确认码 / 命令框
-ALLOWED = {("wol_panel.py", "wol.name")}
+ALLOWED = {("wol_panel.py", "wol.name"), ("bigfish_panel.py", "bigfish.task")}
 WATCHERS = {"kiosk.py"}             # 只订阅焦点框状态 (#100 指示灯), 不接输入框: 仍然不许 attach
 _IME_FILES = {"ime_tk.py", "ime_core.py", "ime_proc.py", "ime_rime.py", "ime_worker.py"}
 
