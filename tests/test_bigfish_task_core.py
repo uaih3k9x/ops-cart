@@ -230,6 +230,27 @@ def test_polled_offline_keeps_watching():
     assert d.active and d.bad and "连不上" in d.msg
 
 
+@pytest.mark.parametrize("state", [["running"], {"running": 1}, 5])
+def test_polled_non_string_state_ends_watching(state):
+    d = _sent()
+    d.polled(dict(_body(), state=state))
+    assert not d.active and d.task is None and d.bad and "读不懂" in d.msg
+
+
+@pytest.mark.parametrize("task_id", [[TID], {TID: 1}, 5])
+def test_polled_non_string_task_id_ends_watching(task_id):
+    d = _sent()
+    d.polled(dict(_body(), task_id=task_id))
+    assert not d.active and d.task is None and d.bad and "读不懂" in d.msg
+
+
+@pytest.mark.parametrize("reason", [["estop"], {"estop": 1}, 5])
+def test_parse_task_non_string_stop_reason_is_blank(reason):
+    body = _body()
+    body["untrusted_agent_output"]["stop_reason"] = reason
+    assert tc.parse_task(body)["stop_reason"] == ""
+
+
 def test_polled_task_gone_ends_watching():
     d = _sent()
     d.polled(tc.Refused("no such task"))

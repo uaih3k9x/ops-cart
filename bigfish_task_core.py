@@ -88,7 +88,7 @@ def send_block(locked, estop, view):
 
 def parse_task(body):
     """bigfish_get_task 的回复 -> 能显示的摘要; 状态不在白名单或任务 ID 不对 -> None."""
-    if not isinstance(body, dict) or body.get("state") not in STATES or not valid_id(body.get("task_id")):
+    if not isinstance(body, dict) or not isinstance(body.get("state"), str) or body["state"] not in STATES or not valid_id(body.get("task_id")):
         return None
     u = body.get("untrusted_agent_output")
     u = u if isinstance(u, dict) else {}

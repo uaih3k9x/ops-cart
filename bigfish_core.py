@@ -124,7 +124,7 @@ def _offline(why):
 
 
 def _current(c):
-    if not isinstance(c, dict) or c.get("state") not in TASK_STATES:
+    if not isinstance(c, dict) or not isinstance(c.get("state"), str) or c["state"] not in TASK_STATES:
         return None
     total = _int(c.get("steps_total"))             # 0 = 总步数未知
     cur = _int(c.get("step_current"), total or STEP_MAX) if total is not None else None

@@ -74,6 +74,16 @@ def test_parse_bad_current_is_dropped(cur):
     assert bf.parse(_text(current=cur), NOW)["current"] is None
 
 
+@pytest.mark.parametrize("state", [["running"], {"running": 1}, 5])
+def test_parse_non_string_state_is_dropped(state):
+    assert bf.parse(_text(current=_cur(state=state)), NOW)["current"] is None
+
+
+@pytest.mark.parametrize("reason", [["estop"], {"estop": 1}, 5])
+def test_parse_non_string_stop_reason_is_blank(reason):
+    assert bf.parse(_text(current=_cur(stop_reason=reason)), NOW)["current"]["stop_reason"] == ""
+
+
 def test_parse_bad_trusted_numbers_are_dropped():
     c = bf.parse(_text(current=_cur(elapsed_s=-1, started_at="x", steps_total=True, step_current=9,
                                     source="\x1b[31mmcp\nX")), NOW)["current"]
