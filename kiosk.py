@@ -23,6 +23,7 @@ import dash_core as dc
 import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
+import ime_tk
 import lamps_core as lc
 import mcp_pxe
 import mcp_kvm
@@ -129,6 +130,8 @@ class Kiosk(tk.Tk):
         self.after(100, self.refresh)
         self.ui.repeat_bg(self._lamp_sample, self._lamp_sampled, every=lc.SAMPLE_MS / 1000)
         self.ui.repeat_bg(self._ups_sample, self._ups_sampled, every=1.0)
+        self._ime_state = None              # #100: 焦点框的输入法状态, 下一次 _lamp_tick 画
+        ime_tk.watch(lambda state: setattr(self, "_ime_state", state))
         self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
         self.after(CH_REAP_MS, self._ch_reap_tick)
 
@@ -354,6 +357,7 @@ class Kiosk(tk.Tk):
             self._lamps[key][2].config(text=name)
         block(uc.UPS_KEY, 9, None)              # issue #4: 电池, 只看不点
         self._lamps[uc.UPS_KEY][2].config(text="电池")
+        block(lc.IME_KEY, 5, None)              # #100: 输入法, 只看不点 (切换仍然只靠单按 Shift)
 
     def _open_pane(self, name, select=None):
         """select: 串口面板要选中的那一路 (issue #5 执行器条点操作头) / 网口模式面板要选中的口 (#12)."""
@@ -513,6 +517,7 @@ class Kiosk(tk.Tk):
         if self._kvm_view is not None:
             look = cfc.kvm_lamp(cfc.kvm_summary(self._kvm_view), on)
             views["kvm"] = look or views["kvm"]
+        views[lc.IME_KEY] = lc.ime_lamp(self._ime_state, on)
         for key, v in views.items():
             f, stripe, lab, last = self._lamps[key]
             text = v["text"]

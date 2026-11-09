@@ -8,6 +8,7 @@
 设了 show= 的 (密码框) 和标了 no_ime 的直接拒; 接入点在 tests/test_ime_tk.py 的 (文件, 用途) 白名单里登记
 (那个测试是提醒, 不是边界: 静态扫描挡不住所有写法, 运行时兜底靠 show= / no_ime).
 拼音期间吃掉的键不会冒泡到 bind_all, 所以每吃一个键补发虚拟事件 INPUT_EVENT, kiosk 拿它算"有人在操作".
+当前焦点框的状态给指示灯 (#100): focus_state() 取, watch(fn) 订阅; 都在 Tk 主线程. 只给 mode / status, 不给拼音和候选.
 """
 
 import threading
@@ -20,6 +21,34 @@ _seq = [0]
 INPUT_EVENT = "<<OpsCartImeInput>>"
 NO_IME = "no_ime"           # 输入框上 `e.no_ime = True`: 要人亲手敲的框 (确认码 / PIN / 串口命令 / MAC / 网络参数), attach 见到就拒
 AUTO_SWITCH_S = 3.0         # 引擎在切中文那一下之后这么久内到、且中间没打字, 才自动切到中文
+WATCH_MS = 1000             # 焦点在框上时多久看一眼引擎还活着没有
+_focus, _published, _watchers = [None], [None], []     # 有焦点的 ImeEntry; 上次发出去的状态; 订阅者
+
+
+def focus_state():
+    """当前焦点框的 {"mode": "en"/"zh", "status": ...}; 焦点不在接了中文的框里 -> None."""
+    w = _focus[0]
+    if w is None:
+        return None
+    v = w.ime.view()
+    return {"mode": v["mode"], "status": v["status"]}
+
+
+def watch(fn):
+    """焦点框状态变了就调 fn(focus_state()). 订阅者出错不影响打字."""
+    _watchers.append(fn)
+
+
+def _publish():
+    state = focus_state()
+    if state == _published[0]:
+        return
+    _published[0] = state
+    for fn in list(_watchers):
+        try:
+            fn(state)
+        except Exception:
+            pass
 
 
 def bar_text(view):
@@ -72,6 +101,7 @@ class ImeEntry:
         self.ime = ime_core.Ime()
         self._result, self._notice = None, ""          # _notice: 不可用的原因, 显示到下一次按键
         self._closed, self._asked_at, self._typed = False, 0.0, False
+        self._watching = False                         # 存活检查的定时器排着没有
         self._lock = threading.Lock()                  # _result / _closed: 后台 _open 和主线程 close 之间
         _seq[0] += 1
         self.tag = f"OpsCartIme{_seq[0]}"
@@ -84,6 +114,8 @@ class ImeEntry:
         entry.bindtags((self.tag,) + tuple(entry.bindtags()))   # 先于输入框自己的 <Return> 之类
         entry.bind_class(self.tag, "<KeyPress>", self._press)
         entry.bind_class(self.tag, "<KeyRelease>", self._release)
+        entry.bind_class(self.tag, "<FocusIn>", self._focus_in)
+        entry.bind_class(self.tag, "<FocusOut>", self._focus_out)
         entry.bind("<Destroy>", lambda _e: self.close(), add="+")
         self._redraw()
 
@@ -114,6 +146,32 @@ class ImeEntry:
         if r.need_engine or r.toggled:
             self._redraw()
         return None
+
+    # ---------------------------------------------------------------- 焦点 (#100)
+
+    def _focus_in(self, _ev):
+        _focus[0] = self
+        self._check_engine()                # 没焦点时引擎可能已经死了
+        _publish()
+        if not self._watching:
+            self._watching = True
+            self.entry.after(WATCH_MS, self._watch)
+
+    def _focus_out(self, _ev):
+        if _focus[0] is self:               # 别的框先收到 In 的话, 这个迟到的 Out 不算数
+            _focus[0] = None
+            _publish()
+
+    def _check_engine(self):
+        if self.ime.check_engine():
+            self._redraw()
+
+    def _watch(self):
+        if self._closed or _focus[0] is not self:
+            self._watching = False
+            return
+        self._check_engine()
+        self.entry.after(WATCH_MS, self._watch)
 
     # ---------------------------------------------------------------- 后台开引擎 (librime 首次部署可能很慢)
 
@@ -157,6 +215,8 @@ class ImeEntry:
 
     def _redraw(self):
         v = self.ime.view()
+        if _focus[0] is self:               # 在动控件之前: 控件出错灯也要对
+            _publish()
         self.mode.config(text=mode_text(v))
         self.mode.place(in_=self.entry, relx=1.0, x=-2, rely=0.5, anchor="e")
         self.mode.lift()
@@ -171,6 +231,9 @@ class ImeEntry:
     def close(self):
         with self._lock:
             already, self._closed = self._closed, True
+        if _focus[0] is self:
+            _focus[0] = None
+            _publish()
         self._discard()
         try:
             self.ime.close()
@@ -178,7 +241,7 @@ class ImeEntry:
             pass
         if already:
             return
-        for seq in ("<KeyPress>", "<KeyRelease>"):     # 面板反复开关不累积绑定和控件
+        for seq in ("<KeyPress>", "<KeyRelease>", "<FocusIn>", "<FocusOut>"):     # 面板反复开关不累积绑定和控件
             try:
                 self.entry.unbind_class(self.tag, seq)
             except Exception:

@@ -362,3 +362,15 @@ def test_reply_drops_lone_surrogates():
                                       '"snap": ["n\\udfff", "n", ["\\ud83d\u597d"], 0, true, 0]}'))
     eng.feed("n")
     assert eng.take_commit() == "你" and eng.snapshot().raw == "n" and eng.snapshot().candidates == ["好"]
+
+
+def test_alive_follows_child_process(fake):
+    eng, why = _open(fake, "ok")
+    assert eng is not None, why
+    try:
+        assert eng.alive() is True
+        eng.proc.kill()
+        eng.proc.wait(timeout=5)
+        assert eng.alive() is False
+    finally:
+        eng.close()

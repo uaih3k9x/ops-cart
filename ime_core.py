@@ -70,6 +70,20 @@ class Ime:
             except Exception:
                 pass
 
+    def check_engine(self):
+        """闲着时引擎也会死 (子进程被 RuntimeMaxSec 收掉), 不按键发现不了. 死了按运行中崩溃处理, 下次 Shift 可重开.
+        状态因此变了 -> True; 引擎没有 alive() 或还活着 -> False."""
+        alive = getattr(self.engine, "alive", None)
+        if alive is None:
+            return False
+        try:
+            if alive():
+                return False
+        except Exception:
+            pass
+        self._drop("中文引擎已退出")
+        return True
+
     def close(self):
         eng, self.engine = self.engine, None
         if eng is not None:

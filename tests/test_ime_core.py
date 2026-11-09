@@ -386,3 +386,37 @@ def test_other_keys_while_composing_and_engine_fails_are_consumed(op, key, char)
     ime.press("n", "n", 0)
     r = ime.press(key, char, 0)
     assert r.consume and r.commit is None and ime.status == "unavailable"
+
+
+# ------------------------------------------------------------ 闲着时引擎死了 (#100)
+
+class _Mortal(FakeEngine):
+    alive_now = True
+
+    def alive(self):
+        return self.alive_now
+
+
+def test_check_engine_alive_changes_nothing():
+    ime = ic.Ime()
+    ime.set_engine(_Mortal(), zh=True)
+    assert ime.check_engine() is False and ime.zh and ime.status == "ready"
+
+
+def test_check_engine_without_probe_or_engine_is_noop():
+    ime = ic.Ime()
+    assert ime.check_engine() is False and ime.status == "off"
+    ime.set_engine(FakeEngine(), zh=True)
+    assert ime.check_engine() is False and ime.zh
+
+
+def test_check_engine_dead_falls_back_and_can_reopen():
+    eng = _Mortal()
+    ime = ic.Ime()
+    ime.set_engine(eng, zh=True)
+    eng.alive_now = False
+    assert ime.check_engine() is True
+    assert ime.status == "unavailable" and not ime.zh and ime.engine is None and eng.closed
+    assert ime.check_engine() is False                       # 只报一次
+    ime.press("Shift_L", "", 0)
+    assert ime.release("Shift_L").need_engine                # 运行中死的, 下次 Shift 可以重开
