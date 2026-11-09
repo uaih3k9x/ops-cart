@@ -251,6 +251,70 @@ def test_polled_other_refusal_keeps_watching(text):
     assert all(text == "" or text not in t for t, _ in d.rows())
 
 
+def _refuse(d, times, text="internal error: boom"):
+    for _ in range(times):
+        d.polled(tc.Refused(text))
+
+
+@pytest.mark.parametrize("text", ["internal error: boom", "ACP 进程已退出", "日后改过的文案", ""])
+def test_polled_repeated_refusal_releases_task(text):
+    d = _sent()
+    _refuse(d, tc.LOST_AFTER - 1, text)
+    assert d.active and d.task_id == TID
+    _refuse(d, 1, text)
+    assert d.task is None and d.task_id is None and d.bad and "可能还在跑" in d.msg
+    assert d.begin("再来", "") == "再来"
+
+
+def test_polled_unexpected_exception_counts_towards_release():
+    d = _sent()
+    for _ in range(tc.LOST_AFTER):
+        d.polled(ValueError("没想到的错"))
+    assert d.task is None and "可能还在跑" in d.msg
+
+
+def test_polled_offline_never_releases():
+    d = _sent()
+    for _ in range(tc.LOST_AFTER * 20):
+        d.polled(tc.Offline("连不上"))
+    assert d.active and d.task_id == TID and "连不上" in d.msg
+
+
+def test_polled_offline_between_refusals_neither_counts_nor_resets():
+    d = _sent()
+    for _ in range(tc.LOST_AFTER - 1):
+        d.polled(tc.Refused("internal error"))
+        d.polled(tc.Offline("连不上"))
+    assert d.active
+    d.polled(tc.Refused("internal error"))
+    assert d.task is None
+
+
+def test_polled_good_reply_resets_refusal_count():
+    d = _sent()
+    _refuse(d, tc.LOST_AFTER - 1)
+    d.polled(_body("running"))
+    _refuse(d, tc.LOST_AFTER - 1)
+    assert d.active
+
+
+def test_polled_reply_for_another_task_does_not_reset_count():
+    d = _sent()
+    _refuse(d, tc.LOST_AFTER - 1)
+    d.polled(_body("running", task_id="t-999"))
+    _refuse(d, 1)
+    assert d.task is None
+
+
+def test_next_task_starts_with_clean_refusal_count():
+    d = _sent()
+    _refuse(d, tc.LOST_AFTER)
+    d.begin("下一条", "")
+    d.sent({"task_id": TID, "state": "starting"})
+    _refuse(d, tc.LOST_AFTER - 1)
+    assert d.active
+
+
 @pytest.mark.parametrize("res", ["x", {"state": "running"}, _body("宇宙毁灭")])
 def test_polled_unreadable_ends_watching(res):
     d = _sent()
@@ -323,6 +387,70 @@ def test_cancel_failure_says_so_and_can_retry():
     d.begin_cancel()
     d.cancelled(tc.Offline("连不上"))
     assert d.bad and tc.OFFLINE in d.msg and d.begin_cancel() == TID
+
+
+def test_cancel_refused_is_not_reported_offline():
+    d = _sent()
+    d.begin_cancel()
+    d.cancelled(tc.Refused("别的拒绝原因"))
+    assert d.bad and tc.OFFLINE not in d.msg and "取消" in d.msg
+    assert not d.cancelling and not d.cancel_asked and d.begin_cancel() == TID
+    assert all("别的拒绝原因" not in t for t, _ in d.rows())
+
+
+def test_cancel_refused_leaves_release_to_polling():
+    d = _sent()
+    d.begin_cancel()
+    d.cancelled(tc.Refused(f"no such task: {TID}"))
+    assert d.active
+    d.polled(tc.Refused(f"no such task: {TID}"))
+    assert d.task is None
+
+
+@pytest.mark.parametrize("res", [{"task_id": TID, "state": "completed", "cancel_requested": False}, {}, "x"])
+def test_cancel_not_requested_is_not_reported_as_asked(res):
+    d = _sent()
+    d.begin_cancel()
+    d.cancelled(res)
+    assert not d.cancel_asked and d.msg != "已请求取消" and "结束" in d.msg and not d.cancelling
+    d.polled(_body("running"))
+    assert d.msg == ""
+
+
+def _cancel_in_flight_then_next_task():
+    d = _sent()
+    d.begin_cancel()
+    d.polled(_body("completed"))
+    d.begin("下一条", "")
+    d.sent({"task_id": "t-b0b", "state": "starting"})
+    return d
+
+
+@pytest.mark.parametrize("res", [{"task_id": TID, "state": "running", "cancel_requested": True},
+                                 tc.Offline("连不上"), tc.Refused("no such task")])
+def test_late_cancel_result_does_not_touch_next_task(res):
+    d = _cancel_in_flight_then_next_task()
+    d.cancelled(res)
+    assert not d.cancel_asked and not d.cancelling and d.msg == "已发出" and not d.bad and d.active
+    d.polled(_body("running", task_id="t-b0b"))
+    assert d.msg == ""
+
+
+def test_next_task_can_be_cancelled_after_late_result():
+    d = _cancel_in_flight_then_next_task()
+    assert d.begin_cancel() is None                     # 上一次还在途
+    d.cancelled({"cancel_requested": True})
+    assert d.begin_cancel() == "t-b0b"
+    d.cancelled({"cancel_requested": True})
+    assert d.cancel_asked and d.msg == "已请求取消"
+
+
+def test_cancel_result_after_task_already_ended_is_ignored():
+    d = _sent()
+    d.begin_cancel()
+    d.polled(_body("cancelled"))
+    d.cancelled({"task_id": TID, "state": "running", "cancel_requested": True})
+    assert not d.cancel_asked and d.msg == "" and not d.cancelling
 
 
 def test_cancel_needs_active_task():

@@ -37,8 +37,9 @@ STATES = {"starting": "启动中", "running": "在做事", "completed": "做完�
 ACTIVE = ("starting", "running")
 _TASK_ID = re.compile(r"t-[0-9a-f]{1,32}")
 _DROP = ("Cc", "Cf", "Cs")      # 控制 / 格式 / 孤立代理
-_GONE = "no such task"          # supervisor 找不到任务时的开头; 只用来判断继续轮询还是放弃, 不显示
+_GONE = "no such task"          # supervisor 找不到任务时的开头; 只用来提前放弃, 不显示. 文案变了也有 LOST_AFTER 兜底
 _ASKED = "已请求取消"
+LOST_AFTER = 5                  # 连续这么多次查询被拒 (约 10 秒) 就不再跟踪; 连不上不算, 等它回来
 _O_PATH = getattr(os, "O_PATH", os.O_RDONLY)    # 只有 Linux 有 O_PATH; 这里只用于打开目录, 别的系统也能走到校验
 
 
@@ -103,8 +104,10 @@ class Desk:
 
     def __init__(self):
         self.draft, self.msg, self.said = "", "", ""
-        self.bad = self.sending = self.cancelling = self.cancel_asked = False
+        self.bad = self.sending = self.cancel_asked = False
         self.task_id, self.task = None, None
+        self.cancelling = None              # 在途的取消是给哪个任务的
+        self.refused = 0                    # 连续被拒的轮询次数
         self.gen = 0                        # 发送成功一次 +1: 面板据此清空输入框
 
     @property
@@ -140,7 +143,7 @@ class Desk:
         elif not isinstance(res, dict) or not valid_id(res.get("task_id")):
             self._say("大肥鱼的回复读不懂，可能已经发出去了；字还在", True)
         else:
-            self.task_id, self.draft, self.cancel_asked = res["task_id"], "", False
+            self.task_id, self.draft, self.cancel_asked, self.refused = res["task_id"], "", False, 0
             self.task = dict(parse_task({"task_id": self.task_id, "state": "starting"}))
             self.gen += 1
             self._say("已发出")
@@ -159,29 +162,40 @@ class Desk:
         if isinstance(res, Refused) and str(res).startswith(_GONE):
             self._gone("任务已不在（大肥鱼可能重启过）")
         elif isinstance(res, Exception):
-            self._say("暂时连不上大肥鱼，状态没更新", True)
+            self.refused += not isinstance(res, Offline)
+            if self.refused >= LOST_AFTER:
+                self._gone("跟踪不到这个任务了，它可能还在跑，可以到别的入口看")
+            else:
+                self._say("暂时连不上大肥鱼，状态没更新", True)
         else:
             task = parse_task(res)
             if task is None:
                 self._gone("任务状态读不懂，不再跟踪")
             elif task["task_id"] == self.task_id:
-                self.task = task
+                self.task, self.refused = task, 0
                 self._say(_ASKED if self.cancel_asked and self.active else "")
 
     def begin_cancel(self):
         if not self.active or self.cancelling:
             return None
-        self.cancelling = True
+        self.cancelling = self.task_id
         self._say("正在取消…")
         return self.task_id
 
     def cancelled(self, res):
-        self.cancelling = False
-        if isinstance(res, Exception):
+        """取消的结果. 只更新提示, 放弃跟踪归轮询: 取消被拒不代表任务不在了."""
+        target, self.cancelling = self.cancelling, None
+        if target != self.task_id or not self.active:       # 在途时任务已结束或换了下一个, 结果和现在无关
+            return
+        if isinstance(res, Refused):
+            self._say("大肥鱼没接受取消", True)
+        elif isinstance(res, Exception):
             self._say(f"取消没发出去：{OFFLINE}", True)
-        else:
+        elif isinstance(res, dict) and res.get("cancel_requested") is True:
             self.cancel_asked = True
             self._say(_ASKED)
+        else:
+            self._say("任务可能已经结束，没有再取消")
 
     def rows(self):
         """面板上这个任务的行 -> [(文字, 标签)], 标签同 bigfish_core.panel_rows."""
