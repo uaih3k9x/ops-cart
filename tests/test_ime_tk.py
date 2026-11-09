@@ -178,6 +178,7 @@ def test_attach_never_raises():
 
 # (文件, 用途) 白名单: 候选上屏等于替人打字, 只接普通文字输入框. 新接一处要改这里, 逼着看一眼是不是 PIN / 确认码 / 命令框
 ALLOWED = {("wol_panel.py", "wol.name"), ("bigfish_panel.py", "bigfish.task")}
+WATCHERS = {"kiosk.py"}             # 只订阅焦点框状态 (#100 指示灯), 不接输入框: 仍然不许 attach
 _IME_FILES = {"ime_tk.py", "ime_core.py", "ime_proc.py", "ime_rime.py", "ime_worker.py"}
 
 
@@ -216,6 +217,8 @@ def ime_refs(src):
     used = bool(bad) or bool(re.search(r"\bime_tk\b", src))
     calls = []
     for m in re.finditer(r"\bime_tk\.(\w+)\(", src):
+        if m.group(1) == "watch":           # 只读状态, 不接输入框; 谁能用看 WATCHERS
+            continue
         if m.group(1) != "attach":
             bad.append(f"ime_tk.{m.group(1)}")
             continue
@@ -241,7 +244,7 @@ def test_only_whitelisted_entries_get_ime():
             for purpose in calls:
                 assert purpose, rel                          # attach 必须带字面的 purpose=
                 pairs[(rel, purpose)] += 1
-    assert users == {f for f, _p in ALLOWED}
+    assert users == {f for f, _p in ALLOWED} | WATCHERS
     assert pairs == Counter(ALLOWED)                         # 每个 (文件, 用途) 恰好一次
 
 
@@ -496,3 +499,215 @@ def test_engine_closed_exactly_once(order):
     while e.afters:
         e.afters.pop(0)()
     assert closes == [1]
+
+
+# ------------------------------------------------------------ #100 焦点框状态 -> 指示灯
+
+@pytest.fixture
+def seen(monkeypatch):
+    monkeypatch.setattr(it, "_watchers", [])
+    monkeypatch.setattr(it, "_focus", [None])
+    monkeypatch.setattr(it, "_published", [None])
+    out = []
+    it.watch(out.append)
+    return out
+
+
+def _focus(e, w, kind="In"):
+    e.class_binds[(w.tag, f"<Focus{kind}>")](_ev(f"Focus{kind}"))
+
+
+def _en(status="off"):
+    return {"mode": "en", "status": status}
+
+
+def _zh():
+    return {"mode": "zh", "status": "ready"}
+
+
+def _shift_keys(press, release):
+    press(_ev("Shift_L"))
+    release(_ev("Shift_L"))
+
+
+def _run_poll(e, w):
+    """跑掉引擎加载的轮询; 焦点在框上时存活检查会一直续, 只跑当前排着的."""
+    for fn in list(e.afters):
+        e.afters.remove(fn)
+        fn()
+
+
+def test_focus_state_none_without_focus(seen):
+    _attach(lambda: (FakeEngine(), ""))
+    assert it.focus_state() is None and seen == []
+
+
+def test_focus_in_and_out_publish(seen):
+    e, w, _p, _r = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    assert seen == [_en()] and it.focus_state() == _en()
+    _focus(e, w, "Out")
+    assert seen == [_en(), None] and it.focus_state() is None
+
+
+def test_state_exposes_only_mode_and_status(seen):
+    e, w, press, release = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    _shift_keys(press, release)
+    _run_poll(e, w)
+    press(_ev("n", "n"))                                     # 在拼: 灯不用知道拼音和候选
+    assert set(it.focus_state()) == {"mode", "status"}
+
+
+def test_shift_flips_state_through_loading(seen):
+    e, w, press, release = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    _shift_keys(press, release)
+    assert seen[-1] == {"mode": "en", "status": "loading"}
+    _run_poll(e, w)
+    assert seen[-1] == _zh()
+    _shift_keys(press, release)
+    assert seen[-1] == _en("ready")
+    _shift_keys(press, release)
+    assert seen[-1] == _zh()
+
+
+def test_unchanged_state_is_not_republished(seen):
+    e, w, press, release = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    press(_ev("a", "a"))
+    press(_ev("b", "b"))
+    assert seen == [_en()]
+
+
+def test_unfocused_entry_does_not_publish(seen):
+    e, w, press, release = _attach(lambda: (FakeEngine(), ""))
+    _shift_keys(press, release)
+    _run_poll(e, w)
+    assert seen == []
+
+
+def test_moving_between_entries_tracks_the_new_one(seen):
+    a, wa, pa, ra = _attach(lambda: (FakeEngine(), ""))
+    b, wb, _p, _r = _attach(lambda: (FakeEngine(), ""))
+    _focus(a, wa)
+    _shift_keys(pa, ra)
+    _run_poll(a, wa)
+    assert seen[-1] == _zh()
+    _focus(b, wb)                                           # Tk 不保证先 Out 后 In
+    assert seen[-1] == _en()
+    _focus(a, wa, "Out")                                    # 迟到的 Out 不能把新框的状态抹掉
+    assert seen[-1] == _en() and it.focus_state() == _en()
+
+
+def test_close_while_focused_clears_state(seen):
+    e, w, press, release = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    _shift_keys(press, release)
+    _run_poll(e, w)
+    assert seen[-1] == _zh()
+    e.binds["<Destroy>"](_ev("Destroy"))                    # 关面板
+    assert seen[-1] is None and it.focus_state() is None
+
+
+def test_close_unbinds_focus(seen):
+    e, w, _p, _r = _attach(lambda: (FakeEngine(), ""))
+    w.close()
+    assert (w.tag, "<FocusIn>") not in e.class_binds and (w.tag, "<FocusOut>") not in e.class_binds
+
+
+def test_engine_crash_on_key_leaves_chinese(seen):
+    eng = FakeEngine()
+
+    def boom(ch):
+        raise OSError("子进程退出了")
+    e, w, press, release = _attach(lambda: (eng, ""))
+    _focus(e, w)
+    _shift_keys(press, release)
+    _run_poll(e, w)
+    eng.feed = boom
+    press(_ev("n", "n"))
+    assert seen[-1] == {"mode": "en", "status": "unavailable"}
+
+
+class _Mortal(FakeEngine):
+    alive_now = True
+
+    def alive(self):
+        return self.alive_now
+
+
+def test_idle_engine_death_noticed_without_keypress(seen):
+    """子进程闲着时被回收 (RuntimeMaxSec), 没人按键也不能停在 简."""
+    eng = _Mortal()
+    e, w, press, release = _attach(lambda: (eng, ""))
+    _focus(e, w)
+    _shift_keys(press, release)
+    _run_poll(e, w)
+    assert seen[-1] == _zh()
+    eng.alive_now = False
+    _run_poll(e, w)
+    assert seen[-1] == {"mode": "en", "status": "unavailable"} and w.mode.kw["text"] == "英·无中文"
+
+
+def test_engine_died_while_unfocused_is_noticed_on_focus(seen):
+    eng = _Mortal()
+    e, w, press, release = _attach(lambda: (eng, ""))
+    _focus(e, w)
+    _shift_keys(press, release)
+    _run_poll(e, w)
+    _focus(e, w, "Out")
+    eng.alive_now = False
+    _focus(e, w)
+    assert seen[-1] == {"mode": "en", "status": "unavailable"}
+
+
+def test_only_one_liveness_timer(seen):
+    e, w, _p, _r = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    n = len(e.afters)
+    _focus(e, w, "Out")
+    _focus(e, w)                                            # 旧定时器还排着: 不再起一个
+    assert len(e.afters) == n == 1
+
+
+def test_liveness_timer_stops_when_focus_leaves_or_closed(seen):
+    e, w, _p, _r = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    _focus(e, w, "Out")
+    _run_poll(e, w)
+    assert e.afters == []
+    _focus(e, w)
+    w.close()
+    _run_poll(e, w)
+    assert e.afters == []
+
+
+def test_watcher_error_does_not_break_input(seen):
+    def bad(_state):
+        raise RuntimeError("灯坏了")
+    it.watch(bad)
+    e, w, press, _r = _attach(lambda: (FakeEngine(), ""))
+    _focus(e, w)
+    assert seen == [_en()] and press(_ev("a", "a")) is None
+
+
+def test_no_ime_entry_never_lights_lamp(seen):
+    """no_ime 的框根本接不上, 焦点切过去时 Out 把灯灭掉, 没有 In 再点亮."""
+    e, w, _p, _r = _attach(lambda: (FakeEngine(), ""))
+    bad = FakeEntry()
+    bad.no_ime = True
+    assert it.attach(bad, purpose="x.y", opener=lambda: (FakeEngine(), ""), label=FakeLabel) is None
+    assert not any(k[1] == "<FocusIn>" for k in bad.class_binds)
+    _focus(e, w)
+    _focus(e, w, "Out")
+    assert seen[-1] is None
+
+
+def test_kiosk_wires_ime_lamp():
+    """kiosk.py 太大不好实例化, 看接线; 灯只注册成只看不点 (切换仍然只靠 Shift)."""
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "kiosk.py"), encoding="utf-8").read()
+    assert "ime_tk.watch(" in src and "lc.ime_lamp(" in src
+    assert "block(lc.IME_KEY, 5, None)" in src

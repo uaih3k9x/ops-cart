@@ -99,9 +99,11 @@ def test_lamp_paint_uses_agent_state():
     calls, fake = _fake(_view(pending_slot=2, stop=1))
     fake._lamp_slots = [{"dev": f"/dev/con-{n}", "present": True, "baud": "9600", "count": 0} for n in range(1, 5)]
     fake._lamps = {k: (_Lab(), _Lab(), _Lab(), [None]) for k in ["con-1", "con-2", "con-3", "con-4"] +
-                   [key for _n, _l, key in kiosk.lc.LOWER]}
+                   [key for _n, _l, key in kiosk.lc.LOWER] + [kiosk.lc.IME_KEY]}
+    fake._ime_state = {"mode": "zh", "status": "ready"}
     fake._lamp_paint()
     assert fake._lamps["con-1"][2].cfg["text"] == "1\n急停"
     assert fake._lamps["con-2"][2].cfg["text"] == "2\n待确认 1"
     assert fake._lamps["con-3"][2].cfg["text"] == "3\n9600"
     assert fake._lamps["kvm"][2].cfg["text"] == "键鼠"
+    assert fake._lamps[kiosk.lc.IME_KEY][2].cfg["text"] == "简"    # #100

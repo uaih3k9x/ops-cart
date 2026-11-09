@@ -184,6 +184,9 @@ class ProcEngine:
     def snapshot(self):
         return self._snap
 
+    def alive(self):
+        return self.proc.poll() is None
+
     def take_commit(self):
         c, self._commit = self._commit, None
         return c
