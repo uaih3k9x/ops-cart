@@ -111,8 +111,8 @@ wrapper 是常驻的 bigfish 用户服务（bigfish-supervisor，用户单元）
 
 **连接**：`/run/user/<bigfish uid>/bigfish/mcp.sock`，一行一个 JSON-RPC，后台线程调用，单次最多 5 秒。root 连 bigfish 的 socket，所以：
 
-- 连接前 `lstat` 核对 socket 和它所在目录的类型、属主，不跟随符号链接；
-- 连接后用 `SO_PEERCRED` 核对对端 uid，不是 bigfish 就一个字节都不发。路径归 bigfish 管，`lstat` 和 `connect` 之间可能被换掉，这一步才是兜底。
+- 连接前用 `O_PATH | O_NOFOLLOW` 依次打开目录和 socket 本身，在 fd 上核对类型、属主，再经 `/proc/self/fd/<fd>` 连接校验过的 inode。目录归 bigfish 管，按名字连接的话校验之后仍可能被换成符号链接；
+- 连接后用 `SO_PEERCRED` 核对对端 uid，作为兜底，不是 bigfish 就一个字节都不发。
 
 连不上、属主不对、超时都显示"大肥鱼不在线"。请求已发出但没等到回复时，提示"可能已经发出去了"，因为派任务不是幂等的，重发前要先看状态。
 

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import tempfile
 import threading
 
@@ -236,6 +237,20 @@ def test_polled_task_gone_ends_watching():
     assert d.begin("再来", "") == "再来"
 
 
+def test_polled_task_gone_matches_real_supervisor_text():
+    d = _sent()
+    d.polled(tc.Refused(f"no such task: {TID}"))
+    assert d.task is None and "不在" in d.msg
+
+
+@pytest.mark.parametrize("text", ["internal error: boom", "ACP 进程已退出", "说 no such task 的别的话", ""])
+def test_polled_other_refusal_keeps_watching(text):
+    d = _sent()
+    d.polled(tc.Refused(text))
+    assert d.active and d.task_id == TID and d.bad and "连不上" in d.msg
+    assert all(text == "" or text not in t for t, _ in d.rows())
+
+
 @pytest.mark.parametrize("res", ["x", {"state": "running"}, _body("宇宙毁灭")])
 def test_polled_unreadable_ends_watching(res):
     d = _sent()
@@ -257,6 +272,50 @@ def test_cancel_flow():
     assert d.begin_cancel() is None                     # 不重复点
     d.cancelled({"task_id": TID, "state": "running", "cancel_requested": True})
     assert not d.cancelling and "取消" in d.msg and not d.bad and d.active      # 等轮询看到 cancelled
+
+
+def _cancel_asked():
+    d = _sent()
+    d.begin_cancel()
+    d.cancelled({"task_id": TID, "state": "running", "cancel_requested": True})
+    return d
+
+
+def test_cancel_note_survives_next_poll():
+    d = _cancel_asked()
+    d.polled(_body("running"))
+    assert d.msg == "已请求取消" and not d.bad and d.active
+
+
+def test_cancel_note_comes_back_after_offline_poll():
+    d = _cancel_asked()
+    d.polled(tc.Offline("连不上"))
+    assert d.bad and "连不上" in d.msg
+    d.polled(_body("running"))
+    assert d.msg == "已请求取消" and not d.bad
+
+
+def test_cancel_note_clears_when_task_ends():
+    d = _cancel_asked()
+    d.polled(_body("cancelled"))
+    assert d.msg == "" and not d.active
+
+
+def test_cancel_note_not_inherited_by_next_task():
+    d = _cancel_asked()
+    d.polled(_body("cancelled"))
+    d.begin("下一条", "")
+    d.sent({"task_id": TID, "state": "starting"})
+    d.polled(_body("running"))
+    assert d.msg == ""
+
+
+def test_failed_cancel_leaves_no_note():
+    d = _sent()
+    d.begin_cancel()
+    d.cancelled(tc.Offline("连不上"))
+    d.polled(_body("running"))
+    assert d.msg == ""
 
 
 def test_cancel_failure_says_so_and_can_retry():
@@ -299,6 +358,17 @@ def short_dir():
     d = tempfile.mkdtemp(prefix="bf", dir="/tmp")     # AF_UNIX 路径有长度上限, pytest 的 tmp_path 太长
     yield d
     shutil.rmtree(d, ignore_errors=True)
+
+
+REAL_OPEN = tc._open_socket
+
+
+@pytest.fixture(autouse=True)
+def _open_socket_without_o_path(monkeypatch):
+    """Mac 没有 O_PATH 和 /proc: 只替换"打开 socket 本身"这一步, 目录校验和类型 / 属主校验照常走真代码."""
+    if not hasattr(os, "O_PATH"):
+        monkeypatch.setattr(tc, "_open_socket", lambda dir_fd, path: (
+            os.dup(dir_fd), os.lstat(os.path.basename(path), dir_fd=dir_fd), path))
 
 
 def _reply(mid, body, error=False):
@@ -427,6 +497,110 @@ def test_call_peer_check_failure_is_offline(short_dir):
     with srv, pytest.raises(tc.Offline):
         _call(path, peer=boom)
     assert seen == []
+
+
+def _two_servers(short_dir):
+    a, b = os.path.join(short_dir, "a"), os.path.join(short_dir, "b")
+    os.mkdir(a)
+    os.mkdir(b)
+    return _serve(a, _ok_handler({"task_id": TID})), _serve(b, _ok_handler({"task_id": TID}))
+
+
+def test_call_connects_to_pinned_target_not_to_the_path(short_dir, monkeypatch):
+    (path, seen, srv), (other, other_seen, other_srv) = _two_servers(short_dir)
+    opened = tc._open_socket
+
+    def pin(dir_fd, p):
+        fd, st, _target = opened(dir_fd, p)
+        return fd, st, other
+    monkeypatch.setattr(tc, "_open_socket", pin)
+    with srv, other_srv:
+        _call(path)
+    assert seen == [] and other_seen
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="要 Linux 的 O_PATH 和 /proc")
+def test_call_ignores_symlink_swapped_in_after_the_check(short_dir, monkeypatch):
+    (path, seen, srv), (other, other_seen, other_srv) = _two_servers(short_dir)
+
+    def swap(dir_fd, p):
+        pinned = REAL_OPEN(dir_fd, p)
+        os.unlink(p)
+        os.symlink(other, p)
+        return pinned
+    monkeypatch.setattr(tc, "_open_socket", swap)
+    with srv, other_srv:
+        _call(path)
+    assert seen and other_seen == []
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="要 Linux 的 O_PATH 和 /proc")
+def test_real_open_returns_symlink_itself_not_its_target(short_dir):
+    path, _seen, srv = _serve(short_dir, _ok_handler({}))
+    os.symlink(path, os.path.join(short_dir, "l"))
+    dir_fd = os.open(short_dir, os.O_RDONLY)
+    with srv:
+        fd, st, target = REAL_OPEN(dir_fd, os.path.join(short_dir, "l"))
+        os.close(fd)
+    os.close(dir_fd)
+    assert stat.S_ISLNK(st.st_mode) and target == f"/proc/self/fd/{fd}"
+
+
+def test_call_without_o_path_is_offline(short_dir, monkeypatch):
+    path, seen, srv = _serve(short_dir, _ok_handler({}))
+    monkeypatch.setattr(tc, "_open_socket", REAL_OPEN)
+    monkeypatch.delattr(os, "O_PATH", raising=False)
+    with srv, pytest.raises(tc.Offline) as e:
+        _call(path)
+    assert seen == [] and e.value.sent is False
+
+
+def _spy_fds(monkeypatch):
+    opened, closed = [], []
+    real_open, real_close, pin = os.open, os.close, tc._open_socket
+
+    def spy_open(*a, **k):
+        opened.append(real_open(*a, **k))
+        return opened[-1]
+
+    def spy_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    def spy_pin(dir_fd, p):
+        res = pin(dir_fd, p)
+        if res[0] not in opened:                # Linux 上真代码走 os.open, 已经记过
+            opened.append(res[0])
+        return res
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", spy_close)
+    monkeypatch.setattr(tc, "_open_socket", spy_pin)
+    return opened, closed
+
+
+def test_call_closes_pin_fds_on_success(short_dir, monkeypatch):
+    path, _seen, srv = _serve(short_dir, _ok_handler({"task_id": TID}))
+    opened, closed = _spy_fds(monkeypatch)
+    with srv:
+        _call(path)
+    assert len(opened) == 2 and sorted(opened) == sorted(closed)
+
+
+def test_call_closes_pin_fds_when_target_is_not_a_socket(short_dir, monkeypatch):
+    p = os.path.join(short_dir, "f")
+    open(p, "w").close()
+    opened, closed = _spy_fds(monkeypatch)
+    with pytest.raises(tc.Offline):
+        _call(p)
+    assert len(opened) == 2 and sorted(opened) == sorted(closed)
+
+
+def test_call_closes_dir_fd_when_dir_owner_is_wrong(short_dir, monkeypatch):
+    path, seen, srv = _serve(short_dir, _ok_handler({}))
+    opened, closed = _spy_fds(monkeypatch)
+    with srv, pytest.raises(tc.Offline):
+        _call(path, uid=os.getuid() + 1)
+    assert len(opened) == 1 and sorted(opened) == sorted(closed) and seen == []
 
 
 def test_call_no_bigfish_user_is_offline(monkeypatch):

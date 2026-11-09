@@ -3,13 +3,14 @@
 只接派任务 / 看任务 / 取消三个工具 (TOOLS), 这个输入框没有任何批准动作; 大肥鱼要动手照旧走 MCP 闸门和现有确认框.
 
 kiosk 是 root, socket 属于 bigfish, 所以连接前后都要核对对方是谁:
-- 连接前 lstat 核对 socket 和它所在目录 (类型、属主, 不跟随符号链接);
-- 连接后用 SO_PEERCRED 核对对端 uid. 路径是 bigfish 能改的, lstat 和 connect 之间可以被换掉, 这一步才是兜底,
-  过不了就一个字节都不发. 拿不到 peer 凭据按连不上处理.
+- 连接前用 O_PATH | O_NOFOLLOW 依次钉住目录和 socket 本身, 在 fd 上核对类型和属主, 再经 /proc/self/fd/<fd> 连这个 inode.
+  目录归 bigfish 所有, 按名字连的话校验之后 mcp.sock 仍可被换成符号链接, 所以连的必须是校验过的 fd, 不是名字;
+- 连接后用 SO_PEERCRED 核对对端 uid, 作兜底, 过不了就一个字节都不发. 拿不到 peer 凭据按连不上处理.
 
 supervisor 的回复全部当不可信数据: 状态只认白名单, 文字一律过 bigfish_core.clean, 显示带 SAYS 前缀.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -36,6 +37,9 @@ STATES = {"starting": "启动中", "running": "在做事", "completed": "做完�
 ACTIVE = ("starting", "running")
 _TASK_ID = re.compile(r"t-[0-9a-f]{1,32}")
 _DROP = ("Cc", "Cf", "Cs")      # 控制 / 格式 / 孤立代理
+_GONE = "no such task"          # supervisor 找不到任务时的开头; 只用来判断继续轮询还是放弃, 不显示
+_ASKED = "已请求取消"
+_O_PATH = getattr(os, "O_PATH", os.O_RDONLY)    # 只有 Linux 有 O_PATH; 这里只用于打开目录, 别的系统也能走到校验
 
 
 class Offline(Exception):
@@ -99,7 +103,7 @@ class Desk:
 
     def __init__(self):
         self.draft, self.msg, self.said = "", "", ""
-        self.bad = self.sending = self.cancelling = False
+        self.bad = self.sending = self.cancelling = self.cancel_asked = False
         self.task_id, self.task = None, None
         self.gen = 0                        # 发送成功一次 +1: 面板据此清空输入框
 
@@ -136,7 +140,7 @@ class Desk:
         elif not isinstance(res, dict) or not valid_id(res.get("task_id")):
             self._say("大肥鱼的回复读不懂，可能已经发出去了；字还在", True)
         else:
-            self.task_id, self.draft = res["task_id"], ""
+            self.task_id, self.draft, self.cancel_asked = res["task_id"], "", False
             self.task = dict(parse_task({"task_id": self.task_id, "state": "starting"}))
             self.gen += 1
             self._say("已发出")
@@ -152,7 +156,7 @@ class Desk:
     def polled(self, res):
         if self.task_id is None:
             return
-        if isinstance(res, Refused):
+        if isinstance(res, Refused) and str(res).startswith(_GONE):
             self._gone("任务已不在（大肥鱼可能重启过）")
         elif isinstance(res, Exception):
             self._say("暂时连不上大肥鱼，状态没更新", True)
@@ -162,7 +166,7 @@ class Desk:
                 self._gone("任务状态读不懂，不再跟踪")
             elif task["task_id"] == self.task_id:
                 self.task = task
-                self._say("")
+                self._say(_ASKED if self.cancel_asked and self.active else "")
 
     def begin_cancel(self):
         if not self.active or self.cancelling:
@@ -176,7 +180,8 @@ class Desk:
         if isinstance(res, Exception):
             self._say(f"取消没发出去：{OFFLINE}", True)
         else:
-            self._say("已请求取消")
+            self.cancel_asked = True
+            self._say(_ASKED)
 
     def rows(self):
         """面板上这个任务的行 -> [(文字, 标签)], 标签同 bigfish_core.panel_rows."""
@@ -212,11 +217,32 @@ def peer_uid(s):
     return struct.unpack("3i", raw)[1]
 
 
-def _check_path(path, uid):
-    for p, kind in ((os.path.dirname(path), stat.S_ISDIR), (path, stat.S_ISSOCK)):
-        st = os.lstat(p)
-        if not kind(st.st_mode) or st.st_uid != uid:
-            raise Offline("socket 的类型或属主不对")
+def _require(st, kind, uid):
+    if not kind(st.st_mode) or st.st_uid != uid:
+        raise Offline("socket 的类型或属主不对")
+
+
+def _open_socket(dir_fd, path):
+    """钉住 socket 本身 -> (fd, 它的 stat, connect 用的路径). 是符号链接时 fd 指向链接本身, 类型校验会拒.
+    os.O_PATH 只有 Linux 有, 别的系统在这里抛 AttributeError, call 按连不上处理."""
+    fd = os.open(os.path.basename(path), os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    return fd, os.fstat(fd), f"/proc/self/fd/{fd}"
+
+
+@contextlib.contextmanager
+def _pinned(path, uid):
+    """校验目录和 socket, 产出只指向校验过的 inode 的 connect 路径; 退出时关掉 fd."""
+    fd = None
+    dir_fd = os.open(os.path.dirname(path), _O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        _require(os.fstat(dir_fd), stat.S_ISDIR, uid)
+        fd, st, target = _open_socket(dir_fd, path)
+        _require(st, stat.S_ISSOCK, uid)
+        yield target
+    finally:
+        os.close(dir_fd)
+        if fd is not None:
+            os.close(fd)
 
 
 def _request(tool, args):
@@ -273,10 +299,9 @@ def call(tool, args, path=None, uid=None, peer=peer_uid, timeout=CALL_S):
     path = path or sock_path(uid)
     deadline, sent = time.monotonic() + timeout, False
     try:
-        _check_path(path, uid)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        with _pinned(path, uid) as target, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            s.connect(path)
+            s.connect(target)
             if peer(s) != uid:
                 raise Offline("对端不是 bigfish")
             sent = True

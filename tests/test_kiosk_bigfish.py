@@ -66,6 +66,12 @@ def test_task_send_gate_all_stopped():
     assert _stopped_fake(b.view(T0))() is True
 
 
+def test_task_send_gate_open_when_only_some_slots_stopped():
+    b = sw.Book.from_text(None, T0)
+    b.estop(sorted(sw.SLOTS)[0], "t", "test", T0)
+    assert _stopped_fake(b.view(T0))() is False
+
+
 def test_confirm_opens_existing_dialog_for_pending_slot():
     calls, fake = _fake(_view(3))
     assert fake._bigfish_pending() == 1
