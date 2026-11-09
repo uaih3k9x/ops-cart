@@ -55,6 +55,10 @@ class Refused(Exception):
     """supervisor 明确拒了 (急停中、并发满、没这个任务...), 文字是不可信数据."""
 
 
+class Busy(Exception):
+    """后台没接这次动作 (上一次还没回来, 或线程起不来): 请求根本没发出去."""
+
+
 def valid_id(task_id):
     return isinstance(task_id, str) and _TASK_ID.fullmatch(task_id) is not None
 
@@ -90,7 +94,7 @@ def parse_task(body):
     u = u if isinstance(u, dict) else {}
     output = u.get("output") if isinstance(u.get("output"), str) else ""
     reason = u.get("stop_reason")
-    return {"task_id": body["task_id"], "state": body["state"], "elapsed_s": bf._num(body.get("elapsed_s"), 0),
+    return {"task_id": body["task_id"], "state": body["state"], "elapsed_s": bf._num(body.get("elapsed_s"), 0, bf.ELAPSED_MAX),
             "total": bf._int(body.get("output_total_chars"), bf.SEQ_MAX) or 0, "output": output[-bf.OUTPUT_TAIL:],
             "steps": len(u["tools"]) if isinstance(u.get("tools"), list) else 0,
             "rejected": len(u["rejected_approvals"]) if isinstance(u.get("rejected_approvals"), list) else 0,
@@ -133,7 +137,9 @@ class Desk:
 
     def sent(self, res):
         self.sending = False
-        if isinstance(res, Refused):
+        if isinstance(res, Busy):
+            self._say("后台正忙，上一次发送可能还没回来；字还在，稍后再发", True)
+        elif isinstance(res, Refused):
             self.said = bf.clean(str(res))
             self._say("大肥鱼没接这个任务，字还在", True)
         elif isinstance(res, Offline) and res.sent:
@@ -144,6 +150,7 @@ class Desk:
             self._say("大肥鱼的回复读不懂，可能已经发出去了；字还在", True)
         else:
             self.task_id, self.draft, self.cancel_asked, self.refused = res["task_id"], "", False, 0
+            self.cancelling = None          # 上一个任务在途的取消和这个任务无关, 迟到的结果 cancelled() 会丢掉
             self.task = dict(parse_task({"task_id": self.task_id, "state": "starting"}))
             self.gen += 1
             self._say("已发出")
@@ -187,7 +194,9 @@ class Desk:
         target, self.cancelling = self.cancelling, None
         if target != self.task_id or not self.active:       # 在途时任务已结束或换了下一个, 结果和现在无关
             return
-        if isinstance(res, Refused):
+        if isinstance(res, Busy):
+            self._say("取消没发出去：后台正忙，稍后再试", True)
+        elif isinstance(res, Refused):
             self._say("大肥鱼没接受取消", True)
         elif isinstance(res, Exception):
             self._say(f"取消没发出去：{OFFLINE}", True)

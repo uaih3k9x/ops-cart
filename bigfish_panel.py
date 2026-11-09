@@ -5,6 +5,7 @@
 Text 只插纯文字 (不认链接、不执行). 这里不审批、不写任何文件; 输入框没有任何通往批准的路.
 """
 
+import sys
 import time
 import tkinter as tk
 
@@ -100,7 +101,7 @@ class BigfishPanel(tk.Frame):
         prompt = self.desk.begin(self.entry.get(), self._block(view))
         self._sync_desk(view)
         if prompt is not None and not self.run_bg(lambda: self.submit(prompt), self._sent, key="bigfish-task-send"):
-            self._sent(tc.Offline("后台忙"))
+            self._sent(tc.Busy())
 
     def _desk_done(self, fn, res):
         """后台结果回来 (主线程). desk 在 kiosk 上, 面板关了也要更新."""
@@ -118,13 +119,13 @@ class BigfishPanel(tk.Frame):
             return
         self._sync_desk()
         if not self.run_bg(lambda: self.cancel_task(task_id), self._cancelled, key="bigfish-task-cancel"):
-            self._cancelled(tc.Offline("后台忙"))
+            self._cancelled(tc.Busy())
 
     def _cancelled(self, res):
         self._desk_done(self.desk.cancelled, res)
 
     def _poll(self):
-        args = self.desk.poll_args()
+        args = self.desk.poll_args() if self.desk is not None else None
         if args:
             self.run_bg(lambda: self.get_task(*args), self._polled, key="bigfish-task-poll")
 
@@ -145,7 +146,7 @@ class BigfishPanel(tk.Frame):
         now = self.clock()
         self._draw(self._load(now), now)
 
-    def refresh(self):
+    def _paint(self):
         now = self.clock()
         view = self._load(now)
         self._draw(view, now)
@@ -162,7 +163,14 @@ class BigfishPanel(tk.Frame):
             self.btn_resume.pack_forget()
         if self.desk is not None:
             self._sync_desk(view)
-            self._poll()
+
+    def refresh(self):
+        """画坏一次不能断刷新链, 也不能停轮询: 下一个好回复才能把坏状态换掉."""
+        for step in (self._paint, self._poll):
+            try:
+                step()
+            except Exception as ex:         # noqa: BLE001
+                print(f"大肥鱼面板刷新出错: {ex!r}", file=sys.stderr)
         self._job = self.after(REFRESH_MS, self.refresh)
 
     def destroy(self):

@@ -438,11 +438,20 @@ def test_late_cancel_result_does_not_touch_next_task(res):
 
 def test_next_task_can_be_cancelled_after_late_result():
     d = _cancel_in_flight_then_next_task()
-    assert d.begin_cancel() is None                     # 上一次还在途
-    d.cancelled({"cancel_requested": True})
+    d.cancelled({"cancel_requested": True})             # 上一个任务的迟到结果
     assert d.begin_cancel() == "t-b0b"
     d.cancelled({"cancel_requested": True})
     assert d.cancel_asked and d.msg == "已请求取消"
+
+
+def test_next_cancel_refused_by_busy_key_then_late_result_is_ignored():
+    """旧取消还占着后台 key 时点取消: 后台不接 (Busy), 旧结果回来不算到新任务头上, 之后能再取消."""
+    d = _cancel_in_flight_then_next_task()
+    assert d.begin_cancel() == "t-b0b"
+    d.cancelled(tc.Busy())
+    assert not d.cancelling and d.bad
+    d.cancelled({"cancel_requested": True})
+    assert not d.cancel_asked and d.begin_cancel() == "t-b0b"
 
 
 def test_cancel_result_after_task_already_ended_is_ignored():
@@ -859,3 +868,54 @@ def test_cancel_logs_source():
 def test_cancel_refuses_invalid_task_id():
     with pytest.raises(ValueError):
         tc.cancel_task("../x", call=lambda t, a: pytest.fail("不该调用"))
+
+
+# ------------------------------------------------------------ #101 第三轮
+
+@pytest.mark.parametrize("raw", ["1e999", "-1e999", "NaN", "Infinity", "1" + "0" * 400, "1e12"], ids=lambda v: str(v)[:8])
+def test_polled_bad_elapsed_is_dropped_and_rows_survive(raw):
+    d = _sent()
+    d.polled(json.loads('{"task_id": "%s", "state": "running", "elapsed_s": %s}' % (TID, raw)))
+    assert d.task["elapsed_s"] is None
+    assert d.rows()[0][0].endswith(tc.STATES["running"])
+
+
+def test_polled_finite_elapsed_still_shown():
+    d = _sent()
+    d.polled(_body())
+    assert d.task["elapsed_s"] == 3.5 and "3 秒" in d.rows()[0][0]
+
+
+@pytest.mark.parametrize("raw", ["1e999", "NaN", "-5", "1.5", "1" + "0" * 400], ids=lambda v: str(v)[:8])
+def test_polled_bad_total_is_zero_and_poll_args_survive(raw):
+    d = _sent()
+    d.polled(json.loads('{"task_id": "%s", "state": "running", "output_total_chars": %s}' % (TID, raw)))
+    assert d.task["total"] == 0 and d.poll_args() == (TID, 0)
+
+
+def test_sent_busy_says_previous_send_and_not_offline():
+    d = tc.Desk()
+    d.begin("看下状态", "")
+    d.sent(tc.Busy())
+    assert not d.sending and d.draft == "看下状态" and d.bad
+    assert "上一次发送" in d.msg and tc.OFFLINE not in d.msg
+
+
+def test_cancel_busy_does_not_say_offline():
+    d = _sent()
+    d.begin_cancel()
+    d.cancelled(tc.Busy())
+    assert not d.cancelling and d.bad and "取消没发出去" in d.msg and tc.OFFLINE not in d.msg
+
+
+def test_sent_success_clears_stale_cancelling():
+    """A 的取消在途时 A 结束、B 发出: B 的取消按钮不该被 A 的在途取消挡住, A 的迟到结果也不碰 B."""
+    d = _sent()
+    d.begin_cancel()
+    d.polled(_body(state="completed"))
+    d.begin("下一个", "")
+    d.sent({"task_id": "t-b", "state": "starting"})
+    assert d.cancelling is None
+    d.cancelled({"cancel_requested": True})
+    assert not d.cancel_asked and d.task_id == "t-b" and d.msg == "已发出"
+    assert d.begin_cancel() == "t-b"

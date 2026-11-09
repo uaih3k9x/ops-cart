@@ -404,3 +404,33 @@ def test_no_tmpfiles_for_bigfish_dirs():
     """两个目录都由大肥鱼那边的 setup-root.sh 建, 本仓库 tmpfiles 不碰."""
     conf = (pathlib.Path(__file__).resolve().parent.parent / "deploy" / "tmpfiles.d" / "ops-cart.conf").read_text()
     assert "bigfish" not in conf
+
+
+# ------------------------------------------------------------ #101 非有限数和超大整数
+
+@pytest.mark.parametrize("v", [float("inf"), float("-inf"), float("nan"), 10 ** 400], ids=lambda v: str(v)[:8])
+def test_num_rejects_non_finite_and_huge(v):
+    assert bf._num(v) is None and bf._num(v, 0) is None
+
+
+def test_num_upper_bound():
+    assert bf._num(5, 0, 5) == 5 and bf._num(6, 0, 5) is None
+
+
+@pytest.mark.parametrize("raw", ["NaN", "1e999", "-Infinity", "1" + "0" * 400], ids=lambda v: str(v)[:8])
+def test_parse_non_finite_written_at_is_not_online(raw):
+    text = '{"schema": 1, "written_at": %s}' % raw
+    assert bf.parse(text, NOW)["online"] is False
+
+
+@pytest.mark.parametrize("raw", ["NaN", "1e999", "1" + "0" * 400, "1e12"], ids=lambda v: str(v)[:8])
+def test_parse_bad_elapsed_in_status_file_dropped(raw):
+    text = '{"schema": 1, "written_at": %f, "current": {"state": "running", "elapsed_s": %s}}' % (NOW, raw)
+    view = bf.parse(text, NOW)
+    assert view["current"]["elapsed_s"] is None
+    assert bf.panel_rows(view, NOW)
+
+
+@pytest.mark.parametrize("v", [float("inf"), float("nan")])
+def test_elapsed_non_finite_is_blank(v):
+    assert bf.elapsed(v) == ""

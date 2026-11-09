@@ -812,3 +812,15 @@ def test_expired_selfcheck_text_points_to_lamp():
     """横条会收起, 自检那行不能只说"点顶上的条"."""
     import kiosk_core as kc
     assert "PXE 灯" in kc.PXE_EXPIRED_TEXT
+
+
+def test_bridge_spawn_failure_releases_key_and_reports():
+    errors = []
+
+    def no_thread(_fn):
+        raise RuntimeError("can't start new thread")
+    b = ui.UiBridge(FakeRoot(), spawn=no_thread, on_error=errors.append)
+    assert b.run_bg(lambda: 1, None, key="pxe") is False
+    assert not b.busy("pxe") and len(errors) == 1
+    b._spawn = _sync_spawn
+    assert b.run_bg(lambda: 1, None, key="pxe") is True

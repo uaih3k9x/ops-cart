@@ -189,3 +189,68 @@ def test_no_confirm_path_from_send():
     for name in ("_send", "_sent", "_cancel", "_cancelled", "_poll", "_polled", "_sync_desk"):
         src = inspect.getsource(getattr(bp.BigfishPanel, name))
         assert "on_confirm" not in src and "btn_confirm" not in src, name
+
+
+def test_send_when_background_busy_says_previous_send_not_offline():
+    fake, _jobs = _fake(run_ok=False)
+    fake._send()
+    assert "上一次发送" in fake.hint.cfg["text"] and tc.OFFLINE not in fake.hint.cfg["text"]
+
+
+def test_cancel_when_background_busy_does_not_say_offline():
+    fake, jobs = _fake()
+    fake._send()
+    _finish(jobs[0])
+    fake.run_bg = lambda *_a, **_k: False
+    fake._cancel()
+    assert not fake.desk.cancelling and tc.OFFLINE not in fake.hint.cfg["text"]
+
+
+def _refreshable(fake):
+    jobs = []
+    fake.after = lambda ms, fn: jobs.append((ms, fn)) or "job"
+    fake.note, fake.ready, fake.pending = (lambda: ""), (lambda: True), (lambda: 0)
+    fake.btn_confirm = _Widget()
+    fake.btn_resume = SimpleNamespace(winfo_manager=lambda: "", pack=lambda **_k: None, pack_forget=lambda: None)
+    fake._paint = bp.BigfishPanel._paint.__get__(fake)
+    fake.refresh = bp.BigfishPanel.refresh.__get__(fake)
+    return jobs
+
+
+def test_refresh_keeps_chain_and_polls_when_draw_raises(capsys):
+    """画坏一次: 下一次 after 照排, 轮询照发 (下一个好回复才能把坏状态换掉), 不往外抛 (__init__ 也调 refresh)."""
+    fake, jobs = _fake()
+    fake._send()
+    _finish(jobs[0])
+    jobs.clear()
+    after = _refreshable(fake)
+
+    def boom(*_a):
+        raise OverflowError("x")
+    fake._draw = boom
+    fake.refresh()
+    assert after == [(bp.REFRESH_MS, fake.refresh)] and fake._job == "job"
+    assert [j[2] for j in jobs] == ["bigfish-task-poll"]
+    assert "OverflowError" in capsys.readouterr().err
+
+
+def test_refresh_keeps_chain_when_poll_raises():
+    fake, _jobs = _fake()
+    after = _refreshable(fake)
+    fake._draw = lambda *_a: None
+
+    def boom():
+        raise RuntimeError("x")
+    fake._poll = boom
+    fake.refresh()
+    assert len(after) == 1
+
+
+def test_refresh_without_desk_does_not_poll():
+    fake, _jobs = _fake()
+    after = _refreshable(fake)
+    fake.desk = None
+    fake._draw = lambda *_a: None
+    fake._poll = bp.BigfishPanel._poll.__get__(fake)
+    fake.refresh()
+    assert len(after) == 1 and "text" not in fake.hint.cfg

@@ -20,6 +20,7 @@ docs/BIGFISH_PANEL.md:
 """
 
 import json
+import math
 import os
 import pwd
 import grp
@@ -51,6 +52,7 @@ STOP_REASONS = {"estop": "急停", "cancelled": "已取消", "end_turn": "正常
                 "max_turn_requests": "轮数到上限", "refusal": "模型拒绝"}
 BAD_SEQ = -1                # v1.1 estop.seq 给了但不合格: 当成和谁都对不上
 SEQ_MAX = 2 ** 53
+ELAPSED_MAX = 366 * 86400    # 已运行秒数的合理上限, 超过按读不懂
 cartlog_event = cartlog.event
 
 
@@ -101,9 +103,15 @@ def clean(text, limit=TITLE_MAX):
     return cfc.one_line(text if isinstance(text, str) else "", limit)
 
 
-def _num(v, lo=None):
-    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and (lo is None or v >= lo)
-    return v if ok else None
+def _num(v, lo=None, hi=None):
+    """合格的有限数原样返回, 否则 None. json.loads 认 NaN / Infinity / 1e999, 超大整数转不了 float."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        finite = math.isfinite(v)
+    except OverflowError:
+        return None
+    return v if finite and (lo is None or v >= lo) and (hi is None or v <= hi) else None
 
 
 def _int(v, hi=STEP_MAX):
@@ -121,7 +129,7 @@ def _current(c):
     total = _int(c.get("steps_total"))             # 0 = 总步数未知
     cur = _int(c.get("step_current"), total or STEP_MAX) if total is not None else None
     reason = c.get("stop_reason")
-    return {"state": c["state"], "started_at": _num(c.get("started_at")), "elapsed_s": _num(c.get("elapsed_s"), 0),
+    return {"state": c["state"], "started_at": _num(c.get("started_at")), "elapsed_s": _num(c.get("elapsed_s"), 0, ELAPSED_MAX),
             "steps_total": total, "step_current": cur,
             "stop_reason": STOP_REASONS.get(reason, "其他") if isinstance(reason, str) and reason else "",
             "source": clean(c.get("source"), TRUSTED_STR_MAX)}
@@ -182,7 +190,7 @@ def lock_line(view):
 
 
 def elapsed(s):
-    if s is None or s < 0:
+    if _num(s, 0) is None:
         return ""
     s = int(s)
     if s < 60:
