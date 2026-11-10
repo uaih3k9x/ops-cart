@@ -403,6 +403,10 @@ def _lock_note(msg):
         pass
 
 
+class PrinterBusy(mc.ToolError):
+    """打印机锁被别人占着: 忙, 不是故障."""
+
+
 @contextlib.contextmanager
 def printer_lock(path=None, wait_s=PRINTER_LOCK_WAIT_S, sleep=time.sleep, note=_lock_note):
     """进程间打印机锁 (flock). 等 wait_s 秒还拿不到就报忙, 不无限等.
@@ -422,7 +426,7 @@ def printer_lock(path=None, wait_s=PRINTER_LOCK_WAIT_S, sleep=time.sleep, note=_
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise mc.ToolError(f"打印机忙 (别的进程在查状态或打印, 等了 {wait_s:g} 秒), 稍后再试") from None
+                    raise PrinterBusy(f"打印机忙 (别的进程在查状态或打印, 等了 {wait_s:g} 秒), 稍后再试") from None
                 sleep(0.05)
         yield
     finally:

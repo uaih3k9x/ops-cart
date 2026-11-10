@@ -40,6 +40,7 @@ from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
 from bigfish_panel import BigfishPanel
+from label_panel import LabelPanel
 from confirm_panel import ConfirmDialog, KvmDialog
 from pxe_req_panel import PxeRequestDialog
 import theme as th
@@ -851,6 +852,8 @@ class Kiosk(tk.Tk):
                                  on_estop=self._bigfish_estop, note=lambda: self._bf_note,
                                  on_resume=self._bigfish_resume, desk=self._bf_desk, run_bg=self.ui.run_bg,
                                  locked=lambda: self._lock_win is not None, agents_stopped=self._bigfish_all_stopped)
+            elif name == "label":           # #104: 渲染和写打印机都在后台
+                w = LabelPanel(self.body, run_bg=self.ui.run_bg)
             elif select and name in ("serial", "netmode"):
                 w = PANE_CLASSES[name](self.body, want=select)
             else:
