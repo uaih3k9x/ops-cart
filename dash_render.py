@@ -11,6 +11,7 @@ import io
 import re
 
 import lamps_core as lc
+import observe_core as oc
 import theme as th
 
 PANEL_W = 800          # 竖屏宽 (= 横屏配置串里的高)
@@ -79,12 +80,17 @@ def wrap(text, font, width, max_lines):
                 cur += ch
     if cur:
         lines.append(cur)
-    if len(lines) > max_lines:
-        last = lines[max_lines - 1]
-        while last and font.getlength(last + "…") > width:
-            last = last[:-1]
-        lines = lines[:max_lines - 1] + [last + "…"]
-    return lines
+    return _clip(lines, font, width, max_lines)
+
+
+def _clip(lines, font, width, max_lines):
+    """超过 max_lines 就截断, 末行收成省略号."""
+    if len(lines) <= max_lines:
+        return lines
+    last = lines[max_lines - 1]
+    while last and font.getlength(last + "…") > width:
+        last = last[:-1]
+    return lines[:max_lines - 1] + [last + "…"]
 
 
 def paragraphs(text):
@@ -405,11 +411,33 @@ def work_tail(view, W=PANEL_W, H=PANEL_H):
 
 FRONT_Y, FRONT_ROW, FRONT_GAP = 926, 30, 6       # 前面板: 两排口, 标题在上面 34 像素
 LOCKED_FRONT_Y = 734                             # 锁屏时画在分隔线下面、公告上面 (#85 闲置锁屏不停观察)
+FRONT_H, LOCKED_FRONT_H = 74, 150                # 堆叠分层时端口区的高度: 正常页到分隔线 (926..1000); 锁屏多给一些
+STACK_GUTTER, STACK_MIN_ROW = 64, 6              # 左边写"成员 N"的宽度 / 行距下限 (再小看不清, 改写提示)
+TIER_LABEL_MIN = 20                              # 层距小于这个就不写"成员 N" (18 号字上下层会压在一起)
 
 
-def front_boxes(front, W=PANEL_W, y0=FRONT_Y):
-    """前面板每个口的框 [(框, 口)]; 列宽按最右一列平分, 最宽 48."""
+def _stack_grid(front, W, height):
+    """堆叠端口区的 (列距, 行距, 层间距); 放不下 None. 层间距随高度: 正常页 3, 锁屏 6."""
+    ports, tiers = front.get("ports") or [], front["tiers"]
+    cols = max((p["x"] for p in ports), default=0) + 1
+    gap = max(3, height // 25)
+    fit = oc.stack_fit(cols, len(tiers), W - 2 * M, height, 48, FRONT_ROW, gap, STACK_GUTTER, STACK_MIN_ROW)
+    return fit + (gap,) if fit else None
+
+
+def front_boxes(front, W=PANEL_W, y0=FRONT_Y, height=FRONT_H):
+    """前面板每个口的框 [(框, 口)]; 列宽按最右一列平分, 最宽 48. 堆叠 (front["tiers"]) 按 height 分层缩小, 放不下空表."""
     ports = front.get("ports") or []
+    if front.get("tiers"):
+        grid = _stack_grid(front, W, height)
+        if not grid:
+            return []
+        w, h, gap = grid
+        out = []
+        for p in ports:
+            x, y = M + STACK_GUTTER + p["x"] * w, y0 + p["y"] * h + p["y"] // 2 * gap
+            out.append(([x, y, x + w - 4, y + h - max(2, h // 6)], p))
+        return out
     cols = max((p["x"] for p in ports), default=0) + 1
     pitch = min(48, (W - 2 * M) // cols)
     out = []
@@ -419,7 +447,16 @@ def front_boxes(front, W=PANEL_W, y0=FRONT_Y):
     return out
 
 
-def _front(d, front, W, y0=FRONT_Y):
+def _tier_labels(front, W=PANEL_W, y0=FRONT_Y, height=FRONT_H):
+    """堆叠每层的成员标识 [(这一层中线的 y, 文字)]; 放不下 / 层距不够写一行字时空表."""
+    grid = _stack_grid(front, W, height)
+    if not grid or 2 * grid[1] + grid[2] < TIER_LABEL_MIN:
+        return []
+    _w, h, gap = grid
+    return [(y0 + t["tier"] * (2 * h + gap) + h, t["label"]) for t in front["tiers"]]
+
+
+def _front(d, front, W, y0=FRONT_Y, height=FRONT_H, see="看车机窗口"):
     title = front.get("title") or ""
     d.text((M, y0 - 34), title, font=_font(24), fill=DIM)
     if front.get("note"):           # 旧数据 / 出错 / 会话掉了: 灯全灰, 原因跟在标题后面
@@ -428,35 +465,53 @@ def _front(d, front, W, y0=FRONT_Y):
         if line:
             d.text((x, y0 - 34), line[0], font=_font(24), fill=WARN)
     color = {"up": ACCENT, "admin": WARN, "standby": DIM, "unknown": th.MARK}
-    for box, p in front_boxes(front, W, y0):
+    tiers = front.get("tiers") or []
+    boxes = front_boxes(front, W, y0, height)
+    if tiers and not boxes:         # 堆叠成员太多, 这块放不下
+        d.text((M, y0), oc.stack_hint(len(tiers), see), font=_font(24), fill=WARN)
+        return
+    if tiers:                       # 成员标识画在这一层的中线上
+        for y, label in _tier_labels(front, W, y0, height):
+            d.text((M, y), label, font=_font(18), fill=DIM, anchor="lm")
+    for box, p in boxes:
         lit = p.get("lit") and p.get("state") in color
         fill = color[p["state"]] if lit else LINE
         if p.get("shape") == "rj45":
             d.rectangle(box, fill=fill)
         else:
-            d.rounded_rectangle(box, 8, fill=fill)
-        d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), str(p.get("label", "")), font=_font(16),
-               fill=lc.LIT_FG if lit else DIM, anchor="mm")
+            d.rounded_rectangle(box, min(8, (box[3] - box[1]) // 2), fill=fill)
+        if not tiers or box[3] - box[1] >= oc.STACK_LABEL_PX:   # 堆叠缩小后矮到写不下就只画灯
+            d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), str(p.get("label", "")), font=_font(16),
+                   fill=lc.LIT_FG if lit else DIM, anchor="mm")
+
+
+def _locked_front_used(front, W):
+    """锁屏前面板从 LOCKED_FRONT_Y 往下实际占的高度: 堆叠按画出来的底边, 放不下时只有一行提示."""
+    if not front.get("tiers"):
+        return 2 * (FRONT_ROW + FRONT_GAP)
+    boxes = front_boxes(front, W, 0, LOCKED_FRONT_H)
+    return max(b[0][3] for b in boxes) if boxes else int(24 * 1.3)
 
 
 def _locked_lines(view, W, H):
     """锁屏公告排版: (字号, 行距, 各行, 第一行顶). 字框 (glyph_boxes) 和实际画字共用, 不能各算各的."""
     paras = paragraphs(view.get("notice")) or ["推车锁定中"]
-    base = LOCKED_FRONT_Y + 2 * (FRONT_ROW + FRONT_GAP) + 20 if view.get("front") else 700   # 观察中: 让出前面板
+    front = view.get("front")
+    base = LOCKED_FRONT_Y + _locked_front_used(front, W) + 20 if front else 700   # 观察中: 让出前面板
     room = H - (190 if view.get("bigfish") else 160) - base   # 分隔线以下、底部提示 (和大肥鱼一行 #53) 以上
-    for size in (96, 80, 64, 52, 44):       # 字号从大往下试, 整段放得进为止
+    for size in (96, 80, 64, 52, 44, 36):   # 字号从大往下试, 整段放得进为止
         lh = int(size * 1.3)
         lines = [ln for p in paras for ln in wrap(p, _font(size), W - 2 * M, 5)]
         if len(lines) * lh <= room:
             break
-    lines = lines[:room // lh]
+    lines = _clip(lines, _font(size), W - 2 * M, max(1, room // lh))     # 最小字号也放不下: 不静默丢行
     return size, lh, lines, base + max(0, (room - lh * len(lines)) // 2)
 
 
 def _locked_body(d, view, W, H):
     """锁屏: 教室引导牌. 公告大字居中; 观察中 (#85 闲置锁屏不停观察) 时上面画一块不露设备名的前面板."""
     if view.get("front"):
-        _front(d, view["front"], W, y0=LOCKED_FRONT_Y)
+        _front(d, view["front"], W, y0=LOCKED_FRONT_Y, height=LOCKED_FRONT_H, see="解锁后看车机窗口")
     size, lh, lines, top = _locked_lines(view, W, H)
     for i, line in enumerate(lines):
         d.text((W // 2, top + i * lh + lh // 2), line, font=_font(size), fill=FG, anchor="mm")
