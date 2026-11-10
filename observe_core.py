@@ -363,7 +363,8 @@ def parser_for(vendor):
     return PARSERS.get(vendor)
 
 
-_MODEL = re.compile(r"^\s*huawei\s+([A-Za-z]+\d[\w-]*)\s.*?uptime is", re.I | re.M)
+_MODEL = re.compile(r"^\s*(?:huawei(?:\s+(?:quidway|cloudengine))?|quidway|cloudengine)\s+([A-Za-z]+\d[\w-]*)\s.*?uptime is",
+                    re.I | re.M)
 
 
 def parse_model(text):
@@ -392,7 +393,7 @@ def port_kind(name):
 
 
 # 框式 / 路由器: slot 不是堆叠成员号, 结构再像也不分层
-_NOT_STACK_MODEL = re.compile(r"^(AR|NE|CX|S(7|9|12)\d|CE(12|16)\d)", re.I)
+_NOT_STACK_MODEL = re.compile(r"^(AR|NE|CX|S[789]\d|S1[26]\d{3}|CE(12|16)\d)", re.I)     # S1[26] 带够位数: S1600 / S1730 是盒式
 STACK_MIN_PORTS = 8                     # 每个成员至少这么多物理口才算证据够 (能堆叠的盒式最小也有 8 口)
 
 
@@ -407,7 +408,7 @@ def _port_key(name):
 def stack_members(names, model=None):
     """判定堆叠 -> {成员号: [接口名]}; 不是或说不准 None (退回两排的排法). 全部满足才算:
     型号不是框式 / 路由器; 物理口全是 成员/子卡/端口 三段式; 第一段至少两个不同的值;
-    每个成员的端口集合完全相同, 且至少 STACK_MIN_PORTS 个; 每个 (子卡, 分组) 的口号都从 1 起 (框式线卡和 AR 从 0 起)."""
+    每个成员的端口集合完全相同, 且至少 STACK_MIN_PORTS 个; 每块子卡的最小口号是 1 (同机内口号可跨分组连续; 框式线卡和 AR 从 0 起)."""
     if model and _NOT_STACK_MODEL.match(model):
         return None
     members, keys = {}, {}
@@ -424,8 +425,8 @@ def stack_members(names, model=None):
     if len(shapes) < 2 or any(s != shapes[0] for s in shapes) or len(shapes[0]) < STACK_MIN_PORTS:
         return None
     first = {}
-    for sub, group, num, _br in shapes[0]:
-        first[sub, group] = min(num, first.get((sub, group), num))
+    for sub, _group, num, _br in shapes[0]:
+        first[sub] = min(num, first.get(sub, num))
     return members if set(first.values()) == {1} else None
 
 
@@ -487,8 +488,9 @@ def stack_fit(cols, tiers, width, height, max_w, max_h, tier_gap, gutter, min_h)
     return (w, h) if h >= min_h and w >= 4 else None
 
 
-def stack_hint(members, see="console"):
-    return f"堆叠 {members} 台, 这里放不下前面板, 端口状态请看 {see}"
+def stack_hint(members, see):
+    """see: 这块屏幕上的人接下来实际能去哪儿看, 如 "看车机窗口"."""
+    return f"堆叠 {members} 台, 这里放不下前面板, 端口状态请{see}"
 
 
 def load_layouts(path=LAYOUTS_PATH):
@@ -514,6 +516,10 @@ MAX_X = 63                              # 面板最多 64 列, 两排 (y 只能 
 
 def _int(v):
     return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _grid_pos(v):
+    return _int(v) and v >= 0
 
 
 def _cell_ok(p):
@@ -943,6 +949,8 @@ def front_view(doc, now, stale_s=FRONT_STALE_S, locked=False):
                                      else "这轮没取到数据" if doc.get("error") else note)
     out = []
     for p in ports:
+        if not (_grid_pos(p.get("x", 0)) and _grid_pos(p.get("y", 0))):
+            continue                        # 快照坏了的格子不上屏 (副屏渲染要拿坐标做算术)
         st, lit = ("unknown", False) if note else lamp(p, now)
         cell = {"x": p.get("x", 0), "y": p.get("y", 0), "shape": p.get("shape", "rj45"),
                 "label": p.get("label", ""), "state": st, "lit": lit}

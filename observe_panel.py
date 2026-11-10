@@ -219,7 +219,9 @@ def panel_tiers(panel, cell=CELL, gap=GAP, pad=PAD, width=None, height=None):
 def panel_hint(panel, cell=CELL, gap=GAP, pad=PAD, width=None, height=None):
     """堆叠成员太多, 车机窗口放不下时的提示; 放得下 / 单机 None."""
     tiers = oc.stack_tiers(panel)
-    return oc.stack_hint(len(tiers)) if tiers and not _stack_grid(panel, cell, gap, pad, width, height) else None
+    if not tiers or _stack_grid(panel, cell, gap, pad, width, height):
+        return None
+    return oc.stack_hint(len(tiers), "退出观察后在 console 上查")     # 观察占着这路串口, 这时敲命令只会让轮询暂停
 
 
 def draw(canvas, cells, tiers=(), hint=None):
@@ -232,11 +234,11 @@ def draw(canvas, cells, tiers=(), hint=None):
         h = y1 - y0
         if c["shape"] == "rj45":
             w = (x1 - x0) // 4
-            notch = min(8, h // 5)
+            notch = min(8, h // 5) if tiers else 8      # 只有堆叠缩小的格子按比例; 单机外观不变
             pts = (x0, y0, x1, y0, x1, y1 - notch, x1 - w, y1 - notch, x1 - w, y1, x0 + w, y1, x0 + w, y1 - notch, x0, y1 - notch)
             i = canvas.create_polygon(*pts, fill=c["fill"], outline=DIM)
         else:
-            inset = min(6, h // 6)
+            inset = min(6, h // 6) if tiers else 6
             i = canvas.create_rectangle(x0, y0 + inset, x1, y1 - inset, fill=c["fill"], outline=DIM)
         hits[i] = c["name"]
         if c["label"]:

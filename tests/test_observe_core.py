@@ -206,6 +206,10 @@ def test_load_layouts_bad_file_is_empty(tmp_path):
     ("Huawei Versatile Routing Platform Software\nVRP (R) software, Version 5.170\nHUAWEI S5735-L24T4S-A1 Routing Switch uptime is 1 week, 2 days", "S5735-L24T4S-A1"),
     ("Huawei AR651C Router uptime is 0 week, 0 day, 1 hour", "AR651C"),
     ("HUAWEI S6730S-H24X6C uptime is 3 days, 4 hours", "S6730S-H24X6C"),
+    ("Huawei CloudEngine S12700E-8 uptime is 1 day", "S12700E-8"),
+    ("Quidway S5700-28C-EI Routing Switch uptime is 1 week, 2 days", "S5700-28C-EI"),
+    ("HUAWEI Quidway S3700-28TP-EI uptime is 2 days", "S3700-28TP-EI"),
+    ("R2 uptime is 1 day", None),                                               # 没有厂商字样: 可能只是主机名
     ("nothing here", None),
 ])
 def test_parse_model(text, model):
@@ -1295,6 +1299,9 @@ def test_stack_ignores_non_physical_interfaces():
     (_stack(), "S7706"),
     (_stack(), "S12708"),
     (_stack(), "CE12804"),
+    (_stack(), "S8708"),
+    (_stack(), "S16708"),
+    (_stack(), "S12700E-8"),
 ])
 def test_not_a_stack_falls_back_to_flat(names, model):
     assert oc.stack_members(names, model) is None
@@ -1304,6 +1311,28 @@ def test_not_a_stack_falls_back_to_flat(names, model):
 def test_stack_allowed_for_box_switch_models():
     assert sorted(oc.stack_members(_stack(), "S5735-L24T4S-A1")) == [0, 1, 2]
     assert sorted(oc.stack_members(_stack(members=(1, 2)), "CE6857")) == [1, 2]    # CE 成员号从 1 起
+    assert sorted(oc.stack_members(_stack(), "S1730S-L24T4S-A1")) == [0, 1, 2]     # S1xxx 盒式不是 S12 / S16 框式
+
+
+def test_chassis_model_from_cloudengine_version_line_is_not_a_stack():
+    model = oc.parse_model("Huawei CloudEngine S12700E-8 uptime is 1 day")
+    assert oc.stack_members(_stack(), model) is None
+
+
+@pytest.mark.parametrize("groups", [
+    (("GigabitEthernet", 1, 36), ("MultiGE", 37, 48)),
+    (("GigabitEthernet", 1, 24), ("XGigabitEthernet", 25, 28)),
+])
+def test_stack_ports_numbered_across_groups(groups):
+    names = [f"{kind}{m}/0/{i}" for m in (1, 2) for kind, lo, hi in groups for i in range(lo, hi + 1)]
+    assert sorted(oc.stack_members(names)) == [1, 2]
+
+
+def test_stack_slot_starting_at_zero_stays_flat_even_with_a_group_from_one():
+    # 子卡里最小口号是 0: 还是框式线卡 / AR 的编号
+    names = [f"{kind}{m}/0/{i}" for m in (1, 2) for kind, lo, hi in (("GigabitEthernet", 0, 23), ("XGigabitEthernet", 24, 27))
+             for i in range(lo, hi + 1)]
+    assert oc.stack_members(names) is None
 
 
 def test_stack_layout_one_tier_per_member_top_down():
@@ -1353,7 +1382,7 @@ def test_stack_fit_three_members_and_too_many():
 
 
 def test_stack_hint_says_how_many():
-    assert "堆叠 12 台" in oc.stack_hint(12) and "车机" in oc.stack_hint(12, "车机窗口")
+    assert "堆叠 12 台" in oc.stack_hint(12, "看车机窗口") and "请看车机窗口" in oc.stack_hint(12, "看车机窗口")
 
 
 def _stack_doc(now):
@@ -1395,3 +1424,18 @@ def test_snapshot_carries_member_through_json():
     ob.ports = {c["name"]: {"state": "up"} for c in ob.panel}
     doc = json.loads(json.dumps(ob.snapshot("con-1", now=5)))
     assert sum(1 for p in doc["ports"] if p["member"] == 2) == 28
+
+
+@pytest.mark.parametrize("bad", [{"x": "1"}, {"y": "1"}, {"x": None}, {"y": None}, {"x": True}, {"y": 1.5}, {"x": -1}, {"y": -2}])
+def test_front_view_drops_cells_with_bad_position(bad):
+    doc = _stack_doc(100)
+    total = len(doc["ports"])
+    doc["ports"][0] = dict(doc["ports"][0], **bad)
+    v = oc.front_view(doc, now=101)
+    assert len(v["ports"]) == total - 1 and len(v["tiers"]) == 3
+
+
+def test_front_view_missing_position_still_defaults_to_origin():
+    doc = {"ts": 100, "polled_at": 100, "state": "polling", "head": "con-1", "ports": [{"state": "up"}]}
+    p = oc.front_view(doc, now=101)["ports"][0]
+    assert (p["x"], p["y"]) == (0, 0)
