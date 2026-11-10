@@ -39,7 +39,7 @@ PIN、密码、命令输入框一律不接（候选上屏等于替人打字，�
 
 librime 是 C++，在 kiosk（root）进程里崩了会带崩车机，还可能把 systemd 的重启次数用完。所以放子进程：
 
-- kiosk 是 root 时用 `systemd-run` 起（stdin/stdout 走 `/run/ops-cart/ime-*` 下的 FIFO，不用 `--pipe`：经 D-Bus 传 fd 会被 SELinux 拒），沙箱属性对齐 `cart-ocr.service`（全表见 `ime_proc._SANDBOX`）：
+- kiosk 是 root 时用 `systemd-run` 起（stdin/stdout 走 `/run/systemd/ime-*` 下的 FIFO，不用 `--pipe`：经 D-Bus 传 fd 会被 SELinux 拒。FIFO 不能放 `/run/ops-cart`：标签继承目录的 `var_run_t`，`init_t` 打不开。改这条路径必须在 `unconfined_service_t` 域的服务里验证，sudo 终端是 `unconfined_t`，不算数），沙箱属性对齐 `cart-ocr.service`（全表见 `ime_proc._SANDBOX`）：
   `DynamicUser`、`PrivateNetwork`、能力集置空、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、
   `ProtectKernelLogs`、`RestrictRealtime`、`ProtectProc=invisible`、`ProtectClock`、`ProtectHostname`、
   `SystemCallFilter=@system-service`、`MemoryDenyWriteExecute`、`UMask=0077`、`MemoryMax=512M`、`MemorySwapMax=0`、

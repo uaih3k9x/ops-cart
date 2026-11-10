@@ -31,7 +31,9 @@ COMMIT_MAX, CAND_MAX, TEXT_MAX, PAGE_MAX = 64, 32, 64, 999      # 子进程回�
 UNIT_PREFIX = "ops-cart-ime"
 KILL_TIMEOUT = 3
 STATE_DIR = "/var/lib/ops-cart-ime"
-FIFO_ROOT = "/run/ops-cart"
+# 别改成 /run/ops-cart: FIFO 的标签继承目录, 由 systemd 以 init_t 打开. /run/ops-cart 是 var_run_t, 单元起不来
+# (208/STDIN, denied { read } scontext=init_t tcontext=var_run_t tclass=fifo_file); /run/systemd 是 init_var_run_t
+FIFO_ROOT = "/run/systemd"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PASS_ENV = ("OPS_CART_LIBRIME", "OPS_CART_RIME_SHARED", "OPS_CART_RIME_SCHEMA")
 
@@ -132,7 +134,6 @@ def _start_in_unit(cmd, timeout):
     systemd-run 返回 0 后 worker 持有自己那端, 再换成单向并放掉 O_RDWR: 不然自己占着对端, worker 死了也读不到 EOF.
     两端都开着 fd 之后路径就没用了, 目录当场删; mkdtemp 名字随机, kiosk 崩溃留下的旧目录挡不住下次.
     """
-    os.makedirs(FIFO_ROOT, mode=0o755, exist_ok=True)
     d = tempfile.mkdtemp(prefix="ime-", dir=FIFO_ROOT)          # 0700
     held, ends = [], []
     try:

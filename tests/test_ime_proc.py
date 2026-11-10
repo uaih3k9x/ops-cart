@@ -8,7 +8,6 @@ import json
 import os
 import sys
 import signal
-import stat
 import subprocess
 import textwrap
 import time
@@ -561,12 +560,11 @@ def test_fifo_leftover_directory_does_not_block(sandboxed):
     eng.close()
 
 
-def test_fifo_root_created_when_missing(sandboxed):
-    os.rmdir(sandboxed.root)
-    eng, why = sandboxed.start()
-    assert eng is not None, why
-    eng.close()
-    assert stat.S_ISDIR(os.stat(sandboxed.root).st_mode)
+def test_fifo_root_keeps_init_var_run_label():
+    """FIFO 的标签继承目录, 打开它的是 init_t. /run/ops-cart 是 var_run_t, 真机 208/STDIN:
+    denied { read } scontext=init_t tcontext=var_run_t tclass=fifo_file. /run/systemd 是 init_var_run_t, 实测可用.
+    Mac 上测不了 SELinux, 只能钉住路径, 别被整理回去."""
+    assert ip.FIFO_ROOT == "/run/systemd" and ip.FIFO_ROOT != "/run/ops-cart"
 
 
 def test_fifo_root_unusable_is_unavailable(sandboxed, monkeypatch):
