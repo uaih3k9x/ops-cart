@@ -204,11 +204,11 @@ class LabelPanel(tk.Frame):
 
     def _print(self, raw, copies):
         fold = lc.fold_mm(self.conf)
-        self._printing = True
         self._say("正在打印…", th.DIM)
-        if not self.run_bg(lambda: self.dev.print_label(raw, fold, copies=copies),
-                           lambda r: self._printed(r, raw, copies), key=KEY_IO):
-            self._printing = False
+        if self.run_bg(lambda: self.dev.print_label(raw, fold, copies=copies),
+                       lambda r: self._printed(r, raw, copies), key=KEY_IO):
+            self._printing = True               # 被拒时前一个任务还占着, 不能动标志
+        else:
             self._say("打印机正忙, 等这一张出完再点", th.WARN)
 
     def print_one(self):
@@ -238,7 +238,8 @@ class LabelPanel(tk.Frame):
         if fresh is not self.conf:
             self.conf = fresh
             self._render_recents()
-            self.run_bg(lambda: self.save(fresh), self._recent_saved, key=KEY_SAVE)
+            if not self.run_bg(lambda: self.save(fresh), self._recent_saved, key=KEY_SAVE):
+                self._say("打好了, 但常用 to 没存下: 上一次保存还没完", th.WARN)
 
     def _recent_saved(self, res):
         if isinstance(res, Exception) and self._alive():
@@ -248,13 +249,16 @@ class LabelPanel(tk.Frame):
 
     def _io(self, work, done_text):
         def done(res):
+            self._printing = False
             if not self._alive():
                 return
             if isinstance(res, Exception):
                 self._fail(res)
             else:
                 self._say(done_text)
-        if not self.run_bg(work, done, key=KEY_IO):
+        if self.run_bg(work, done, key=KEY_IO):
+            self._printing = True
+        else:
             self._say("打印机正忙, 稍后再点", th.WARN)
 
     def feed(self):
@@ -281,29 +285,32 @@ class LabelPanel(tk.Frame):
         except lc.LabelError as ex:
             self._fail(ex)
             return
-        if not self.run_bg(lambda: self.save(new), lambda r: self._cal_saved(r, new), key=KEY_SAVE):
+        if not self.run_bg(lambda: self.save(new), lambda r: self._cal_saved(r, mm), key=KEY_SAVE):
             self._say("上一次保存还没完, 稍后再点", th.WARN)
 
-    def _cal_saved(self, res, new):
+    def _cal_saved(self, res, mm):
         if not self._alive():
             return
         if isinstance(res, Exception):
             self._fail(res, "校准没存下: ")
             return
-        self.conf = new
+        self.conf = lc.set_fold(self.conf, lc.PAPER, mm)        # 保存期间 conf 可能变了 (常用 to), 不用旧快照盖
         self._show_cal_info()
-        self._say(f"已保存折痕 {lc.fold_mm(new):g} mm")
+        self._say(f"已保存折痕 {mm:g} mm")
         self._schedule_preview()
 
     # ------------------------------------------------------------ 打印机状态
 
     def _status_tick(self):
         self._status_job = self.after(STATUS_MS, self._status_tick)
-        if not self._printing:                  # 打印时不抢锁, 打完下一轮再看
+        if not self._printing:                  # 打印 / 走纸 / 打刻度尺时不抢锁, 打完下一轮再看
             self.run_bg(self.dev.query_status, self._status_done, key=KEY_STATUS)
 
     def _status_done(self, res):
         if not self._alive():
+            return
+        if isinstance(res, ld.ml.PrinterBusy):  # 拿不到锁只是有人在用, 不算故障
+            self.status.config(text="打印机忙", fg=th.DIM)
             return
         if isinstance(res, Exception):
             self.status.config(text=f"打印机: {res}", fg=th.BAD)

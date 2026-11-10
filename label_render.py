@@ -107,7 +107,9 @@ class FreeType:
 
     def _glyph(self, ch):
         idx = self.ft.FT_Get_Char_Index(self.face, ord(ch))
-        if idx == 0 and not ch.isspace():
+        if idx == 0 and ch.isspace():   # 字体没有这种空白 (如全角空格): 借空格的宽度, 不画 .notdef 的方框
+            idx = self.ft.FT_Get_Char_Index(self.face, ord(" "))
+        if idx == 0:
             raise lc.LabelError(f"字体里没有这个字: {ch}")
         if self.ft.FT_Load_Glyph(self.face, idx, FT_LOAD_RENDER | FT_LOAD_NO_BITMAP):
             raise lc.LabelError(f"渲染这个字失败: {ch}")

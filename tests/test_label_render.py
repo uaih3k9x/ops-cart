@@ -1,10 +1,12 @@
 """中文渲染 (#104): ctypes + libfreetype 放在一次性子进程里. 协议和失败提示用假 run 测, 真 FreeType 有就测."""
 
+import ctypes
 import ctypes.util
 import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,6 +85,27 @@ def test_decode_rejects_bad_ink_size():
 def test_no_font_found_is_clear(tmp_path):
     with pytest.raises(lc.LabelError, match="字体"):
         lr.open_first([(str(tmp_path / "nope.ttc"), 0)], loader=lambda p, i: (_ for _ in ()).throw(OSError(p)))
+
+
+def _fake_face(index_of):
+    loaded, face, slot = [], lr._Face(), lr._GlyphSlot()
+    face.glyph = ctypes.pointer(slot)
+    ft = SimpleNamespace(FT_Get_Char_Index=lambda f, code: index_of.get(code, 0),
+                         FT_Load_Glyph=lambda f, idx, flags: loaded.append(idx) or 0)
+    return SimpleNamespace(ft=ft, face=ctypes.pointer(face)), loaded
+
+
+def test_blank_missing_from_font_borrows_space_not_notdef():
+    fake, loaded = _fake_face({0x20: 3})
+    lr.FreeType._glyph(fake, "\u3000")
+    assert loaded == [3]
+
+
+def test_ink_char_missing_from_font_still_refused():
+    fake, loaded = _fake_face({0x20: 3})
+    with pytest.raises(lc.LabelError, match="没有"):
+        lr.FreeType._glyph(fake, "\u4e2d")
+    assert loaded == []
 
 
 def test_noto_candidates_prefer_simplified_chinese_face():

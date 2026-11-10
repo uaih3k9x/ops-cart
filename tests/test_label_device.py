@@ -1,8 +1,10 @@
 """打印机写入和状态 (#104): 写有超时, 打印机不在有提示, 忙有提示. 全用假设备, 不碰 /dev/usb/lp0."""
 
 import contextlib
+import fcntl
 import os
 import socket
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,6 +47,56 @@ def test_write_job_oserror_is_clear(monkeypatch):
         ld.write_job(b"x" * 100000, dev="/dev/fake", timeout=1)
 
 
+class FakeUsblp:
+    """按 usblp 非阻塞写记账: write 提交 URB 马上返回, 在途时不可写 (wcomplete=0), close 取消在途 URB."""
+
+    def __init__(self, stall=False):
+        self.got, self.inflight, self.stall = bytearray(), False, stall
+        self.cancelled, self.closed, self.log = 0, 0, []
+
+    def select(self, r, w, x, t=None):
+        self.log.append("select")
+        if self.inflight and self.stall:
+            return [], [], []
+        self.inflight = False
+        return [], w, []
+
+    def write(self, fd, data):
+        if self.inflight:
+            raise BlockingIOError
+        self.inflight = True
+        self.got += bytes(data)
+        self.log.append("write")
+        return len(data)
+
+    def close(self, fd):
+        self.cancelled += self.inflight
+        self.closed += 1
+        self.log.append("close")
+
+
+def _use_usblp(monkeypatch, dev):
+    monkeypatch.setattr(ld.ml, "_open", lambda path, flags: 99)
+    monkeypatch.setattr(ld, "select", SimpleNamespace(select=dev.select))
+    monkeypatch.setattr(ld, "os", SimpleNamespace(write=dev.write, close=dev.close, O_WRONLY=1, O_RDWR=2, O_NONBLOCK=4))
+
+
+def test_write_job_waits_for_last_urb_before_close(monkeypatch):
+    dev = FakeUsblp()
+    _use_usblp(monkeypatch, dev)
+    data = b"x" * (2 * ld._CHUNK + 1)
+    ld.write_job(data, dev="/dev/fake", timeout=1)
+    assert bytes(dev.got) == data and dev.cancelled == 0 and dev.log[-3:] == ["write", "select", "close"]
+
+
+def test_write_job_last_urb_stalled_is_timeout_not_success(monkeypatch):
+    dev = FakeUsblp(stall=True)
+    _use_usblp(monkeypatch, dev)
+    with pytest.raises(mc.ToolError, match="超时"):
+        ld.write_job(b"x", dev="/dev/fake", timeout=0.01)
+    assert dev.closed == 1
+
+
 # ---------------------------------------------------------------- 状态
 
 def test_read_status_returns_byte(monkeypatch):
@@ -77,6 +129,17 @@ def test_query_status_does_not_wait_for_lock():
         yield
     assert ld.query_status(read=lambda: 0x04, lock=lock)["flags"] == ["缺纸"]
     assert waits == [0]
+
+
+def test_query_status_lock_held_is_printer_busy(tmp_path):
+    path = tmp_path / "lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(ld.ml.PrinterBusy, match="忙"):
+            ld.query_status(read=lambda: 0, lock=lambda wait_s: ld.ml.printer_lock(path=str(path), wait_s=wait_s))
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------- 发送
@@ -137,7 +200,7 @@ def test_print_label_refuses_blocking_layout():
     assert sent == []
 
 
-def test_print_label_allows_fold_warning_and_returns_it():
+def test_print_label_allows_fold_warning_and_returns_it():      # 兜底路径: 真实版面不压折痕, 这里手搓一个
     def render(lines, fold):
         ink = lc.Ink(8, 2, b"\x01" * 16)
         return lc.Plan([lc.Placed(480, lc.dots(fold) - 1, ink)], fold, lc.dots(fold), 20, lines)

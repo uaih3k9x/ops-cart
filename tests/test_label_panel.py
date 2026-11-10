@@ -73,6 +73,25 @@ def fake(run_bg=None, **over):
     return f
 
 
+def deferred():
+    """像真 run_bg: key 占着就拒, 回调要等 finish() (主线程下一轮)."""
+    busy, pending = set(), []
+
+    def run_bg(work, done, key=None):
+        if key in busy:
+            return False
+        busy.add(key)
+        pending.append((key, work, done))
+        return True
+
+    def finish():
+        key, work, done = pending.pop(0)
+        busy.discard(key)
+        done(work())
+    run_bg.pending = pending
+    return run_bg, finish
+
+
 # ---------------------------------------------------------------- 预览
 
 def test_preview_runs_in_background_with_calibrated_fold():
@@ -101,7 +120,7 @@ def test_render_error_shown_not_raised():
     assert f.msg.cfg["text"] == "字太多" and f.msg.cfg["fg"] == th.BAD and f.calls.clear
 
 
-def test_fold_warning_shown_after_preview(monkeypatch):
+def test_fold_warning_shown_after_preview(monkeypatch):       # 兜底路径: 真实版面不会压折痕
     f = fake()
     monkeypatch.setattr(lp.lc, "problems", lambda p: [lc.FOLD_WARNING])
     f._start_preview()
@@ -193,6 +212,35 @@ def test_print_busy_says_so():
     assert "忙" in f.msg.cfg["text"]
 
 
+def test_rejected_second_click_keeps_printing_flag():
+    run_bg, finish = deferred()
+    f = fake(run_bg=run_bg)
+    f.print_one()
+    assert f._printing is True
+    f.print_one()                           # 第一张还没回来, 第二次被拒
+    assert f._printing is True and "忙" in f.msg.cfg["text"]
+    finish()
+    assert f._printing is False
+
+
+def test_rejected_print_does_not_set_flag():
+    f = fake(run_bg=lambda work, done, key=None: False)
+    f.print_one()
+    assert f._printing is False
+
+
+def test_recent_save_rejected_says_so():
+    def run_bg(work, done, key=None):
+        if key == lp.KEY_SAVE:
+            return False
+        done(work())
+        return True
+    f = fake(run_bg=run_bg)
+    f.vars[0].set("to SW-B")
+    f.print_one()
+    assert "常用" in f.msg.cfg["text"] and f.msg.cfg["fg"] == th.WARN
+
+
 def test_printed_saves_recent_to():
     saved = []
     f = fake()
@@ -257,6 +305,37 @@ def test_status_skipped_while_printing():
     assert f.calls.run == [] and f.calls.after
 
 
+def test_status_lock_held_is_busy_not_fault():
+    f = fake()
+
+    def held():
+        raise lp.ld.ml.PrinterBusy("打印机忙 (别的进程在查状态或打印, 等了 0 秒), 稍后再试")
+    f.dev.query_status = held
+    f._status_tick()
+    assert f.status.cfg["text"] == "打印机忙" and f.status.cfg["fg"] == th.DIM
+
+
+@pytest.mark.parametrize("action", ["feed", "ruler"])
+def test_status_skipped_during_feed_and_ruler(action):
+    run_bg, finish = deferred()
+    f = fake(run_bg=run_bg)
+    getattr(f, action)()
+    f._status_tick()
+    assert [p[0] for p in run_bg.pending] == [lp.KEY_IO]
+    finish()
+    assert f._printing is False
+    f._status_tick()
+    assert [p[0] for p in run_bg.pending] == [lp.KEY_STATUS]
+
+
+def test_rejected_feed_does_not_clear_running_print_flag():
+    run_bg, finish = deferred()
+    f = fake(run_bg=run_bg)
+    f.print_one()
+    f.feed()
+    assert f._printing is True and "忙" in f.msg.cfg["text"]
+
+
 # ---------------------------------------------------------------- 走纸 / 校准
 
 def test_feed_and_ruler_background():
@@ -297,6 +376,16 @@ def test_save_cal_bad_reading_refused(text):
     f.cal_entry.set(text)
     f.save_cal()
     assert saved == [] and f.msg.cfg["fg"] == th.BAD
+
+
+def test_cal_saved_merges_into_current_conf():
+    run_bg, finish = deferred()
+    f = fake(run_bg=run_bg)
+    f.cal_entry.set("11.5")
+    f.save_cal()
+    f.conf = lc.remember_to(f.conf, ["to SW-B"])        # 保存期间打成功了一张
+    finish()
+    assert lc.fold_mm(f.conf) == 11.5 and f.conf["recent_to"] == ["to SW-B"]
 
 
 def test_save_cal_write_failure_keeps_old_value():

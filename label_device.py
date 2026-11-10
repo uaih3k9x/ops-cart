@@ -20,7 +20,10 @@ _CHUNK = 4096
 
 
 def _pump(fd, data, deadline, dev):
-    """非阻塞写完 data; 到期抛超时. 超时时打印机可能已经收了半个任务, 话里说清楚."""
+    """非阻塞写完 data, 并等最后一块传完才返回; 到期抛超时 (打印机可能已经收了半个任务, 话里说清楚).
+
+    usblp 的非阻塞 write 提交 URB 就返回, close 会取消还在途的 URB, 任务尾巴就丢了;
+    所以发完要再等一次可写 (usblp 的 wcomplete). 可写只说明传输结束, 不代表打印机出了纸."""
     view, total = memoryview(data), len(data)
     while view:
         left = deadline - time.monotonic()
@@ -34,6 +37,8 @@ def _pump(fd, data, deadline, dev):
             time.sleep(0.01)
         except OSError as e:
             raise mc.ToolError(f"写 {dev} 失败: {e}") from None
+    if not select.select([], [fd], [], max(deadline - time.monotonic(), 0))[1]:
+        raise mc.ToolError(f"写打印机超时: {total} 字节已提交, 最后一块没传完 ({dev}); 看看打印机, 必要时重新上电")
 
 
 def write_job(data, dev=ml.PRINTER, timeout=WRITE_TIMEOUT_S):
@@ -84,7 +89,7 @@ def _note(msg):
 
 
 def print_label(lines, fold_mm, copies=1, render=lr.render_plan, send_fn=send, note=_note):
-    """渲染 -> 查版面 -> 发打印机. 返回 Plan (带压折痕提示). 出旗子 / 出纸不打."""
+    """渲染 -> 查版面 -> 发打印机. 返回 Plan. 出旗子 / 出纸不打."""
     plan = render(lines, fold_mm)
     bad = lc.blocking(plan)
     if bad:

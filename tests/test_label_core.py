@@ -143,7 +143,14 @@ def test_rotate180_pixels():
     assert lc.rotate180(lc.Ink(2, 2, b"\x01\x00\x00\x00")) == lc.Ink(2, 2, b"\x00\x00\x00\x01")
 
 
-# ---------------------------------------------------------------- 压折痕
+# ---------------------------------------------------------------- 压折痕 (兜底: 真实版面自动避开, 下面多数用例是手搓的版面)
+
+@pytest.mark.parametrize("fold_mm", [lc.FOLD_DEFAULT_MM, 14.0])
+def test_real_layout_full_of_ink_stays_off_fold(fold_mm):
+    _, h = lc.face_box(lc.dots(fold_mm))
+    ink = lc.Ink(lc.CANVAS_W, h, b"\x01" * (lc.CANVAS_W * h))
+    assert lc.FOLD_WARNING not in lc.problems(lc.build_plan(lc.Fit(20, ["x"], [ink], h), fold_mm))
+
 
 def _plan_with(ink, x, y, fold_mm=10.0):
     return lc.Plan(items=[lc.Placed(x, y, ink)], fold_mm=fold_mm, fold=lc.dots(fold_mm), px=20, lines=["x"], )
@@ -292,6 +299,13 @@ def test_remember_to_keeps_recent_unique_and_capped():
     for i in range(lc.RECENT_MAX + 3):
         conf = lc.remember_to(conf, [f"to X{i}"])
     assert len(conf["recent_to"]) == lc.RECENT_MAX and conf["recent_to"][0] == f"to X{lc.RECENT_MAX + 2}"
+
+
+def test_load_conf_rechecks_recent_to(tmp_path):
+    p = tmp_path / "label.json"
+    bad = ["x" * (lc.MAX_LINE_CHARS + 1), "to A\r\nPRINT 9", "to OK"]
+    p.write_text(json.dumps({"papers": {}, "recent_to": bad}), encoding="utf-8")
+    assert lc.load_conf(str(p))["recent_to"] == ["to OK"]
 
 
 def test_with_to_prefix():

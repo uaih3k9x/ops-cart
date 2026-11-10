@@ -19,8 +19,8 @@ D = cl.D
 _, PAGE_H = tp.parse(cl.to_tspl(cl.HEAD + cl.page([])).encode())[0]["size"]
 
 MARGIN = D // 2                 # 旗子边 / 纸边留白 (点)
-FOLD_GAP = D // 2               # 版面离折痕的距离 (点)
-FOLD_WARN = D // 4              # 墨离折痕比这还近就提示
+FOLD_GAP = D // 2               # 版面离折痕的距离 (点): 画布到这条线为止, 真实版面的墨碰不到折痕
+FOLD_WARN = D // 4              # 兜底: 比 FOLD_GAP 小, 真实路径不触发; 只防排版改坏或手搓的 Plan
 CANVAS_WB = (int((cl.FR - cl.FL) * D) - 2 * MARGIN) // 8        # 位图宽 (字节), 整字节才能按位翻转
 CANVAS_W = CANVAS_WB * 8
 MIN_PX, MAX_PX, PX_STEP = 16, 64, 2     # 字号 (点); 16 点 = 2mm, 再小现场看不清
@@ -185,7 +185,7 @@ def problems(plan):
             out.append("字出了旗子左右边")
         if top < 0 or bottom >= PAGE_H:
             out.append("字出了纸")
-        if top < plan.fold + FOLD_WARN and bottom >= plan.fold - FOLD_WARN:
+        if top < plan.fold + FOLD_WARN and bottom >= plan.fold - FOLD_WARN:     # 兜底, 见 FOLD_WARN
             out.append(FOLD_WARNING)
     return list(dict.fromkeys(out))
 
@@ -256,7 +256,8 @@ def load_conf(path=CONF_PATH):
                       if k in PAPERS and isinstance(v, dict) and _fold_ok(v.get("fold_mm"))}
     recent = raw.get("recent_to")
     if isinstance(recent, list):
-        conf["recent_to"] = [s for s in recent if isinstance(s, str) and s][:RECENT_MAX]
+        conf["recent_to"] = [s for s in recent if isinstance(s, str) and s and len(s) <= MAX_LINE_CHARS
+                             and not _has_control(s)][:RECENT_MAX]
     return conf
 
 
