@@ -7,6 +7,9 @@ import io
 import json
 import os
 import sys
+import signal
+import stat
+import subprocess
 import textwrap
 import time
 
@@ -128,13 +131,15 @@ def test_worker_cmd_as_root_uses_systemd_run_sandbox(monkeypatch):
     monkeypatch.setattr(ip.os, "geteuid", lambda: 0)
     monkeypatch.setattr(ip.shutil, "which", lambda n: "/usr/bin/systemd-run" if n == "systemd-run" else None)
     cmd = ip.worker_cmd()
-    assert cmd[0] == "/usr/bin/systemd-run" and "--pipe" in cmd
+    assert cmd[0] == "/usr/bin/systemd-run" and "--pipe" not in cmd     # --pipe 经 D-Bus 传 fd, kiosk 的域被 SELinux 拒
+    assert "--service-type=exec" in cmd                                 # 返回 0 = worker 已经 exec, FIFO 两端都开好了
     props = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-p"]
     for want in ("DynamicUser=yes", "PrivateNetwork=yes", "NoNewPrivileges=yes", "ProtectSystem=strict",
                  "ProtectHome=yes", "CapabilityBoundingSet=", "RestrictAddressFamilies=AF_UNIX",
                  "StateDirectory=ops-cart-ime"):
         assert want in props, want
     assert any(a.startswith("MemoryMax=") for a in props)
+    assert "StandardError=journal" in props
     assert "--setenv=OPS_CART_RIME_USER=/var/lib/ops-cart-ime" in cmd
     assert cmd[-1].endswith("ime_worker.py") and cmd[-2] == "-I"
 
@@ -374,3 +379,207 @@ def test_alive_follows_child_process(fake):
         assert eng.alive() is False
     finally:
         eng.close()
+
+
+# ------------------------------------------------------------ root 路径: FIFO + 假 systemd-run (真 FIFO, 不传 fd)
+
+_FAKE_RUN = textwrap.dedent('''
+    #!PYTHON
+    # 假 systemd-run: 解析 StandardInput/StandardOutput, 像 systemd 那样单向打开 FIFO (会阻塞), 起 worker 后立刻返回
+    import json, os, stat, subprocess, sys, time
+    args, props, i = sys.argv[1:], {}, 0
+    while args[i].startswith("-"):
+        if args[i] == "-p":
+            k, _, v = args[i + 1].partition("=")
+            props[k] = v
+            i += 2
+        else:
+            i += 1
+    mode, rec = os.environ["FAKE_RUN"], os.environ["FAKE_RUN_REC"]
+    inp, out = props["StandardInput"].split(":", 1)[1], props["StandardOutput"].split(":", 1)[1]
+    d = {"argv": sys.argv[1:], "dir_mode": stat.S_IMODE(os.stat(os.path.dirname(inp)).st_mode),
+         "fifo": [stat.S_ISFIFO(os.stat(p).st_mode) for p in (inp, out)], "props": props}
+    if mode == "fail":
+        sys.stderr.write("Failed to start transient service unit: Connection reset by peer\\n"); sys.exit(1)
+    if mode == "hang":
+        time.sleep(30)
+    if mode != "never_open":
+        fi, fo = os.open(inp, os.O_RDONLY), os.open(out, os.O_WRONLY)
+        p = subprocess.Popen(sys.argv[1:][i:], stdin=fi, stdout=fo, stderr=subprocess.DEVNULL, start_new_session=True)
+        d["pid"] = p.pid
+    with open(rec, "w") as f:
+        json.dump(d, f)
+''').lstrip()
+
+
+@pytest.fixture
+def sandboxed(tmp_path, monkeypatch):
+    """走 root + systemd-run 那条路, 但 systemd-run 是假的, worker 是 _FAKE (模式看环境变量)."""
+    bin_dir, here, root = tmp_path / "bin", tmp_path / "here", tmp_path / "run"
+    bin_dir.mkdir(), here.mkdir(), root.mkdir()
+    run = bin_dir / "systemd-run"
+    run.write_text(_FAKE_RUN.replace("PYTHON", sys.executable), encoding="utf-8")
+    run.chmod(0o755)
+    (here / "ime_worker.py").write_text('import os, sys; sys.argv.append(os.environ["FAKE_MODE"])\n' + _FAKE,
+                                        encoding="utf-8")
+    rec, killed = tmp_path / "rec.json", []
+    monkeypatch.setattr(ip.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ip.shutil, "which", lambda n: str(run) if n == "systemd-run" else None)
+    monkeypatch.setattr(ip, "_own_cgroup", lambda: "0::/system.slice/kiosk.service\n")
+    monkeypatch.setattr(ip, "_HERE", str(here))
+    monkeypatch.setattr(ip, "FIFO_ROOT", str(root))
+    monkeypatch.setattr(ip, "_kill_unit", killed.append)
+    monkeypatch.setenv("FAKE_RUN_REC", str(rec))
+
+    class S:
+        pass
+    s = S()
+    s.root, s.killed = root, killed
+    s.rec = lambda: json.loads(rec.read_text(encoding="utf-8"))
+
+    def start(mode="ok", run_mode="ok", **kw):
+        monkeypatch.setenv("FAKE_MODE", mode)
+        monkeypatch.setenv("FAKE_RUN", run_mode)
+        return ip.open_engine(**kw)
+    s.start = start
+    return s
+
+
+def _wait_for(pred, seconds=5):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_fifo_roundtrip_without_fd_passing(sandboxed):
+    eng, why = sandboxed.start()
+    assert eng is not None, why
+    try:
+        rec = sandboxed.rec()
+        assert "--pipe" not in rec["argv"] and rec["fifo"] == [True, True]
+        assert rec["dir_mode"] == 0o700                    # 目录只有 root 进得去
+        assert rec["props"]["StandardError"] == "journal" and rec["props"]["DynamicUser"] == "yes"
+        assert rec["props"]["BindsTo"] == "kiosk.service" and rec["props"]["RuntimeMaxSec"] == "900"
+        ime = ic.Ime()
+        ime.set_engine(eng, zh=True)
+        for ch in "nihao":
+            assert ime.press(ch, ch, 0).consume
+        assert ime.view()["candidates"] == ["你好"] and ime.press("space", " ", 0).commit == "你好"
+        assert eng.alive() is True
+    finally:
+        eng.close()
+    assert eng.proc.poll() is not None and not eng.alive()
+    assert len(sandboxed.killed) == 1 and sandboxed.killed[0].startswith("ops-cart-ime-")   # 还是按单元名杀
+
+
+def test_fifo_directory_gone_once_open_and_after_close(sandboxed):
+    eng, why = sandboxed.start()
+    assert eng is not None, why
+    assert os.listdir(sandboxed.root) == []                # 两端都开着 fd, 路径没用了
+    eng.close()
+    eng.close()
+    assert os.listdir(sandboxed.root) == []
+
+
+def test_fifo_systemd_run_failure_reports_and_cleans(sandboxed):
+    eng, why = sandboxed.start(run_mode="fail")
+    assert eng is None and "不可用" in why and "Connection reset" in why
+    assert os.listdir(sandboxed.root) == []
+
+
+def test_fifo_systemd_run_hang_times_out_and_cleans(sandboxed):
+    t = time.time()
+    eng, why = sandboxed.start(run_mode="hang", open_timeout=0.5)
+    assert eng is None and "超时" in why and time.time() - t < 5
+    assert os.listdir(sandboxed.root) == [] and len(sandboxed.killed) == 1
+
+
+def test_fifo_worker_crash_during_open_is_eof(sandboxed):
+    t = time.time()
+    eng, why = sandboxed.start(mode="open_crash")          # open_timeout 默认 600: 靠 EOF 发现, 不是等超时
+    assert eng is None and "退出" in why and time.time() - t < 10
+    assert os.listdir(sandboxed.root) == [] and len(sandboxed.killed) == 1
+
+
+def test_fifo_worker_hang_during_open_times_out(sandboxed):
+    t = time.time()
+    eng, why = sandboxed.start(mode="open_hang", open_timeout=0.5)
+    assert eng is None and "超时" in why and time.time() - t < 5
+
+
+def test_fifo_worker_never_opened_is_failure_not_deadlock(sandboxed):
+    """systemd-run 说成功, worker 却没接上 FIFO: kiosk 换成单向后立刻 EOF, 不能卡住."""
+    t = time.time()
+    eng, why = sandboxed.start(run_mode="never_open")
+    assert eng is None and "退出" in why and time.time() - t < 5
+    assert os.listdir(sandboxed.root) == []
+
+
+@pytest.mark.parametrize("mode,word", [("crash_on_feed", "退出"), ("hang_on_feed", "超时"), ("garbage", "回复")])
+def test_fifo_runtime_failures_degrade(sandboxed, mode, word):
+    eng, why = sandboxed.start(mode=mode, key_timeout=0.5)
+    assert eng is not None, why
+    ime = ic.Ime()
+    ime.set_engine(eng, zh=True)
+    r = ime.press("n", "n", 0)
+    assert not r.consume and ime.status == "unavailable" and word in ime.reason
+    assert eng.proc.poll() is not None and len(sandboxed.killed) == 1
+
+
+def test_fifo_worker_death_found_by_check_engine(sandboxed):
+    """闲着时 worker 被 RuntimeMaxSec 收掉: systemd-run 早退出了, 只能靠 FIFO EOF 发现."""
+    eng, why = sandboxed.start()
+    assert eng is not None, why
+    ime = ic.Ime()
+    ime.set_engine(eng, zh=True)
+    assert ime.check_engine() is False and eng.alive() is True
+    os.kill(sandboxed.rec()["pid"], signal.SIGKILL)
+    assert _wait_for(lambda: not eng.alive())
+    assert ime.check_engine() is True and ime.status == "unavailable"
+    eng.close()
+
+
+def test_fifo_write_to_dead_worker_is_failure(sandboxed):
+    eng, why = sandboxed.start()
+    assert eng is not None, why
+    os.kill(sandboxed.rec()["pid"], signal.SIGKILL)
+    assert _wait_for(lambda: not eng.alive())
+    with pytest.raises(OSError, match="退出"):
+        eng.feed("n")
+
+
+def test_fifo_leftover_directory_does_not_block(sandboxed):
+    stale = sandboxed.root / "ime-stale"
+    stale.mkdir()
+    (stale / "in").write_text("", encoding="utf-8")
+    eng, why = sandboxed.start()
+    assert eng is not None, why
+    assert eng.feed("n") is True
+    eng.close()
+
+
+def test_fifo_root_created_when_missing(sandboxed):
+    os.rmdir(sandboxed.root)
+    eng, why = sandboxed.start()
+    assert eng is not None, why
+    eng.close()
+    assert stat.S_ISDIR(os.stat(sandboxed.root).st_mode)
+
+
+def test_fifo_root_unusable_is_unavailable(sandboxed, monkeypatch):
+    blocker = sandboxed.root / "file"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(ip, "FIFO_ROOT", str(blocker))     # 是文件, 建不了目录
+    eng, why = sandboxed.start()
+    assert eng is None and "不可用" in why
+
+
+def test_non_root_path_still_plain_pipes(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(ip, "FIFO_ROOT", str(tmp_path / "must-not-exist"))
+    eng, why = _open(fake, "ok")
+    assert eng is not None, why
+    assert isinstance(eng.proc, subprocess.Popen) and not (tmp_path / "must-not-exist").exists()
+    eng.close()
