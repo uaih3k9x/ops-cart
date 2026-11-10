@@ -116,6 +116,7 @@ class WifiPanel(BridgePanel):
         self.pw_entry = tk.Entry(form, textvariable=self.pw_var, width=24, show="*", font=FONT_MONO,
                                  bg=th.BG, fg=FG, insertbackground=FG, **th.SUNKEN)
         self.pw_entry.pack(side="left", padx=6, ipady=3)
+        self._pw_caps = th.caps_hint(self.pw_entry)
         self.pw_entry.bind("<Return>", lambda _e: self.connect_form())
         self.show_var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text="显示密码", variable=self.show_var, command=self._toggle_show,
@@ -146,12 +147,12 @@ class WifiPanel(BridgePanel):
         self.auth_pw_entry = tk.Entry(row, textvariable=self.auth_pw, width=20, show="*", font=FONT_MONO,
                                       bg=th.BG, fg=FG, insertbackground=FG, **th.SUNKEN)
         self.auth_pw_entry.pack(side="left", padx=6, ipady=3)
+        self._auth_pw_caps = th.caps_hint(self.auth_pw_entry)
         self.auth_pw_entry.bind("<Return>", lambda _e: self.auth_save())
         self.auth_show = tk.BooleanVar(value=False)
         tk.Checkbutton(row, text="显示", variable=self.auth_show, font=FONT, bg=BG, fg=th.TEXT,
                        selectcolor=BOX, activebackground=BG, activeforeground=FG,
-                       command=lambda: self.auth_pw_entry.config(show="" if self.auth_show.get() else "*")
-                       ).pack(side="left", padx=4)
+                       command=self._toggle_auth_show).pack(side="left", padx=4)
         self._btn(row, "保存", self.auth_save)
         self._btn(row, "立即认证", self.auth_now, bg=th.PRIMARY)
         self.auth_lbl = tk.Label(box, text="", font=FONT, bg=BG, fg=th.DIM, anchor="w")
@@ -226,6 +227,11 @@ class WifiPanel(BridgePanel):
 
     def _toggle_show(self):
         self.pw_entry.config(show="" if self.show_var.get() else "*")
+        self._pw_caps()
+
+    def _toggle_auth_show(self):
+        self.auth_pw_entry.config(show="" if self.auth_show.get() else "*")
+        self._auth_pw_caps()
 
     def _say(self, text, ok=True):
         self.msg.config(text=text, fg=th.OK if ok else th.BAD)
