@@ -259,25 +259,59 @@ def test_refresh_without_desk_does_not_poll():
 # ------------------------------------------------------------ 回复滚动区: 假 Text, 不起 Tk
 
 class _Log:
-    """记录写入的假 Text: 行号从 1 算, 只认 "<行>.0" 到 "end" 的删除."""
+    """假 Text, 按字符建模, 守真 Tk 的 end 语义: 末尾有一个删不掉的换行, "end" 在它后面, "end-1c" 在它前面;
+    删除范围碰到这个换行且起点在行首时, 起点前的换行也一起删 (Tk 把它当成"删整行")."""
 
     def __init__(self, view=(0.0, 1.0)):
-        self.lines, self.view, self.seen, self.state, self.writes = [], view, [], "disabled", 0
+        self.chars, self.view, self.seen, self.moved, self.state, self.writes = [], view, [], [], "disabled", 0
+
+    @property
+    def lines(self):
+        text = "".join(c for c, _ in self.chars)
+        out, at = [], 0
+        for line in text.split("\n"):
+            if at < len(self.chars):
+                out.append((line, self.chars[at][1]))
+            at += len(line) + 1
+        return out
 
     def yview(self):
         return self.view
 
+    def yview_moveto(self, fraction):
+        self.moved.append(fraction)
+
     def config(self, **kw):
         self.state = kw.get("state", self.state)
 
+    def _at(self, index):
+        if index == "end":
+            return len(self.chars) + 1
+        if index == "end-1c":
+            return len(self.chars)
+        line, column = (int(x) for x in index.split("."))
+        assert column == 0
+        at = 0
+        for _ in range(line - 1):
+            found = next((i for i in range(at, len(self.chars)) if self.chars[i][0] == "\n"), None)
+            if found is None:
+                return len(self.chars)
+            at = found + 1
+        return at
+
     def delete(self, first, last):
-        assert self.state == "normal" and last == "end"
-        del self.lines[int(first.split(".")[0]) - 1:]
+        assert self.state == "normal"
+        start, stop = self._at(first), self._at(last)
+        if stop > len(self.chars):
+            stop = len(self.chars)
+            if 0 < start <= stop and self.chars[start - 1][0] == "\n":
+                start -= 1
+        del self.chars[start:stop]
         self.writes += 1
 
     def insert(self, _at, text, tag):
         assert self.state == "normal" and text.endswith("\n")
-        self.lines.append((text[:-1], tag))
+        self.chars.extend((c, tag) for c in text)
         self.writes += 1
 
     def see(self, where):
@@ -416,6 +450,67 @@ def test_draw_skips_unchanged_status_pane():
     writes = fake.text.writes
     draw(_online(), NOW)
     assert fake.text.writes == writes
+
+
+def test_status_pane_keeps_scroll_position_on_redraw():
+    fake = _log_fake()
+    fake.text = _Log(view=(0.4, 0.8))
+    fake._shown = None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    bp.BigfishPanel._draw.__get__(fake)(_online(), NOW)
+    assert fake.text.moved == [0.4]
+
+
+class _Tk:
+    def __init__(self, *_a, **kw):
+        self.kw, self.packed, self.binds = dict(kw), None, {}
+
+    def config(self, **kw):
+        self.kw.update(kw)
+
+    def pack(self, **kw):
+        self.packed = kw
+
+    def bind(self, event, fn):
+        self.binds[event] = fn
+
+    def set(self, *_a):
+        pass
+
+    def yview(self, *_a):
+        pass
+
+
+def _built(monkeypatch, desk):
+    bars = []
+    monkeypatch.setattr(bp.tk, "Frame", _Tk)
+    monkeypatch.setattr(bp.tk, "Scrollbar", lambda *a, **k: bars.append(_Tk(*a, **k)) or bars[-1])
+    fake = SimpleNamespace(desk=desk, _text=lambda _parent: _Tk())
+    fake._scrolled = bp.BigfishPanel._scrolled.__get__(fake)
+    bp.BigfishPanel._build_status.__get__(fake)()
+    return fake, bars
+
+
+def test_status_pane_scrolls_when_desk_present(monkeypatch):
+    fake, bars = _built(monkeypatch, tc.Desk())
+    assert len(bars) == 1 and fake.text.kw["height"] == bp.STATUS_LINES
+    assert fake.text.kw["yscrollcommand"] == bars[0].set and bars[0].kw["command"] == fake.text.yview
+
+
+def test_status_pane_without_desk_fills_panel(monkeypatch):
+    fake, bars = _built(monkeypatch, None)
+    assert bars == [] and fake.text.packed == {"fill": "both", "expand": True}
+
+
+def test_hint_wraps_to_its_width(monkeypatch):
+    monkeypatch.setattr(bp.tk, "Label", _Tk)
+    fake = SimpleNamespace()
+    bp.BigfishPanel._build_hint.__get__(fake)()
+    assert fake.hint.kw["justify"] == "left"
+    fake.hint.binds["<Configure>"](SimpleNamespace(width=300))
+    assert 0 < fake.hint.kw["wraplength"] <= 300
+    fake.hint.binds["<Configure>"](SimpleNamespace(width=1))
+    assert fake.hint.kw["wraplength"] > 0               # 0 在 Tk 里是"不折行"
 
 
 def test_draw_without_desk_has_no_log():

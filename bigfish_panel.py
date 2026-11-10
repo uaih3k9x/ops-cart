@@ -21,6 +21,7 @@ REFRESH_MS = 2000
 STATUS_LINES = 9                    # 有滚动区时上面状态区的高度
 FOLLOW_AT = 0.999                   # 滚动条到这儿算在底部, 新内容跟着走
 LOG_BATCH = 2000                    # 一次刷新最多插这么多行 (重开面板补历史也不卡主线程), 剩下的下次接着插
+HINT_PAD = 8                        # 折行宽度比控件窄这么多, 留给 Label 的内边距
 TAGS = {"own": "FG", "dim": "DIM", "bad": "BAD", "untrusted": "AGENT"}
 
 
@@ -36,12 +37,7 @@ class BigfishPanel(tk.Frame):
         self.submit, self.get_task, self.cancel_task = submit, get_task, cancel_task
         self.entry = self.log = None
         self._shown, self._log_gen, self._log_n, self._log_live = None, None, 0, []
-        self.text = self._text(self)
-        if desk is None:
-            self.text.pack(fill="both", expand=True)
-        else:
-            self.text.config(height=STATUS_LINES)
-            self.text.pack(fill="x")
+        self._build_status()
         if desk is not None:
             self._build_desk()
         bar = tk.Frame(self, bg=BG)
@@ -68,15 +64,33 @@ class BigfishPanel(tk.Frame):
         b.pack(side="left", padx=6)
         return b
 
-    def _build_log(self):
+    def _scrolled(self):
         wrap = tk.Frame(self, bg=BG)
-        wrap.pack(fill="both", expand=True)
-        self.log = self._text(wrap)
-        self.log.config(height=1)           # 只占 expand 分到的地方, 不把下面的输入行挤出屏
-        bar = tk.Scrollbar(wrap, orient="vertical", width=24, command=self.log.yview)
-        self.log.config(yscrollcommand=bar.set)
+        text = self._text(wrap)
+        bar = tk.Scrollbar(wrap, orient="vertical", width=24, command=text.yview)
+        text.config(yscrollcommand=bar.set)
         bar.pack(side="right", fill="y")
-        self.log.pack(side="left", fill="both", expand=True)
+        text.pack(side="left", fill="both", expand=True)
+        return wrap, text
+
+    def _build_status(self):
+        if self.desk is None:
+            self.text = self._text(self)
+            self.text.pack(fill="both", expand=True)
+            return
+        wrap, self.text = self._scrolled()  # 固定高度放不下 Mac 派来任务的全部步骤和输出尾巴
+        self.text.config(height=STATUS_LINES)
+        wrap.pack(fill="x")
+
+    def _build_log(self):
+        wrap, self.log = self._scrolled()
+        self.log.config(height=1)           # 只占 expand 分到的地方, 不把下面的输入行挤出屏
+        wrap.pack(fill="both", expand=True)
+
+    def _build_hint(self):
+        self.hint = tk.Label(self, text="", font=th.FONT, bg=BG, fg=th.DIM, anchor="w", justify="left")
+        self.hint.pack(fill="x", padx=18, pady=(0, 8))
+        self.hint.bind("<Configure>", lambda e: self.hint.config(wraplength=max(e.width - HINT_PAD, 1)))
 
     def _page(self, n):
         self.log.yview_scroll(n, "pages")
@@ -95,8 +109,7 @@ class BigfishPanel(tk.Frame):
         self.entry.bind("<Next>", lambda _e: self._page(1))
         self.btn_send = self._btn(row, "发送", th.PRIMARY, th.WHITE, self._send)
         self.btn_cancel = self._btn(row, "取消任务", th.BTN2, th.FG, self._cancel)
-        self.hint = tk.Label(self, text="", font=th.FONT, bg=BG, fg=th.DIM, anchor="w")
-        self.hint.pack(fill="x", padx=18, pady=(0, 8))
+        self._build_hint()
         self._desk_gen = self.desk.gen
 
     def _load(self, now):
@@ -169,11 +182,13 @@ class BigfishPanel(tk.Frame):
             rows = self.desk.rows() + [("", "dim")] + rows      # 人刚派的任务放最上面, 不被状态行挤出屏
         if rows != self._shown:
             self._shown = rows
+            top = self.text.yview()[0]      # 计时每秒都在变, 整段重画不能把人翻到的位置拉回顶上
             self.text.config(state="normal")
             self.text.delete("1.0", "end")
             for line, tag in rows:
                 self.text.insert("end", line + "\n", tag)
             self.text.config(state="disabled")
+            self.text.yview_moveto(top)
         if self.desk is not None:
             self._update_log()
 
@@ -193,7 +208,7 @@ class BigfishPanel(tk.Frame):
             return
         follow = log.yview()[1] >= FOLLOW_AT
         log.config(state="normal")
-        log.delete(f"{self._log_n + 1}.0", "end")
+        log.delete(f"{self._log_n + 1}.0", "end-1c")   # 不能用 end: Tk 会连前一行的换行一起删, 下一行就粘上去了
         for line, tag in fresh + live:
             log.insert("end", line + "\n", tag)
         log.config(state="disabled")

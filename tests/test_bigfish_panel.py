@@ -144,12 +144,18 @@ def test_reply_log_keeps_scroll_position_when_new_output_arrives(root):
     root.geometry("800x600")
     root.update()
 
-    def feed(n):
+    want = []
+
+    def feed_text(text):
         got = w.desk.got
-        text = "".join(f"行{got}-{i}\n" for i in range(n))
         w._polled({"task_id": "t-1", "state": "running", "output_offset": got, "output_total_chars": got + len(text),
                    "untrusted_agent_output": {"output": text}})
         root.update()
+
+    def feed(n):
+        lines = [f"行{w.desk.got}-{i}" for i in range(n)]
+        want.extend(lines)
+        feed_text("".join(line + "\n" for line in lines))
     feed(300)
     assert w.log.yview()[1] == 1.0                      # 在底部: 跟着走
     w.log.yview_moveto(0.2)
@@ -162,4 +168,17 @@ def test_reply_log_keeps_scroll_position_when_new_output_arrives(root):
     feed(50)
     assert w.log.yview()[1] == 1.0
     assert w.log.cget("state") == "disabled"
+    feed_text("半")                                     # 半行就地换掉: 不粘上一行, 不留旧半行
+    assert w.log.get("1.0", "end-1c") == "".join(f"{bf.SAYS}{x}\n" for x in want + ["半"])
+    feed_text("行\n")
+    assert w.log.get("1.0", "end-1c") == "".join(f"{bf.SAYS}{x}\n" for x in want + ["半行"])
+    w.destroy()
+
+
+def test_status_pane_scrollbar_and_hint_wrap(root):
+    w, _ = _desk_panel(root)
+    root.geometry("800x600")
+    root.deiconify()
+    root.update()
+    assert w.text.cget("yscrollcommand") and w.hint.cget("wraplength") > 0
     w.destroy()
