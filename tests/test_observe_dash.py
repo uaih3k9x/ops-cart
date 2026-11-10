@@ -1044,3 +1044,289 @@ def test_survey_refusal_names_who_holds(monkeypatch, holder, word):
     p = P()
     sp.SerialPanel.survey(p)
     assert word in p.written[-1]
+
+
+# ------------------------------------------------------------ 堆叠: 三成员 84 口放得下 (#85)
+
+def _stack_names(members=(0, 1, 2)):
+    return [f"GigabitEthernet{m}/0/{i}" for m in members for i in range(1, 25)] + \
+           [f"XGigabitEthernet{m}/0/{i}" for m in members for i in range(1, 5)]
+
+
+def _stack_view(members=(0, 1, 2), locked=False):
+    ports = [dict(c, state="up", in_uti=0.0, out_uti=0.0) for c in oc.auto_layout(_stack_names(members))]
+    return dc.layout_view({"ts": 100, "observe": dict(_snap(100, ports), ends_at=700), "notice": "欢迎"},
+                          locked=locked, now=101)
+
+
+def test_panel_cells_stack_fits_real_canvas():
+    panel = oc.auto_layout(_stack_names())
+    cells = op.panel_cells(panel, {}, now=0, width=1056, height=340)
+    assert len(cells) == 84
+    assert max(c["box"][2] for c in cells) <= 1056 and max(c["box"][3] for c in cells) <= 340
+    assert min(c["box"][2] - c["box"][0] for c in cells) == op.CELL
+    assert all(c["label"] for c in cells)
+    tops = sorted({c["box"][1] for c in cells})
+    assert tops[2] - tops[1] > tops[1] - tops[0]                                 # 层间比层内宽
+
+
+def test_panel_cells_stack_keeps_full_name_for_hover():
+    cells = op.panel_cells(oc.auto_layout(_stack_names()), {}, now=0, width=1056, height=340)
+    assert {c["name"] for c in cells} == set(_stack_names())
+
+
+def test_panel_tiers_label_each_member_left_of_ports():
+    panel = oc.auto_layout(_stack_names())
+    tiers = op.panel_tiers(panel, width=1056, height=340)
+    cells = op.panel_cells(panel, {}, now=0, width=1056, height=340)
+    assert [t["text"] for t in tiers] == ["成员 0", "成员 1", "成员 2"]
+    assert all(t["x"] < min(c["box"][0] for c in cells) for t in tiers)
+    assert tiers[0]["y"] < tiers[1]["y"] < tiers[2]["y"]
+
+
+def test_panel_stack_shrinks_for_four_members_and_small_canvas():
+    panel = oc.auto_layout(_stack_names((0, 1, 2, 3)))
+    cells = op.panel_cells(panel, {}, now=0, width=1056, height=340)
+    assert len(cells) == 112 and max(c["box"][3] for c in cells) <= 340
+    cells = op.panel_cells(oc.auto_layout(_stack_names()), {}, now=0, width=1056, height=250)
+    assert max(c["box"][3] for c in cells) <= 250
+
+
+def test_panel_stack_nine_members_drops_labels_but_still_draws():
+    panel = oc.auto_layout(_stack_names(tuple(range(9))))
+    cells = op.panel_cells(panel, {}, now=0, width=1056, height=340)
+    assert len(cells) == 9 * 28 and max(c["box"][3] for c in cells) <= 340
+    assert not any(c["label"] for c in cells)
+    assert op.panel_hint(panel, width=1056, height=340) is None
+
+
+def test_panel_stack_too_many_members_gives_hint():
+    panel = oc.auto_layout(_stack_names(tuple(range(1, 17))))
+    assert op.panel_cells(panel, {}, now=0, width=1056, height=340) == []
+    assert op.panel_tiers(panel, width=1056, height=340) == []
+    assert "堆叠 16 台" in op.panel_hint(panel, width=1056, height=340)
+
+
+def test_panel_single_box_unchanged_with_height():
+    panel = oc.auto_layout([f"GigabitEthernet0/0/{i}" for i in range(1, 25)])
+    assert op.panel_cells(panel, {}, now=0, width=1056, height=340) == op.panel_cells(panel, {}, now=0, width=1056)
+    assert op.panel_tiers(panel, width=1056, height=340) == [] and op.panel_hint(panel) is None
+
+
+def test_draw_member_labels_are_not_hover_targets():
+    class C:
+        def __init__(self):
+            self.n, self.texts = 0, []
+
+        def delete(self, *a):
+            pass
+
+        def _new(self, *a, **k):
+            self.n += 1
+            return self.n
+
+        create_polygon = create_rectangle = _new
+
+        def create_text(self, *a, **k):
+            self.texts.append(k.get("text"))
+            return self._new()
+
+    panel = oc.auto_layout(_stack_names())
+    c = C()
+    hits = op.draw(c, op.panel_cells(panel, {}, now=0, width=1056, height=340),
+                   op.panel_tiers(panel, width=1056, height=340))
+    assert "成员 2" in c.texts and all(v.endswith(tuple("0123456789")) and "Ethernet" in v for v in hits.values())
+    c = C()
+    op.draw(c, [], hint="堆叠 16 台")
+    assert c.texts == ["堆叠 16 台"]
+
+
+def test_draw_small_cell_shape_stays_inside_box():
+    class C:
+        def __init__(self):
+            self.poly = self.rect = None
+
+        def delete(self, *a):
+            pass
+
+        def create_polygon(self, *a, **k):
+            self.poly = a
+            return 1
+
+        def create_rectangle(self, *a, **k):
+            self.rect = a
+            return 2
+
+        def create_text(self, *a, **k):
+            return 3
+
+    c = C()
+    op.draw(c, [dict(name="a", box=(0, 0, 12, 12), shape="rj45", label="", fill="x", fg="y"),
+                dict(name="b", box=(0, 0, 12, 12), shape="sfp", label="", fill="x", fg="y")],
+            tiers=[{"text": "成员 1", "x": 0, "y": 0}])
+    ys = [v for i, v in enumerate(c.poly) if i % 2]
+    assert all(0 <= v <= 12 for v in ys) and c.poly[5] > 0                        # 卡口不把方块吃没
+    assert c.rect[1] < c.rect[3]
+
+
+def test_draw_single_box_keeps_fixed_notch_and_inset():
+    class C:
+        def delete(self, *a):
+            pass
+
+        def create_polygon(self, *a, **k):
+            self.poly = a
+            return 1
+
+        def create_rectangle(self, *a, **k):
+            self.rect = a
+            return 2
+
+        def create_text(self, *a, **k):
+            return 3
+
+    c = C()
+    op.draw(c, [dict(name="a", box=(0, 0, 30, 30), shape="rj45", label="", fill="x", fg="y"),
+                dict(name="b", box=(0, 0, 30, 30), shape="sfp", label="", fill="x", fg="y")])
+    assert c.poly[5] == 30 - 8                                                   # 单机: 卡口 8, 不随格子缩
+    assert (c.rect[1], c.rect[3]) == (6, 30 - 6)                                 # 单机: 内缩 6
+
+
+def test_panel_hint_says_exit_observing_first():
+    hint = op.panel_hint(oc.auto_layout(_stack_names(tuple(range(1, 17)))), width=1056, height=340)
+    assert "退出观察后" in hint
+
+
+class _Text:
+    """只记文字的假 ImageDraw."""
+
+    def __init__(self):
+        self.texts = []
+
+    def text(self, xy, s, **k):
+        self.texts.append(s)
+
+
+def test_front_hint_normal_page_points_to_car_window():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    d = _Text()
+    r._front(d, _stack_view(tuple(range(6)))["front"], r.PANEL_W)
+    assert any("请看车机窗口" in t for t in d.texts)
+
+
+def test_locked_hint_says_unlock_first():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    d = _Text()
+    v = _stack_view(tuple(range(9)), locked=True)
+    assert r.front_boxes(v["front"], y0=r.LOCKED_FRONT_Y, height=r.LOCKED_FRONT_H) == []
+    r._locked_body(d, v, r.PANEL_W, r.PANEL_H)
+    assert any("解锁后" in t and "车机窗口" in t for t in d.texts)
+
+
+@pytest.mark.parametrize("members,locked,want", [
+    (3, False, 3),      # 正常页层距 25
+    (4, False, 0),      # 正常页层距 19: 字会互相压, 不画
+    (7, True, 7),       # 锁屏层距 22
+    (8, True, 0),       # 锁屏层距 18
+])
+def test_tier_labels_only_when_tiers_are_tall_enough(members, locked, want):
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = _stack_view(tuple(range(members)), locked=locked)
+    kw = {"y0": r.LOCKED_FRONT_Y, "height": r.LOCKED_FRONT_H} if locked else {}
+    assert len(r._tier_labels(v["front"], r.PANEL_W, **kw)) == want
+
+
+def test_front_boxes_three_members_fit_normal_page():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = _stack_view()
+    boxes = r.front_boxes(v["front"])
+    assert len(boxes) == 84
+    assert max(b[0][2] for b in boxes) <= r.PANEL_W - r.M
+    assert min(b[0][1] for b in boxes) >= r.FRONT_Y and max(b[0][3] for b in boxes) < 1000   # 不压分隔线
+    assert min(b[0][0] for b in boxes) >= r.M + r.STACK_GUTTER                                # 左边留给成员号
+    assert min(b[0][3] - b[0][1] for b in boxes) >= 6
+    r.render(v)
+
+
+def test_front_boxes_single_box_unchanged():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = dc.layout_view({"ts": 100, "observe": _snap(100)}, now=101)
+    (x0, y0, x1, y1), _p = r.front_boxes(v["front"])[1]
+    assert (x0, y0, x1, y1) == (r.M, r.FRONT_Y + 36, r.M + 44, r.FRONT_Y + 66)
+
+
+def test_render_stack_draws_lit_lamps():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = _stack_view()
+    img = r.render(v)
+    (x0, y0, x1, y1), port = r.front_boxes(v["front"])[-1]
+    assert port["state"] == "up" and img.getpixel(((x0 + x1) // 2, (y0 + y1) // 2)) == _rgb(th.LAMP_OK)
+
+
+def test_front_boxes_six_members_hint_on_normal_page():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = _stack_view(tuple(range(6)))
+    assert r.front_boxes(v["front"]) == []
+    r.render(v)                                                                  # 只画提示, 不崩
+
+
+def test_locked_stack_fits_and_notice_below():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = _stack_view(locked=True)
+    boxes = r.front_boxes(v["front"], y0=r.LOCKED_FRONT_Y, height=r.LOCKED_FRONT_H)
+    assert len(boxes) == 84 and min(b[0][3] - b[0][1] for b in boxes) >= 18      # 锁屏空间大, 端口号写得下
+    size, lh, lines, top = r._locked_lines(v, r.PANEL_W, r.PANEL_H)
+    assert top >= max(b[0][3] for b in boxes)
+    r.render(v)
+
+
+def _locked_notice(members, notice):
+    return dict(_stack_view(tuple(range(members)), locked=True), notice=notice)
+
+
+def test_locked_stack_four_line_notice_keeps_every_line():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    size, lh, lines, top = r._locked_lines(_locked_notice(3, "一\n二\n三\n四"), r.PANEL_W, r.PANEL_H)
+    assert lines == ["一", "二", "三", "四"] and size == 36
+
+
+def test_locked_stack_four_line_notice_keeps_every_line_with_bigfish():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = dict(_locked_notice(3, "一\n二\n三\n四"), bigfish="大肥鱼在线")
+    assert len(r._locked_lines(v, r.PANEL_W, r.PANEL_H)[2]) == 4
+
+
+def test_locked_stack_notice_starts_under_what_is_actually_drawn():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    v = _locked_notice(3, "一")
+    bottom = max(b[0][3] for b in r.front_boxes(v["front"], y0=r.LOCKED_FRONT_Y, height=r.LOCKED_FRONT_H))
+    assert bottom - r.LOCKED_FRONT_Y == 147
+    size, lh, lines, top = r._locked_lines(_locked_notice(2, "一\n二\n三\n四"), r.PANEL_W, r.PANEL_H)
+    assert (size, len(lines)) == (44, 4)                                         # 2 成员到 121, 比 3 成员多一档字
+
+
+def test_locked_stack_hint_only_takes_one_text_line():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    size, lh, lines, top = r._locked_lines(_locked_notice(9, "一\n二\n三\n四"), r.PANEL_W, r.PANEL_H)
+    assert len(lines) == 4 and size >= 64
+    assert r.LOCKED_FRONT_Y + 24 <= top < r.LOCKED_FRONT_Y + r.LOCKED_FRONT_H
+
+
+def test_locked_notice_too_long_ends_with_ellipsis():
+    pytest.importorskip("PIL")
+    import dash_render as r
+    size, lh, lines, top = r._locked_lines(_locked_notice(3, "一\n二\n三\n四\n五\n六"), r.PANEL_W, r.PANEL_H)
+    assert size == 36 and len(lines) == 4 and lines[-1].endswith("…") and lines[0] == "一"
+    assert top + lh * len(lines) <= r.PANEL_H - 160

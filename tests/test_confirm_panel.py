@@ -1,5 +1,7 @@
 """confirm_panel Tk 冒烟测试 (#23): 真起 Tk (没显示就跳过), 按按钮看交出去的动作; 不碰状态文件和串口."""
 
+from types import SimpleNamespace
+
 import pytest
 
 tk = pytest.importorskip("tkinter")
@@ -193,6 +195,44 @@ def test_dialog_live_failure_is_ignored(root):
     d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=boom)
     d.update_idletasks()
     assert not any("当前最后一行" in t for t in _labels(d))
+
+
+def test_dialog_warns_off_registered_vendor_prompt(root):
+    """#93 (推车真屏跑): 登记思科时华为式 <SW1> 不算提示符."""
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=lambda n: "<SW1>", vendor=lambda n: "cisco")
+    d.update_idletasks()
+    assert any("！！设备现在不在提示符上" in t for t in _labels(d))
+
+
+class _Lab:
+    def __init__(self):
+        self.cfg = {}
+
+    def config(self, **kw):
+        self.cfg.update(kw)
+
+
+def _refresh_fake(view, **callbacks):
+    """假 self 走 refresh 的原地刷新分支 (Mac 上没有 Tk 也跑): -> 那条挂起项 "设备最后一行" Label 的字."""
+    ids = tuple(p["id"] for p in view["pending"])
+    labs = lambda: {i: _Lab() for i in ids}                             # noqa: E731
+    fake = SimpleNamespace(n=1, live=None, vendor=None, title_lbl=_Lab(), status_lbl=_Lab(), config=lambda **kw: None,
+                           _key=(False, False, ids), _meta=labs(), _reason=labs(), _line=labs())
+    fake.__dict__.update(callbacks)
+    cp.ConfirmDialog.refresh(fake, view)
+    return fake._line[ids[0]].cfg["text"]
+
+
+def _boom(n):
+    raise OSError("x")
+
+
+@pytest.mark.parametrize("vendor,warned", [(lambda n: "cisco", True), (lambda n: "huawei", False), (None, False),
+                                           (_boom, False)])
+def test_refresh_uses_slot_vendor(vendor, warned):
+    """#93: vendor 回调的厂商传给 card; 没给或出错退回不分厂商的判断, 确认框照常画."""
+    text = _refresh_fake(_view(), live=lambda n: "<SW1>", vendor=vendor)
+    assert ("！！设备现在不在提示符上" in text) is warned and "当前最后一行：<SW1>" in text
 
 
 def test_view_fixtures_build_without_display():
