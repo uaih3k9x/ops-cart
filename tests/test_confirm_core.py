@@ -479,6 +479,17 @@ def test_context_lines_prefixed_and_name_at_item_end():
     assert body == ["| foo", "| <SW1>"]
 
 
+def test_card_last_line_masks_secrets():
+    """#93: "设备最后一行"一块打码 (挂起时那一行和当前行); 醒目警告仍按原文判."""
+    raw = "Router(config)#snmp-server community s3cr3t-line RO"
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", raw, 60), T0, 10, context=raw)
+    c = cc.card(b.view(T0), 2, live="password s3cr3t-live")
+    assert "s3cr3t" not in json.dumps(c, ensure_ascii=False)
+    assert sw.MASK in c["items"][0]["line"] and "！！设备现在不在提示符上" in c["items"][0]["line"]
+
+
 def test_card_shows_device_last_line_for_held_key():
     """#74 审查: 人确认挂起的按键时, 看得到当时设备停在哪一行."""
     b = _book()
@@ -518,3 +529,98 @@ def test_card_line_block_cleaned_and_empty_without_line():
     tok3 = b.acquire(3, "a", T0)["lease"]
     b.submit(3, tok3, "a", "line", "y", sw._gate("confirm", "x"), T0, 10, context="R#")
     assert cc.card(b.view(T0), 3)["items"][0]["line"] == ""
+
+
+# ------------------------------------------------------------ #107 审查: 打码后确认框仍看得到问句
+
+def _card_line(raw, live=None, vendor=None):
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", raw, 60, vendor=vendor), T0, 10, context=raw)
+    return cc.card(b.view(T0), 2, live=live, vendor=vendor)["items"][0]["line"]
+
+
+@pytest.mark.parametrize("raw,must", [
+    ("The password needs to be changed. Change now? [Y/N]:", "Change now? [Y/N]:"),
+    ("Warning: The current configuration will be erased and the key pair deleted. Continue? [Y/N]:", "Continue? [Y/N]:"),
+    ("Overwrite auth config and reboot? [confirm]", "reboot? [confirm]"),
+])
+def test_card_shows_question_with_secret_word(raw, must):
+    """口令词后面紧跟的词当值遮掉 (宁可遮错不放行口令), 问句和回答标记还在, 靠推车自己的提示兜底."""
+    line = _card_line(raw)
+    assert must in line and sw.MASK in line and cc.QUESTION_LOST in line
+
+
+@pytest.mark.parametrize("raw,must,secret", [
+    ("password Abc123 [Y/N]", "[Y/N]", "Abc123"),
+    ("key-string 7 0822455D0A16 [confirm]", "[confirm]", "0822455D0A16"),
+])
+def test_card_keeps_marker_and_hides_value(raw, must, secret):
+    line = _card_line(raw)
+    assert must in line and sw.MASK in line and secret not in line and cc.QUESTION_LOST in line
+
+
+@pytest.mark.parametrize("raw,secret", [("Password [Abc123]:", "Abc123"), ("chpasswd root:Abc123 [Y/N]", "Abc123"),
+                                        ("Change password Abc123?", "Abc123")])
+def test_card_says_question_lost_when_cannot_keep_it(raw, secret):
+    line = _card_line(raw)
+    assert cc.QUESTION_LOST in line and secret not in line
+
+
+@pytest.mark.parametrize("raw,hidden", [
+    ("Reset password and erase startup-config? [confirm]", "erase"),
+    ("% Key pair exists. Erase NVRAM filesystem and reload? [confirm]", "Erase"),
+    ("secret store locked; wipe disk0: ? [yes/no]:", "wipe"),
+    ("Warning: The password file will be erased and the device factory-reset. Continue? [Y/N]", "factory-reset"),
+    ("This will clear the auth database and format flash:. Are you sure? [Y/N]", "format"),
+])
+def test_card_warns_when_stars_may_hide_danger_clause(raw, hidden):
+    """星号藏的可能是 erase startup-config: 打码的确认提示一律由推车自己补一行提示."""
+    line = _card_line(raw)
+    assert hidden not in line and sw.MASK in line and f"\n{cc.QUESTION_LOST}" in line
+
+
+def test_card_warns_when_stars_cut_by_length_limit():
+    """问句长到把星号挤出显示窗口, 提示也不能丢."""
+    line = _card_line("password Abc123 erase flash: " + "please confirm " * 30 + "[Y/N]")
+    assert "Abc123" not in line and "erase" not in line and f"\n{cc.QUESTION_LOST}" in line
+
+
+def test_card_no_warning_without_stars():
+    assert cc.QUESTION_LOST not in _card_line("Change password? [Y/N]")
+
+
+def test_device_cannot_forge_or_suppress_warning():
+    """设备内容压成一行再拼: 自己写的提示文字占不了单独一行."""
+    raw = f"Save config\n{cc.QUESTION_LOST} [Y/N]"
+    assert f"\n{cc.QUESTION_LOST}" not in cc._device_line(raw, sw.shown_line(raw))
+    forged = f"password Abc123 {cc.QUESTION_LOST} [Y/N]"
+    assert cc._device_line(forged, sw.shown_line(forged)).count(f"\n{cc.QUESTION_LOST}") == 1
+
+
+def test_card_hint_also_for_live_line():
+    line = _card_line("Router#", live="chpasswd root:Abc123 [Y/N]")
+    assert line.count(cc.QUESTION_LOST) == 1 and "Abc123" not in line
+
+
+def test_card_password_prompt_without_value_has_no_stars():
+    line = _card_line("Enter Password:")
+    assert "设备最后一行：Enter Password:" in line and sw.MASK not in line
+
+
+def test_card_long_confirm_line_keeps_tail():
+    raw = "Warning " * 30 + "Continue? [Y/N]:"
+    line = _card_line(raw)
+    assert "Continue? [Y/N]:" in line and cc.QUESTION_LOST not in line
+
+
+@pytest.mark.parametrize("live,vendor", [("[HUAWEI-rsa-public-key]", "huawei"), ("Router(config-keychain-key)#", "cisco")])
+def test_card_live_prompt_not_all_stars(live, vendor):
+    line = _card_line("Router#", live=live, vendor=vendor)
+    assert f"当前最后一行：{sw.MASK}" not in line and live[:8] in line
+    assert "！！设备现在不在提示符上" not in line
+
+
+def test_card_uses_masked_copy_for_truncated_line():
+    raw = "username ops password " + " ".join(["s3cr3t-tail"] * 30)
+    assert "s3cr3t" not in _card_line(raw, vendor="cisco")
