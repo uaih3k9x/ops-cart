@@ -48,6 +48,11 @@ def _btn(parent, text, cmd, bg=None):
                      activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=10)
 
 
+def caps_view(on, line):
+    """标题栏 ⇪ 的 (文字, 颜色), line 是控制台光标所在行: 大写锁定开着就显示, 现场是 Password: 时换醒目颜色 (#88)."""
+    return (th.CAPS_MARK if on else "", th.BAD if observe_core.classify(line) == "password" else FG)
+
+
 def observe_vendor(cfg):
     """观察用哪个厂商的解析器: survey_vendor 是 auto (#56 起的默认) 或没有解析器的厂商时按华为."""
     v = cfg.get("survey_vendor")
@@ -88,7 +93,7 @@ class SerialPanel(tk.Frame):
         self.term = TermFeed()
         self.chat_off = None
         self._serves, self._kvm_devs, self._byid, self._aliases = {}, set(), [], []
-        self._busy = self._pasting = self._reconnect = self._surveying = False
+        self._busy = self._pasting = self._reconnect = self._surveying = self._caps = False
         self._want = want                    # issue #5: 打开面板时点中的那一路, 列表回来后落位
         self._menu_ports = []                # 下拉列表当前列出的口
         self._build()
@@ -126,8 +131,12 @@ class SerialPanel(tk.Frame):
 
         # 左: 控制台
         left = tk.Frame(pane, bg=BG)
-        self.con_title = tk.Label(left, text="控制台 · 未连接", font=FONT, bg=BG, fg=DIM, anchor="w")
-        self.con_title.pack(fill="x")
+        head = tk.Frame(left, bg=BG)
+        head.pack(fill="x")
+        self.caps_mark = tk.Label(head, text="", font=FONT, bg=BG, fg=FG)
+        self.caps_mark.pack(side="right")
+        self.con_title = tk.Label(head, text="控制台 · 未连接", font=FONT, bg=BG, fg=DIM, anchor="w")
+        self.con_title.pack(side="left", fill="x", expand=True)
         self.console = tk.Text(left, font=FONT_MONO, bg=BG2, fg=th.TEXT, **th.SUNKEN,
                                insertbackground=FG, wrap="char", highlightthickness=2,
                                highlightbackground=BG2, highlightcolor=th.PRIMARY)
@@ -156,6 +165,7 @@ class SerialPanel(tk.Frame):
         self.chat_entry.no_ime = True       # 发往串口的命令, 不接中文输入 (中文输入的 NO_IME 约定)
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())
+        self.chat_entry.bind("<KeyPress>", self._note_caps, add="+")
         _btn(row, "发送", self.chat_send, bg=th.PRIMARY).pack(side="left", padx=(6, 0))
         pane.add(right, stretch="never", minsize=260, width=CHAT_WIDTH)
 
@@ -170,7 +180,16 @@ class SerialPanel(tk.Frame):
 
     # ------------------------------------------------------------ 控制台
 
+    def _note_caps(self, ev):
+        self._caps = th.caps_on(ev.state, ev.keysym)
+        self._paint_caps()
+
+    def _paint_caps(self):
+        text, fg = caps_view(self._caps, self.console.get("end-1c linestart", "end-1c"))
+        self.caps_mark.config(text=text, fg=fg)
+
     def _on_console_key(self, ev):
+        self._note_caps(ev)
         if ev.keysym == "F2":
             return self._toggle_focus()
         if ev.state & _CTRL and ev.keysym.lower() == "v":
@@ -307,6 +326,7 @@ class SerialPanel(tk.Frame):
             c.delete("1.0", "1000.0")
         c.mark_set("insert", "end-1c")
         c.see("end")
+        self._paint_caps()
 
     # ------------------------------------------------------------ 聊天
 
