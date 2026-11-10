@@ -479,6 +479,17 @@ def test_context_lines_prefixed_and_name_at_item_end():
     assert body == ["| foo", "| <SW1>"]
 
 
+def test_card_last_line_masks_secrets():
+    """#93: "设备最后一行"一块打码 (挂起时那一行和当前行); 醒目警告仍按原文判."""
+    raw = "Router(config)#snmp-server community s3cr3t-line RO"
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", raw, 60), T0, 10, context=raw)
+    c = cc.card(b.view(T0), 2, live="password s3cr3t-live")
+    assert "s3cr3t" not in json.dumps(c, ensure_ascii=False)
+    assert sw.MASK in c["items"][0]["line"] and "！！设备现在不在提示符上" in c["items"][0]["line"]
+
+
 def test_card_shows_device_last_line_for_held_key():
     """#74 审查: 人确认挂起的按键时, 看得到当时设备停在哪一行."""
     b = _book()

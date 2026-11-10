@@ -1881,3 +1881,52 @@ def test_gate_line_not_in_event_log():
         if g:
             assert "line" not in g and g["line_len"] == len(raw) and len(g["line_sha"]) == 16
     assert any(e.get("gate") for e in b.events if e["ev"] == "pending")
+
+
+# ------------------------------------------------------------ #93: 设备那一行不经理由进日志
+
+@pytest.mark.parametrize("raw", ["Router(config)#snmp-server community s3cr3t-line RO",
+                                 "set password s3cr3t-line [Y/N]:"])
+def test_device_line_with_secret_not_in_event_log_via_classify_key(raw):
+    """真实带口令的最后一行走 classify_key -> submit -> confirm -> finish: 理由和日志都没有明文."""
+    g = sw.classify_key("enter", raw, 60.0, vendor="cisco")
+    assert g["verdict"] == "confirm" and "s3cr3t" not in g["reason"] and g["line"] == raw   # 比对还要用原文
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "key", "enter", g, T0, timeout=30, context=raw)
+    b.confirm(p["id"], "human", T0 + 1, current=raw)
+    b.finish(p["id"], {"status": "refused", "echo": "", "note": "x"}, T0 + 2)
+    assert any(e.get("gate") for e in b.events)
+    assert "s3cr3t" not in json.dumps(b.events, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("key,text,quiet", [("enter", "", 60.0), ("enter", "Proceed? [confirm]", 60.0),
+                                            ("enter", "half output s3cr3t", 60.0), ("enter", "<SW1>", 1.0),
+                                            ("space", "<SW1>", None)])
+def test_classify_key_still_confirms_after_reason_change(key, text, quiet):
+    """反例: 理由不再引用设备行, 判定不能跟着松."""
+    g = sw.classify_key(key, text, quiet)
+    assert g["verdict"] == "confirm" and "s3cr3t" not in g["reason"]
+
+
+def test_shown_line_masks_and_keeps_one_line():
+    masked = sw.shown_line("Router(config)#snmp-server community s3cr3t-line RO")
+    assert "s3cr3t" not in masked and sw.MASK in masked
+    assert sw.shown_line("A\nB") == "A B"
+    assert sw.shown_line("Proceed with reload? [confirm]") == "Proceed with reload? [confirm]"
+    assert sw.shown_line(None) == ""
+
+
+def test_masked_view_masks_copy_only():
+    """给 Agent 的 pending_list: gate.line 打码; 原视图 (确认时比对、卡片要用) 不动."""
+    raw = "Router(config)#snmp-server community s3cr3t-line RO"
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    p = b.submit(1, "tokA", "agentA", "line", "y", dict(_gate_confirm(), line=raw), T0, timeout=30, context=raw)
+    view = b.view(T0)
+    masked = sw.masked_view(view, {1: "cisco"})
+    assert "s3cr3t" not in masked["pending"][0]["gate"]["line"] and view["pending"][0]["gate"]["line"] == raw
+    b.reject(p["id"], "human", T0 + 1)
+    view = b.view(T0 + 1)
+    assert "s3cr3t" not in sw.masked_view(view, {})["history"][-1]["gate"]["line"]
+    assert view["history"][-1]["gate"]["line"] == raw

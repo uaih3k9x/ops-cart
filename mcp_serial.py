@@ -356,8 +356,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         before, now_line = sw.last_line(text), sw.last_line(now_text)
         if now_text is not None and now_line == before and quiet is not None and quiet >= sw.HUMAN_QUIET_S:
             return gate
-        why = ("模型判的时候设备变了 (最后一行: " + (now_line[-80:] or "看不到") + ")" if now_line != before or now_text is None
-               else "模型判的时候设备日志还有动静, 可能有人正在敲")
+        why = (("模型判的时候设备变了" + ("" if now_line else " (现在看不到最后一行)")) if now_line != before or now_text is None
+               else "模型判的时候设备日志还有动静, 可能有人正在敲")     # 不引用设备行: 理由进执行绪日志 (#93)
         return dict(gate, verdict="confirm", layer=3, reason=f"{why}; 模型原本放行 ({gate.get('reason')}), 改为要人确认")
 
     def send_command(a):
@@ -435,9 +435,8 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
                     + ("" if vendor in sa.ALLOW else "认不出厂商或该厂商不开第 1 层白名单 (如 linux), 清单为空.")})]
 
     def pending_list(a):
-        if readonly:
-            return [mc.json_content(store.peek(a.get("slot")))]
-        return [mc.json_content(_run(lambda b, now: b.view(now, a.get("slot"))))]
+        view = store.peek(a.get("slot")) if readonly else _run(lambda b, now: b.view(now, a.get("slot")))
+        return [mc.json_content(sw.masked_view(view, rules().get("slots")))]
 
     def estop(a):
         slot = a.get("slot")
@@ -544,8 +543,8 @@ def recheck(it, dev, tail, rules, size=None):
     except Exception:                   # noqa: BLE001  看不到 = 不知道会回答什么
         text = None
     now_line = sw.last_line(text)
-    shown = now_line[-sw.LINE_SHOWN:] or "(看不到)"
     vendor = (rules().get("slots") or {}).get(it["slot"])
+    shown = sw.shown_line(now_line, vendor)[-sw.LINE_SHOWN:] or "(看不到)"     # 这句说明进执行绪日志, 打码 (#93)
     if it["kind"] == "key":
         g = sw.classify_key(it["cmd"], text, float("inf"), vendor=vendor)
         if g["verdict"] == "pass":
@@ -560,7 +559,7 @@ def recheck(it, dev, tail, rules, size=None):
                 and was_size is not None and size == was_size):
             return None                 # 挂起时就停在这个确认提示上: 人看过、明确要回答它; 还是同一行、日志没新字节才发
         why = ("看不到设备现在停在哪" if not now_line else
-               f"设备现在不在提示符上 (挂起时最后一行: {was or '(没记)'}), 这条发出去可能替人回答")
+               f"设备现在不在提示符上 (挂起时最后一行: {sw.shown_line(was, vendor) or '(没记)'}), 这条发出去可能替人回答")
     return f"确认时重看设备, 没发: {why}; 设备现在最后一行: {shown}. 要发请让 Agent 重新挂起"
 
 

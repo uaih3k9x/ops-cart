@@ -206,14 +206,14 @@ def _line_info(p, live=None, vendor=None):
 def _line_lines(p, live=None, vendor=None):
     """挂起时设备停在哪一行 (按键和命令都记, #74 第二、三轮); 给了 live 再附上当前最后一行. 都是设备输出, 只当数据显示.
     挂起时那一行不代表现在: 人确认时推车会重看一次. 车机确认框和命令行共用 (第五轮).
-    两行都过 one_line (#65 第六轮: 不可信文字压成一行、洗掉控制 / 格式字符, 防伪造推车自己的块).
+    两行都先打码 (#93) 再过 one_line (#65 第六轮: 不可信文字压成一行、洗掉控制 / 格式字符, 防伪造推车自己的块).
     醒目警告: 挂起时就停在确认提示上 (这条在回答它); 设备现在不在 (本槽位厂商的) 提示符上."""
     line = (p.get("gate") or {}).get("line")
-    out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{one_line(line, LINE_SHOW_MAX)}" if line else ""
+    out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{one_line(sw.shown_line(line, vendor), LINE_SHOW_MAX)}" if line else ""
     if line and p.get("kind") == "line" and sw.is_confirm_prompt(line):
         out = "\n！！这条会回答设备的确认提示（挂起时设备就停在上面），确认前看清楚" + out
     if live:
-        out += f"\n当前最后一行：{one_line(live, LINE_SHOW_MAX)}"
+        out += f"\n当前最后一行：{one_line(sw.shown_line(live, vendor), LINE_SHOW_MAX)}"
         if not sw.at_any_prompt(live, vendor):
             out += "\n！！设备现在不在提示符上，这条发出去可能替人回答问题"
     return out

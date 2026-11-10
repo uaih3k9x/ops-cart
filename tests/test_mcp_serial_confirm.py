@@ -357,6 +357,67 @@ def test_recheck_passes_vendor(rig):
     assert status in NOT_SENT and rig.sent == []
 
 
+@pytest.mark.parametrize("tool,args", [("send_key", {"key": "enter"}), ("send_command", {"command": "save"})])
+def test_recheck_vendor_end_to_end(rig, tool, args):
+    """#93: 登记思科, 挂起和确认时设备都停在 <SW1> (输出不变, #65 放行): 只有 recheck 按登记厂商判才拦得住."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = "<SW1>"
+    p = rig.ok(tool, dict(args, slot=1, lease=rig.lease(1)))
+    assert p["status"] == "pending"
+    status, note = _confirm(rig, p["id"])
+    assert status == "refused" and rig.sent == [] and "确认时重看设备" in note
+
+
+SECRET_LINE = "Router(config)#snmp-server community s3cr3t-line RO"
+
+
+def _log_text(rig):
+    return "".join(open(os.path.join(rig.log_dir, f), encoding="utf-8").read() for f in os.listdir(rig.log_dir))
+
+
+@pytest.mark.parametrize("tool,args", [("send_key", {"key": "enter"}), ("send_command", {"command": "save"})])
+def test_recheck_note_and_log_mask_device_line(rig, tool, args):
+    """#93: recheck 的说明要给人看设备停在哪, 但打码; 执行绪日志、pending_list 都没有明文."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = SECRET_LINE
+    p = rig.ok(tool, dict(args, slot=1, lease=rig.lease(1)))
+    assert "s3cr3t" not in p["reason"]
+    assert "s3cr3t" not in json.dumps(rig.ok("pending_list"), ensure_ascii=False)
+    status, note = _confirm(rig, p["id"])
+    assert status == "refused" and rig.sent == []
+    assert "s3cr3t" not in note and "snmp-server community" in note
+    assert "s3cr3t" not in json.dumps(rig.ok("pending_list"), ensure_ascii=False)
+    assert "s3cr3t" not in _log_text(rig)
+
+
+def test_settled_reason_does_not_quote_device_line(rig):
+    """#93: 模型判的时候设备变了, 转挂起: 理由说变了, 不引用设备行; 确实不直发."""
+    rig.model()
+    rig.tail_text["/dev/con-1"] = "<SW1>"
+    tok = rig.lease(1)
+    real = rig.llm
+
+    def moved(instructions, data, conf):
+        rig.tail_text["/dev/con-1"] = "snmp-agent community write s3cr3t-line"
+        return real(instructions, data, conf)
+    rig.llm = moved
+    p = rig.ok("send_command", {"slot": 1, "command": "system-view", "lease": tok})
+    assert p["status"] == "pending" and rig.sent == []
+    assert "设备变了" in p["reason"] and "s3cr3t" not in p["reason"]
+    assert "s3cr3t" not in _log_text(rig)
+
+
+def test_confirm_prompt_with_secret_still_matches_raw_line(rig):
+    """打码只在显示: 确认时比对用原文, 带口令词的确认提示没变就照常发."""
+    raw = "set password s3cr3t-line [Y/N]:"
+    rig.tail_text["/dev/con-1"] = f"<SW1>x\n{raw}"
+    tok = rig.lease(1)
+    p = _sc(rig, "y", tok)
+    assert rig.store.view()["pending"][0]["gate"]["line"] == raw
+    status, _note = _confirm(rig, p["id"])
+    assert status == "sent" and rig.sent == [("/dev/con-1", "y", False)]
+
+
 def test_recheck_covers_space(rig):
     tok = rig.lease(1)
     rig.tail_text["/dev/con-1"] = "Router#"

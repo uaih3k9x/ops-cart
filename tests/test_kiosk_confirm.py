@@ -49,6 +49,16 @@ def _fake(view):
     return calls, fake
 
 
+def test_open_confirm_passes_registered_vendor(monkeypatch):
+    """#93: 确认框按规则文件登记的厂商判"不在提示符上"; 没登记给 None."""
+    seen = {}
+    monkeypatch.setattr(kiosk, "ConfirmDialog", lambda *a, **kw: seen.update(kw) or "dlg")
+    monkeypatch.setattr(kiosk.sw, "load_rules", lambda: {"slots": {1: "cisco"}})
+    _calls, fake = _fake(_view())
+    kiosk.Kiosk._open_confirm(fake, 1)
+    assert fake._confirm_win == "dlg" and seen["vendor"](1) == "cisco" and seen["vendor"](2) is None
+
+
 def test_head_click_opens_confirm_only_when_agent_involved():
     calls, fake = _fake(_view(pending_slot=1, writer_slot=2, stop=3))
     for n in (1, 2, 3, 4):

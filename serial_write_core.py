@@ -426,9 +426,9 @@ def classify_key(key, text=None, quiet_s=None, vendor=None):
     if not ln:
         return _gate("confirm", f"看不到设备最后一行 (读不到输出或日志是空的), 不知道 {k['label']} 会回答什么, 要人确认")
     if is_confirm_prompt(ln):
-        return _gate("confirm", f"设备停在确认提示上 ({ln[-80:]}), {k['label']} 等于替人回答, 要人确认", line=ln)
-    if not at_any_prompt(ln, vendor):
-        return _gate("confirm", f"设备不在提示符或翻页上 (最后一行: {ln[-80:]}; 可能是确认提示后又刷了日志、"
+        return _gate("confirm", f"设备停在确认提示上, {k['label']} 等于替人回答, 要人确认", line=ln)
+    if not at_any_prompt(ln, vendor):           # 理由进执行绪日志, 不引用设备行 (#93); 那一行在 gate.line, 卡片单独一块
+        return _gate("confirm", f"设备不在提示符或翻页上 (可能是确认提示后又刷了日志、"
                                 f"半截输出或开机滚屏), {k['label']} 可能替人回答, 要人确认", line=ln)
     if key == "space" and _PAGER.fullmatch(ln):        # 翻页空格不会回答确认提示, 不等 5 秒 (#74 第二轮)
         return _gate("pass", f"固定特殊键 {k['label']} (第 1 层放行, 翻页)", line=ln)
@@ -564,6 +564,23 @@ def _ctx_line(ln, in_key=False, vendor=None):
         kept = rest[:cut[1]]
         return _show(head + kept) + ("" if kept.endswith((" ", "=", "-p", "/")) or not kept else " ") + MASK, in_key
     return _show(_ANSI.sub("", ln)), in_key
+
+
+def shown_line(ln, vendor=None):
+    """设备的一行 -> 打码后的一行, 给理由说明 / 确认框 / pending_list 用 (#93). 先打码后截短, 否则口令词可能被截掉.
+    压空白在打码前: 换行拆开的 password\\nxxx 也认得出."""
+    return _ctx_line(" ".join(str(ln or "").split()), False, vendor)[0]
+
+
+def masked_view(view, vendors=None):
+    """给 Agent 的视图: 挂起项和历史的 gate.line 打码 (#93), 返回副本. Book.view 本身不动: 确认时比对要原文.
+    vendors = {槽位: 登记的厂商}."""
+    def mask(it):
+        g = it.get("gate")
+        if not (isinstance(g, dict) and g.get("line")):
+            return it
+        return dict(it, gate=dict(g, line=shown_line(g["line"], (vendors or {}).get(it.get("slot")))))
+    return dict(view, pending=[mask(it) for it in view["pending"]], history=[mask(it) for it in view["history"]])
 
 
 def _tail_hash(text):

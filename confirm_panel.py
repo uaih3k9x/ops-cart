@@ -18,8 +18,16 @@ BG, CARD, FG, DIM, BTN = th.follow(                     # 条目凹进去 (按�
                  "stop": (th.ALERT_BG, th.WHITE), "plain": (th.BTN2, th.FG)})
 
 
+def _ask(fn, n):
+    """车机给的回调 (当前最后一行 / 槽位厂商): 没给或出错就是 None, 不影响确认框. 这里只管显示, 发不发 recheck 自己判."""
+    try:
+        return fn(n) if fn else None
+    except Exception:                   # noqa: BLE001
+        return None
+
+
 class ConfirmDialog(tk.Toplevel):
-    def __init__(self, master, n, view, on_action, on_serial=None, ask=None, live=None):
+    def __init__(self, master, n, view, on_action, on_serial=None, ask=None, live=None, vendor=None):
         super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=cc.PENDING_COLOR, **th.DIALOG)
         self.n, self.on_action, self.on_serial = n, on_action, on_serial
         self.ask = ask or (lambda title, msg: messagebox.askyesno(title, msg, parent=self))
@@ -39,6 +47,7 @@ class ConfirmDialog(tk.Toplevel):
         self.foot.pack(pady=(6, 14))
         self._key, self._meta, self._reason = None, {}, {}
         self.live = live                # n -> 设备当前最后一行 (#74 第三轮); 出错就不显示
+        self.vendor = vendor            # n -> 规则文件登记的厂商 (#93); 没登记 None
         self.refresh(view)
 
     # ---- 画
@@ -52,12 +61,9 @@ class ConfirmDialog(tk.Toplevel):
 
     def refresh(self, view):
         """视图读不懂 (None / 缺字段) 当全部急停画."""
+        line, vendor = _ask(self.live, self.n), _ask(self.vendor, self.n)
         try:
-            line = self.live(self.n) if self.live else None
-        except Exception:                   # noqa: BLE001  读不到当前行不影响确认框
-            line = None
-        try:
-            c = cc.card(view, self.n, live=line)
+            c = cc.card(view, self.n, live=line, vendor=vendor)
             states = cc.slot_states(view)
         except (KeyError, TypeError, StopIteration):
             view = cc.stopped_view()
