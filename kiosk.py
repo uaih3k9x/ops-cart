@@ -32,6 +32,7 @@ import mcp_serial
 import sun_core
 import ups_core as uc
 import serial_core as sc
+import serial_write_core as sw
 import observe_panel
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
@@ -554,7 +555,8 @@ class Kiosk(tk.Tk):
             self._close_confirm()
             self._open_pane("serial", lc.slot_for_lamp(f"con-{n}"))
         self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial,
-                                          live=lambda k: mcp_serial.log_last_line(lc.SLOTS[k - 1]))
+                                          live=lambda k: mcp_serial.log_last_line(lc.SLOTS[k - 1]),
+                                          vendor=lambda k: (sw.load_rules().get("slots") or {}).get(k))
 
     def _close_confirm(self):
         if self._confirm_win is not None and self._confirm_win.winfo_exists():
@@ -1364,6 +1366,7 @@ class Kiosk(tk.Tk):
                      insertbackground=th.FG, **th.SUNKEN)
         e.no_ime = True                     # 要人亲手敲, 不接中文输入 (中文输入的 NO_IME 约定)
         e.pack(ipady=8)
+        th.caps_hint(e)
         e.bind("<Return>", lambda _e: self._try_unlock())
         self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg=th.BG, fg=th.DIM)
         self._lock_msg.pack(pady=12)
