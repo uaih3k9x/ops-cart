@@ -178,12 +178,6 @@ def test_poll_args_only_while_active():
     assert d.poll_args() is None and not d.active
 
 
-def test_poll_requests_only_tail_of_long_output():
-    d = _sent()
-    d.polled(_body(output="x" * 10, total=bf.OUTPUT_TAIL + 500))
-    assert d.poll_args() == (TID, 500)
-
-
 def test_polled_shows_progress_and_reply_as_untrusted():
     d = _sent()
     d.polled(_body(output="第一行\n第二行\x1b[0m\n", tools=3, rejected=2))
@@ -191,16 +185,9 @@ def test_polled_shows_progress_and_reply_as_untrusted():
     assert "在做事" in rows[0][0] and rows[0][1] == "own"
     assert any("3" in t and "工具" in t and tag == "dim" for t, tag in rows)
     assert any("2" in t and "自动拒绝" in t and tag == "bad" for t, tag in rows)
-    said = [t for t, tag in rows if tag == "untrusted"]
-    assert said == [bf.SAYS + "第一行", bf.SAYS + bf.clean("第二行\x1b[0m")]
-    assert all("\x1b" not in t for t, _ in rows)
-
-
-def test_polled_only_last_lines_kept():
-    d = _sent()
-    d.polled(_body(output="\n".join(f"行{i}" for i in range(50))))
-    said = [t for t, tag in d.rows() if tag == "untrusted"]
-    assert len(said) == bf.OUTPUT_LINES and said[-1] == bf.SAYS + "行49"
+    done, live = d.log_rows()
+    assert done == [(bf.SAYS + "第一行", "untrusted"), (bf.SAYS + bf.clean("第二行\x1b[0m"), "untrusted")] and live == []
+    assert all("\x1b" not in t for t, _ in done)
 
 
 def test_polled_done_allows_next_task():
@@ -347,6 +334,220 @@ def test_polled_ignores_reply_for_another_task():
     d = _sent()
     d.polled(_body("completed", task_id="t-999"))
     assert d.active and d.task["state"] == "starting"
+
+
+# ------------------------------------------------------------ Desk: 回复增量 (滚动区)
+
+def _feed(d, text, offset=None, state="running", total=None, **kw):
+    offset = d.got if offset is None else offset
+    d.polled(_body(state, output=text, total=offset + len(text) if total is None else total, output_offset=offset, **kw))
+
+
+def _said(d):
+    done, live = d.log_rows()
+    return [t[len(bf.SAYS):] for t, _ in done], live
+
+
+def test_poll_asks_only_for_what_it_has_not_got():
+    d = _sent()
+    _feed(d, "x" * 10)
+    assert d.poll_args() == (TID, 10)
+    _feed(d, "y" * 5)
+    assert d.poll_args() == (TID, 15)
+
+
+def test_log_keeps_every_line_not_just_last_five():
+    d = _sent()
+    _feed(d, "".join(f"行{i}\n" for i in range(50)))
+    done, _ = _said(d)
+    assert len(done) == 50 and done[0] == "行0" and done[-1] == "行49"
+
+
+def test_log_rows_are_prefixed_and_tagged_untrusted():
+    d = _sent()
+    _feed(d, "一\n半")
+    done, live = d.log_rows()
+    assert done == [(bf.SAYS + "一", "untrusted")] and live == [(bf.SAYS + "半", "untrusted")]
+
+
+def test_log_holds_partial_line_until_newline():
+    d = _sent()
+    _feed(d, "前半")
+    assert _said(d) == ([], [(bf.SAYS + "前半", "untrusted")])
+    _feed(d, "后半\n下一")
+    assert _said(d) == (["前半后半"], [(bf.SAYS + "下一", "untrusted")])
+
+
+def test_log_committed_lines_never_rewritten():
+    d = _sent()
+    _feed(d, "一\n二\n")
+    first = list(d.log_rows()[0])
+    _feed(d, "三\n")
+    assert d.log_rows()[0][:2] == first
+
+
+def test_log_ignores_duplicate_or_stale_reply():
+    d = _sent()
+    _feed(d, "一\n")
+    _feed(d, "一\n", offset=0)
+    assert _said(d)[0] == ["一"] and d.got == 2
+
+
+def test_log_ignores_reply_from_the_future():
+    d = _sent()
+    _feed(d, "丢了开头\n", offset=100)
+    assert _said(d)[0] == [] and d.got == 0
+
+
+def test_log_stale_reply_still_updates_state():
+    d = _sent()
+    _feed(d, "一\n")
+    _feed(d, "x", offset=0, state="completed", total=2)
+    assert not d.active and d.got == 2 and _said(d)[0] == ["一"]
+
+
+def test_log_cleans_control_sequences():
+    d = _sent()
+    _feed(d, "\x1b[31m红\x1b[0m\x07字\u202e反\n\x1b]0;标题\x07正文\n")
+    done, _ = _said(d)
+    assert done[0] == bf.clean("\x1b[31m红\x1b[0m\x07字\u202e反")
+    assert all(ch not in "".join(done) for ch in ("\x1b", "\x07", "\u202e"))
+
+
+def test_log_drops_blank_lines():
+    d = _sent()
+    _feed(d, "一\n\n   \n二\n")
+    assert _said(d)[0] == ["一", "二"]
+
+
+def test_log_long_line_is_split_not_truncated():
+    d = _sent()
+    _feed(d, "字" * (tc.LINE_CHUNK * 2 + 5) + "\n")
+    done, _ = _said(d)
+    assert [len(x) for x in done] == [tc.LINE_CHUNK, tc.LINE_CHUNK, 5] and "…" not in "".join(done)
+
+
+def test_log_long_partial_commits_in_chunks():
+    d = _sent()
+    _feed(d, "字" * (tc.LINE_CHUNK + 3))
+    done, live = _said(d)
+    assert [len(x) for x in done] == [tc.LINE_CHUNK] and live == [(bf.SAYS + "字" * 3, "untrusted")]
+
+
+def test_log_length_is_capped_and_says_so():
+    d = _sent()
+    for _ in range(tc.LOG_MAX // tc.FEED_MAX + 3):
+        _feed(d, ("字" * 99 + "\n") * (tc.FEED_MAX // 100))
+    done, live = d.log_rows()
+    assert sum(len(t) for t, _ in done) <= tc.LOG_MAX + len(done) * len(bf.SAYS)
+    assert live and live[-1][1] == "dim" and str(tc.LOG_MAX) in live[-1][0]
+
+
+def test_log_notes_supervisor_truncation():
+    d = _sent()
+    _feed(d, "一\n", output_truncated=True)
+    assert d.log_rows()[1][-1][1] == "dim"
+
+
+def test_log_feeds_at_most_a_bounded_slice_per_poll():
+    """主线程每次轮询只处理这么多字, 回复再大也不卡界面."""
+    d = _sent()
+    _feed(d, "x" * (tc.FEED_MAX * 2), state="completed")
+    assert d.got == tc.FEED_MAX and not d.active
+
+
+def test_poll_continues_after_task_ends_until_drained():
+    d = _sent()
+    text = "x" * (tc.FEED_MAX + 7)
+    _feed(d, text, state="completed")
+    assert d.poll_args() == (TID, tc.FEED_MAX)
+    _feed(d, text[tc.FEED_MAX:], state="completed", total=len(text))
+    assert d.poll_args() is None and d.got == len(text)
+
+
+def test_poll_stops_if_supervisor_lies_about_total():
+    d = _sent()
+    _feed(d, "", state="completed", total=999999)
+    assert d.poll_args() is None
+
+
+def test_new_task_clears_log_but_gone_keeps_it():
+    d = _sent()
+    _feed(d, "旧\n半")
+    d.polled(tc.Refused("no such task"))
+    assert _said(d)[0] == ["旧"]
+    d.begin("下一条", "")
+    d.sent({"task_id": TID, "state": "starting"})
+    assert d.log_rows() == ([], []) and d.got == 0 and d.poll_args() == (TID, 0)
+
+
+def test_rows_no_longer_carry_reply_text():
+    d = _sent()
+    _feed(d, "回复正文\n")
+    assert all("回复正文" not in t for t, _ in d.rows())
+
+
+def test_reply_limit_fits_a_full_reply():
+    assert tc.REPLY_MAX >= 3 * (1 << 20)
+
+
+# ------------------------------------------------------------ 健康闸门 / 失败分类 (v1.2)
+
+@pytest.mark.parametrize("code,word", [("container_down", "容器"), ("egress_down", "出口"), ("docker_down", "Docker")])
+def test_send_block_when_runtime_down(code, word):
+    why = tc.send_block(_no, _no, _online(health=code))
+    assert word in why and code not in why
+
+
+@pytest.mark.parametrize("code", [None, "ok", "unknown", "other"])
+def test_send_block_open_for_ok_unknown_and_old_supervisor(code):
+    assert tc.send_block(_no, _no, _online(health=code)) == ""
+
+
+def test_send_block_view_without_health_key_still_open():
+    view = _online()
+    view.pop("health", None)
+    assert tc.send_block(_no, _no, view) == ""
+
+
+def test_send_block_estop_beats_health():
+    assert "急停" in tc.send_block(_no, _yes, _online(health="container_down"))
+
+
+def test_failed_with_code_shows_reason_not_raw_error():
+    d = _sent()
+    d.polled(_body("failed", error="ACP process exited (code 1)", fail_code="container_down"))
+    rows = d.rows()
+    assert (bf.FAIL_TEXT["container_down"], "bad") in rows
+    assert all("ACP process" not in t for t, _ in rows)
+
+
+def test_failed_without_code_keeps_old_behaviour():
+    d = _sent()
+    d.polled(_body("failed", error="ACP process exited (code 1)"))
+    assert (bf.SAYS + "ACP process exited (code 1)", "untrusted") in d.rows()
+
+
+@pytest.mark.parametrize("code", ["瞎编<<>>", "CONTAINER_DOWN"])
+def test_failed_unknown_code_shows_other(code):
+    d = _sent()
+    d.polled(_body("failed", error="原始错误", fail_code=code))
+    rows = d.rows()
+    assert (bf.FAIL_OTHER, "bad") in rows and "其他" in bf.FAIL_OTHER
+    assert all("瞎编" not in t and "原始错误" not in t and code not in t for t, _ in rows)
+
+
+@pytest.mark.parametrize("code", [5, ["acp_exit"], {"a": 1}, ""])
+def test_failed_junk_code_is_treated_as_absent(code):
+    d = _sent()
+    d.polled(_body("failed", fail_code=code))
+    assert d.task["fail"] == ""
+
+
+def test_running_task_shows_no_failure():
+    d = _sent()
+    d.polled(_body("running", fail_code="acp_exit"))
+    assert (bf.FAIL_TEXT["acp_exit"], "bad") not in d.rows()
 
 
 # ------------------------------------------------------------ Desk: 取消

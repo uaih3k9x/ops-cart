@@ -25,7 +25,10 @@ import cartlog
 
 PROMPT_MAX = 2000
 CALL_S = 5.0
-REPLY_MAX = 1 << 20
+REPLY_MAX = 4 << 20              # 一次回复可能是整段输出 + 全部工具摘要; 单行上限和 CALL_S 兜着, 卡不住后台线程
+LOG_MAX = 200000                # 滚动区最多留这么多字, 和 supervisor 的输出上限一样
+FEED_MAX = 32000                # 主线程一次轮询最多处理这么多字, 没处理完的下次接着要
+LINE_CHUNK = 1000               # 超长的行切开显示, 不截断
 SOURCE = "车机·人"
 OFFLINE = "大肥鱼不在线"
 LOCKED = "车机已锁屏，解锁后才能发"
@@ -83,7 +86,10 @@ def send_block(locked, estop, view):
         return LOCKED
     if _held(estop) or view.get("estop_seen"):
         return ESTOP
-    return "" if view.get("online") else OFFLINE
+    if not view.get("online"):
+        return OFFLINE
+    code = view.get("health")           # 只拦已知的故障; 旧 supervisor (没字段)、unknown、不认识的值都照常发
+    return bf.HEALTH_TEXT[code][1] if code in bf.HEALTH_TEXT else ""
 
 
 def parse_task(body):
@@ -94,12 +100,15 @@ def parse_task(body):
     u = u if isinstance(u, dict) else {}
     output = u.get("output") if isinstance(u.get("output"), str) else ""
     reason = u.get("stop_reason")
+    fail = bf.fail_text(body.get("fail_code"))      # 有分类就只显示车机写死的原因; 旧 supervisor 没这个字段, 照旧显示 error
     return {"task_id": body["task_id"], "state": body["state"], "elapsed_s": bf._num(body.get("elapsed_s"), 0, bf.ELAPSED_MAX),
-            "total": bf._int(body.get("output_total_chars"), bf.SEQ_MAX) or 0, "output": output[-bf.OUTPUT_TAIL:],
+            "total": bf._int(body.get("output_total_chars"), bf.SEQ_MAX) or 0, "output": output,
+            "offset": bf._int(body.get("output_offset"), bf.SEQ_MAX) or 0, "truncated": body.get("output_truncated") is True,
+            "fail": fail,
             "steps": len(u["tools"]) if isinstance(u.get("tools"), list) else 0,
             "rejected": len(u["rejected_approvals"]) if isinstance(u.get("rejected_approvals"), list) else 0,
             "stop_reason": bf.STOP_REASONS.get(reason, "其他") if isinstance(reason, str) and reason else "",
-            "error": bf.clean(u.get("error"))}
+            "error": "" if fail else bf.clean(u.get("error"))}
 
 
 class Desk:
@@ -112,7 +121,13 @@ class Desk:
         self.task_id, self.task = None, None
         self.cancelling = None              # 在途的取消是给哪个任务的
         self.refused = 0                    # 连续被拒的轮询次数
-        self.gen = 0                        # 发送成功一次 +1: 面板据此清空输入框
+        self.gen = 0                        # 发送成功一次 +1: 面板据此清空输入框和滚动区
+        self._reset_log()
+
+    def _reset_log(self):
+        self.lines, self.tail = [], ""      # 定稿的行 (只追加); 还没等到换行的半行 (未清洗)
+        self.got = self.kept = 0            # 收到的字数 (下次轮询的偏移); 留下的字数
+        self.more = self.cut = False        # 任务结束了但还没收完; 超长截了
 
     @property
     def active(self):
@@ -152,12 +167,13 @@ class Desk:
             self.task_id, self.draft, self.cancel_asked, self.refused = res["task_id"], "", False, 0
             self.cancelling = None          # 上一个任务在途的取消和这个任务无关, 迟到的结果 cancelled() 会丢掉
             self.task = dict(parse_task({"task_id": self.task_id, "state": "starting"}))
+            self._reset_log()
             self.gen += 1
             self._say("已发出")
 
     def poll_args(self):
-        """正在跟任务 -> (task_id, 从第几个字符读); 只读尾巴, 长任务不用每次搬全文."""
-        return (self.task_id, max(0, self.task["total"] - bf.OUTPUT_TAIL)) if self.active else None
+        """正在跟任务, 或任务结束了但回复还没收完 -> (task_id, 已收到的字数), 每次只要新内容."""
+        return (self.task_id, self.got) if self.active or (self.task is not None and self.more) else None
 
     def _gone(self, why):
         self.task_id, self.task = None, None
@@ -179,8 +195,46 @@ class Desk:
             if task is None:
                 self._gone("任务状态读不懂，不再跟踪")
             elif task["task_id"] == self.task_id:
+                self._feed(task)
                 self.task, self.refused = task, 0
                 self._say(_ASKED if self.cancel_asked and self.active else "")
+
+    def _feed(self, task):
+        """收下这次回复的增量. 偏移对不上 (迟到 / 重复的回复) 整段不收, 下次还从 got 读; 一次最多处理 FEED_MAX 字."""
+        text = task.pop("output")
+        if task["offset"] != self.got:
+            return
+        text = text[:FEED_MAX]
+        self.got += len(text)
+        self.more = bool(text) and self.got < task["total"]
+        room = LOG_MAX - self.kept
+        self.cut = self.cut or task["truncated"] or len(text) > room
+        text = text[:room]
+        self.kept += len(text)
+        parts = (self.tail + text).splitlines(keepends=True)
+        self.tail = parts.pop() if parts and parts[-1].splitlines()[0] == parts[-1] else ""
+        for part in parts:
+            self._commit(part)
+        while len(self.tail) >= LINE_CHUNK:
+            self._commit(self.tail[:LINE_CHUNK])
+            self.tail = self.tail[LINE_CHUNK:]
+
+    def _commit(self, raw):
+        """一行定稿: 过长的切成几行, 每段单独清洗; 空行不显示."""
+        for i in range(0, len(raw), LINE_CHUNK):
+            text = bf.clean(raw[i:i + LINE_CHUNK], LINE_CHUNK)
+            if text:
+                self.lines.append((bf.SAYS + text, "untrusted"))
+
+    def log_rows(self):
+        """滚动区的内容 -> (定稿的行, 还会变的行). 定稿的行只会在后面追加, 面板据此增量刷新."""
+        live = []
+        text = bf.clean(self.tail, LINE_CHUNK)
+        if text:
+            live.append((bf.SAYS + text, "untrusted"))
+        if self.cut:
+            live.append((f"回复太长，车机只显示前 {LOG_MAX} 字", "dim"))
+        return self.lines, live
 
     def begin_cancel(self):
         if not self.active or self.cancelling:
@@ -221,8 +275,10 @@ class Desk:
                 out.append((f"调用工具 {t['steps']} 次", "dim"))
             if t["rejected"]:
                 out.append((f"{t['rejected']} 个动作被自动拒绝", "bad"))
-            lines = [x for x in (bf.clean(ln) for ln in t["output"].splitlines()) if x][-bf.OUTPUT_LINES:]
-            out += [(bf.SAYS + x, "untrusted") for x in lines + ([t["error"]] if t["error"] else [])]
+            if t["state"] == "failed" and t["fail"]:
+                out.append((t["fail"], "bad"))
+            if t["error"]:
+                out.append((bf.SAYS + t["error"], "untrusted"))
         if self.said:
             out.append((bf.SAYS + self.said, "untrusted"))
         return out

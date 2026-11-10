@@ -254,3 +254,386 @@ def test_refresh_without_desk_does_not_poll():
     fake._poll = bp.BigfishPanel._poll.__get__(fake)
     fake.refresh()
     assert len(after) == 1 and "text" not in fake.hint.cfg
+
+
+# ------------------------------------------------------------ 回复滚动区: 假 Text, 不起 Tk
+
+TAIL_Y, LINE_H, LOG_H, LOG_PADY = 568, 20, 600, 12     # 末行正好贴着底部内边距
+
+
+class _Log:
+    """假 Text, 按字符建模, 守真 Tk 的 end 语义: 末尾有一个删不掉的换行, "end" 在它后面, "end-1c" 在它前面;
+    删除范围碰到这个换行且起点在行首时, 起点前的换行也一起删 (Tk 把它当成"删整行")."""
+
+    def __init__(self, view=(0.0, 1.0)):
+        self.chars, self.view, self.seen, self.moved, self.state, self.writes = [], view, [], [], "disabled", 0
+        self.viewable, self.tail_y = True, TAIL_Y if view[1] >= 1.0 else None       # 末行的 y, None = 不在屏上
+
+    @property
+    def lines(self):
+        text = "".join(c for c, _ in self.chars)
+        out, at = [], 0
+        for line in text.split("\n"):
+            if at < len(self.chars):
+                out.append((line, self.chars[at][1]))
+            at += len(line) + 1
+        return out
+
+    def yview(self):
+        return self.view
+
+    def yview_moveto(self, fraction):
+        self.moved.append(fraction)
+
+    def config(self, **kw):
+        self.state = kw.get("state", self.state)
+
+    def _at(self, index):
+        if index == "end":
+            return len(self.chars) + 1
+        if index == "end-1c":
+            return len(self.chars)
+        line, column = (int(x) for x in index.split("."))
+        assert column == 0
+        at = 0
+        for _ in range(line - 1):
+            found = next((i for i in range(at, len(self.chars)) if self.chars[i][0] == "\n"), None)
+            if found is None:
+                return len(self.chars)
+            at = found + 1
+        return at
+
+    def delete(self, first, last):
+        assert self.state == "normal"
+        start, stop = self._at(first), self._at(last)
+        if stop > len(self.chars):
+            stop = len(self.chars)
+            if 0 < start <= stop and self.chars[start - 1][0] == "\n":
+                start -= 1
+        del self.chars[start:stop]
+        self.writes += 1
+
+    def insert(self, _at, text, tag):
+        assert self.state == "normal" and text.endswith("\n")
+        self.chars.extend((c, tag) for c in text)
+        self.writes += 1
+
+    def see(self, where):
+        self.seen.append(where)
+
+    def winfo_viewable(self):
+        return self.viewable
+
+    def winfo_height(self):
+        return LOG_H
+
+    def cget(self, _key):
+        return LOG_PADY
+
+    def dlineinfo(self, index):
+        assert self.viewable and index == "end-1c"      # 没上屏时量出来的不算数
+        return None if self.tail_y is None else (16, self.tail_y, 700, LINE_H, 16)
+
+
+def _log_fake(view=(0.0, 1.0)):
+    fake, _jobs = _fake()
+    fake.desk.begin("看下状态", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    fake.log = _Log(view)
+    fake._log_gen, fake._log_n, fake._log_live = None, 0, []
+    fake._follow, fake._log_placed = True, True
+    fake._update_log = bp.BigfishPanel._update_log.__get__(fake)
+    fake._log_at_bottom = bp.BigfishPanel._log_at_bottom.__get__(fake)
+    fake._log_shown = bp.BigfishPanel._log_shown.__get__(fake)
+    return fake
+
+
+def _feed(fake, text):
+    got = fake.desk.got
+    fake.desk.polled({"task_id": TID, "state": "running", "output_offset": got, "output_total_chars": got + len(text),
+                      "untrusted_agent_output": {"output": text}})
+
+
+def _plain(fake):
+    return [t[len(bf.SAYS):] for t, _ in fake.log.lines]
+
+
+def test_log_first_paint_inserts_all_and_follows_bottom():
+    fake = _log_fake()
+    _feed(fake, "一\n二\n")
+    fake._update_log()
+    assert _plain(fake) == ["一", "二"] and fake.log.seen == ["end"] and fake.log.state == "disabled"
+    assert all(tag == "untrusted" for _, tag in fake.log.lines)
+
+
+def test_log_no_change_does_not_touch_widget():
+    fake = _log_fake()
+    _feed(fake, "一\n半")
+    fake._update_log()
+    writes, seen = fake.log.writes, list(fake.log.seen)
+    fake._update_log()
+    assert fake.log.writes == writes and fake.log.seen == seen
+
+
+def test_log_only_appends_and_keeps_earlier_lines():
+    fake = _log_fake()
+    _feed(fake, "一\n二\n")
+    fake._update_log()
+    deletes = []
+    real = fake.log.delete
+    fake.log.delete = lambda a, b: deletes.append(a) or real(a, b)
+    _feed(fake, "三\n")
+    fake._update_log()
+    assert _plain(fake) == ["一", "二", "三"] and deletes == ["3.0"]
+
+
+def test_log_partial_line_is_replaced_in_place():
+    fake = _log_fake()
+    _feed(fake, "一\n前")
+    fake._update_log()
+    _feed(fake, "后")
+    fake._update_log()
+    assert _plain(fake) == ["一", "前后"]
+    _feed(fake, "\n")
+    fake._update_log()
+    assert _plain(fake) == ["一", "前后"]
+
+
+def test_log_scrolled_up_is_not_pulled_back():
+    fake = _log_fake(view=(0.1, 0.5))
+    _feed(fake, "一\n")
+    fake._update_log()
+    _feed(fake, "二\n")
+    fake._update_log()
+    assert fake.log.seen == [] and _plain(fake) == ["一", "二"]
+
+
+def test_log_resumes_following_when_back_at_bottom():
+    fake = _log_fake(view=(0.1, 0.5))
+    _feed(fake, "一\n")
+    fake._update_log()
+    fake.log.tail_y = TAIL_Y
+    _feed(fake, "二\n")
+    fake._update_log()
+    assert fake.log.seen == ["end"]
+
+
+def test_log_partly_visible_last_line_is_not_bottom():
+    fake = _log_fake()
+    fake.log.tail_y = TAIL_Y + LINE_H // 2              # 上翻一行, 末行还露半截
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake.log.seen == [] and fake._follow is False
+
+
+def test_log_off_screen_keeps_follow_without_measuring():
+    fake = _log_fake()
+    fake.log.viewable = False                           # dlineinfo 没上屏时读了会断言失败
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake._follow is True and fake.log.seen == ["end"]
+
+
+def test_log_not_measured_before_first_layout():
+    fake = _log_fake()
+    fake._log_placed, fake.log.tail_y = False, None     # 重开面板: 已映射, 但 Map / Configure 还没来, 视图还在开头
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake._follow is True and fake.log.seen == ["end"]
+
+
+def test_log_scrolled_up_state_kept_while_off_screen():
+    fake = _log_fake()
+    fake._update_log()
+    fake._follow, fake.log.viewable = False, False
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake._follow is False and fake.log.seen == []
+
+
+def test_log_shown_jumps_to_end_when_following():
+    fake = _log_fake()
+    fake._log_placed = False
+    fake._log_shown()
+    assert fake._log_placed is True and fake.log.seen == ["end"]
+
+
+def test_log_shown_leaves_scrolled_up_view_alone():
+    fake = _log_fake()
+    fake._follow = False
+    fake._log_shown()
+    assert fake.log.seen == []
+
+
+def test_log_position_tracked_even_without_new_output():
+    fake = _log_fake()
+    _feed(fake, "一\n")
+    fake._update_log()
+    fake.log.tail_y = None                              # 人翻上去了, 这轮没有新内容
+    fake._update_log()
+    assert fake._follow is False                        # 之后窗口变矮 (<Configure>) 不能把人拉回底部
+
+
+def test_log_new_task_follows_even_if_scrolled_up_before():
+    fake = _log_fake()
+    _feed(fake, "旧\n")
+    fake._update_log()
+    fake._follow, fake.log.viewable = False, False
+    fake.desk.begin("下一条", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    _feed(fake, "新\n")
+    fake._update_log()
+    assert fake._follow is True and fake.log.seen[-1] == "end"
+
+
+def test_log_new_task_starts_over():
+    fake = _log_fake()
+    _feed(fake, "旧\n")
+    fake._update_log()
+    fake.desk.begin("下一条", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    _feed(fake, "新\n")
+    fake._update_log()
+    assert _plain(fake) == ["新"]
+
+
+def test_log_new_task_with_no_output_yet_clears_old():
+    fake = _log_fake()
+    _feed(fake, "旧\n")
+    fake._update_log()
+    fake.desk.begin("下一条", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    fake._update_log()
+    assert fake.log.lines == []
+
+
+def test_log_first_paint_is_batched_so_main_thread_stays_free():
+    fake = _log_fake()
+    fake.desk.lines.extend((f"{bf.SAYS}{i}", "untrusted") for i in range(bp.LOG_BATCH + 5))
+    fake.desk.tail = "半"
+    fake._update_log()
+    assert len(fake.log.lines) == bp.LOG_BATCH and fake.log.lines[-1][0] == f"{bf.SAYS}{bp.LOG_BATCH - 1}"
+    fake._update_log()
+    assert len(fake.log.lines) == bp.LOG_BATCH + 6 and fake.log.lines[-1][0] == bf.SAYS + "半"
+
+
+def test_draw_updates_log_and_status_pane():
+    fake = _log_fake()
+    fake.text = _Log()
+    fake._shown = None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    _feed(fake, "一\n")
+    bp.BigfishPanel._draw.__get__(fake)(_online(), NOW)
+    assert _plain(fake) == ["一"] and any("派的任务" in t for t, _ in fake.text.lines)
+    assert all("一" != t for t, _ in fake.text.lines)
+
+
+def test_draw_skips_unchanged_status_pane():
+    fake = _log_fake()
+    fake.text = _Log()
+    fake._shown = None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    draw = bp.BigfishPanel._draw.__get__(fake)
+    draw(_online(), NOW)
+    writes = fake.text.writes
+    draw(_online(), NOW)
+    assert fake.text.writes == writes
+
+
+def test_status_pane_keeps_scroll_position_on_redraw():
+    fake = _log_fake()
+    fake.text = _Log(view=(0.4, 0.8))
+    fake._shown = None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    bp.BigfishPanel._draw.__get__(fake)(_online(), NOW)
+    assert fake.text.moved == [0.4]
+
+
+class _Tk:
+    def __init__(self, *_a, **kw):
+        self.kw, self.packed, self.binds = dict(kw), None, {}
+
+    def config(self, **kw):
+        self.kw.update(kw)
+
+    def pack(self, **kw):
+        self.packed = kw
+
+    def bind(self, event, fn):
+        self.binds[event] = fn
+
+    def set(self, *_a):
+        pass
+
+    def yview(self, *_a):
+        pass
+
+
+def _built(monkeypatch, desk):
+    bars = []
+    monkeypatch.setattr(bp.tk, "Frame", _Tk)
+    monkeypatch.setattr(bp.tk, "Scrollbar", lambda *a, **k: bars.append(_Tk(*a, **k)) or bars[-1])
+    fake = SimpleNamespace(desk=desk, _text=lambda _parent: _Tk())
+    fake._scrolled = bp.BigfishPanel._scrolled.__get__(fake)
+    bp.BigfishPanel._build_status.__get__(fake)()
+    return fake, bars
+
+
+def test_status_pane_scrolls_when_desk_present(monkeypatch):
+    fake, bars = _built(monkeypatch, tc.Desk())
+    assert len(bars) == 1 and fake.text.kw["height"] == bp.STATUS_LINES
+    assert fake.text.kw["yscrollcommand"] == bars[0].set and bars[0].kw["command"] == fake.text.yview
+
+
+def test_log_rejumps_to_end_after_map_and_resize(monkeypatch):
+    monkeypatch.setattr(bp.tk, "Frame", _Tk)
+    monkeypatch.setattr(bp.tk, "Scrollbar", lambda *a, **k: _Tk(*a, **k))
+    calls = []
+    fake = SimpleNamespace(_text=lambda _parent: _Tk(), _log_shown=lambda _e=None: calls.append(1))
+    fake._scrolled = bp.BigfishPanel._scrolled.__get__(fake)
+    bp.BigfishPanel._build_log.__get__(fake)()
+    fake.log.binds["<Map>"](None)
+    fake.log.binds["<Configure>"](None)
+    assert calls == [1, 1]
+
+
+def test_status_pane_without_desk_fills_panel(monkeypatch):
+    fake, bars = _built(monkeypatch, None)
+    assert bars == [] and fake.text.packed == {"fill": "both", "expand": True}
+
+
+def test_hint_wraps_to_its_width(monkeypatch):
+    monkeypatch.setattr(bp.tk, "Label", _Tk)
+    fake = SimpleNamespace()
+    bp.BigfishPanel._build_hint.__get__(fake)()
+    assert fake.hint.kw["justify"] == "left"
+    fake.hint.binds["<Configure>"](SimpleNamespace(width=300))
+    assert 0 < fake.hint.kw["wraplength"] <= 300
+    fake.hint.binds["<Configure>"](SimpleNamespace(width=1))
+    assert fake.hint.kw["wraplength"] > 0               # 0 在 Tk 里是"不折行"
+
+
+def test_draw_without_desk_has_no_log():
+    fake = _log_fake()
+    fake.text, fake._shown, fake.desk = _Log(), None, None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    fake._update_log = lambda: pytest.fail("没有 desk 不该碰滚动区")
+    bp.BigfishPanel._draw.__get__(fake)(_online(), NOW)
+
+
+def test_page_keys_scroll_log():
+    calls = []
+    fake = SimpleNamespace(log=SimpleNamespace(yview_scroll=lambda n, unit: calls.append((n, unit))))
+    assert bp.BigfishPanel._page.__get__(fake)(-1) == "break"
+    assert calls == [(-1, "pages")]
+
+
+def test_container_down_greys_out_with_reason_and_keeps_text():
+    view = _online()
+    view["health"] = "container_down"
+    fake, jobs = _fake(view=view)
+    fake._sync_desk()
+    assert fake.btn_send.cfg["state"] == "disabled" and fake.entry.state == "disabled"
+    assert fake.hint.cfg["text"] == bf.HEALTH_TEXT["container_down"][1] and fake.entry.value == "看下状态"
+    fake._send()
+    assert jobs == []

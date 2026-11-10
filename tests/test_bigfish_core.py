@@ -444,3 +444,95 @@ def test_parse_bad_elapsed_in_status_file_dropped(raw):
 @pytest.mark.parametrize("v", [float("inf"), float("nan")])
 def test_elapsed_non_finite_is_blank(v):
     assert bf.elapsed(v) == ""
+
+
+# ------------------------------------------------------------ v1.2: 健康枚举 / 失败分类
+
+@pytest.mark.parametrize("raw,want", [("ok", "ok"), ("unknown", "unknown"), ("container_down", "container_down"),
+                                      ("egress_down", "egress_down"), ("docker_down", "docker_down"),
+                                      ("瞎编<<>>", "other"), ("", None), (5, None), (["ok"], None), (None, None)])
+def test_parse_health(raw, want):
+    assert bf.parse(_text(health=raw), NOW)["health"] == want
+
+
+def test_parse_old_supervisor_without_new_fields():
+    v = bf.parse(_text(), NOW)
+    assert v["health"] is None and v["current"]["fail"] == ""
+
+
+def test_offline_view_has_no_health():
+    assert bf.parse(None, NOW)["health"] is None
+
+
+def _idle(health):
+    return bf.parse(json.dumps({"schema": 1, "written_at": NOW, "health": health}), NOW)
+
+
+@pytest.mark.parametrize("code", ["container_down", "egress_down", "docker_down"])
+def test_panel_idle_shows_reason_and_fix(code):
+    rows = bf.panel_rows(_idle(code), NOW)
+    assert rows == [(bf.HEALTH_TEXT[code][1], "bad")] and code not in rows[0][0]
+
+
+def test_container_down_points_at_egress_service():
+    assert "bigfish-egress" in bf.HEALTH_TEXT["container_down"][1] and "密钥" in bf.HEALTH_TEXT["container_down"][1]
+
+
+def test_panel_unknown_health_value_shows_other_not_raw():
+    rows = bf.panel_rows(_idle("瞎编<<>>"), NOW)
+    assert "其他" in rows[0][0] and rows[0][1] == "bad" and all("瞎编" not in t for t, _ in rows)
+
+
+@pytest.mark.parametrize("health", ["ok", "unknown", None])
+def test_panel_idle_when_healthy(health):
+    assert bf.panel_rows(_idle(health), NOW) == [("空闲", "dim")]
+
+
+def test_panel_running_shows_alert_above_head():
+    rows = bf.panel_rows(bf.parse(_text(health="egress_down"), NOW), NOW)
+    assert rows[0] == (bf.HEALTH_TEXT["egress_down"][1], "bad") and "在做事" in rows[1][0]
+
+
+def test_lock_line_idle_says_short_reason_without_raw():
+    line = bf.lock_line(_idle("container_down"))
+    assert line == "大肥鱼 · " + bf.HEALTH_TEXT["container_down"][0] and "container_down" not in line
+
+
+def test_lock_line_running_keeps_progress():
+    assert "在做事" in bf.lock_line(bf.parse(_text(health="container_down"), NOW))
+
+
+def test_lock_line_estop_beats_health():
+    v = bf.parse(json.dumps({"schema": 1, "written_at": NOW, "health": "container_down", "estop": {"seen": True}}), NOW)
+    assert bf.lock_line(v) == "大肥鱼 · 急停中"
+
+
+def test_lock_line_healthy_unchanged():
+    assert bf.lock_line(_idle("ok")) == "大肥鱼 · 空闲"
+
+
+@pytest.mark.parametrize("code", sorted(bf.FAIL_TEXT))
+def test_fail_codes_map_to_fixed_text(code):
+    v = bf.parse(_text(current=_cur(state="failed", fail_code=code)), NOW)
+    assert v["current"]["fail"] == bf.FAIL_TEXT[code] and code not in v["current"]["fail"]
+
+
+@pytest.mark.parametrize("code", ["container_down", "docker_down", "egress_down", "acp_exit", "acp_error",
+                                  "model_error", "timeout", "estop"])
+def test_every_supervisor_fail_code_has_text(code):
+    assert code in bf.FAIL_TEXT
+
+
+@pytest.mark.parametrize("raw,want", [("瞎编", bf.FAIL_OTHER), ("", ""), (5, ""), (["x"], ""), (None, "")])
+def test_fail_code_junk(raw, want):
+    assert bf.fail_text(raw) == want
+
+
+def test_panel_failed_shows_reason_and_not_raw():
+    rows = bf.panel_rows(bf.parse(_text(current=_cur(state="failed", fail_code="timeout")), NOW), NOW)
+    assert (bf.FAIL_TEXT["timeout"], "bad") in rows
+
+
+def test_panel_estop_cancelled_does_not_repeat_reason():
+    rows = bf.panel_rows(bf.parse(_text(current=_cur(state="cancelled", stop_reason="estop", fail_code="estop")), NOW), NOW)
+    assert (bf.FAIL_TEXT["estop"], "bad") not in rows and "急停" in rows[0][0]

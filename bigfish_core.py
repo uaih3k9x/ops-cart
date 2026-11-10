@@ -50,6 +50,26 @@ TASK_STATES = {"starting": "启动中", "running": "在做事", "done": "做完�
 # stop_reason 只显示枚举 (ACP 的 stopReason + wrapper 自己的 estop / cancelled), 不认识的显示"其他", 不露原文
 STOP_REASONS = {"estop": "急停", "cancelled": "已取消", "end_turn": "正常结束", "max_tokens": "超出长度",
                 "max_turn_requests": "轮数到上限", "refusal": "模型拒绝"}
+# v1.2: 健康和失败分类都只认枚举, 文字由车机这边写死, 不显示状态文件里的原始字符串. 不认识的值显示"其他".
+# 健康: 枚举 -> (锁屏一行用的短句, 面板和发送提示用的原因 + 恢复办法). ok / unknown 不显示
+HEALTH_QUIET = ("ok", "unknown")
+HEALTH_TEXT = {
+    "container_down": ("Agent 容器没起来", "Agent 容器没起来：可能是开机时缺少模型密钥，检查 bigfish-egress 服务"),
+    "egress_down": ("模型出口没起来", "模型出口容器没起来，Agent 连不上模型：检查 bigfish-egress 服务"),
+    "docker_down": ("Docker 没响应", "大肥鱼的 Docker 没响应：刚硬急停过要人工恢复，否则检查 bigfish 用户的 docker 服务"),
+}
+HEALTH_OTHER = ("运行环境其他异常", "大肥鱼运行环境报告了其他异常：任务可能失败，看 bigfish-supervisor 日志")
+FAIL_TEXT = {
+    "container_down": "没跑起来：Agent 容器不在，检查 bigfish-egress 服务",
+    "docker_down": "没跑起来：大肥鱼的 Docker 没响应",
+    "egress_down": "模型调用失败：模型出口容器不在，检查 bigfish-egress 服务",
+    "acp_exit": "Agent 进程中途退出了，可以重发；反复出现看 bigfish-supervisor 日志",
+    "acp_error": "Agent 启动时出错，可以重发；反复出现看 bigfish-supervisor 日志",
+    "model_error": "模型调用失败：中转不通或今日额度用完，稍后再试",
+    "timeout": "等 Agent 响应超时，稍后再试",
+    "estop": "被急停打断",
+}
+FAIL_OTHER = "其他错误；看 bigfish-supervisor 日志"
 BAD_SEQ = -1                # v1.1 estop.seq 给了但不合格: 当成和谁都对不上
 SEQ_MAX = 2 ** 53
 ELAPSED_MAX = 366 * 86400    # 已运行秒数的合理上限, 超过按读不懂
@@ -120,7 +140,24 @@ def _int(v, hi=STEP_MAX):
 
 def _offline(why):
     return {"online": False, "why": why, "estop_seen": False, "estop_seq": None, "current": None, "running_count": 0,
-            "said": {"title": "", "output": [], "steps": []}}
+            "health": None, "said": {"title": "", "output": [], "steps": []}}
+
+
+def fail_text(code):
+    """失败分类 -> 中文. 没有这个字段 (旧 supervisor) 或不是字符串 -> "", 不认识的 -> FAIL_OTHER."""
+    return FAIL_TEXT.get(code, FAIL_OTHER) if isinstance(code, str) and code else ""
+
+
+def _health(v):
+    """状态文件的 health -> 枚举; 不认识的 -> "other"; 没有 / 不是字符串 -> None (旧 supervisor)."""
+    if not isinstance(v, str) or not v:
+        return None
+    return v if v in HEALTH_QUIET or v in HEALTH_TEXT else "other"
+
+
+def health_text(code):
+    """-> (短句, 原因 + 恢复办法); 不用显示时 None."""
+    return HEALTH_OTHER if code == "other" else HEALTH_TEXT.get(code)
 
 
 def _current(c):
@@ -132,7 +169,7 @@ def _current(c):
     return {"state": c["state"], "started_at": _num(c.get("started_at")), "elapsed_s": _num(c.get("elapsed_s"), 0, ELAPSED_MAX),
             "steps_total": total, "step_current": cur,
             "stop_reason": STOP_REASONS.get(reason, "其他") if isinstance(reason, str) and reason else "",
-            "source": clean(c.get("source"), TRUSTED_STR_MAX)}
+            "source": clean(c.get("source"), TRUSTED_STR_MAX), "fail": fail_text(c.get("fail_code"))}
 
 
 def _said(u):
@@ -165,6 +202,7 @@ def parse(text, now):
     seq = None if "seq" not in es else (_int(es["seq"], SEQ_MAX) if _int(es["seq"], SEQ_MAX) is not None else BAD_SEQ)
     return {"online": True, "why": "", "estop_seen": es.get("seen") is True, "estop_seq": seq,   # seq: v1.1
             "current": _current(d.get("current")), "running_count": _int(d.get("running_count")) or 0,
+            "health": _health(d.get("health")),     # v1.2
             "said": _said(d.get("untrusted"))}
 
 
@@ -186,7 +224,12 @@ def _doing(view):
 
 def lock_line(view):
     """锁屏 / 副屏一行, 不含大肥鱼的原文."""
-    return "大肥鱼 · " + (_doing(view) if view["online"] else view["why"])
+    if not view["online"]:
+        return "大肥鱼 · " + view["why"]
+    cur, h = view["current"], health_text(view.get("health"))
+    if h and not view["estop_seen"] and (cur is None or cur["state"] not in ("starting", "running")):
+        return "大肥鱼 · " + h[0]
+    return "大肥鱼 · " + _doing(view)
 
 
 def elapsed(s):
@@ -207,14 +250,18 @@ def panel_rows(view, now, note="", ready=True):
     if not view["online"]:
         return top + [("大肥鱼" + view["why"], "bad")]
     cur, said = view["current"], view["said"]
+    h = health_text(view.get("health"))
+    alert = [(h[1], "bad")] if h else []
     if cur is None and not view["estop_seen"]:
-        return top + [("空闲", "dim")]
+        return top + (alert or [("空闲", "dim")])
     head = _doing(view)
     if cur and cur["state"] == "running" and cur["elapsed_s"] is not None:
         head += " · " + elapsed(cur["elapsed_s"])
     if cur and cur["state"] in ("failed", "cancelled") and cur["stop_reason"]:
         head += " · " + cur["stop_reason"]
-    rows = top + [(head, "bad" if head == "急停中" or (cur and cur["state"] == "estopped") else "own")]
+    rows = top + alert + [(head, "bad" if head == "急停中" or (cur and cur["state"] == "estopped") else "own")]
+    if cur and cur["state"] == "failed" and cur["fail"]:
+        rows.append((cur["fail"], "bad"))
     lines = [said["title"]] + [f"[{st}] {t}" if st else t for st, t in said["steps"]] + said["output"]
     return rows + [(SAYS + x, "untrusted") for x in lines if x]
 
