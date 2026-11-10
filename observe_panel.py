@@ -28,6 +28,8 @@ FONT, FONT_MONO = th.FONT_SMALL, th.FONT_MONO
 CELL, GAP, PAD = 40, 8, 16              # 口的格子 / 间隔 / 边距 (像素); 列多了按画布宽度缩
 WIN_W, WIN_H = 1100, 440
 CANVAS_W = WIN_W - 2 * PAD              # 画布左右各让出 PAD
+CANVAS_H = 340                          # 窗口 440 - 边框 12 - 标题栏 44 - 状态行 44; 画布还没出来时按这个算
+MEMBER_GUTTER, TIER_GAP, MIN_PITCH = 72, 8, 12  # 堆叠: 左边写"成员 N"的宽度 / 层间距 / 行距下限
 FRAME_MS = 60                           # 刷新灯 (闪烁) 的间隔
 SNAP_S = 5                              # 多久给副屏写一次快照
 
@@ -159,9 +161,39 @@ def _lit_color(state):
     return {"up": th.LAMP_OK, "admin": th.LAMP_WARN, "standby": th.DIM, "unknown": th.MARK}.get(state, OFF)
 
 
-def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD, stale=False, width=None):
+def _stack_grid(panel, cell, gap, pad, width, height):
+    """堆叠面板的 (层表, 格距); 放不下 / 不是堆叠 None. 车机的格子是正方形, 取列距和行距小的那个."""
+    tiers = oc.stack_tiers(panel)
+    if not tiers:
+        return None
+    cols = max(c["x"] for c in panel) + 1
+    fit = oc.stack_fit(cols, len(tiers), (width or CANVAS_W) - 2 * pad, (height or CANVAS_H) - 2 * pad,
+                       cell + gap, cell + gap, TIER_GAP, MEMBER_GUTTER, MIN_PITCH)
+    return (tiers, min(fit)) if fit else None
+
+
+def _cell(c, ports, now, stale, box, label):
+    state, lit = ("unknown", False) if stale else oc.lamp(ports.get(c["name"]), now)
+    return {"name": c["name"], "box": box, "shape": c.get("shape", "rj45"), "label": label,
+            "fill": _lit_color(state) if lit else OFF, "fg": th.LAMP_LIT_FG if lit and state != "down" else DIM}
+
+
+def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD, stale=False, width=None, height=None):
     """面板格子 + 当前端口状态 -> 要画的东西 [{name, box, fill, fg, shape, label}]. stale: 数据不可信, 全灰.
-    width: 画布宽; 列多 (48 口 + 上行) 放不下就把格子等比缩小 (同 dash_render.front_boxes)."""
+    width: 画布宽; 列多 (48 口 + 上行) 放不下就把格子等比缩小 (同 dash_render.front_boxes).
+    堆叠 (格子带 member): 一层两排, 按画布宽高缩小; 格子太小不写端口号; 实在放不下返回空表 (panel_hint 给提示)."""
+    if oc.stack_tiers(panel):
+        grid = _stack_grid(panel, cell, gap, pad, width, height)
+        if not grid:
+            return []
+        pitch = grid[1]
+        size = pitch - max(2, pitch // 6)
+        out = []
+        for c in panel:
+            x0, y0 = pad + MEMBER_GUTTER + c["x"] * pitch, pad + c["y"] * pitch + c["y"] // 2 * TIER_GAP
+            out.append(_cell(c, ports, now, stale, (x0, y0, x0 + size, y0 + size),
+                             c.get("label", "") if size >= oc.STACK_LABEL_PX else ""))
+        return out
     cols = max((c["x"] for c in panel), default=0) + 1
     pitch = cell + gap
     if width:
@@ -170,28 +202,49 @@ def panel_cells(panel, ports, now, cell=CELL, gap=GAP, pad=PAD, stale=False, wid
         cell = pitch - gap
     out = []
     for c in panel:
-        state, lit = ("unknown", False) if stale else oc.lamp(ports.get(c["name"]), now)
         x0, y0 = pad + c["x"] * pitch, pad + c["y"] * pitch
-        out.append({"name": c["name"], "box": (x0, y0, x0 + cell, y0 + cell), "shape": c.get("shape", "rj45"),
-                    "label": c.get("label", ""), "fill": _lit_color(state) if lit else OFF,
-                    "fg": th.LAMP_LIT_FG if lit and state != "down" else DIM})
+        out.append(_cell(c, ports, now, stale, (x0, y0, x0 + cell, y0 + cell), c.get("label", "")))
     return out
 
 
-def draw(canvas, cells):
-    """画到画布上, 返回 {图元 id: 接口名} 给悬停 / 点击查. rj45 画成带卡口的方块, 光口画成长方块."""
+def panel_tiers(panel, cell=CELL, gap=GAP, pad=PAD, width=None, height=None):
+    """堆叠每层左边的成员标识 [{text, x, y}] (y 是这一层的中线); 单机 / 放不下空表."""
+    grid = _stack_grid(panel, cell, gap, pad, width, height)
+    if not grid:
+        return []
+    tiers, pitch = grid
+    return [{"text": oc.member_label(m), "x": pad, "y": pad + t * (2 * pitch + TIER_GAP) + pitch} for t, m in tiers]
+
+
+def panel_hint(panel, cell=CELL, gap=GAP, pad=PAD, width=None, height=None):
+    """堆叠成员太多, 车机窗口放不下时的提示; 放得下 / 单机 None."""
+    tiers = oc.stack_tiers(panel)
+    return oc.stack_hint(len(tiers)) if tiers and not _stack_grid(panel, cell, gap, pad, width, height) else None
+
+
+def draw(canvas, cells, tiers=(), hint=None):
+    """画到画布上, 返回 {图元 id: 接口名} 给悬停 / 点击查. rj45 画成带卡口的方块, 光口画成长方块.
+    tiers: 堆叠的成员标识; hint: 放不下时的提示. 这两样不进悬停表."""
     canvas.delete("all")
     hits = {}
     for c in cells:
         x0, y0, x1, y1 = c["box"]
+        h = y1 - y0
         if c["shape"] == "rj45":
             w = (x1 - x0) // 4
-            pts = (x0, y0, x1, y0, x1, y1 - 8, x1 - w, y1 - 8, x1 - w, y1, x0 + w, y1, x0 + w, y1 - 8, x0, y1 - 8)
+            notch = min(8, h // 5)
+            pts = (x0, y0, x1, y0, x1, y1 - notch, x1 - w, y1 - notch, x1 - w, y1, x0 + w, y1, x0 + w, y1 - notch, x0, y1 - notch)
             i = canvas.create_polygon(*pts, fill=c["fill"], outline=DIM)
         else:
-            i = canvas.create_rectangle(x0, y0 + 6, x1, y1 - 6, fill=c["fill"], outline=DIM)
+            inset = min(6, h // 6)
+            i = canvas.create_rectangle(x0, y0 + inset, x1, y1 - inset, fill=c["fill"], outline=DIM)
         hits[i] = c["name"]
-        hits[canvas.create_text((x0 + x1) // 2, (y0 + y1) // 2 - 2, text=c["label"], fill=c["fg"], font=FONT)] = c["name"]
+        if c["label"]:
+            hits[canvas.create_text((x0 + x1) // 2, (y0 + y1) // 2 - 2, text=c["label"], fill=c["fg"], font=FONT)] = c["name"]
+    for t in tiers:
+        canvas.create_text(t["x"], t["y"], text=t["text"], fill=FG, font=FONT, anchor="w")
+    if hint:
+        canvas.create_text(PAD, PAD, text=hint, fill=th.WARN, font=FONT, anchor="nw")
     return hits
 
 
@@ -374,9 +427,10 @@ class ObserveWindow(tk.Toplevel):
         obs = self.obs
         if obs and obs.panel:
             stale = obs.state != "polling" or bool(obs.error)
-            width = self.canvas.winfo_width()
-            self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time(), stale=stale,
-                                                      width=width if width > 1 else CANVAS_W))
+            width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+            size = {"width": width if width > 1 else CANVAS_W, "height": height if height > 1 else CANVAS_H}
+            self.hits = draw(self.canvas, panel_cells(obs.panel, obs.ports, time.time(), stale=stale, **size),
+                             panel_tiers(obs.panel, **size), panel_hint(obs.panel, **size))
         if obs and self.worker and obs.state == "polling" and not self._closing:
             self._status(obs)
             self.title_lbl.config(text=f"观察 {self.dev} · {obs.device}" + (f" · {obs.model}" if obs.model else ""))

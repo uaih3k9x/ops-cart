@@ -5,7 +5,7 @@
 "开始观察": probe() 读 conbroker 日志尾, 现场正是用户视图提示符 <xxx> 才给人确认设备名, 人确认后 start(xxx).
 
   parse_brief  display interface brief (华为 S / AR / VRP8); PARSERS 按厂商留位置给 H3C / 锐捷.
-  layout       接口名 -> 面板格子 (GE/XGE/25GE/40GE/100GE 分组, 奇数口上、偶数口下), 可按型号用 JSON 覆盖.
+  layout       接口名 -> 面板格子 (GE/XGE/25GE/40GE/100GE 分组, 奇数口上、偶数口下), 可按型号用 JSON 覆盖; 堆叠按成员分层.
   lamp         灯: up 常亮, 有流量按 InUti/OutUti 闪 (lamps_core.blink_on), *down 琥珀, ^down 灰, down 灭.
   Pacer        轮询节奏: 按一轮实际耗时留空 (占空比), 日志在我们没发的时候长了 = 有人在用, 停手 quiet 秒后再来.
   Observer     probe (看现场) / start (人确认后) / tick (到点轮询一次) / stop (只停轮询, 不发任何字节).
@@ -391,22 +391,104 @@ def port_kind(name):
     return group, tuple(int(x) for x in m.group(2).split("/")), int(m.group(3)), shape
 
 
-def auto_layout(names, x0=0):
-    """按 (槽位, 分组) 从左往右排, 组间空一列; 组内按口号, 第 1、3、5… 个在上排, 第 2、4、6… 个在下排."""
+# 框式 / 路由器: slot 不是堆叠成员号, 结构再像也不分层
+_NOT_STACK_MODEL = re.compile(r"^(AR|NE|CX|S(7|9|12)\d|CE(12|16)\d)", re.I)
+STACK_MIN_PORTS = 8                     # 每个成员至少这么多物理口才算证据够 (能堆叠的盒式最小也有 8 口)
+
+
+def _port_key(name):
+    """成员内的位置: (子卡, 分组, 口号, 拆分号). 只有 成员/子卡/端口 三段式才有."""
+    k = port_kind(name)
+    if not k or len(k[1]) != 2:
+        return None
+    return k[1][1], k[0], k[2], int(_KIND.match(name).group(4) or 0)
+
+
+def stack_members(names, model=None):
+    """判定堆叠 -> {成员号: [接口名]}; 不是或说不准 None (退回两排的排法). 全部满足才算:
+    型号不是框式 / 路由器; 物理口全是 成员/子卡/端口 三段式; 第一段至少两个不同的值;
+    每个成员的端口集合完全相同, 且至少 STACK_MIN_PORTS 个; 每个 (子卡, 分组) 的口号都从 1 起 (框式线卡和 AR 从 0 起)."""
+    if model and _NOT_STACK_MODEL.match(model):
+        return None
+    members, keys = {}, {}
+    for n in names:
+        if not port_kind(n):
+            continue
+        key = _port_key(n)
+        if key is None:
+            return None
+        member = port_kind(n)[1][0]
+        members.setdefault(member, []).append(n)
+        keys.setdefault(member, set()).add(key)
+    shapes = list(keys.values())
+    if len(shapes) < 2 or any(s != shapes[0] for s in shapes) or len(shapes[0]) < STACK_MIN_PORTS:
+        return None
+    first = {}
+    for sub, group, num, _br in shapes[0]:
+        first[sub, group] = min(num, first.get((sub, group), num))
+    return members if set(first.values()) == {1} else None
+
+
+def _groups(names):
+    """物理口按 (槽位, 分组) 归堆, 组内 ((口号, 拆分号), 接口名, port_kind)."""
     groups = {}
     for n in names:
         k = port_kind(n)
         if k:
             sub = _KIND.match(n).group(4)
             groups.setdefault((k[1], GROUP_ORDER.index(k[0])), []).append(((k[2], int(sub or 0)), n, k))
+    return groups
+
+
+def _place(groups, x0, y0=0, **extra):
+    """组从左往右排, 组间空一列; 组内按口号, 第 1、3、5… 个在上排, 第 2、4、6… 个在下排."""
     out, x = [], x0
     for key in sorted(groups):
         items = sorted(groups[key])
         for i, ((num, sub), n, k) in enumerate(items):
             out.append({"name": n, "label": f"{num}:{sub}" if sub else str(num), "group": k[0],
-                        "x": x + i // 2, "y": i % 2, "shape": k[3]})
+                        "x": x + i // 2, "y": y0 + i % 2, "shape": k[3], **extra})
         x += (len(items) + 1) // 2 + 1
     return out
+
+
+def auto_layout(names, x0=0, model=None):
+    """单机: 一层两排 (_place). 堆叠 (stack_members): 成员按号从上到下各占一层 (两排), 格子多一个 member."""
+    members = stack_members(names, model)
+    if not members:
+        return _place(_groups(names), x0)
+    out = []
+    for tier, m in enumerate(sorted(members)):
+        out += _place(_groups(members[m]), x0, y0=tier * 2, member=m)
+    return out
+
+
+def stack_tiers(cells):
+    """分层面板的 [(层, 成员号)], 从上到下; 单机 / 旧快照没有 member 字段, 空表. 层 = y // 2."""
+    tiers = {}
+    for c in cells:
+        if _int(c.get("member")) and _int(c.get("y", 0)):
+            tiers[c.get("y", 0) // 2] = c["member"]
+    return sorted(tiers.items())
+
+
+def member_label(member):
+    return f"成员 {member}"
+
+
+STACK_LABEL_PX = 18                     # 端口框矮于这个高度就不写端口号 (写不下)
+
+
+def stack_fit(cols, tiers, width, height, max_w, max_h, tier_gap, gutter, min_h):
+    """分层面板的 (列距, 行距) 像素: 左边让出 gutter 写成员号, 层间多留 tier_gap, 不超过 max_w / max_h;
+    行距小于 min_h = 放不下, None (调用方写提示)."""
+    w = min(max_w, (width - gutter) // max(1, cols))
+    h = min(max_h, (height - (tiers - 1) * tier_gap) // max(1, 2 * tiers))
+    return (w, h) if h >= min_h and w >= 4 else None
+
+
+def stack_hint(members, see="console"):
+    return f"堆叠 {members} 台, 这里放不下前面板, 端口状态请看 {see}"
 
 
 def load_layouts(path=LAYOUTS_PATH):
@@ -443,7 +525,7 @@ def layout(names, model=None, layouts=None):
     layouts = layouts or {}
     keys = [k for k in layouts if model and model.startswith(k)]
     if not keys:
-        return auto_layout(names)
+        return auto_layout(names, model=model)
     ov = layouts[max(keys, key=len)]["ports"]
     out = []
     for n in names:
@@ -453,7 +535,7 @@ def layout(names, model=None, layouts=None):
             out.append({"name": n, "label": str(p.get("label") or (k[2] if k else n)), "group": k[0] if k else "",
                         "x": p["x"], "y": p["y"], "shape": p.get("shape") or (k[3] if k else "rj45")})
     right = max((p["x"] for p in out), default=-2) + 2
-    return out + auto_layout([n for n in names if n not in ov], x0=right)
+    return out + _place(_groups(n for n in names if n not in ov), right)     # 覆盖优先: 其余的接右边, 不分层
 
 
 # ------------------------------------------------------------ 灯
@@ -845,7 +927,8 @@ _STATE_NOTE = {"idle": "准备开始", "failed": "没开始", "lost": "会话掉
 
 
 def front_view(doc, now, stale_s=FRONT_STALE_S, locked=False):
-    """快照 -> 副屏前面板区块 {title, stale, note, ports: [{x, y, shape, label, state, lit}]}; 没有 / 车机没在写 None.
+    """快照 -> 副屏前面板区块 {title, stale, note, tiers, ports: [{x, y, shape, label, state, lit, member?}]}; 没有 / 车机没在写 None.
+    tiers: 堆叠每层的成员标识 [{tier, label}], 单机和旧快照是空表.
     准备中 / 没开始 / 掉线 / 很久没轮询成功 / 出错: 灯全灰 (stale), note 写原因; 还没有端口也照样给标题和原因.
     locked: 车机锁着屏 (闲置锁屏不停观察, 维护者定): 照常画端口灯和端口号, 但不露设备名 / 型号 / 接口全名 /
     设备原文, 标题只写"串口观察中 · con-N · 剩余 xx 分钟", 停止原因只给不带设备名的说法."""
@@ -861,8 +944,11 @@ def front_view(doc, now, stale_s=FRONT_STALE_S, locked=False):
     out = []
     for p in ports:
         st, lit = ("unknown", False) if note else lamp(p, now)
-        out.append({"x": p.get("x", 0), "y": p.get("y", 0), "shape": p.get("shape", "rj45"),
-                    "label": p.get("label", ""), "state": st, "lit": lit})
+        cell = {"x": p.get("x", 0), "y": p.get("y", 0), "shape": p.get("shape", "rj45"),
+                "label": p.get("label", ""), "state": st, "lit": lit}
+        if _int(p.get("member")):
+            cell["member"] = p["member"]
+        out.append(cell)
     if locked:
         title = " · ".join(x for x in ("串口观察中" if state == "polling" else "串口观察已停止",
                                        str(doc.get("head") or "")) if x)
@@ -871,7 +957,8 @@ def front_view(doc, now, stale_s=FRONT_STALE_S, locked=False):
             title += f" · 剩余 {max(0, math.ceil((ends - now) / 60))} 分钟"
     else:
         title = " · ".join(str(x) for x in (doc.get("head"), doc.get("device") or doc.get("model")) if x)
-    return {"title": title, "state": state, "stale": bool(note), "note": note, "ports": out}
+    tiers = [{"tier": t, "label": member_label(m)} for t, m in stack_tiers(out)]
+    return {"title": title, "state": state, "stale": bool(note), "note": note, "ports": out, "tiers": tiers}
 
 
 def snapshot_path(head, state_dir=None):
