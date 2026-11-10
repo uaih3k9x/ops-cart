@@ -1363,6 +1363,7 @@ class Kiosk(tk.Tk):
                      insertbackground=th.FG, **th.SUNKEN)
         e.no_ime = True                     # 要人亲手敲, 不接中文输入 (中文输入的 NO_IME 约定)
         e.pack(ipady=8)
+        th.caps_hint(e)
         e.bind("<Return>", lambda _e: self._try_unlock())
         self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg=th.BG, fg=th.DIM)
         self._lock_msg.pack(pady=12)

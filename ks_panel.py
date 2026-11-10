@@ -60,9 +60,10 @@ class KsPanel(tk.Frame):
         tk.Label(row, text="  root 密码:", font=FONT, bg=th.PANEL,
                  fg=th.TEXT).pack(side="left")
         self.pw_var = tk.StringVar()
-        tk.Entry(row, textvariable=self.pw_var, width=18, show="*", font=FONT_MONO,
-                 bg=th.BG, fg=th.FG, insertbackground=th.FG,
-                 **th.SUNKEN).pack(side="left", padx=4)
+        pw_e = tk.Entry(row, textvariable=self.pw_var, width=18, show="*", font=FONT_MONO,
+                        bg=th.BG, fg=th.FG, insertbackground=th.FG, **th.SUNKEN)
+        pw_e.pack(side="left", padx=4)
+        th.caps_hint(pw_e)
         tk.Button(row, text="设密码(hash)", font=FONT, command=self.apply_password,
                   bg=th.PRIMARY, fg=th.FG, activebackground=th.ACTIVE,
                   **th.RAISED, cursor="hand2", padx=10).pack(side="left", padx=4)

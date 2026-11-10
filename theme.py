@@ -320,6 +320,45 @@ def unreadable(top, floor=4.5):
     return out
 
 
+# ---------------------------------------------------------------- 大写锁定提示 (#88)
+
+CAPS_MARK = "\u21ea"             # ⇪
+_LOCK_BIT = 0x2                  # Tk 事件 state 里的 Lock 位
+
+
+def caps_on(state, keysym):
+    """按键事件之后大写锁定开没开. 按大写锁定键这一下, state 还是按键之前的, 要反过来算."""
+    locked = bool(state & _LOCK_BIT)
+    return not locked if keysym == "Caps_Lock" else locked
+
+
+def caps_hint(entry, label=None):
+    """打码输入框有焦点且大写锁定开着时, 框内右侧显示 ⇪; 明文 (show 为空) 不显示.
+    FocusIn 事件不带修饰键状态, 焦点刚进来时不显示, 第一次按键后才更新.
+    返回 refresh: 改了 entry 的 show (显示密码开关) 之后调一下. label 给测试注入."""
+    if label is None:
+        import tkinter as tk
+        label = tk.Label
+    mark = label(entry, text=CAPS_MARK, font=entry.cget("font"), bg=entry.cget("background"), fg=WARN,
+                 padx=0, pady=0, **FLAT)
+    on = False
+
+    def refresh():
+        if on and entry.cget("show"):
+            mark.place(relx=1.0, x=-2, rely=0.5, anchor="e")
+        else:
+            mark.place_forget()
+
+    def note(next_on):
+        nonlocal on
+        on = next_on
+        refresh()
+
+    entry.bind("<KeyPress>", lambda e: note(caps_on(e.state, e.keysym)), add="+")
+    entry.bind("<FocusOut>", lambda _e: note(False), add="+")
+    return refresh
+
+
 # 副屏桌宠 (#35): 猫不跟深浅模式变; K 描边 W 主毛色 D 远侧腿 S 条纹 B 肚子 P 粉 C 腮红 E 眼 H 高光 # 花斑
 PET_COATS = {
     "ginger": {"K": "#0c0e13", "W": "#f2a44f", "D": "#c47a33", "S": "#c8712b", "B": "#ffe6c2", "P": "#ff9db2",
