@@ -529,3 +529,66 @@ def test_card_line_block_cleaned_and_empty_without_line():
     tok3 = b.acquire(3, "a", T0)["lease"]
     b.submit(3, tok3, "a", "line", "y", sw._gate("confirm", "x"), T0, 10, context="R#")
     assert cc.card(b.view(T0), 3)["items"][0]["line"] == ""
+
+
+# ------------------------------------------------------------ #107 审查: 打码后确认框仍看得到问句
+
+def _card_line(raw, live=None, vendor=None):
+    b = _book()
+    tok = b.acquire(2, "a", T0)["lease"]
+    b.submit(2, tok, "a", "key", "enter", sw.classify_key("enter", raw, 60, vendor=vendor), T0, 10, context=raw)
+    return cc.card(b.view(T0), 2, live=live, vendor=vendor)["items"][0]["line"]
+
+
+@pytest.mark.parametrize("raw,must", [
+    ("The password needs to be changed. Change now? [Y/N]:", "Change now? [Y/N]:"),
+    ("Warning: The current configuration will be erased and the key pair deleted. Continue? [Y/N]:", "Continue? [Y/N]:"),
+    ("Overwrite auth config and reboot? [confirm]", "reboot? [confirm]"),
+])
+def test_card_shows_question_with_secret_word(raw, must):
+    line = _card_line(raw)
+    assert must in line and sw.MASK not in line and cc.QUESTION_LOST not in line
+
+
+@pytest.mark.parametrize("raw,must,secret", [
+    ("password Abc123 [Y/N]", "[Y/N]", "Abc123"),
+    ("key-string 7 0822455D0A16 [confirm]", "[confirm]", "0822455D0A16"),
+])
+def test_card_keeps_marker_and_hides_value(raw, must, secret):
+    line = _card_line(raw)
+    assert must in line and sw.MASK in line and secret not in line and cc.QUESTION_LOST not in line
+
+
+@pytest.mark.parametrize("raw,secret", [("Password [Abc123]:", "Abc123"), ("chpasswd root:Abc123 [Y/N]", "Abc123"),
+                                        ("Change password Abc123?", "Abc123")])
+def test_card_says_question_lost_when_cannot_keep_it(raw, secret):
+    line = _card_line(raw)
+    assert cc.QUESTION_LOST in line and secret not in line
+
+
+def test_card_hint_also_for_live_line():
+    line = _card_line("Router#", live="chpasswd root:Abc123 [Y/N]")
+    assert line.count(cc.QUESTION_LOST) == 1 and "Abc123" not in line
+
+
+def test_card_password_prompt_without_value_has_no_stars():
+    line = _card_line("Enter Password:")
+    assert "设备最后一行：Enter Password:" in line and sw.MASK not in line
+
+
+def test_card_long_confirm_line_keeps_tail():
+    raw = "Warning " * 30 + "Continue? [Y/N]:"
+    line = _card_line(raw)
+    assert "Continue? [Y/N]:" in line and cc.QUESTION_LOST not in line
+
+
+@pytest.mark.parametrize("live,vendor", [("[HUAWEI-rsa-public-key]", "huawei"), ("Router(config-keychain-key)#", "cisco")])
+def test_card_live_prompt_not_all_stars(live, vendor):
+    line = _card_line("Router#", live=live, vendor=vendor)
+    assert f"当前最后一行：{sw.MASK}" not in line and live[:8] in line
+    assert "！！设备现在不在提示符上" not in line
+
+
+def test_card_uses_masked_copy_for_truncated_line():
+    raw = "username ops password " + " ".join(["s3cr3t-tail"] * 30)
+    assert "s3cr3t" not in _card_line(raw, vendor="cisco")

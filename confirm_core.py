@@ -194,6 +194,15 @@ def _trusted(slot_view):
 
 
 LINE_SHOW_MAX = 160          # 确认框里挂起时 / 当前最后一行显示多少字
+QUESTION_LOST = "！！问句被打码截掉，去串口会话看原文再确认"
+
+
+def _device_line(raw, shown):
+    """设备一行 (raw 原文, shown 已打码) -> 卡片上的文字: 过长留行尾 (问句和 [Y/N] 在行尾);
+    原文是确认提示、打码后认不出了就在下一行明说."""
+    s = one_line(shown, sw.LINE_SHOWN)
+    s = s if len(s) <= LINE_SHOW_MAX else "…" + s[-LINE_SHOW_MAX:]
+    return s + (f"\n{QUESTION_LOST}" if sw.is_confirm_prompt(raw) and not sw.is_confirm_prompt(shown) else "")
 
 
 def _line_info(p, live=None, vendor=None):
@@ -208,12 +217,13 @@ def _line_lines(p, live=None, vendor=None):
     挂起时那一行不代表现在: 人确认时推车会重看一次. 车机确认框和命令行共用 (第五轮).
     两行都先打码 (#93) 再过 one_line (#65 第六轮: 不可信文字压成一行、洗掉控制 / 格式字符, 防伪造推车自己的块).
     醒目警告: 挂起时就停在确认提示上 (这条在回答它); 设备现在不在 (本槽位厂商的) 提示符上."""
-    line = (p.get("gate") or {}).get("line")
-    out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{one_line(sw.shown_line(line, vendor), LINE_SHOW_MAX)}" if line else ""
+    gate = p.get("gate") or {}
+    line = gate.get("line")
+    out = f"\n挂起时（{p.get('age_s', 0)} 秒前）设备最后一行：{_device_line(line, sw.gate_shown(gate, vendor))}" if line else ""
     if line and p.get("kind") == "line" and sw.is_confirm_prompt(line):
         out = "\n！！这条会回答设备的确认提示（挂起时设备就停在上面），确认前看清楚" + out
     if live:
-        out += f"\n当前最后一行：{one_line(sw.shown_line(live, vendor), LINE_SHOW_MAX)}"
+        out += f"\n当前最后一行：{_device_line(live, sw.shown_line(live, vendor))}"
         if not sw.at_any_prompt(live, vendor):
             out += "\n！！设备现在不在提示符上，这条发出去可能替人回答问题"
     return out

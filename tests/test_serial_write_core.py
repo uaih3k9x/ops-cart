@@ -1930,3 +1930,134 @@ def test_masked_view_masks_copy_only():
     view = b.view(T0 + 1)
     assert "s3cr3t" not in sw.masked_view(view, {})["history"][-1]["gate"]["line"]
     assert view["history"][-1]["gate"]["line"] == raw
+
+
+# ------------------------------------------------------------ #107 审查: 打码不能把确认提示的问句吃掉
+
+@pytest.mark.parametrize("line", [
+    "The password needs to be changed. Change now? [Y/N]:",
+    "Warning: The current configuration will be erased and the key pair deleted. Continue? [Y/N]:",
+    "Overwrite auth config and reboot? [confirm]",
+    "Change password now? [Y/N]",
+    "Change password? (yes/no)",
+])
+def test_confirm_question_with_plain_english_kept_whole(line):
+    assert sw.shown_line(line) == line
+
+
+@pytest.mark.parametrize("line", ["Enter Password:", "Password:", "password", "Enter Password :"])
+def test_secret_word_without_value_not_masked(line):
+    assert sw.shown_line(line) == line
+
+
+@pytest.mark.parametrize("line,shown", [
+    ("password Abc123 [Y/N]", "password ****** [Y/N]"),
+    ("key-string 7 0822455D0A16 [confirm]", "key ****** [confirm]"),
+    ("set password Abc123. Change now? [Y/N]:", "set password ****** Change now? [Y/N]:"),
+    ("password is Abc123. Continue? [Y/N]", "password ****** Continue? [Y/N]"),
+    ('set password "my new config" [Y/N]', "set password ****** [Y/N]"),
+    ("set password change [Y/N]", "set password ****** [Y/N]"),      # 一个光秃秃的词, 哪怕是常见词也按值算
+    ("secret 5 $1$abc$def (yes/no)?", "secret ****** (yes/no)?"),
+    ("set community s3cr3t-line and reboot? [confirm]", "set community ****** and reboot? [confirm]"),
+])
+def test_confirm_prompt_masks_value_keeps_answer_marker(line, shown):
+    assert sw.shown_line(line) == shown
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("password Abc123 [Y/N]", "Abc123"), ("key-string 7 0822455D0A16 [confirm]", "0822455D0A16"),
+    ("set password hunter2 now? [Y/N]", "hunter2"), ("password Abc123?", "Abc123"),
+    ("Password [Abc123]:", "Abc123"), ("password=Abc123 [Y/N]", "Abc123"),
+    ("password: Abc123 [Y/N]", "Abc123"), ("mysql -pAbc123? [Y/N]", "Abc123"),
+    ("curl https://u:Abc123@example.org/x? [Y/N]", "Abc123"), ("chpasswd root:Abc123 [Y/N]", "Abc123"),
+    ("password hunter2 needs to be changed? [Y/N]", "hunter2"),
+    ("password needs Abc123 to be changed? [Y/N]", "Abc123"),
+    ("key Abc123 password Def456 [confirm]", "Def456"),
+    ("set password​ Abc123 [Y/N]", "Abc123"),
+])
+def test_confirm_prompt_never_leaks_value(line, secret):
+    for out in (sw.shown_line(line), sw.device_context(line)["lines"][0], sw.device_lines(line)[0]):
+        assert secret not in out, out
+
+
+@pytest.mark.parametrize("line,secret", [("set password xxx", "xxx"), ("password needs to be Abc123", "Abc123"),
+                                         ("password Abc123", "Abc123")])
+def test_non_confirm_lines_still_truncated_after_secret_word(line, secret):
+    """不是确认提示的行 (日志 / 设备最近输出 / 回显) 维持口令词后整段打码, 不按"像不像英语"放行."""
+    shown = sw.shown_line(line)
+    assert secret not in shown and shown.endswith(sw.MASK)
+
+
+@pytest.mark.parametrize("line", ["set password Enter Password:", "Enter Password: Abc123", "Password:Abc123"])
+def test_value_after_colon_is_not_treated_as_empty(line):
+    assert sw.MASK in sw.shown_line(line)
+
+
+# ------------------------------------------------------------ #107 审查: 提示符不打成一行星号, 密文不借提示符形状漏出
+
+@pytest.mark.parametrize("line,vendor", [("[HUAWEI-rsa-public-key]", "huawei"), ("[HUAWEI-rsa-public-key]", None),
+                                         ("Router(config-keychain-key)#", "cisco"),
+                                         ("Router(config-keychain-key)#", None)])
+def test_real_prompt_with_secret_word_not_all_stars(line, vendor):
+    assert sw.at_any_prompt(line, vendor)
+    shown = sw.shown_line(line, vendor)
+    assert shown != sw.MASK and shown.startswith(line[:8]) and sw.MASK in shown
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("[Qx7pL2mZ9vR4tY8wK3nB-key]", "Qx7pL2mZ9vR4tY8wK3nB"),
+    ("[~x-cipher%^%#Qx7pL2mZ9vR4tY8%^%#]", "Qx7pL2mZ9vR4tY8"),
+    ("[aB3$dE6^gH9*jK2@mN5!-psk]", "aB3$dE6^gH9"),
+    ("[Qx7pL-2mZ9v-R4tY8-wK3nB-key]", "Qx7pL"),
+    ("[key-Qx7pL2mZ9vR4tY8wK3nB]", "Qx7pL2mZ9vR4tY8wK3nB"),
+    ("<secret-Abc123>", "Abc123"),
+    ("[key:S3cr3tValue]", "S3cr3tValue"),
+    ("R1(snmp-server community Pub1ic RO)#", "Pub1ic"),
+])
+def test_secret_cannot_hide_in_prompt_shape(line, secret):
+    assert secret not in sw.shown_line(line), line
+
+
+@pytest.mark.parametrize("line", ["Qx7pL2mZ9vR4tY8wK3nB", "aB3$dE6^gH9*jK2@mN5!", "%^%#Qx7pL2mZ9vR4tY8%^%#"])
+def test_bare_cipher_line_still_all_stars(line):
+    assert sw.shown_line(line) == sw.MASK
+
+
+# ------------------------------------------------------------ #107 审查: 先打码再截短
+
+LONG_SECRET_LINE = "username ops password " + " ".join(["s3cr3t-tail"] * 30)
+
+
+def test_gate_keeps_raw_line_and_masked_display_copy():
+    assert "password" not in LONG_SECRET_LINE[-sw.LINE_SHOWN:]        # 口令词确实落在截掉的前段
+    g = sw.classify_key("enter", LONG_SECRET_LINE, 60.0, vendor="cisco")
+    assert g["line"] == LONG_SECRET_LINE[-sw.LINE_SHOWN:]             # 比对用的原文字段不变
+    assert "s3cr3t" not in g["line_shown"] and sw.MASK in g["line_shown"]
+
+
+def test_line_fields_mask_before_truncating():
+    f = sw.line_fields(LONG_SECRET_LINE, "cisco")
+    assert f["line"] == LONG_SECRET_LINE[-sw.LINE_SHOWN:] and "s3cr3t" not in f["line_shown"]
+    assert len(sw.line_fields("x" * 500)["line_shown"]) <= sw.LINE_SHOWN
+
+
+def test_masked_view_uses_display_copy_for_long_line():
+    g = sw.classify_key("enter", LONG_SECRET_LINE, 60.0, vendor="cisco")
+    b = book()
+    b.acquire(1, "agentA", T0, token="tokA")
+    b.submit(1, "tokA", "agentA", "key", "enter", g, T0, timeout=30, context="<SW1>")
+    view = b.view(T0)
+    masked = sw.masked_view(view, {1: "cisco"})
+    assert "s3cr3t" not in json.dumps(masked["pending"], ensure_ascii=False)
+    assert view["pending"][0]["gate"]["line"] == LONG_SECRET_LINE[-sw.LINE_SHOWN:]    # Book.view 仍是原文
+
+
+def test_masked_view_old_state_without_display_copy():
+    """升级前的状态文件没有 line_shown: 回退到对 line 打码."""
+    raw = "Router(config)#snmp-server community s3cr3t-line RO"
+    assert "s3cr3t" not in sw.gate_shown({"line": raw}, "cisco") and sw.gate_shown({}, None) == ""
+
+
+def test_display_copy_not_in_event_log():
+    g = sw.classify_key("enter", LONG_SECRET_LINE, 60.0, vendor="cisco")
+    assert "line_shown" not in sw._log_gate(g) and "line" not in sw._log_gate(g)

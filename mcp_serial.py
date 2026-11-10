@@ -385,7 +385,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
         if gate["verdict"] == "pass" and gate.get("layer") == 2:
             gate = _settled(n, s, text, gate)         # 模型判了几十秒: 设备还停在原处、日志也安静才直发 (#74 第五轮)
         if text:
-            gate["line"] = sw.last_line(text)[-sw.LINE_SHOWN:]     # 挂起时设备停在哪: 确认时比对 (#74 第三轮)
+            gate.update(sw.line_fields(sw.last_line(text), r.get("slots", {}).get(n)))     # 挂起时设备停在哪: 确认时比对 (#74 第三轮)
         if s.get("count") is not None:
             gate["log_size"] = s["count"]             # 挂起时 conbroker 日志多大: 例外 (同一确认行) 要求没新字节
         if intent:
@@ -559,7 +559,7 @@ def recheck(it, dev, tail, rules, size=None):
                 and was_size is not None and size == was_size):
             return None                 # 挂起时就停在这个确认提示上: 人看过、明确要回答它; 还是同一行、日志没新字节才发
         why = ("看不到设备现在停在哪" if not now_line else
-               f"设备现在不在提示符上 (挂起时最后一行: {sw.shown_line(was, vendor) or '(没记)'}), 这条发出去可能替人回答")
+               f"设备现在不在提示符上 (挂起时最后一行: {sw.gate_shown(it.get('gate'), vendor) or '(没记)'}), 这条发出去可能替人回答")
     return f"确认时重看设备, 没发: {why}; 设备现在最后一行: {shown}. 要发请让 Agent 重新挂起"
 
 

@@ -27,6 +27,7 @@
 """
 
 import collections
+import functools
 import hashlib
 import json
 import math
@@ -300,11 +301,11 @@ def slot_vendor(slot, rules, text):
 
 # ------------------------------------------------------------ 闸门
 
-def _gate(verdict, reason, danger=(), vendor=None, layer=None, model=None, line=None):
+def _gate(verdict, reason, danger=(), vendor=None, layer=None, model=None, line=None, line_vendor=None):
     g = {"verdict": verdict, "layer": layer or (1 if verdict == "pass" else 3), "reason": reason,
          "danger": list(danger), "vendor": vendor}
     if line is not None:
-        g["line"] = line[-LINE_SHOWN:]  # 发键时设备停在哪一行: 人确认时看 (设备输出, 只当数据显示)
+        g.update(line_fields(line, line_vendor))     # 发键时设备停在哪一行: 人确认时看 (设备输出, 只当数据显示)
     if model is not None:
         g["model"] = model          # 第 2 层的原始判断 / 出错说明, 随闸门结果整个进执行绪日志
     return g
@@ -425,18 +426,19 @@ def classify_key(key, text=None, quiet_s=None, vendor=None):
     ln = last_line(text)
     if not ln:
         return _gate("confirm", f"看不到设备最后一行 (读不到输出或日志是空的), 不知道 {k['label']} 会回答什么, 要人确认")
+    _g = functools.partial(_gate, line=ln, line_vendor=vendor)
     if is_confirm_prompt(ln):
-        return _gate("confirm", f"设备停在确认提示上, {k['label']} 等于替人回答, 要人确认", line=ln)
+        return _g("confirm", f"设备停在确认提示上, {k['label']} 等于替人回答, 要人确认")
     if not at_any_prompt(ln, vendor):           # 理由进执行绪日志, 不引用设备行 (#93); 那一行在 gate.line, 卡片单独一块
-        return _gate("confirm", f"设备不在提示符或翻页上 (可能是确认提示后又刷了日志、"
-                                f"半截输出或开机滚屏), {k['label']} 可能替人回答, 要人确认", line=ln)
+        return _g("confirm", f"设备不在提示符或翻页上 (可能是确认提示后又刷了日志、"
+                             f"半截输出或开机滚屏), {k['label']} 可能替人回答, 要人确认")
     if key == "space" and _PAGER.fullmatch(ln):        # 翻页空格不会回答确认提示, 不等 5 秒 (#74 第二轮)
-        return _gate("pass", f"固定特殊键 {k['label']} (第 1 层放行, 翻页)", line=ln)
+        return _g("pass", f"固定特殊键 {k['label']} (第 1 层放行, 翻页)")
     if quiet_s is None or quiet_s < HUMAN_QUIET_S:
         when = "不知道设备最近有没有动静" if quiet_s is None else f"设备日志 {max(0, quiet_s):.0f} 秒前还有动静"
-        return _gate("confirm", f"{when}, 可能有人正在敲 (conbroker 会让 Agent 的键排队到人停手), "
-                                f"{k['label']} 可能替人回答, 要人确认; 没人时等 {HUMAN_QUIET_S} 秒再发", line=ln)
-    return _gate("pass", f"固定特殊键 {k['label']} (第 1 层放行)", line=ln)
+        return _g("confirm", f"{when}, 可能有人正在敲 (conbroker 会让 Agent 的键排队到人停手), "
+                             f"{k['label']} 可能替人回答, 要人确认; 没人时等 {HUMAN_QUIET_S} 秒再发")
+    return _g("pass", f"固定特殊键 {k['label']} (第 1 层放行)")
 
 
 # ------------------------------------------------------------ 日志行
@@ -487,6 +489,22 @@ _B64 = re.compile(r"\s*[A-Za-z0-9+/=]{32,}\s*")
 _IFNAME = re.compile(r"[A-Za-z][A-Za-z-]*\d+(?:[/:.]\d+)+(?:\([\w.]+\))?")          # GigabitEthernet0/0/1(10G)
 _HEXSEP = re.compile(r"[0-9A-Fa-f]+(?:[-:.][0-9A-Fa-f]+)+")                          # MAC / IPv6 / 序列号分段
 MASK = "******"
+_NO_VALUE = re.compile(r"\s*[:?]?\s*")                                              # 口令词后面什么值都没有
+_NAME_SEP = re.compile(r"[-_()]")
+_NAME_PART = re.compile(r"[A-Za-z]*(?:\d+(?:[/:.]\d+)*)?")                             # 词 / SW1 / GigabitEthernet0/0/1
+_ANSWER_WIN = 32            # 回答标记只在行尾这么多字里找: 长行上的 \s*$ 会退化成平方
+_ANSWER_MARK = re.compile(                                                            # 内容固定, 藏不下值; 带默认值的 [x]: 不算
+    rf"(?:\[confirm\]|[\[(（<]\s*{_YN}\s*[/|,]\s*{_YN}\s*[\])）>]|\[y\]es\s*/\s*\[n\]o)\s*[:：?？]*\s*$", re.I)
+_WORD_END = ".,;:!?？："
+# 确认提示里跟在口令词后面的普通英语. 只收问句用词; 别加 default / public / admin 这类常被当口令的词.
+_PROSE = frozenset("""
+    a an and all any are at be been by can current data delete deleted do does existing expire expired expires
+    file files for from has have if in is it its may must need needs new no not now of on or pair please required
+    should sure that the then this to was were will with would you your
+    apply change changed changes clear cleared config configuration confirm continue create created erase erased
+    generate generated overwrite overwritten proceed reboot reload remove removed replace replaced reset restart
+    save saved update updated want
+""".split()) | {""}
 
 
 def _show(ln):
@@ -540,6 +558,36 @@ def _bare_prompt(m, vendor=None):
     return True
 
 
+def _named_prompt(m, vendor=None):
+    """原文过得了提示符白名单 ([HUAWEI-rsa-public-key] 这类, 名字里带口令词才走到这) -> 不按"像密文"整行抹成星号,
+    后面照常从口令词起打码. 名字拆开后每段都得是普通的词或接口号, 字母数字掺着、带符号的不算: 密文不能借提示符的形状漏出去."""
+    return at_any_prompt(m, vendor) and all(_NAME_PART.fullmatch(p) for p in _NAME_SEP.split(m.strip("[]<>~*#$")))
+
+
+def _masked_question(kept, tail):
+    """确认提示里口令词后面的部分 -> 打码后的一行. 只留两样: 行尾固定形状的回答标记, 和紧贴它、全是常见英语词的问句;
+    其余都当值. 一个光秃秃的词 (set password change [Y/N]) 也当值. 整段都是问句就原样留."""
+    win = tail[-_ANSWER_WIN:]
+    hit = _ANSWER_MARK.search(win)
+    body, mark = tail, ""
+    if hit:
+        body, mark = tail[:len(tail) - len(win) + hit.start()], hit.group().strip()
+    words = body.split()
+    keep = len(words)
+    while keep and words[keep - 1].rstrip(_WORD_END).lower() in _PROSE:
+        keep -= 1
+    if keep == 0 and len(words) == 1 and words[0].isalnum():
+        keep = 1
+    if keep == 0:
+        return _show(kept + tail)
+    question = " ".join(words[keep:] + ([mark] if mark else []))
+    return _show(kept) + _mask_glue(kept) + MASK + (" " + _show(question) if question else "")
+
+
+def _mask_glue(kept):
+    return "" if kept.endswith((" ", "=", "-p", "/")) or not kept else " "
+
+
 def _ctx_line(ln, in_key=False, vendor=None):
     """一行设备输出 -> (给人看的一行, 是否在私钥块里)."""
     m = _for_match(ln)
@@ -550,7 +598,8 @@ def _ctx_line(ln, in_key=False, vendor=None):
     if _bare_prompt(m, vendor):
         return _show(m), in_key
     head, rest = "", m
-    if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest) or _cipher_like(rest):
+    if _B64.fullmatch(rest) or _SECRET_CONT.match(rest) or _SECRET_WHOLE.search(rest) \
+            or (_cipher_like(rest) and not _named_prompt(rest, vendor)):
         return _show(head) + MASK, in_key
     cut = None
     for rx in (_SECRET_SHORT, _SECRET_LONG, _SECRET_DASH, _SECRET_URL, _SECRET_SPACED, _SECRET_SMB):
@@ -561,8 +610,12 @@ def _ctx_line(ln, in_key=False, vendor=None):
                 cut = (hit.start(), keep)
             break
     if cut:
-        kept = rest[:cut[1]]
-        return _show(head + kept) + ("" if kept.endswith((" ", "=", "-p", "/")) or not kept else " ") + MASK, in_key
+        kept, after = rest[:cut[1]], rest[cut[1]:]
+        if _NO_VALUE.fullmatch(after):              # Enter Password: 后面没东西, 加星号反而像已经输了口令
+            return _show(rest), in_key
+        if is_confirm_prompt(rest):                 # 问句要留给确认的人看 (#107 审查); 普通行照旧从口令词起整段打码
+            return _masked_question(kept, after), in_key
+        return _show(head + kept) + _mask_glue(kept) + MASK, in_key
     return _show(_ANSI.sub("", ln)), in_key
 
 
@@ -572,6 +625,18 @@ def shown_line(ln, vendor=None):
     return _ctx_line(" ".join(str(ln or "").split()), False, vendor)[0]
 
 
+def line_fields(line, vendor=None):
+    """挂起时记下的设备最后一行: line 是原文 (确认时比对), line_shown 先打码再截短 (显示用, 口令词可能在截掉的前段)."""
+    return {"line": line[-LINE_SHOWN:], "line_shown": shown_line(line, vendor)[-LINE_SHOWN:]}
+
+
+def gate_shown(gate, vendor=None):
+    """闸门记的设备最后一行 -> 显示用的打码文字. 升级前的挂起项没有 line_shown, 回退到对截短后的原文打码."""
+    g = gate or {}
+    s = g.get("line_shown")
+    return s if isinstance(s, str) else shown_line(g.get("line"), vendor)
+
+
 def masked_view(view, vendors=None):
     """给 Agent 的视图: 挂起项和历史的 gate.line 打码 (#93), 返回副本. Book.view 本身不动: 确认时比对要原文.
     vendors = {槽位: 登记的厂商}."""
@@ -579,7 +644,9 @@ def masked_view(view, vendors=None):
         g = it.get("gate")
         if not (isinstance(g, dict) and g.get("line")):
             return it
-        return dict(it, gate=dict(g, line=shown_line(g["line"], (vendors or {}).get(it.get("slot")))))
+        shown = dict(g, line=gate_shown(g, (vendors or {}).get(it.get("slot"))))
+        shown.pop("line_shown", None)
+        return dict(it, gate=shown)
     return dict(view, pending=[mask(it) for it in view["pending"]], history=[mask(it) for it in view["history"]])
 
 
@@ -596,6 +663,7 @@ def _log_gate(gate):
     挂起项 / 审批界面里的 gate 不动 (确认时比对、卡片显示要用)."""
     g = dict(gate)
     line = str(g.pop("line") or "")
+    g.pop("line_shown", None)
     g["line_len"] = len(line)
     g["line_sha"] = hashlib.sha256(line.encode("utf-8")).hexdigest()[:16]
     return g

@@ -709,3 +709,28 @@ def test_recheck_direct_refuses(kind, cmd, now, vendor, was, sizes, shown):
 ])
 def test_recheck_direct_passes(kind, cmd, now, vendor, was, sizes):
     assert _rc(kind, cmd, now, vendor, was, was_size=sizes[0], size=sizes[1]) is None
+
+
+# ------------------------------------------------------------ #107 审查: 先打码再截短
+
+LONG_SECRET = "username ops password " + " ".join(["s3cr3t-tail"] * 30)
+
+
+@pytest.mark.parametrize("tool,args", [("send_key", {"key": "enter"}), ("send_command", {"command": "save"})])
+def test_held_long_line_display_copy_masked(rig, tool, args):
+    """口令词落在末尾 200 字之外: 比对字段仍是原文, pending_list 和 recheck 说明看不到密文尾巴."""
+    rig.rules = dict(rig.rules, slots={1: "cisco"})
+    rig.tail_text["/dev/con-1"] = LONG_SECRET
+    p = rig.ok(tool, dict(args, slot=1, lease=rig.lease(1)))
+    assert rig.store.view()["pending"][0]["gate"]["line"] == LONG_SECRET[-sw.LINE_SHOWN:]
+    assert "s3cr3t" not in rig.store.view()["pending"][0]["gate"]["line_shown"]
+    assert "s3cr3t" not in json.dumps(rig.ok("pending_list"), ensure_ascii=False)
+    status, note = _confirm(rig, p["id"])
+    assert status == "refused" and rig.sent == [] and "s3cr3t" not in note
+
+
+def test_recheck_note_uses_display_copy():
+    gate = sw.line_fields(LONG_SECRET, "cisco")
+    it = {"kind": "line", "cmd": "y", "slot": 1, "gate": gate}
+    note = ms.recheck(it, "/dev/con-1", lambda d, n: "still booting", lambda: {"slots": {1: "cisco"}})
+    assert "s3cr3t" not in note and sw.MASK in note
