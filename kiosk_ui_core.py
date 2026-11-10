@@ -298,6 +298,7 @@ PANES = {
     "netmode": "网口模式 · LAN1 / LAN2 各一个模式, 每个都能撤, 再点一次按钮返回",
     "wol": "网络唤醒 · 双击清单里的机器直接唤醒, 再点一次按钮返回",
     "bigfish": "大肥鱼",
+    "label": "打标签 · 线缆旗形纸, 中文照打; 再点一次按钮返回",
 }
 
 
@@ -350,6 +351,7 @@ MENU = {
         _page("画面设置", "video"),
         _pane("串口会话:  开 / 关", "serial", attr="btn_serial"),
         _pane("大肥鱼", "bigfish"),                                       # #53 只读看进度
+        _pane("打标签", "label"),                                         # #104
         _page("装机", "install", attr="btn_install_page"),
         _page("网络", "net"),
         _act("锁屏", "lock_now"),

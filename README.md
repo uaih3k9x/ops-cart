@@ -44,6 +44,7 @@
 | `wifi_panel.py` · `wifi_core.py` · `wifi_prefer.py` · `ruijie_portal.py` | 无线管理、优先级生效、校园网认证 |
 | `netmode_panel.py` · `netmode_core.py` · `netprof_core.py` | 网口模式（关闭 / DHCP / 静态），可撤回 |
 | `wol_panel.py` · `wol_core.py` | 网络唤醒 |
+| `label_panel.py` · `label_core.py` · `label_render.py` · `label_device.py` | 车机打线缆标签（#104）：输入、预览、打印、刻度尺校准（折痕读数按纸型存 `/etc/ops-cart/label.json`）；中文用 FreeType 渲染成位图，网页口不开放 |
 | `ch9329.py` · `kvm_core.py` · `kvm_broker.py` · `kvm_broker_core.py` | CH9329 协议栈和命令行；画面源与键鼠绑定；键鼠代理（`/run/ops-kvm/kvm.sock`） |
 | `serial_panel.py` · `serial_core.py` · `survey_core.py` | 串口面板、conbroker 接口、多厂商只读巡检 |
 | `observe_core.py` · `observe_panel.py` | 串口观察模式（#85，半自动）：人登录后确认设备名，推车只发 `display` 只读命令，画前面板和端口灯；有人 attach 就暂停，主动锁屏或到时长上限（默认 30 分钟）就停 |

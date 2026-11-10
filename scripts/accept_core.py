@@ -255,6 +255,7 @@ REQUIRED_PY = (
     "confirm_panel", "dash_core", "dash_render", "dash_service", "hidpdc", "httpserve",
     "ime_core", "ime_proc", "ime_rime", "ime_tk", "ime_worker", "kiosk",
     "kiosk_core", "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core",
+    "label_core", "label_device", "label_panel", "label_render",
     "lamps_core", "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe",
     "mcp_serial", "netmode_core", "netmode_panel", "netprof_core", "notify_core", "observe_core", "observe_panel", "ocr_rapid_worker",
     "pet_core", "pet_render", "pet_sprites", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
