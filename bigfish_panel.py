@@ -1,6 +1,8 @@
 """车机大肥鱼面板 (#53): 看它在做什么; 确认 / 拒绝打开现有确认框, 急停就是全部急停 (顺带写大肥鱼的急停信号).
 #99: 给了 desk 就多一行输入框, 能派任务、看这个任务、取消它. 逻辑全在 bigfish_task_core, 这里只接线.
 
+回复单独放滚动区, 只追加新内容, 人往上翻时不拉回底部.
+
 数据只来自 bigfish_core.load (大肥鱼导出的白名单状态文件) 和任务接口. 大肥鱼说的话用单独的颜色、等宽字、SAYS 前缀,
 Text 只插纯文字 (不认链接、不执行). 这里不审批、不写任何文件; 输入框没有任何通往批准的路.
 """
@@ -16,6 +18,9 @@ import theme as th
 
 BG, = th.follow(globals(), BG="PANEL")
 REFRESH_MS = 2000
+STATUS_LINES = 9                    # 有滚动区时上面状态区的高度
+FOLLOW_AT = 0.999                   # 滚动条到这儿算在底部, 新内容跟着走
+LOG_BATCH = 2000                    # 一次刷新最多插这么多行 (重开面板补历史也不卡主线程), 剩下的下次接着插
 TAGS = {"own": "FG", "dim": "DIM", "bad": "BAD", "untrusted": "AGENT"}
 
 
@@ -29,13 +34,14 @@ class BigfishPanel(tk.Frame):
         self.estop_on = estop_on
         self.desk, self.run_bg, self.locked, self.agents_stopped = desk, run_bg, locked, agents_stopped
         self.submit, self.get_task, self.cancel_task = submit, get_task, cancel_task
-        self.entry = None
-        self.text = tk.Text(self, font=th.FONT_BIG, bg=BG, fg=th.FG, **th.FLAT, wrap="word",
-                            state="disabled", padx=16, pady=12, cursor="arrow")
-        self.text.pack(fill="both", expand=True)
-        for tag, color in TAGS.items():
-            self.text.tag_config(tag, foreground=getattr(th, color))
-        self.text.tag_config("untrusted", font=th.FONT_MONO, lmargin1=24, lmargin2=24)
+        self.entry = self.log = None
+        self._shown, self._log_gen, self._log_n, self._log_live = None, None, 0, []
+        self.text = self._text(self)
+        if desk is None:
+            self.text.pack(fill="both", expand=True)
+        else:
+            self.text.config(height=STATUS_LINES)
+            self.text.pack(fill="x")
         if desk is not None:
             self._build_desk()
         bar = tk.Frame(self, bg=BG)
@@ -48,13 +54,36 @@ class BigfishPanel(tk.Frame):
         self._job = None
         self.refresh()
 
+    def _text(self, parent):
+        w = tk.Text(parent, font=th.FONT_BIG, bg=BG, fg=th.FG, **th.FLAT, wrap="word",
+                    state="disabled", padx=16, pady=12, cursor="arrow")
+        for tag, color in TAGS.items():
+            w.tag_config(tag, foreground=getattr(th, color))
+        w.tag_config("untrusted", font=th.FONT_MONO, lmargin1=24, lmargin2=24)
+        return w
+
     def _btn(self, parent, text, bg, fg, cmd):
         b = tk.Button(parent, text=text, font=th.FONT_BIG, command=cmd or (lambda: None), bg=bg, fg=fg,
                       activebackground=bg, activeforeground=fg, **th.RAISED, padx=24, pady=10, cursor="hand2")
         b.pack(side="left", padx=6)
         return b
 
+    def _build_log(self):
+        wrap = tk.Frame(self, bg=BG)
+        wrap.pack(fill="both", expand=True)
+        self.log = self._text(wrap)
+        self.log.config(height=1)           # 只占 expand 分到的地方, 不把下面的输入行挤出屏
+        bar = tk.Scrollbar(wrap, orient="vertical", width=24, command=self.log.yview)
+        self.log.config(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+
+    def _page(self, n):
+        self.log.yview_scroll(n, "pages")
+        return "break"
+
     def _build_desk(self):
+        self._build_log()
         row = tk.Frame(self, bg=BG)
         row.pack(fill="x", padx=18, pady=(0, 4))
         self.entry = tk.Entry(row, font=th.FONT_BIG, bg=th.BG, fg=th.FG, insertbackground=th.FG, **th.SUNKEN)
@@ -62,6 +91,8 @@ class BigfishPanel(tk.Frame):
         self.entry.insert(0, self.desk.draft)
         self.task_ime = ime_tk.attach(self.entry, purpose="bigfish.task", font=th.FONT, bg=th.BOX, fg=th.FG)
         self.entry.bind("<Return>", lambda _e: self._send())   # 拼音期间的回车被中文输入吃掉, 到不了这里
+        self.entry.bind("<Prior>", lambda _e: self._page(-1))  # 焦点总在输入框, 翻页键直接翻回复
+        self.entry.bind("<Next>", lambda _e: self._page(1))
         self.btn_send = self._btn(row, "发送", th.PRIMARY, th.WHITE, self._send)
         self.btn_cancel = self._btn(row, "取消任务", th.BTN2, th.FG, self._cancel)
         self.hint = tk.Label(self, text="", font=th.FONT, bg=BG, fg=th.DIM, anchor="w")
@@ -136,11 +167,39 @@ class BigfishPanel(tk.Frame):
         rows = bf.panel_rows(view, now, note=self.note(), ready=self.ready())
         if self.desk is not None and self.desk.rows():
             rows = self.desk.rows() + [("", "dim")] + rows      # 人刚派的任务放最上面, 不被状态行挤出屏
-        self.text.config(state="normal")
-        self.text.delete("1.0", "end")
-        for line, tag in rows:
-            self.text.insert("end", line + "\n", tag)
-        self.text.config(state="disabled")
+        if rows != self._shown:
+            self._shown = rows
+            self.text.config(state="normal")
+            self.text.delete("1.0", "end")
+            for line, tag in rows:
+                self.text.insert("end", line + "\n", tag)
+            self.text.config(state="disabled")
+        if self.desk is not None:
+            self._update_log()
+
+    def _update_log(self):
+        """回复滚动区的增量刷新: 定稿的行只追加, 只重写最后还会变的几行; 人往上翻时不动视图."""
+        d, log = self.desk, self.log
+        if self._log_gen != d.gen:
+            self._log_gen, self._log_n, self._log_live = d.gen, 0, []
+            log.config(state="normal")
+            log.delete("1.0", "end")
+            log.config(state="disabled")
+        done, live = d.log_rows()
+        fresh = done[self._log_n:self._log_n + LOG_BATCH]
+        n = self._log_n + len(fresh)
+        live = live if n == len(done) else []       # 没追上时半行先不画
+        if not fresh and live == self._log_live:
+            return
+        follow = log.yview()[1] >= FOLLOW_AT
+        log.config(state="normal")
+        log.delete(f"{self._log_n + 1}.0", "end")
+        for line, tag in fresh + live:
+            log.insert("end", line + "\n", tag)
+        log.config(state="disabled")
+        self._log_n, self._log_live = n, live
+        if follow:
+            log.see("end")
 
     def _redraw(self):
         now = self.clock()

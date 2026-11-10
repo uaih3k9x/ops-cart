@@ -254,3 +254,191 @@ def test_refresh_without_desk_does_not_poll():
     fake._poll = bp.BigfishPanel._poll.__get__(fake)
     fake.refresh()
     assert len(after) == 1 and "text" not in fake.hint.cfg
+
+
+# ------------------------------------------------------------ 回复滚动区: 假 Text, 不起 Tk
+
+class _Log:
+    """记录写入的假 Text: 行号从 1 算, 只认 "<行>.0" 到 "end" 的删除."""
+
+    def __init__(self, view=(0.0, 1.0)):
+        self.lines, self.view, self.seen, self.state, self.writes = [], view, [], "disabled", 0
+
+    def yview(self):
+        return self.view
+
+    def config(self, **kw):
+        self.state = kw.get("state", self.state)
+
+    def delete(self, first, last):
+        assert self.state == "normal" and last == "end"
+        del self.lines[int(first.split(".")[0]) - 1:]
+        self.writes += 1
+
+    def insert(self, _at, text, tag):
+        assert self.state == "normal" and text.endswith("\n")
+        self.lines.append((text[:-1], tag))
+        self.writes += 1
+
+    def see(self, where):
+        self.seen.append(where)
+
+
+def _log_fake(view=(0.0, 1.0)):
+    fake, _jobs = _fake()
+    fake.desk.begin("看下状态", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    fake.log = _Log(view)
+    fake._log_gen, fake._log_n, fake._log_live = None, 0, []
+    fake._update_log = bp.BigfishPanel._update_log.__get__(fake)
+    return fake
+
+
+def _feed(fake, text):
+    got = fake.desk.got
+    fake.desk.polled({"task_id": TID, "state": "running", "output_offset": got, "output_total_chars": got + len(text),
+                      "untrusted_agent_output": {"output": text}})
+
+
+def _plain(fake):
+    return [t[len(bf.SAYS):] for t, _ in fake.log.lines]
+
+
+def test_log_first_paint_inserts_all_and_follows_bottom():
+    fake = _log_fake()
+    _feed(fake, "一\n二\n")
+    fake._update_log()
+    assert _plain(fake) == ["一", "二"] and fake.log.seen == ["end"] and fake.log.state == "disabled"
+    assert all(tag == "untrusted" for _, tag in fake.log.lines)
+
+
+def test_log_no_change_does_not_touch_widget():
+    fake = _log_fake()
+    _feed(fake, "一\n半")
+    fake._update_log()
+    writes, seen = fake.log.writes, list(fake.log.seen)
+    fake._update_log()
+    assert fake.log.writes == writes and fake.log.seen == seen
+
+
+def test_log_only_appends_and_keeps_earlier_lines():
+    fake = _log_fake()
+    _feed(fake, "一\n二\n")
+    fake._update_log()
+    deletes = []
+    real = fake.log.delete
+    fake.log.delete = lambda a, b: deletes.append(a) or real(a, b)
+    _feed(fake, "三\n")
+    fake._update_log()
+    assert _plain(fake) == ["一", "二", "三"] and deletes == ["3.0"]
+
+
+def test_log_partial_line_is_replaced_in_place():
+    fake = _log_fake()
+    _feed(fake, "一\n前")
+    fake._update_log()
+    _feed(fake, "后")
+    fake._update_log()
+    assert _plain(fake) == ["一", "前后"]
+    _feed(fake, "\n")
+    fake._update_log()
+    assert _plain(fake) == ["一", "前后"]
+
+
+def test_log_scrolled_up_is_not_pulled_back():
+    fake = _log_fake(view=(0.1, 0.5))
+    _feed(fake, "一\n")
+    fake._update_log()
+    _feed(fake, "二\n")
+    fake._update_log()
+    assert fake.log.seen == [] and _plain(fake) == ["一", "二"]
+
+
+def test_log_resumes_following_when_back_at_bottom():
+    fake = _log_fake(view=(0.1, 0.5))
+    _feed(fake, "一\n")
+    fake._update_log()
+    fake.log.view = (0.5, 1.0)
+    _feed(fake, "二\n")
+    fake._update_log()
+    assert fake.log.seen == ["end"]
+
+
+def test_log_new_task_starts_over():
+    fake = _log_fake()
+    _feed(fake, "旧\n")
+    fake._update_log()
+    fake.desk.begin("下一条", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    _feed(fake, "新\n")
+    fake._update_log()
+    assert _plain(fake) == ["新"]
+
+
+def test_log_new_task_with_no_output_yet_clears_old():
+    fake = _log_fake()
+    _feed(fake, "旧\n")
+    fake._update_log()
+    fake.desk.begin("下一条", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    fake._update_log()
+    assert fake.log.lines == []
+
+
+def test_log_first_paint_is_batched_so_main_thread_stays_free():
+    fake = _log_fake()
+    fake.desk.lines.extend((f"{bf.SAYS}{i}", "untrusted") for i in range(bp.LOG_BATCH + 5))
+    fake.desk.tail = "半"
+    fake._update_log()
+    assert len(fake.log.lines) == bp.LOG_BATCH and fake.log.lines[-1][0] == f"{bf.SAYS}{bp.LOG_BATCH - 1}"
+    fake._update_log()
+    assert len(fake.log.lines) == bp.LOG_BATCH + 6 and fake.log.lines[-1][0] == bf.SAYS + "半"
+
+
+def test_draw_updates_log_and_status_pane():
+    fake = _log_fake()
+    fake.text = _Log()
+    fake._shown = None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    _feed(fake, "一\n")
+    bp.BigfishPanel._draw.__get__(fake)(_online(), NOW)
+    assert _plain(fake) == ["一"] and any("派的任务" in t for t, _ in fake.text.lines)
+    assert all("一" != t for t, _ in fake.text.lines)
+
+
+def test_draw_skips_unchanged_status_pane():
+    fake = _log_fake()
+    fake.text = _Log()
+    fake._shown = None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    draw = bp.BigfishPanel._draw.__get__(fake)
+    draw(_online(), NOW)
+    writes = fake.text.writes
+    draw(_online(), NOW)
+    assert fake.text.writes == writes
+
+
+def test_draw_without_desk_has_no_log():
+    fake = _log_fake()
+    fake.text, fake._shown, fake.desk = _Log(), None, None
+    fake.note, fake.ready = (lambda: ""), (lambda: True)
+    fake._update_log = lambda: pytest.fail("没有 desk 不该碰滚动区")
+    bp.BigfishPanel._draw.__get__(fake)(_online(), NOW)
+
+
+def test_page_keys_scroll_log():
+    calls = []
+    fake = SimpleNamespace(log=SimpleNamespace(yview_scroll=lambda n, unit: calls.append((n, unit))))
+    assert bp.BigfishPanel._page.__get__(fake)(-1) == "break"
+    assert calls == [(-1, "pages")]
+
+
+def test_container_down_greys_out_with_reason_and_keeps_text():
+    view = _online()
+    view["health"] = "container_down"
+    fake, jobs = _fake(view=view)
+    fake._sync_desk()
+    assert fake.btn_send.cfg["state"] == "disabled" and fake.entry.state == "disabled"
+    assert fake.hint.cfg["text"] == bf.HEALTH_TEXT["container_down"][1] and fake.entry.value == "看下状态"
+    fake._send()
+    assert jobs == []

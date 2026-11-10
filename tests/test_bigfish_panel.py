@@ -133,3 +133,33 @@ def test_panel_without_desk_has_no_input_row(root):
                         on_confirm=lambda: None, on_estop=lambda: None, clock=lambda: NOW)
     assert w.entry is None
     w.destroy()
+
+
+def test_reply_log_keeps_scroll_position_when_new_output_arrives(root):
+    w, jobs = _desk_panel(root)
+    w.entry.insert(0, "看下状态")
+    w.btn_send.invoke()
+    work, done = jobs[0]
+    done(work())
+    root.geometry("800x600")
+    root.update()
+
+    def feed(n):
+        got = w.desk.got
+        text = "".join(f"行{got}-{i}\n" for i in range(n))
+        w._polled({"task_id": "t-1", "state": "running", "output_offset": got, "output_total_chars": got + len(text),
+                   "untrusted_agent_output": {"output": text}})
+        root.update()
+    feed(300)
+    assert w.log.yview()[1] == 1.0                      # 在底部: 跟着走
+    w.log.yview_moveto(0.2)
+    root.update()
+    before = w.log.index("@0,0")
+    feed(50)
+    assert w.log.index("@0,0") == before                # 往上翻时不拉回底部
+    w.log.yview_moveto(1.0)
+    root.update()
+    feed(50)
+    assert w.log.yview()[1] == 1.0
+    assert w.log.cget("state") == "disabled"
+    w.destroy()
