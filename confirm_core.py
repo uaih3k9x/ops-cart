@@ -194,15 +194,16 @@ def _trusted(slot_view):
 
 
 LINE_SHOW_MAX = 160          # 确认框里挂起时 / 当前最后一行显示多少字
-QUESTION_LOST = "！！问句被打码截掉，去串口会话看原文再确认"
+QUESTION_LOST = "！！这一行有内容被打码，问句可能不全，去串口会话看原文再确认"
 
 
 def _device_line(raw, shown):
     """设备一行 (raw 原文, shown 已打码) -> 卡片上的文字: 过长留行尾 (问句和 [Y/N] 在行尾);
-    原文是确认提示、打码后认不出了就在下一行明说."""
+    原文是确认提示、显示文字里有星号就在下一行明说 (星号藏的可能是 erase startup-config, 不只是口令).
+    提示由推车拼在设备内容之后, 设备内容已压成一行, 伪造不了."""
     s = one_line(shown, sw.LINE_SHOWN)
     s = s if len(s) <= LINE_SHOW_MAX else "…" + s[-LINE_SHOW_MAX:]
-    return s + (f"\n{QUESTION_LOST}" if sw.is_confirm_prompt(raw) and not sw.is_confirm_prompt(shown) else "")
+    return s + (f"\n{QUESTION_LOST}" if sw.is_confirm_prompt(raw) and sw.MASK in shown else "")
 
 
 def _line_info(p, live=None, vendor=None):

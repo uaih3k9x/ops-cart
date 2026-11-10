@@ -729,6 +729,15 @@ def test_held_long_line_display_copy_masked(rig, tool, args):
     assert status == "refused" and rig.sent == [] and "s3cr3t" not in note
 
 
+def test_passed_key_result_shows_masked_gate(rig):
+    """放行分支的返回值给 Agent: gate.line 用显示字段, 没有 line_shown; 落盘和比对的原文不动."""
+    raw = "R1(config-keychain-key)#"
+    rig.tail_text["/dev/con-1"] = raw
+    out = rig.ok("send_key", {"slot": 1, "key": "enter", "lease": rig.lease(1)})
+    assert out["status"] == "sent" and out["gate"]["verdict"] == "pass"
+    assert "line_shown" not in out["gate"] and out["gate"]["line"] == sw.shown_line(raw) != raw
+
+
 def test_recheck_note_uses_display_copy():
     gate = sw.line_fields(LONG_SECRET, "cisco")
     it = {"kind": "line", "cmd": "y", "slot": 1, "gate": gate}

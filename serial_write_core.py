@@ -566,17 +566,18 @@ def _named_prompt(m, vendor=None):
 
 def _masked_question(kept, tail):
     """确认提示里口令词后面的部分 -> 打码后的一行. 只留两样: 行尾固定形状的回答标记, 和紧贴它、全是常见英语词的问句;
-    其余都当值. 一个光秃秃的词 (set password change [Y/N]) 也当值. 整段都是问句就原样留."""
+    其余都当值. 口令词后紧跟内容就是值位置 (enable password change? / Password: reload [Y/N]), 哪怕全是常见词也至少
+    抹掉第一个词, 宁可遮错, 卡片上有提示兜底; 后面没有内容 (只有 ? 或回答标记) 才原样留."""
     win = tail[-_ANSWER_WIN:]
     hit = _ANSWER_MARK.search(win)
     body, mark = tail, ""
     if hit:
         body, mark = tail[:len(tail) - len(win) + hit.start()], hit.group().strip()
-    words = body.split()
+    words = body.lstrip(" :").split()
     keep = len(words)
     while keep and words[keep - 1].rstrip(_WORD_END).lower() in _PROSE:
         keep -= 1
-    if keep == 0 and len(words) == 1 and words[0].isalnum():
+    if keep == 0 and words and words[0].rstrip(_WORD_END).isalnum():
         keep = 1
     if keep == 0:
         return _show(kept + tail)
@@ -626,8 +627,13 @@ def shown_line(ln, vendor=None):
 
 
 def line_fields(line, vendor=None):
-    """挂起时记下的设备最后一行: line 是原文 (确认时比对), line_shown 先打码再截短 (显示用, 口令词可能在截掉的前段)."""
-    return {"line": line[-LINE_SHOWN:], "line_shown": shown_line(line, vendor)[-LINE_SHOWN:]}
+    """挂起时记下的设备最后一行: line 是原文 (确认时比对), line_shown 先打码再截短 (显示用, 口令词可能在截掉的前段).
+    星号被截出窗口时补回行首: 卡片靠它提示"有内容被打码"."""
+    full = shown_line(line, vendor)
+    shown = full[-LINE_SHOWN:]
+    if MASK in full and MASK not in shown:
+        shown = MASK + shown[len(MASK):]
+    return {"line": line[-LINE_SHOWN:], "line_shown": shown}
 
 
 def gate_shown(gate, vendor=None):
@@ -637,16 +643,24 @@ def gate_shown(gate, vendor=None):
     return s if isinstance(s, str) else shown_line(g.get("line"), vendor)
 
 
+def masked_gate(gate, vendor=None):
+    """给 Agent 看的闸门结果副本: line 换成打码的显示字段, 去掉 line_shown. 原 gate 不动 (确认时比对要原文).
+    没记 line 的闸门原样返回."""
+    if not gate.get("line"):
+        return gate
+    shown = dict(gate, line=gate_shown(gate, vendor))
+    shown.pop("line_shown", None)
+    return shown
+
+
 def masked_view(view, vendors=None):
     """给 Agent 的视图: 挂起项和历史的 gate.line 打码 (#93), 返回副本. Book.view 本身不动: 确认时比对要原文.
     vendors = {槽位: 登记的厂商}."""
     def mask(it):
         g = it.get("gate")
-        if not (isinstance(g, dict) and g.get("line")):
+        if not isinstance(g, dict):
             return it
-        shown = dict(g, line=gate_shown(g, (vendors or {}).get(it.get("slot"))))
-        shown.pop("line_shown", None)
-        return dict(it, gate=shown)
+        return dict(it, gate=masked_gate(g, (vendors or {}).get(it.get("slot"))))
     return dict(view, pending=[mask(it) for it in view["pending"]], history=[mask(it) for it in view["history"]])
 
 

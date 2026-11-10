@@ -326,7 +326,7 @@ def build_tools(store, slots, tail, send, rules=sw.load_rules, who=current_who, 
             status, out, note = "error", "", f"{type(e).__name__}: {e}"
         ms_ = int((time.monotonic() - t0) * 1000)
         store.run(lambda b, now: b.finish(it["id"], {"status": status, "echo": out, "ms": ms_, "note": note}, now))
-        res = {"status": status, "id": it["id"], "slot": n, "cmd": cmd, "gate": gate,
+        res = {"status": status, "id": it["id"], "slot": n, "cmd": cmd, "gate": sw.masked_gate(gate),
                "output": out if len(out) <= OUTPUT_MAX else out[:OUTPUT_MAX] + f"\n…(截断, 共 {len(out)} 字)"}
         if note:
             res["note"] = note

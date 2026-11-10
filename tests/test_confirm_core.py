@@ -546,8 +546,9 @@ def _card_line(raw, live=None, vendor=None):
     ("Overwrite auth config and reboot? [confirm]", "reboot? [confirm]"),
 ])
 def test_card_shows_question_with_secret_word(raw, must):
+    """口令词后面紧跟的词当值遮掉 (宁可遮错不放行口令), 问句和回答标记还在, 靠推车自己的提示兜底."""
     line = _card_line(raw)
-    assert must in line and sw.MASK not in line and cc.QUESTION_LOST not in line
+    assert must in line and sw.MASK in line and cc.QUESTION_LOST in line
 
 
 @pytest.mark.parametrize("raw,must,secret", [
@@ -556,7 +557,7 @@ def test_card_shows_question_with_secret_word(raw, must):
 ])
 def test_card_keeps_marker_and_hides_value(raw, must, secret):
     line = _card_line(raw)
-    assert must in line and sw.MASK in line and secret not in line and cc.QUESTION_LOST not in line
+    assert must in line and sw.MASK in line and secret not in line and cc.QUESTION_LOST in line
 
 
 @pytest.mark.parametrize("raw,secret", [("Password [Abc123]:", "Abc123"), ("chpasswd root:Abc123 [Y/N]", "Abc123"),
@@ -564,6 +565,37 @@ def test_card_keeps_marker_and_hides_value(raw, must, secret):
 def test_card_says_question_lost_when_cannot_keep_it(raw, secret):
     line = _card_line(raw)
     assert cc.QUESTION_LOST in line and secret not in line
+
+
+@pytest.mark.parametrize("raw,hidden", [
+    ("Reset password and erase startup-config? [confirm]", "erase"),
+    ("% Key pair exists. Erase NVRAM filesystem and reload? [confirm]", "Erase"),
+    ("secret store locked; wipe disk0: ? [yes/no]:", "wipe"),
+    ("Warning: The password file will be erased and the device factory-reset. Continue? [Y/N]", "factory-reset"),
+    ("This will clear the auth database and format flash:. Are you sure? [Y/N]", "format"),
+])
+def test_card_warns_when_stars_may_hide_danger_clause(raw, hidden):
+    """星号藏的可能是 erase startup-config: 打码的确认提示一律由推车自己补一行提示."""
+    line = _card_line(raw)
+    assert hidden not in line and sw.MASK in line and f"\n{cc.QUESTION_LOST}" in line
+
+
+def test_card_warns_when_stars_cut_by_length_limit():
+    """问句长到把星号挤出显示窗口, 提示也不能丢."""
+    line = _card_line("password Abc123 erase flash: " + "please confirm " * 30 + "[Y/N]")
+    assert "Abc123" not in line and "erase" not in line and f"\n{cc.QUESTION_LOST}" in line
+
+
+def test_card_no_warning_without_stars():
+    assert cc.QUESTION_LOST not in _card_line("Change password? [Y/N]")
+
+
+def test_device_cannot_forge_or_suppress_warning():
+    """设备内容压成一行再拼: 自己写的提示文字占不了单独一行."""
+    raw = f"Save config\n{cc.QUESTION_LOST} [Y/N]"
+    assert f"\n{cc.QUESTION_LOST}" not in cc._device_line(raw, sw.shown_line(raw))
+    forged = f"password Abc123 {cc.QUESTION_LOST} [Y/N]"
+    assert cc._device_line(forged, sw.shown_line(forged)).count(f"\n{cc.QUESTION_LOST}") == 1
 
 
 def test_card_hint_also_for_live_line():

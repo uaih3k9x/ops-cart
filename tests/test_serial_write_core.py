@@ -1934,17 +1934,6 @@ def test_masked_view_masks_copy_only():
 
 # ------------------------------------------------------------ #107 审查: 打码不能把确认提示的问句吃掉
 
-@pytest.mark.parametrize("line", [
-    "The password needs to be changed. Change now? [Y/N]:",
-    "Warning: The current configuration will be erased and the key pair deleted. Continue? [Y/N]:",
-    "Overwrite auth config and reboot? [confirm]",
-    "Change password now? [Y/N]",
-    "Change password? (yes/no)",
-])
-def test_confirm_question_with_plain_english_kept_whole(line):
-    assert sw.shown_line(line) == line
-
-
 @pytest.mark.parametrize("line", ["Enter Password:", "Password:", "password", "Enter Password :"])
 def test_secret_word_without_value_not_masked(line):
     assert sw.shown_line(line) == line
@@ -1986,6 +1975,50 @@ def test_non_confirm_lines_still_truncated_after_secret_word(line, secret):
     """不是确认提示的行 (日志 / 设备最近输出 / 回显) 维持口令词后整段打码, 不按"像不像英语"放行."""
     shown = sw.shown_line(line)
     assert secret not in shown and shown.endswith(sw.MASK)
+
+
+@pytest.mark.parametrize("line,word", [
+    ("enable password change?", "change"), ("Password: reload [Y/N]", "reload"), ("password: SAVE [Y/N]", "SAVE"),
+    ("Password:reload [Y/N]", "reload"), ("set password change now [Y/N]", "change"),
+    ("username bob secret reload now?", "reload"), ("snmp-server community all ?", "all"),
+    ("R1(config)#enable password reload ?", "reload"),
+])
+def test_common_word_in_value_position_is_masked(line, word):
+    """口令恰好是常见词: 口令词后紧跟内容就是值位置, 至少抹掉第一个词."""
+    shown = sw.shown_line(line)
+    assert sw.MASK in shown and word not in shown, shown
+
+
+@pytest.mark.parametrize("line", ["Change password? [Y/N]", "password [Y/N]", "password : [Y/N]", "Enter Password:",
+                                  "Password:", "Change password?", "Change password? (yes/no)"])
+def test_secret_word_without_value_stays_readable(line):
+    assert sw.shown_line(line) == line
+
+
+@pytest.mark.parametrize("line,must", [
+    ("The password needs to be changed. Change now? [Y/N]:", "Change now? [Y/N]:"),
+    ("The password will be changed. Continue? [Y/N]:", "Continue? [Y/N]:"),
+    ("Warning: The current configuration will be erased and the key pair deleted. Continue? [Y/N]:", "Continue? [Y/N]:"),
+    ("Overwrite auth config and reboot? [confirm]", "and reboot? [confirm]"),
+    ("Change password now? [Y/N]", "[Y/N]"),
+])
+def test_question_kept_after_first_word_masked(line, must):
+    """口令词后紧跟的词可能就是口令 (和 set password change now 分不开): 遮第一个词, 后面的问句和回答标记留着."""
+    shown = sw.shown_line(line)
+    assert sw.MASK in shown and shown.endswith(must), shown
+
+
+def test_line_fields_keep_stars_when_truncated():
+    line = "password Abc123 " + "please confirm " * 30 + "[Y/N]"
+    f = sw.line_fields(line)
+    assert sw.MASK in f["line_shown"] and len(f["line_shown"]) <= sw.LINE_SHOWN and f["line_shown"].endswith("[Y/N]")
+
+
+def test_masked_gate_returns_masked_copy():
+    g = sw.classify_key("enter", LONG_SECRET_LINE, 60.0, vendor="cisco")
+    shown = sw.masked_gate(g)
+    assert "s3cr3t" not in json.dumps(shown, ensure_ascii=False) and "line_shown" not in shown
+    assert g["line"] == LONG_SECRET_LINE[-sw.LINE_SHOWN:] and "line_shown" in g
 
 
 @pytest.mark.parametrize("line", ["set password Enter Password:", "Enter Password: Abc123", "Password:Abc123"])
