@@ -19,7 +19,6 @@ import theme as th
 BG, = th.follow(globals(), BG="PANEL")
 REFRESH_MS = 2000
 STATUS_LINES = 9                    # 有滚动区时上面状态区的高度
-FOLLOW_AT = 0.999                   # 滚动条到这儿算在底部, 新内容跟着走
 LOG_BATCH = 2000                    # 一次刷新最多插这么多行 (重开面板补历史也不卡主线程), 剩下的下次接着插
 HINT_PAD = 8                        # 折行宽度比控件窄这么多, 留给 Label 的内边距
 TAGS = {"own": "FG", "dim": "DIM", "bad": "BAD", "untrusted": "AGENT"}
@@ -37,6 +36,7 @@ class BigfishPanel(tk.Frame):
         self.submit, self.get_task, self.cancel_task = submit, get_task, cancel_task
         self.entry = self.log = None
         self._shown, self._log_gen, self._log_n, self._log_live = None, None, 0, []
+        self._follow, self._log_placed = True, False    # 新内容是否跟到底; 控件拿到真实大小后才量得准
         self._build_status()
         if desk is not None:
             self._build_desk()
@@ -85,12 +85,24 @@ class BigfishPanel(tk.Frame):
     def _build_log(self):
         wrap, self.log = self._scrolled()
         self.log.config(height=1)           # 只占 expand 分到的地方, 不把下面的输入行挤出屏
+        self.log.bind("<Map>", self._log_shown)        # 第一次画在控件上屏之前, 那时的 see 不生效
+        self.log.bind("<Configure>", self._log_shown)
         wrap.pack(fill="both", expand=True)
 
     def _build_hint(self):
         self.hint = tk.Label(self, text="", font=th.FONT, bg=BG, fg=th.DIM, anchor="w", justify="left")
         self.hint.pack(fill="x", padx=18, pady=(0, 8))
         self.hint.bind("<Configure>", lambda e: self.hint.config(wraplength=max(e.width - HINT_PAD, 1)))
+
+    def _log_shown(self, _e=None):
+        self._log_placed = True
+        if self._follow:
+            self.log.see("end")
+
+    def _log_at_bottom(self):
+        """末行完整可见才算在底部. 不用 yview 比例: 几千行后上翻几行比例也接近 1; dlineinfo 半截露出时也有值, 要比到底边."""
+        info = self.log.dlineinfo("end-1c")
+        return info is not None and info[1] + info[3] <= self.log.winfo_height() - int(self.log.cget("pady"))
 
     def _page(self, n):
         self.log.yview_scroll(n, "pages")
@@ -200,20 +212,22 @@ class BigfishPanel(tk.Frame):
             log.config(state="normal")
             log.delete("1.0", "end")
             log.config(state="disabled")
+            self._follow = True
+        if self._log_placed and log.winfo_viewable():   # 没上屏时量出来的不算数, 保持原值
+            self._follow = self._log_at_bottom()
         done, live = d.log_rows()
         fresh = done[self._log_n:self._log_n + LOG_BATCH]
         n = self._log_n + len(fresh)
         live = live if n == len(done) else []       # 没追上时半行先不画
         if not fresh and live == self._log_live:
             return
-        follow = log.yview()[1] >= FOLLOW_AT
         log.config(state="normal")
         log.delete(f"{self._log_n + 1}.0", "end-1c")   # 不能用 end: Tk 会连前一行的换行一起删, 下一行就粘上去了
         for line, tag in fresh + live:
             log.insert("end", line + "\n", tag)
         log.config(state="disabled")
         self._log_n, self._log_live = n, live
-        if follow:
+        if self._follow:
             log.see("end")
 
     def _redraw(self):

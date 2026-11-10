@@ -2,6 +2,7 @@
 
 import gc
 import json
+import time
 
 import pytest
 
@@ -135,50 +136,99 @@ def test_panel_without_desk_has_no_input_row(root):
     w.destroy()
 
 
-def test_reply_log_keeps_scroll_position_when_new_output_arrives(root):
+def _show(root, w):
+    """pack 面板, 窗口放到屏幕外再显示: 控件没上屏时 see / dlineinfo 都不算数, 断言没有意义."""
+    w.pack(fill="both", expand=True)
+    root.geometry("800x600-4000-4000")
+    root.deiconify()
+    end = time.monotonic() + 5
+    while not w.log.winfo_viewable() and time.monotonic() < end:
+        root.update()
+        time.sleep(0.01)
+    root.update()
+    assert w.log.winfo_viewable()
+
+
+def _sent(root):
     w, jobs = _desk_panel(root)
+    _show(root, w)
     w.entry.insert(0, "看下状态")
     w.btn_send.invoke()
     work, done = jobs[0]
     done(work())
-    root.geometry("800x600")
+    root.update()
+    return w
+
+
+def _feed_text(root, w, text):
+    got = w.desk.got
+    w._polled({"task_id": "t-1", "state": "running", "output_offset": got, "output_total_chars": got + len(text),
+               "untrusted_agent_output": {"output": text}})
     root.update()
 
-    want = []
 
-    def feed_text(text):
-        got = w.desk.got
-        w._polled({"task_id": "t-1", "state": "running", "output_offset": got, "output_total_chars": got + len(text),
-                   "untrusted_agent_output": {"output": text}})
-        root.update()
-
-    def feed(n):
-        lines = [f"行{w.desk.got}-{i}" for i in range(n)]
+def _feed(root, w, n, want=None):
+    lines = [f"行{w.desk.got}-{i}" for i in range(n)]
+    if want is not None:
         want.extend(lines)
-        feed_text("".join(line + "\n" for line in lines))
-    feed(300)
-    assert w.log.yview()[1] == 1.0                      # 在底部: 跟着走
+    _feed_text(root, w, "".join(line + "\n" for line in lines))
+
+
+def _at_end(w):
+    return w.log.dlineinfo("end-1c") is not None
+
+
+def test_reply_log_keeps_scroll_position_when_new_output_arrives(root):
+    w = _sent(root)
+    want = []
+    _feed(root, w, 300, want)
+    assert _at_end(w)                                   # 在底部: 跟着走
     w.log.yview_moveto(0.2)
     root.update()
     before = w.log.index("@0,0")
-    feed(50)
+    _feed(root, w, 50, want)
     assert w.log.index("@0,0") == before                # 往上翻时不拉回底部
     w.log.yview_moveto(1.0)
     root.update()
-    feed(50)
-    assert w.log.yview()[1] == 1.0
+    _feed(root, w, 50, want)
+    assert _at_end(w)
     assert w.log.cget("state") == "disabled"
-    feed_text("半")                                     # 半行就地换掉: 不粘上一行, 不留旧半行
+    _feed_text(root, w, "半")                           # 半行就地换掉: 不粘上一行, 不留旧半行
     assert w.log.get("1.0", "end-1c") == "".join(f"{bf.SAYS}{x}\n" for x in want + ["半"])
-    feed_text("行\n")
+    _feed_text(root, w, "行\n")
     assert w.log.get("1.0", "end-1c") == "".join(f"{bf.SAYS}{x}\n" for x in want + ["半行"])
+    w.destroy()
+
+
+def test_reply_log_scrolled_up_a_few_lines_in_long_output_stays_put(root):
+    w = _sent(root)
+    _feed(root, w, 3000)
+    _feed(root, w, 10)                                  # 3000 行分两批画完
+    assert _at_end(w)
+    w.log.yview_scroll(-2, "units")
+    root.update()
+    before = w.log.index("@0,0")
+    _feed(root, w, 5)
+    assert w.log.index("@0,0") == before and not _at_end(w)
+    w.destroy()
+
+
+def test_reopened_panel_starts_at_end_and_keeps_following(root):
+    w = _sent(root)
+    _feed(root, w, 300)
+    desk = w.desk
+    w.destroy()
+    w, _ = _desk_panel(root, desk=desk)                 # 重开: 第一次画在控件上屏之前
+    assert not w.log.winfo_ismapped()
+    _show(root, w)
+    assert _at_end(w)
+    _feed(root, w, 20)
+    assert _at_end(w)
     w.destroy()
 
 
 def test_status_pane_scrollbar_and_hint_wrap(root):
     w, _ = _desk_panel(root)
-    root.geometry("800x600")
-    root.deiconify()
-    root.update()
+    _show(root, w)
     assert w.text.cget("yscrollcommand") and w.hint.cget("wraplength") > 0
     w.destroy()

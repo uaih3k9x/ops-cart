@@ -258,12 +258,16 @@ def test_refresh_without_desk_does_not_poll():
 
 # ------------------------------------------------------------ 回复滚动区: 假 Text, 不起 Tk
 
+TAIL_Y, LINE_H, LOG_H, LOG_PADY = 568, 20, 600, 12     # 末行正好贴着底部内边距
+
+
 class _Log:
     """假 Text, 按字符建模, 守真 Tk 的 end 语义: 末尾有一个删不掉的换行, "end" 在它后面, "end-1c" 在它前面;
     删除范围碰到这个换行且起点在行首时, 起点前的换行也一起删 (Tk 把它当成"删整行")."""
 
     def __init__(self, view=(0.0, 1.0)):
         self.chars, self.view, self.seen, self.moved, self.state, self.writes = [], view, [], [], "disabled", 0
+        self.viewable, self.tail_y = True, TAIL_Y if view[1] >= 1.0 else None       # 末行的 y, None = 不在屏上
 
     @property
     def lines(self):
@@ -317,6 +321,19 @@ class _Log:
     def see(self, where):
         self.seen.append(where)
 
+    def winfo_viewable(self):
+        return self.viewable
+
+    def winfo_height(self):
+        return LOG_H
+
+    def cget(self, _key):
+        return LOG_PADY
+
+    def dlineinfo(self, index):
+        assert self.viewable and index == "end-1c"      # 没上屏时量出来的不算数
+        return None if self.tail_y is None else (16, self.tail_y, 700, LINE_H, 16)
+
 
 def _log_fake(view=(0.0, 1.0)):
     fake, _jobs = _fake()
@@ -324,7 +341,10 @@ def _log_fake(view=(0.0, 1.0)):
     fake.desk.sent({"task_id": TID, "state": "starting"})
     fake.log = _Log(view)
     fake._log_gen, fake._log_n, fake._log_live = None, 0, []
+    fake._follow, fake._log_placed = True, True
     fake._update_log = bp.BigfishPanel._update_log.__get__(fake)
+    fake._log_at_bottom = bp.BigfishPanel._log_at_bottom.__get__(fake)
+    fake._log_shown = bp.BigfishPanel._log_shown.__get__(fake)
     return fake
 
 
@@ -392,10 +412,78 @@ def test_log_resumes_following_when_back_at_bottom():
     fake = _log_fake(view=(0.1, 0.5))
     _feed(fake, "一\n")
     fake._update_log()
-    fake.log.view = (0.5, 1.0)
+    fake.log.tail_y = TAIL_Y
     _feed(fake, "二\n")
     fake._update_log()
     assert fake.log.seen == ["end"]
+
+
+def test_log_partly_visible_last_line_is_not_bottom():
+    fake = _log_fake()
+    fake.log.tail_y = TAIL_Y + LINE_H // 2              # 上翻一行, 末行还露半截
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake.log.seen == [] and fake._follow is False
+
+
+def test_log_off_screen_keeps_follow_without_measuring():
+    fake = _log_fake()
+    fake.log.viewable = False                           # dlineinfo 没上屏时读了会断言失败
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake._follow is True and fake.log.seen == ["end"]
+
+
+def test_log_not_measured_before_first_layout():
+    fake = _log_fake()
+    fake._log_placed, fake.log.tail_y = False, None     # 重开面板: 已映射, 但 Map / Configure 还没来, 视图还在开头
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake._follow is True and fake.log.seen == ["end"]
+
+
+def test_log_scrolled_up_state_kept_while_off_screen():
+    fake = _log_fake()
+    fake._update_log()
+    fake._follow, fake.log.viewable = False, False
+    _feed(fake, "一\n")
+    fake._update_log()
+    assert fake._follow is False and fake.log.seen == []
+
+
+def test_log_shown_jumps_to_end_when_following():
+    fake = _log_fake()
+    fake._log_placed = False
+    fake._log_shown()
+    assert fake._log_placed is True and fake.log.seen == ["end"]
+
+
+def test_log_shown_leaves_scrolled_up_view_alone():
+    fake = _log_fake()
+    fake._follow = False
+    fake._log_shown()
+    assert fake.log.seen == []
+
+
+def test_log_position_tracked_even_without_new_output():
+    fake = _log_fake()
+    _feed(fake, "一\n")
+    fake._update_log()
+    fake.log.tail_y = None                              # 人翻上去了, 这轮没有新内容
+    fake._update_log()
+    assert fake._follow is False                        # 之后窗口变矮 (<Configure>) 不能把人拉回底部
+
+
+def test_log_new_task_follows_even_if_scrolled_up_before():
+    fake = _log_fake()
+    _feed(fake, "旧\n")
+    fake._update_log()
+    fake._follow, fake.log.viewable = False, False
+    fake.desk.begin("下一条", "")
+    fake.desk.sent({"task_id": TID, "state": "starting"})
+    _feed(fake, "新\n")
+    fake._update_log()
+    assert fake._follow is True and fake.log.seen[-1] == "end"
 
 
 def test_log_new_task_starts_over():
@@ -495,6 +583,18 @@ def test_status_pane_scrolls_when_desk_present(monkeypatch):
     fake, bars = _built(monkeypatch, tc.Desk())
     assert len(bars) == 1 and fake.text.kw["height"] == bp.STATUS_LINES
     assert fake.text.kw["yscrollcommand"] == bars[0].set and bars[0].kw["command"] == fake.text.yview
+
+
+def test_log_rejumps_to_end_after_map_and_resize(monkeypatch):
+    monkeypatch.setattr(bp.tk, "Frame", _Tk)
+    monkeypatch.setattr(bp.tk, "Scrollbar", lambda *a, **k: _Tk(*a, **k))
+    calls = []
+    fake = SimpleNamespace(_text=lambda _parent: _Tk(), _log_shown=lambda _e=None: calls.append(1))
+    fake._scrolled = bp.BigfishPanel._scrolled.__get__(fake)
+    bp.BigfishPanel._build_log.__get__(fake)()
+    fake.log.binds["<Map>"](None)
+    fake.log.binds["<Configure>"](None)
+    assert calls == [1, 1]
 
 
 def test_status_pane_without_desk_fills_panel(monkeypatch):
