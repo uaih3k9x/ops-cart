@@ -307,3 +307,67 @@ def test_http_legacy_rescue_and_fifo_refused_with_odd_case(http):
     os.mkfifo(root / "GRUB.CFG-C0000202")
     assert get("Grub.Cfg-C0000201")[0] == 403
     assert get("GRUB.CFG-C0000202")[0] == 403
+
+
+# ---------------------------------------------------------------- #58 第二轮审查
+
+MEMTEST_DEFAULT = ("set default=0\nset timeout=3\n\n"
+                   f"menuentry 'mt' {{\n    chainloader (http,{IP})/memtest/memtest64.efi\n}}\n" + ps.LOCAL_ENTRY)
+
+
+def test_memtest_default_menu_counts_as_manual_only():
+    """Memtest 只能手选: 默认项是 Memtest 的手写 / 遗留菜单跟救援默认一样处理."""
+    assert ps.rescue_default_menu(MEMTEST_DEFAULT)
+    assert ps.rescue_default_menu(MEMTEST_DEFAULT.replace("memtest/memtest64.efi", "MEMTEST/MT86PLUS.EFI"))
+    assert not ps.rescue_default_menu(ps.grub_menu(IP))           # 生成的: Memtest 是最后一项, 不是默认
+
+
+def test_tftp_memtest_default_falls_back(tmp_path):
+    _w(tmp_path, "grub.cfg-C0000201", MEMTEST_DEFAULT)
+    srv, _ = _tftp(tmp_path)
+    f, _size, tag = srv.open_file("grub.cfg-C0000201", CLIENT)
+    assert f.read() == ps.grub_menu(IP).encode() and "回默认菜单" in tag
+
+
+def test_http_memtest_default_refused(http):
+    root, get = http
+    _w(root, "grub.cfg-C0000201", MEMTEST_DEFAULT)
+    assert get("grub.cfg-C0000201")[0] == 403
+
+
+def test_disarm_removes_memtest_default_menu(tmp_path, env):
+    root = tmp_path / "tftp"
+    _w(root, "grub.cfg-C0000201", MEMTEST_DEFAULT)
+    kc.pxe_disarm(root=root, path=tmp_path / "m.json")
+    assert not (root / "grub.cfg-C0000201").exists()
+
+
+@pytest.mark.parametrize("exc", [OSError(37, "No locks available"), BlockingIOError(11, "busy")])
+def test_disarm_not_blocked_by_lock(tmp_path, env, monkeypatch, exc):
+    """上锁绝不能被锁挡住: flock 抛错 (ENOLCK) 或一直拿不到 (别人占着), 都不加锁照做并记事件."""
+    calls = []
+
+    def flock(fd, op):
+        calls.append(op)
+        raise exc
+    monkeypatch.setattr(kc.fcntl, "flock", flock)
+    monkeypatch.setattr(kc.time, "sleep", lambda s: None)
+    state = tmp_path / "m.json"
+    _armed(state)
+    kc.pxe_disarm(root=tmp_path / "tftp", path=state)
+    assert not state.exists() and (tmp_path / "tftp" / "grub.cfg").exists()
+    assert calls and all(op & kc.fcntl.LOCK_NB for op in calls) and len(calls) <= kc.DISARM_LOCK_TRIES
+    assert any("不加锁" in e for e in env)
+
+
+def test_disarm_leaves_pxelinux_cfg_under_win_and_clonezilla(tmp_path, env):
+    """docstring: clonezilla/ 和 win/ 不删. 那里的 pxelinux.cfg TFTP/HTTP 本来就不发 (白名单)."""
+    root = tmp_path / "tftp"
+    a = _w(root, "win/pxelinux.cfg/default", ROCKY)
+    b = _w(root, "clonezilla/pxelinux.cfg/default", ROCKY)
+    c = _w(root, "bios/pxelinux.cfg/default", ROCKY)
+    kc.pxe_disarm(root=root, path=tmp_path / "m.json")
+    assert a.exists() and b.exists() and not c.exists()
+    srv, _ = _tftp(root)
+    with pytest.raises(FileNotFoundError):
+        srv.open_file("win/pxelinux.cfg/default", CLIENT)

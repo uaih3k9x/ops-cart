@@ -108,8 +108,8 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
                                                               pxe_mode(self.pxe_mode_path, self.now())):
                 self.send_error(403, "Install mode is locked")
                 return None
-            if rescue_default_menu(text):                   # #70: 默认项可能是救援 (root + sshd), 同 TFTP 不发
-                log.warning("拒绝 %s 取 %s: 默认项是救援", self.client_address[0], base)
+            if rescue_default_menu(text):                   # #70: 默认项可能是救援 (root + sshd) 或 Memtest, 同 TFTP 不发
+                log.warning("拒绝 %s 取 %s: 默认项是救援或 Memtest", self.client_address[0], base)
                 self.send_error(403, "Rescue default menu refused")
                 return None
         return super().send_head()

@@ -25,6 +25,8 @@ BIOS: 固件 PXE ─► pxelinux.0 ─► pxelinux.cfg/default ─► 在 boot: 
   `pxeserver.pxelinux_menu`（`DEFAULT local`，10 秒超时 `LOCALBOOT 0` 交回 BIOS 按启动顺序往下试；`rescue` / `memtest` 要在
   `boot:` 下手敲）。两边都守 #70：救援带 sshd，只能人在屏幕前手选。自动装机菜单里没有这一项。
 - Memtest 不动硬盘，所以放在人人能取的默认菜单里，不算解锁菜单。
+- 但 Memtest 也只能手选：默认项是 Memtest 的手写 / 遗留 grub 菜单（`pxeserver.rescue_default_menu` 认 `memtest` / `mt86plus`，
+  不分大小写）跟救援默认一样处理——TFTP 换默认菜单、HTTP 403、上锁时删。
 
 ## 安全启动：要先关
 

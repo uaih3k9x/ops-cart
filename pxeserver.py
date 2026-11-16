@@ -894,6 +894,13 @@ def grub_menu_clone(ip, purpose, params):
 
 
 _RESCUE_KW = ("inst.rescue", "inst.sshd")
+
+
+def _manual_only(text):
+    """只能手选的项: 救援 (inst.rescue / inst.sshd, 区分大小写同 GRUB 参数) 或 Memtest86+ (#58 审查; 不分大小写,
+    认 memtest 这个词, 路径 memtest/memtest64.efi、mt86plus 都算)."""
+    low = text.lower()
+    return any(k in text for k in _RESCUE_KW) or "memtest" in low or "mt86plus" in low
 MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 不发 (TFTP 换默认菜单, HTTP 403), 上锁时删
 _TOP_DEFAULT = re.compile(r"set default=(0|[1-9][0-9]*)")
 _TOP_TIMEOUT = re.compile(r"set timeout=[0-9]+")
@@ -902,8 +909,8 @@ _BODY_BAD = set(";{}$\"'\\")
 
 
 def rescue_default_menu(text):
-    r"""默认项可能是救援 (inst.rescue / inst.sshd: root 可能无密码) 的菜单, #70 之前的老菜单就是.
-    不带这两个关键字的放过. 带的话用正向语法白名单, 只有完全落在这个子集里、且默认项不带关键字才放过:
+    r"""默认项可能是救援 (inst.rescue / inst.sshd: root 可能无密码) 或 Memtest86+ 的菜单 (都只能手选; #70 之前的老菜单、
+    手写的 Memtest 默认菜单就是). 不带这些关键字 (_manual_only) 的放过. 带的话用正向语法白名单, 只有完全落在这个子集里、且默认项不带关键字才放过:
       顶层每行 (去掉首尾空白, CRLF 当 LF) 只能是: 空行; # 注释; set default=<十进制, 无前导零> (至多一次);
       set timeout=<数字>; menuentry '<不含引号和反斜杠的标题>' {
       菜单项里每行任意命令, 但不许出现 ; { } $ " ' \ (只许 \" 这种转义引号, 克隆参数要用), 不许再开 menuentry
@@ -912,7 +919,7 @@ def rescue_default_menu(text):
     只针对 #70 之前的老菜单和普通手写菜单, 不防能写 tftp 树的对抗者 (发送时兜底, 不是访问控制).
     关键字被 GRUB 转义藏起来 (inst.res\cue 这种) 认不出, 同理不防."""
     text = text.lstrip("\ufeff").replace("\r\n", "\n")
-    if not any(k in text for k in _RESCUE_KW):
+    if not _manual_only(text):
         return False
     entries, body, default = [], None, None
     for line in text.split("\n"):
@@ -938,15 +945,13 @@ def rescue_default_menu(text):
     if body is not None or not entries:
         return True
     idx = default if default is not None and default < len(entries) else 0
-    return any(k in entries[idx] for k in _RESCUE_KW)
+    return _manual_only(entries[idx])
 
 
 def unlock_only_menu(text):
     """只能给解锁那台机器的菜单: 带自动装机 (inst.ks=)、WinPE 链式加载项或 Clonezilla 克隆项."""
     return "inst.ks=" in text or WINPE_CHAIN in text or CLONE_KERNEL in text or "ocs_live_run" in text
 
-
-MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 当装机菜单对待 (不读一半就放行)
 
 
 def norm_name(name):
@@ -1159,7 +1164,7 @@ class TftpServer:
                                                                 pxe_mode(self.pxe_mode_path, self.now())):
                 why = "未解锁"
             elif rescue_default_menu(text):
-                why = "默认项是救援"
+                why = "默认项是救援或 Memtest"
         if why:
             data = grub_menu(self.ip).encode()
             return io.BytesIO(data), len(data), f"TFTP RRQ {name} {why}, 回默认菜单"

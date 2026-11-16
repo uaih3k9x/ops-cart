@@ -1131,11 +1131,16 @@ def _arm_clone(mac, now, root, path, seconds, purpose, confirm, conf_path, batch
                (f"; 不放行 {', '.join(skipped)}" if skipped else ""))
 
 
+DISARM_LOCK_TRIES = 50       # 上锁抢锁: LOCK_NB 每 0.1 秒试一次, 至多约 5 秒, 拿不到就不加锁照做
+
+
 @contextlib.contextmanager
 def _pxe_lock(path, required):
     """arm / disarm 共用的跨进程锁 (#55 审查): <状态文件>.lock 上 flock, 约定同 mcp_pxe / mcp_serial.
     车机 UI 的 pxe_arm 和 MCP 进程的 pxe_disarm 不会交错成"菜单删了、状态还是 install".
-    required=False (上锁) 时锁文件打不开就不加锁照做, 记事件: 上锁不能被锁挡住."""
+    required=True (解锁): 阻塞等锁, 打不开 / flock 出错就抛.
+    required=False (上锁): 绝不能被锁挡住. LOCK_NB 有限次重试 (DISARM_LOCK_TRIES); 锁文件打不开、flock 出错
+    (如 ENOLCK)、一直被占着, 都不加锁照做, 记事件 (#58 审查)."""
     try:
         fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as e:
@@ -1145,7 +1150,23 @@ def _pxe_lock(path, required):
         yield
         return
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if required:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            why = "一直被占着"
+            for i in range(DISARM_LOCK_TRIES):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    why = None
+                    break
+                except BlockingIOError:
+                    if i + 1 < DISARM_LOCK_TRIES:
+                        time.sleep(0.1)
+                except OSError as e:
+                    why = e.strerror or str(e)
+                    break
+            if why:
+                _pxe_event(f"拿不到装机模式锁 {path}.lock ({why}), 不加锁照样上锁")
         yield
     finally:
         os.close(fd)
@@ -1223,7 +1244,7 @@ def _scrub_tftp(root):
       超过 MENU_MAX、默认/fallback 项是救援 (pxeserver.rescue_default_menu, #70 之前的老菜单) 的删;
       根下 grub.cfg-01-* 和 EFI/BOOT/grub.cfg 不看内容一律删 (同 setup-cart.sh).
     - grub.cfg.* (手工备份, GRUB 不取, TFTP/HTTP 也不发): 带装机项或超长的再清一道 (#55); 救援默认的老备份不动.
-    - pxelinux.cfg (任何一级, #55): 推车只生成根下 pxelinux.cfg/default (普通文件), 别的不看内容一律删,
+    - pxelinux.cfg (任何一级, win/ 和 clonezilla/ 下除外, #55): 推车只生成根下 pxelinux.cfg/default (普通文件), 别的不看内容一律删,
       含子目录、FIFO 等非常规文件、符号链接 (只删链接); pxelinux.cfg 本身不是目录 (文件 / 链接) 也删."""
     removed, failed = [], []
 
@@ -1238,8 +1259,12 @@ def _scrub_tftp(root):
                 continue
             _rm(e.path, root, removed, failed)
 
+    keep_top = ("win", "clonezilla")              # 这两棵树不删 (pxe_disarm); 里面的 pxelinux.cfg TFTP/HTTP 也不发
     for d, dirs, files in os.walk(root):          # 不跟随符号链接目录
+        top = pxeserver.norm_name(os.path.relpath(d, root).split(os.sep)[0])
         for name in list(dirs):
+            if top in keep_top or (d == root and pxeserver.norm_name(name) in keep_top):
+                continue
             if pxeserver.norm_name(name) == "pxelinux.cfg":
                 dirs.remove(name)
                 full = os.path.join(d, name)
@@ -1251,7 +1276,8 @@ def _scrub_tftp(root):
             full, n = os.path.join(d, name), pxeserver.norm_name(name)
             rel = os.path.relpath(full, root)
             if n == "pxelinux.cfg":
-                _rm(full, root, removed, failed)
+                if top not in keep_top:
+                    _rm(full, root, removed, failed)
                 continue
             backup = n.startswith("grub.cfg.")
             if not (n == "grub.cfg" or n.startswith("grub.cfg-") or backup) or (d == root and name == "grub.cfg"):
