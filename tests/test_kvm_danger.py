@@ -373,3 +373,10 @@ def test_decided_dangerous(cmd):
 @pytest.mark.parametrize("cmd", DOTDOT_HARMLESS + TRUNCATE_HARMLESS)
 def test_decided_harmless(cmd):
     assert mk.danger_of(cmd) == [], (cmd, mk.danger_of(cmd))
+
+
+def test_copy_out_of_etc_allowed_copy_into_etc_held():
+    """维护者口径 (#71 三审): 从 /etc 往外拷放行 (读取不危险), 拷进 /etc 拦."""
+    assert mk.danger_of("cp /etc/hosts ~/x") == []
+    assert mk.danger_of("cp /etc/hosts ~/hosts.bak") == []
+    assert mk.danger_of("cp x /etc/hosts")

@@ -97,7 +97,7 @@ DANGER_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
     ("tee 写设备", r"\btee\b(?:\s+-\S+)*\s+" + _DEV),
     ("tee 覆盖 /etc /boot", r"\btee\b(?:\s+-\S+)*\s+" + _ETC),
     ("of= 设备", r"\bof=\s*" + _DEV),
-    # cp / mv ... 的参数里有设备或 /etc、/boot 就算 (不分源和目标, 往多拦: cp /etc/fstab ~/x 也挂起)
+    # cp / mv ... 的后面参数里有设备或 /etc、/boot 就算; 紧跟命令名的第一个参数不算 (从 /etc 往外拷放行: cp /etc/hosts ~/x)
     ("拷到设备", _B + r"(?:cp|mv|install|rsync|ln)\s(?:.*\s|.*(?:-t|--target-directory=?))\s*" + _DEV),
     ("覆盖 /etc /boot", _B + r"(?:cp|mv|install|rsync|ln)\s(?:.*\s|.*(?:-t|--target-directory=?))\s*" + _ETC),
     # Linux: 递归改系统目录的权限 / 属主 / 属性, 截断 / 覆盖关键文件
