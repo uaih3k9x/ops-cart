@@ -18,8 +18,16 @@ BG, CARD, FG, DIM, BTN = th.follow(                     # 条目凹进去 (按�
                  "stop": (th.ALERT_BG, th.WHITE), "plain": (th.BTN2, th.FG)})
 
 
+def _ask(fn, n):
+    """车机给的回调 (当前最后一行 / 槽位厂商): 没给或出错就是 None, 不影响确认框. 这里只管显示, 发不发 recheck 自己判."""
+    try:
+        return fn(n) if fn else None
+    except Exception:                   # noqa: BLE001
+        return None
+
+
 class ConfirmDialog(tk.Toplevel):
-    def __init__(self, master, n, view, on_action, on_serial=None, ask=None):
+    def __init__(self, master, n, view, on_action, on_serial=None, ask=None, live=None, vendor=None):
         super().__init__(master, bg=BG, highlightthickness=3, highlightbackground=cc.PENDING_COLOR, **th.DIALOG)
         self.n, self.on_action, self.on_serial = n, on_action, on_serial
         self.ask = ask or (lambda title, msg: messagebox.askyesno(title, msg, parent=self))
@@ -37,7 +45,9 @@ class ConfirmDialog(tk.Toplevel):
         self.msg.pack()
         self.foot = tk.Frame(self, bg=BG)
         self.foot.pack(pady=(6, 14))
-        self._key, self._meta = None, {}
+        self._key, self._meta, self._reason = None, {}, {}
+        self.live = live                # n -> 设备当前最后一行 (#74 第三轮); 出错就不显示
+        self.vendor = vendor            # n -> 规则文件登记的厂商 (#93); 没登记 None
         self.refresh(view)
 
     # ---- 画
@@ -51,8 +61,9 @@ class ConfirmDialog(tk.Toplevel):
 
     def refresh(self, view):
         """视图读不懂 (None / 缺字段) 当全部急停画."""
+        line, vendor = _ask(self.live, self.n), _ask(self.vendor, self.n)
         try:
-            c = cc.card(view, self.n)
+            c = cc.card(view, self.n, live=line, vendor=vendor)
             states = cc.slot_states(view)
         except (KeyError, TypeError, StopIteration):
             view = cc.stopped_view()
@@ -65,13 +76,18 @@ class ConfirmDialog(tk.Toplevel):
         if key == self._key:
             for it in c["items"]:
                 self._meta[it["id"]].config(text=it["meta"])
+                self._reason[it["id"]].config(text=it["reason"])
+                self._line[it["id"]].config(text=it.get("line") or "")      # 当前最后一行跟着刷新 (#74)
             return
         self._key = key
         for w in list(self.body.winfo_children()) + list(self.foot.winfo_children()):
             w.destroy()
-        self._meta = {}
+        self._meta, self._reason, self._line = {}, {}, {}
         if not c["items"]:
             tk.Label(self.body, text="没有等确认的命令", font=FONT, bg=BG, fg=DIM).pack(pady=20)
+        if c.get("trusted"):                                # 可信记录 (#65): 推车自己记的, 正常字色, 和设备输出分开
+            tk.Label(self.body, text=c["trusted"], font=FONT, bg=BG, fg=FG, anchor="w", justify="left",
+                     wraplength=700).pack(fill="x", pady=(0, 4))
         for it in c["items"]:
             self._item(it)
         if c["stopped"]:
@@ -92,10 +108,27 @@ class ConfirmDialog(tk.Toplevel):
                  wraplength=680).pack(fill="x")
         self._meta[it["id"]] = tk.Label(f, text=it["meta"], font=FONT, bg=CARD, fg=DIM, anchor="w")
         self._meta[it["id"]].pack(fill="x")
-        tk.Label(f, text=it["reason"], font=FONT, bg=CARD, fg=FG, anchor="w", justify="left",
-                 wraplength=680).pack(fill="x")
+        self._reason[it["id"]] = tk.Label(f, text=it["reason"], font=FONT, bg=CARD, fg=FG, anchor="w",
+                                          justify="left", wraplength=680)
+        self._reason[it["id"]].pack(fill="x")
         if it["danger"]:
             tk.Label(f, text=it["danger"], font=FONT_BIG, bg=CARD, fg=th.BAD, anchor="w").pack(fill="x")
+        if it.get("note"):
+            tk.Label(f, text=it["note"], font=FONT, bg=CARD, fg=th.BAD, anchor="w", justify="left",
+                     wraplength=680).pack(fill="x")
+        for key in ("model", "intent"):                     # 模型理由 / Agent 自述 (#65 第六 / 七轮: 排在提示后、设备输出前): 不可信, 灰字一行
+            if it.get(key):
+                tk.Label(f, text=it[key], font=FONT, bg=CARD, fg=DIM, anchor="w", justify="left",
+                         wraplength=680).pack(fill="x")
+        # 设备最后一行 (#74): 不可信, 灰字; 排在 Agent 自述后、设备最近输出前. 空的也建, 刷新时可能有内容
+        self._line[it["id"]] = tk.Label(f, text=it.get("line") or "", font=FONT, bg=CARD, fg=DIM, anchor="w",
+                                        justify="left", wraplength=680)
+        self._line[it["id"]].pack(fill="x")
+        if it.get("context"):                               # 设备最近输出 (#65): 不可信, 灰字等宽, 只作参考
+            tk.Label(f, text=it["context"], font=th.font(14, mono=True), bg=CARD, fg=DIM, anchor="w",
+                     justify="left", wraplength=680).pack(fill="x")
+        if it.get("name"):                                  # 设备自报名 (#65 第八轮): 条目末尾, 不可信
+            tk.Label(f, text=it["name"], font=FONT, bg=CARD, fg=DIM, anchor="w").pack(fill="x")
         row = tk.Frame(f, bg=CARD)
         row.pack(anchor="e", pady=(4, 0))
         self._btn(row, "确认发送", "go", lambda: self._confirm(it), name=f"confirm-{it['id']}")
@@ -130,6 +163,9 @@ class KvmDialog(ConfirmDialog):
         self._meta = {}
         if not c["items"]:
             tk.Label(self.body, text="没有等确认的内容", font=FONT, bg=BG, fg=DIM).pack(pady=20)
+        if c.get("trusted"):                                # 可信记录 (#65): 推车自己记的, 正常字色, 和设备输出分开
+            tk.Label(self.body, text=c["trusted"], font=FONT, bg=BG, fg=FG, anchor="w", justify="left",
+                     wraplength=700).pack(fill="x", pady=(0, 4))
         for it in c["items"]:
             self._item(it)
         if c["stopped"]:

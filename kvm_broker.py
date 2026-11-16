@@ -16,6 +16,7 @@ import grp
 import json
 import os
 import pwd
+import secrets
 import socket
 import socketserver
 import struct
@@ -99,6 +100,7 @@ class Broker:
         self.arb = kbc.Arbiter(quiet_s, wait_max_s, lease=lease, ext_stop=lambda: serial_all_stopped(estop_flag))
         self.human_uids = human_uids            # None = 信自报 (测试 / 非 Linux); 正式跑 main 传 human_uids()
         self.bursts = kbc.HumanBursts(quiet_s)
+        self.boot = secrets.token_hex(8)        # 启动 id: 重启后 human_n 从 0 重数, 键鼠闸门拿它区分 (#64)
         self.idle_wait = min(1.0, quiet_s / 2)
         self.cv = threading.Condition()
         self.devs, self.workers, self.events = {}, {}, {}
@@ -239,7 +241,7 @@ class Broker:
         dev = self.realpath(r["port"]) if r.get("port") else None
         with self.cv:
             if r["op"] == "status":
-                return {"ok": True, "status": self.arb.status(self.clock())}
+                return {"ok": True, "status": self.arb.status(self.clock()), "boot": self.boot}
             if r["op"] == "resume" and r["src"] != "human":
                 return {"ok": False, "err": "human_only", "msg": MSG["human_only"]}
             if r["op"] == "resume" and self.arb.ext_stop():
@@ -412,6 +414,11 @@ class BrokerCh:
 
     def status(self):
         return self._control("status", True)["status"]
+
+    def boot_status(self):
+        """-> (代理启动 id, status); 老代理不报启动 id 时是 None."""
+        resp = self._control("status", True)
+        return resp.get("boot"), resp["status"]
 
     def _control(self, op, all_devs):
         port, self.port = self.port, None if all_devs else self.port

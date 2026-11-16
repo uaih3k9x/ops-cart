@@ -15,9 +15,11 @@ import re
 import time
 
 import atomicfile
+import bigfish_core
 import confirm_core
 import lamps_core
 import lldp_core
+import observe_core
 import pxeserver
 import sun_core
 import ups_core
@@ -33,7 +35,7 @@ STALE_S = 3.0                              # 快照超过这么久没更新 = �
 # 没列出来的 (lamps / kiosk) 每轮都取, 灯条闪烁靠它.
 PERIODS = {"net": 5, "rows": 10, "temps": 2, "fans": 2, "lan2": 5, "uptime": 30,
            "todo": 30, "dream": 60, "notice": 5, "ups": 5, "lldp": 2, "pxe": 1,
-           "svcs": 5, "version": 300, "theme": 5}
+           "svcs": 5, "version": 300, "theme": 5, "observe": 1, "bigfish": 2}
 # LLDP 监听哪些口 (#14): 跟下排 LAN1 / LAN2 灯同一份配置, 网口名不另写
 LLDP_IFACES = [(name, key[4:]) for name, _label, key in lamps_core.LOWER
                if name in ("LAN1", "LAN2") and key.startswith("net:")]
@@ -79,6 +81,8 @@ def collect(ctx):
         "kvm_agent": _pull(ctx, "kvm_agent", None),  # 键鼠 Agent 状态 {stopped, pending, writer, sending} (#43)
         "agent": _pull(ctx, "agent", None),         # Agent 写串口每槽位 [{estop, pending, writer, sending}] #23
         "theme": _pull(ctx, "theme", dict(THEME_DARK)),  # 深浅模式 {mode, setting, next_switch} #31
+        "observe": _pull(ctx, "observe", []),       # 串口观察模式的快照 (#85), 车机每一路写一份 observe/<操作头>.json
+        "bigfish": _pull(ctx, "bigfish", ""),       # 大肥鱼锁屏一行 (#53), 只有枚举出来的字, 不含它说的话
     }
     return snap
 
@@ -232,6 +236,11 @@ def agent_sample(path=None, clock=time.time):
     return [dict(st[n], writer=bool(st[n]["writer"])) for n in sorted(st)]
 
 
+def bigfish_sample(clock=time.time):
+    """大肥鱼锁屏一行 (#53): "大肥鱼 · 空闲" / "大肥鱼 · 不在线" 之类, 不含原文 (快照 0644)."""
+    return bigfish_core.lock_line(bigfish_core.load(clock()))
+
+
 def _agent_states(agent):
     """快照里的 agent -> {槽位: 状态}; 没这项 (老快照) None; 格式不对 = 全部急停."""
     if agent is None:
@@ -305,6 +314,12 @@ def _serve(guard, now):
     return {"text": n["text"], "level": "bad"}
 
 
+def _front(docs, now, locked=False):
+    """每一路一份观察快照 (新写的在前), 取第一份车机还在写的. 锁屏时照样画, 但不露设备名 (#85)."""
+    docs = [docs] if isinstance(docs, dict) else docs if isinstance(docs, list) else []
+    return next((v for v in (observe_core.front_view(d, now, locked=locked) for d in docs) if v), None)
+
+
 def layout_view(snap, locked=False, active=(), now=None):
     """快照 + 锁屏状态 + 正在动的计数器 → 版面模型. 渲染层只认这个结构.
 
@@ -342,6 +357,8 @@ def layout_view(snap, locked=False, active=(), now=None):
         "peers": [] if locked else peers(snap),      # 锁屏是教室引导牌, 不露交换机名
         "serve": _serve(snap.get("pxe"), now),       # 锁屏也显示: 发地址影响整个网段
         "stale": stale(snap, now),
+        "front": _front(snap.get("observe"), now, locked),   # 观察中的设备前面板 (#85); 锁屏时不露设备名
+        "bigfish": snap.get("bigfish") if locked and isinstance(snap.get("bigfish"), str) else "",   # #53
     }
     return view
 
@@ -598,6 +615,8 @@ def default_ctx(ddir=None, clock=time.monotonic, lldp=None):
         "agent": lambda: agent_sample(),
         "kvm_agent": lambda: kvm_sample(),
         "theme": theme_sampler(),
+        "observe": lambda: observe_core.read_snapshots(),
+        "bigfish": lambda: bigfish_sample(),
     }
     for key, period in PERIODS.items():
         ctx[key] = every(period, ctx[key], clock)

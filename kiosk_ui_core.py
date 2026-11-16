@@ -89,7 +89,12 @@ class UiBridge:
             except Exception as ex:          # noqa: BLE001  交给 done 显示, 不让线程静默死掉
                 res = ex
             self.post(finish, res)
-        self._spawn(wrap)
+        try:
+            self._spawn(wrap)
+        except Exception as ex:              # noqa: BLE001  线程起不来 (资源耗尽): 放掉 key, 否则永远"上一次没回来"
+            self._busy.discard(key)
+            self._on_error(ex)
+            return False
         return True
 
     def repeat_bg(self, work, done, every, sleep=time.sleep):
@@ -181,7 +186,7 @@ def pxe_tick_decide(st, log_text, now, consumed=kc.pxe_consumed):
 def pxe_button_texts(view):
     """-> (装机页按钮, 主页按钮) 的文字."""
     if view["mode"] != "install":
-        return "装机模式:  救援 (安全)", "装机"
+        return "装机模式:  本地盘 (安全)", "装机"
     left = view["left"]
     mmss = f"{left // 60:02d}:{left % 60:02d}"
     who = f"{view['count']} 台" if view.get("count", 1) > 1 else view["mac"][-8:]
@@ -292,6 +297,8 @@ PANES = {
     "wifi": "无线网络 · 优先级从上往下自动连, 再点一次按钮返回",
     "netmode": "网口模式 · LAN1 / LAN2 各一个模式, 每个都能撤, 再点一次按钮返回",
     "wol": "网络唤醒 · 双击清单里的机器直接唤醒, 再点一次按钮返回",
+    "bigfish": "大肥鱼",
+    "label": "打标签 · 线缆旗形纸, 中文照打; 再点一次按钮返回",
 }
 
 
@@ -343,6 +350,8 @@ MENU = {
         _pane("UVC 预览:  开 / 关", "preview", attr="btn_video"),
         _page("画面设置", "video"),
         _pane("串口会话:  开 / 关", "serial", attr="btn_serial"),
+        _pane("大肥鱼", "bigfish"),                                       # #53 只读看进度
+        _pane("打标签", "label"),                                         # #104
         _page("装机", "install", attr="btn_install_page"),
         _page("网络", "net"),
         _act("锁屏", "lock_now"),
@@ -356,7 +365,7 @@ MENU = {
     ],
     "install": [
         _act("PXE 装机服务:  开 / 关", "toggle_pxe", attr="btn_pxe"),
-        _act("装机模式:  救援 (安全)", "toggle_install_mode", attr="btn_install"),
+        _act("装机模式:  本地盘 (安全)", "toggle_install_mode", attr="btn_install"),
         _pane("Kickstart 编辑", "ks", attr="btn_ks"),
     ],
     "net": [
@@ -369,6 +378,40 @@ MENU = {
         _act("关机", "poweroff", style="danger"),
     ],
 }
+
+
+TOGGLES = (("btn_video", "UVC 预览"), ("btn_serial", "串口会话"), ("btn_pxe", "PXE 装机服务"))
+
+
+def toggle_texts(pane, rows):
+    """三颗开关按钮显示当前状态. pane = 左侧开着的面板; rows = 自检结果 (PXE 服务看 "PXE SERVER" 那行).
+    自检还没出结果 (rows is None) 写 "读取中"; 有结果时只有在跑 (OK) 算开, "--" (没自启没在跑) / 没这行都算关."""
+    pxe = None if rows is None else any(r.get("label") == "PXE SERVER" and r.get("state") == "OK" for r in rows)
+    on = {"btn_video": pane == "preview", "btn_serial": pane == "serial", "btn_pxe": pxe}
+    return {attr: "%s:  %s" % (label, {True: "开", False: "关", None: "读取中"}[on[attr]])
+            for attr, label in TOGGLES}
+
+
+def pxe_toggle_text(on):
+    """PXE 启停成功后先按结果写按钮, 自检回来再校正."""
+    return toggle_texts(None, pxe_rows_set([], on))["btn_pxe"]
+
+
+def pxe_rows_set(rows, on):
+    """启停成功后把自检结果里 PXE SERVER 那行改成 OK / "--" (没有就补一行), 别的行原样. 返回新列表."""
+    row = {"label": "PXE SERVER", "state": "OK" if on else "--", "detail": "RUNNING" if on else "OFF"}
+    out = [dict(r, state=row["state"], detail=row["detail"]) if r.get("label") == "PXE SERVER" else r
+           for r in rows or []]
+    return out if any(r.get("label") == "PXE SERVER" for r in out) else out + [row]
+
+
+def preview_exit_note(returncode):
+    return "UVC 预览已退出 (rc=%s)" % returncode
+
+
+def preview_died(pane, returncode):
+    """预览面板开着但 mpv 已经退出 (起不来 / 采集卡拔了): 该关面板."""
+    return pane == "preview" and returncode is not None
 
 
 # ---------------------------------------------------------------- 键鼠透传

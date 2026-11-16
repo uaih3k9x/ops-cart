@@ -27,7 +27,8 @@ _DOC_V4 = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", 
                                               "127.0.0.0/8")]
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _DOC_V6 = ipaddress.ip_network("2001:db8::/32")
-_OK_USERS = {"ops", "user", "you", "example", "<user>", "username"}
+_OK_USERS = {"ops", "user", "you", "example", "<user>", "username",
+             "bigfish"}                 # 大肥鱼的服务账号 (#53), 不是人名
 
 _V4 = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?!\.?\d)")
 _V6 = re.compile(r"(?<![0-9A-Za-z:])((?:[0-9a-fA-F]{1,4}:){1,7}:?(?:[0-9a-fA-F]{1,4})?(?::[0-9a-fA-F]{1,4})*)"

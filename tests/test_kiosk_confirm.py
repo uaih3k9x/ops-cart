@@ -18,7 +18,7 @@ def _view(pending_slot=1, writer_slot=None, stop=None):
     b = sw.Book.from_text(None, T0)
     if pending_slot:
         tok = b.acquire(pending_slot, "a", T0)["lease"]
-        b.submit(pending_slot, tok, "a", "line", "save", DANGER, T0, 30)
+        b.submit(pending_slot, tok, "a", "line", "save", DANGER, T0, 30, context="<SW1>")
     if writer_slot:
         b.acquire(writer_slot, "b", T0)
     if stop:
@@ -43,9 +43,20 @@ def _fake(view):
     fake._serial_say = lambda text, ok=True: calls["say"].append((text, ok))
     fake._open_pane = lambda name, sel=None: calls["pane"].append((name, sel))
     fake._open_confirm = lambda n: calls["confirm"].append(n)
+    fake._bigfish_ctl = lambda op, ok=True: None          # 大肥鱼急停 (#53) 另有 test_kiosk_bigfish
     for name in ("_serial_action", "_head_click", "_lamp_paint"):
         setattr(fake, name, getattr(kiosk.Kiosk, name).__get__(fake))
     return calls, fake
+
+
+def test_open_confirm_passes_registered_vendor(monkeypatch):
+    """#93: 确认框按规则文件登记的厂商判"不在提示符上"; 没登记给 None."""
+    seen = {}
+    monkeypatch.setattr(kiosk, "ConfirmDialog", lambda *a, **kw: seen.update(kw) or "dlg")
+    monkeypatch.setattr(kiosk.sw, "load_rules", lambda: {"slots": {1: "cisco"}})
+    _calls, fake = _fake(_view())
+    kiosk.Kiosk._open_confirm(fake, 1)
+    assert fake._confirm_win == "dlg" and seen["vendor"](1) == "cisco" and seen["vendor"](2) is None
 
 
 def test_head_click_opens_confirm_only_when_agent_involved():
@@ -98,9 +109,11 @@ def test_lamp_paint_uses_agent_state():
     calls, fake = _fake(_view(pending_slot=2, stop=1))
     fake._lamp_slots = [{"dev": f"/dev/con-{n}", "present": True, "baud": "9600", "count": 0} for n in range(1, 5)]
     fake._lamps = {k: (_Lab(), _Lab(), _Lab(), [None]) for k in ["con-1", "con-2", "con-3", "con-4"] +
-                   [key for _n, _l, key in kiosk.lc.LOWER]}
+                   [key for _n, _l, key in kiosk.lc.LOWER] + [kiosk.lc.IME_KEY]}
+    fake._ime_state = {"mode": "zh", "status": "ready"}
     fake._lamp_paint()
     assert fake._lamps["con-1"][2].cfg["text"] == "1\n急停"
     assert fake._lamps["con-2"][2].cfg["text"] == "2\n待确认 1"
     assert fake._lamps["con-3"][2].cfg["text"] == "3\n9600"
     assert fake._lamps["kvm"][2].cfg["text"] == "键鼠"
+    assert fake._lamps[kiosk.lc.IME_KEY][2].cfg["text"] == "简"    # #100
