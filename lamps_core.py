@@ -12,6 +12,7 @@ import re
 import struct
 import time
 
+import cartlog
 import theme as th
 
 SAMPLE_MS = 200
@@ -28,6 +29,7 @@ HEALTH_COLOR, BODY, EMPTY_BODY, FG, EMPTY_FG, LIT_FG = th.follow(
 LOWER = [("键鼠", "CH9329", "kvm"), ("PXE", "PXE SERVER", "pxe"),
          ("LAN1", "LAN1 / PXE", "net:eno1"), ("LAN2", "LAN2", "net:enp3s0"),
          ("Wi-Fi", "WIFI", "net:wlp4s0")]
+IME_KEY = "ime"         # 输入法灯在 kiosk._lamps 里的键 (#100)
 SLOTS = [f"/dev/con-{n}" for n in range(1, 5)]   # /etc/udev/rules.d/99-cart-console.rules
 
 
@@ -38,7 +40,7 @@ def slot_for_lamp(key):
     不存在的口, 面板显示"未插", 再点开服务 conbroker 就报"无 conN 这个设备"。
     """
     return f"/dev/{key}"
-PXE_LOG = "/opt/pxe/pxeserver.log"
+PXE_LOG = os.path.join(cartlog.LOG_DIR, "pxeserver.log")     # #95 跟 kiosk_core.PXE_LOG 一样
 SPKR = "/dev/input/by-path/platform-pcspkr-event-spkr"
 EV_SND, SND_TONE = 0x12, 0x02
 
@@ -75,6 +77,20 @@ def lamp_view(health, active, on, bell=False):
     if active and on:
         return {"bg": color, "fg": LIT_FG, "bar": color}
     return {"bg": BODY, "fg": FG, "bar": color}
+
+
+def ime_lamp(state, on):
+    """输入法灯 (#100), 只看不点. state: 焦点框的 {"mode", "status"}, None = 焦点不在接了中文的框里, 灭.
+    加载中 / 不可用优先于中英 (同输入框旁的标记)."""
+    if state is None:
+        return dict(lamp_view(None, False, on), text="")
+    if state["status"] == "loading":
+        return dict(lamp_view("OK", True, on), text="简…")
+    if state["status"] == "unavailable":
+        return dict(lamp_view("WARN", True, True), text="ENG!")
+    if state["mode"] == "zh":
+        return dict(lamp_view("OK", True, True), text="简")
+    return dict(lamp_view("OK", False, on), text="ENG")
 
 
 def health_of(rows, label):

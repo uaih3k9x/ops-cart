@@ -12,7 +12,8 @@
   boot.ipxe、win/、clonezilla/ 不拦 (PE / live 系统本身不动硬盘, 写不写盘全看菜单里的参数;
   而且菜单被取走就上锁, 之后还得取得到)
 - pxelinux.cfg/ 下任何东西 (#55, 含 default、子目录、别名) 一律 404: pxelinux.0 只走 TFTP, TFTP 发的是生成的
-- grub.cfg* 超过 pxeserver.MENU_MAX 的当装机菜单 (不再只看前 64KB 却发整个文件)
+- grub.cfg* 超过 pxeserver.MENU_MAX 的、不是普通文件的 (FIFO / 设备) 一律 403
+- 默认项可能是救援的 grub.cfg* (pxeserver.rescue_default_menu, #70 之前的老菜单) 403: 救援只能手选
 - 不列目录 (一律 404)
 - *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希)、*.tmp (atomicfile 临时文件)、grub.cfg.* 永远 404
 - 文件名判断都先过 pxeserver.norm_name (Windows 部署 NTFS 大小写不敏感: KS.CFG、Grub.cfg-01-… 是同一个文件)
@@ -32,7 +33,7 @@ import sys
 import time
 
 from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, norm_name,
-                       private_name, pxe_mode, pxelinux_cfg_gate, unlock_only_menu)
+                       private_name, pxe_mode, pxelinux_cfg_gate, rescue_default_menu, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -88,15 +89,28 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(403, "Install mode is locked")
                 return None
             self.event(f"ks 被取走 {base} mac={mac} from {self.client_address[0]}")
-        elif base.startswith("grub.cfg") and os.path.isfile(path):
+        elif base.startswith("grub.cfg") and os.path.lexists(path):
+            # grub.cfg.* 和 .bak 上面已经 404, 走到这里的是 grub.cfg / grub.cfg-*, 同 TFTP.
+            # 不是普通文件的一律 403 (不打开 FIFO).
+            if not os.path.isfile(path):
+                self.send_error(403, "Not a regular file")
+                return None
             try:
                 with open(path, "rb") as f:
-                    head = f.read(MENU_MAX + 1)
-                armed = len(head) > MENU_MAX or unlock_only_menu(head.decode("utf-8", "replace"))
+                    raw = f.read(MENU_MAX + 1)
             except OSError:
-                armed = False
-            if armed and not install_allowed(menu_mac(base), pxe_mode(self.pxe_mode_path, self.now())):
+                raw = b""
+            if len(raw) > MENU_MAX:                         # 超长不当菜单发, 同 TFTP
+                self.send_error(403, "Menu too large")
+                return None
+            text = raw.decode("utf-8", "replace")
+            if unlock_only_menu(text) and not install_allowed(menu_mac(base),
+                                                              pxe_mode(self.pxe_mode_path, self.now())):
                 self.send_error(403, "Install mode is locked")
+                return None
+            if rescue_default_menu(text):                   # #70: 默认项可能是救援 (root + sshd), 同 TFTP 不发
+                log.warning("拒绝 %s 取 %s: 默认项是救援", self.client_address[0], base)
+                self.send_error(403, "Rescue default menu refused")
                 return None
         return super().send_head()
 

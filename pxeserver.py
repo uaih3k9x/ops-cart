@@ -18,7 +18,9 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -743,7 +745,7 @@ class DhcpServer:
 
 
 # ---------------------------------------------------------------- 装机菜单与装机模式
-# 默认只有救援菜单; 推车上解锁时 kiosk_core 只给选定 MAC 写 grub.cfg-01-<mac>, 状态在 pxe-mode.json.
+# 默认菜单超时后从本地盘启动, 救援只能手选 (#70); 推车上解锁时 kiosk_core 只给选定 MAC 写 grub.cfg-01-<mac>, 状态在 pxe-mode.json.
 # 菜单模板只在这里一份 (kiosk_core 也用它); TFTP/HTTP 发菜单和 ks 之前再看一遍 pxe-mode.json 兜底,
 # 车机界面不在时也不会误装.
 
@@ -760,35 +762,41 @@ IPXE_SCRIPT = "boot.ipxe"
 WINPE_TITLE = "WinPE (GRUB -> iPXE -> wimboot)"
 
 
+# 本地盘: GRUB (EFI) 的 exit 退回固件, 固件按 BootOrder 接着试下一项 (一般就是硬盘), 跟没 PXE 时一样.
+# 不 chainloader 某个 .efi: 路径因机器而异 (有的机器 bootmgfw.efi 还被换过), 开了安全启动时也未必让加载.
+LOCAL_TITLE = "Boot from local disk"
+LOCAL_ENTRY = f"menuentry '{LOCAL_TITLE}' {{\n    exit\n}}\n"
+
 # Memtest86+ (#55): 官方 x86_64 文件既是 EFI 程序又是 Linux bzImage, 一个文件 UEFI / BIOS 两边都用.
 # 放 tftp 根目录下 memtest/, 由 memtest_core.py 按固定版本下载校验后写入 (二进制不进仓库).
-# 不动硬盘, 所以挂在人人可取的救援菜单最后一项; EFI 文件没有签名, 开着安全启动会被 shim/GRUB 拒绝.
+# 不动硬盘, 挂在默认菜单 (超时本地盘) 最后一项, 只能手选; EFI 文件没有签名, 开着安全启动会被 shim/GRUB 拒绝.
 MEMTEST_EFI = "memtest/memtest64.efi"
 MEMTEST_TITLE = "Memtest86+ memory test (HTTP; turn Secure Boot OFF first)"
 
 
 def grub_menu(ip, install=False):
-    """GRUB 菜单: 救援 (默认, 不装系统) / 自动装机. 每项都给 HTTP (快) 和 TFTP (慢) 两条路.
-    救援菜单最后加 Memtest86+ (chainloader, 只走 HTTP); 装机菜单倒计时短, 不加.
+    """GRUB 菜单: 默认 (第 0 项本地盘, 后面救援, 最后 Memtest86+) / 自动装机. 救援是 root 带 sshd (可能无密码),
+    只能人在屏幕前手选 (#70); Memtest 同样手选 (chainloader, 只走 HTTP). Linux 项都给 HTTP (快) 和 TFTP (慢) 两条路.
+    装机菜单倒计时短, 不加 Memtest.
     装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此核对是不是解锁的那台
     (防误装; MAC 头是客户端自报的, 不当访问控制)."""
     repo = f"http://{ip}:8000"
     if install:
-        title, args, timeout = ("Rocky 9.8 auto install",
-                                f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg inst.ks.sendmac", 5)
-        extra = ""
-    else:
-        title, args, timeout = ("Rescue shell", _rescue_args(repo), 10)
-        extra = f"\nmenuentry '{MEMTEST_TITLE}' {{\n    chainloader (http,{ip})/{MEMTEST_EFI}\n}}\n"
-    return f"set default=0\nset timeout={timeout}\n\n" + _linux_entries(ip, title, args) + extra
+        return ("set default=0\nset timeout=5\n\n" +
+                _linux_entries(ip, "Rocky 9.8 auto install",
+                               f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg inst.ks.sendmac"))
+    return ("set default=0\nset timeout=10\n\n" + LOCAL_ENTRY + "\n" + _rescue_entries(ip) +
+            f"\nmenuentry '{MEMTEST_TITLE}' {{\n    chainloader (http,{ip})/{MEMTEST_EFI}\n}}\n")
 
 
 def pxelinux_menu(ip):
-    """BIOS 机器的 pxelinux.cfg/default: 默认救援 (10 秒), 另一项 Memtest86+. 不用 menu.c32,
-    boot: 提示符下敲标签名. pxelinux.0 只会 TFTP, 路径相对 tftp 根. 没有任何自动装机项.
+    """BIOS 机器的 pxelinux.cfg/default: 默认本地盘 (10 秒超时, LOCALBOOT 0 交回 BIOS 按启动顺序往下试),
+    救援和 Memtest86+ 只能在 boot: 提示符下手敲标签名 (#70 同一条门禁). 不用 menu.c32.
+    pxelinux.0 只会 TFTP, 路径相对 tftp 根. 没有任何自动装机项.
     ALLOWOPTIONS 0: 不能给标签加内核参数; IMPLICIT 0: 只能起 LABEL 里写的, 不能敲任意内核 / 配置文件名."""
-    return ("DEFAULT rescue\nPROMPT 1\nTIMEOUT 100\nALLOWOPTIONS 0\nIMPLICIT 0\n"
-            "SAY Rescue shell in 10 s. Type memtest and Enter for Memtest86+.\n\n"
+    return ("DEFAULT local\nPROMPT 1\nTIMEOUT 100\nALLOWOPTIONS 0\nIMPLICIT 0\n"
+            "SAY Local disk in 10 s. Type rescue or memtest and Enter to pick one.\n\n"
+            "LABEL local\n    LOCALBOOT 0\n\n"
             "LABEL rescue\n    KERNEL vmlinuz\n"
             f"    APPEND initrd=initrd.img ip=dhcp {_rescue_args(f'http://{ip}:8000')}\n\n"
             f"LABEL memtest\n    LINUX {MEMTEST_EFI}\n")
@@ -796,6 +804,10 @@ def pxelinux_menu(ip):
 
 def _rescue_args(repo):
     return f"inst.stage2={repo}/rocky inst.rescue inst.sshd inst.text"
+
+
+def _rescue_entries(ip):
+    return _linux_entries(ip, "Rescue shell", _rescue_args(f"http://{ip}:8000"))
 
 
 def _linux_entries(ip, title, args):
@@ -808,11 +820,11 @@ def _linux_entries(ip, title, args):
 
 
 def grub_menu_winpe(ip):
-    """解锁用途 winpe 的 MAC 菜单: 默认 WinPE, 后面救援; 不带任何自动装机项 (跟 rocky 用途分开,
+    """解锁用途 winpe 的 MAC 菜单: 默认 WinPE, 后面本地盘、救援; 不带任何自动装机项 (跟 rocky 用途分开,
     免得倒计时误装). timeout 放长到 15 秒, 被测机那头有时间看清."""
     return (f"set default=0\nset timeout=15\n\n"
             f"menuentry '{WINPE_TITLE}' {{\n    chainloader (http,{ip})/{WINPE_CHAIN}\n}}\n\n" +
-            _linux_entries(ip, "Rescue shell", _rescue_args(f"http://{ip}:8000")))
+            LOCAL_ENTRY + "\n" + _rescue_entries(ip))
 
 
 def ipxe_script():
@@ -866,8 +878,9 @@ def _grub_arg(token):
 
 
 def grub_menu_clone(ip, purpose, params):
-    """解锁用途 clone-save / clone-restore 的 MAC 菜单: 第 0 项 Clonezilla, 后面救援, timeout 15,
-    不带任何自动装机项. 抓镜像默认第 0 项; 恢复要写盘, 默认第 1 项救援, 人在屏幕前手选才写.
+    """解锁用途 clone-save / clone-restore 的 MAC 菜单: 第 0 项 Clonezilla, 第 1 项本地盘, 后面救援,
+    timeout 15, 不带任何自动装机项. 抓镜像默认第 0 项; 恢复要写盘, 默认第 1 项本地盘 (#70 前是救援),
+    人在屏幕前手选才写.
     params 是 clone_core.boot_params 的 token 列表; 只走 HTTP."""
     if purpose not in CLONE_TITLES:
         raise ValueError(f"克隆用途不对: {purpose!r}")
@@ -877,7 +890,55 @@ def grub_menu_clone(ip, purpose, params):
             f"menuentry '{CLONE_TITLES[purpose]}' {{\n"
             f"    linux (http,{ip})/{CLONE_KERNEL} {args} fetch=http://{ip}/{CLONE_DIR}/filesystem.squashfs\n"
             f"    initrd (http,{ip})/{CLONE_DIR}/initrd.img\n}}\n\n" +
-            _linux_entries(ip, "Rescue shell", _rescue_args(f"http://{ip}:8000")))
+            LOCAL_ENTRY + "\n" + _rescue_entries(ip))
+
+
+_RESCUE_KW = ("inst.rescue", "inst.sshd")
+MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 不发 (TFTP 换默认菜单, HTTP 403), 上锁时删
+_TOP_DEFAULT = re.compile(r"set default=(0|[1-9][0-9]*)")
+_TOP_TIMEOUT = re.compile(r"set timeout=[0-9]+")
+_TOP_ENTRY = re.compile(r"menuentry '[^'\\]*' \{")
+_BODY_BAD = set(";{}$\"'\\")
+
+
+def rescue_default_menu(text):
+    r"""默认项可能是救援 (inst.rescue / inst.sshd: root 可能无密码) 的菜单, #70 之前的老菜单就是.
+    不带这两个关键字的放过. 带的话用正向语法白名单, 只有完全落在这个子集里、且默认项不带关键字才放过:
+      顶层每行 (去掉首尾空白, CRLF 当 LF) 只能是: 空行; # 注释; set default=<十进制, 无前导零> (至多一次);
+      set timeout=<数字>; menuentry '<不含引号和反斜杠的标题>' {
+      菜单项里每行任意命令, 但不许出现 ; { } $ " ' \ (只许 \" 这种转义引号, 克隆参数要用), 不许再开 menuentry
+      / submenu; 收尾的 } 必须独占一行; 文末不能有没闭合的项.
+    default 没设按 0, 越界按 GRUB 回落第 0 项. 推车生成的所有菜单和 windows/grub.cfg 都在这个子集里.
+    只针对 #70 之前的老菜单和普通手写菜单, 不防能写 tftp 树的对抗者 (发送时兜底, 不是访问控制).
+    关键字被 GRUB 转义藏起来 (inst.res\cue 这种) 认不出, 同理不防."""
+    text = text.lstrip("\ufeff").replace("\r\n", "\n")
+    if not any(k in text for k in _RESCUE_KW):
+        return False
+    entries, body, default = [], None, None
+    for line in text.split("\n"):
+        s = line.strip()
+        if body is not None:
+            if s == "}":
+                entries.append("\n".join(body))
+                body = None
+            elif _BODY_BAD & set(s.replace('\\"', "")) or re.match(r"(menuentry|submenu)\b", s):
+                return True
+            else:
+                body.append(s)
+            continue
+        if not s or s.startswith("#") or _TOP_TIMEOUT.fullmatch(s):
+            continue
+        m = _TOP_DEFAULT.fullmatch(s)
+        if m and default is None:
+            default = int(m.group(1))
+        elif _TOP_ENTRY.fullmatch(s):
+            body = []
+        else:
+            return True
+    if body is not None or not entries:
+        return True
+    idx = default if default is not None and default < len(entries) else 0
+    return any(k in entries[idx] for k in _RESCUE_KW)
 
 
 def unlock_only_menu(text):
@@ -890,6 +951,7 @@ MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* �
 
 def norm_name(name):
     """门禁比较用的文件名: 截掉 ":" 之后 (NTFS 备用数据流 ks.cfg::$DATA), 去尾部点和空格, 转小写.
+    只为门禁比较 (ks / grub.cfg* / pxelinux.cfg / 备份名) 照 NTFS 的规则归一, 不是通用的文件名归一函数, 别拿去拼路径或开文件.
     Windows 部署 (NTFS 大小写不敏感、自动去尾点) 上 KS.CFG / Grub.cfg-01-… / ks.cfg. 都是同一个文件."""
     return name.split(":", 1)[0].rstrip(". ").lower()
 
@@ -926,7 +988,7 @@ def norm_mac(mac):
 def pxe_mode(path=PXE_MODE, now=None):
     """{"mode": "rescue"} / {"mode": "install", mac, since, until} / 过期则 mode="expired".
     恢复一批 (#18) 时文件里多一个 macs 名单, 结果里也带 macs. 文件没有、坏了、字段不对
-    (含 macs 不是非空 MAC 列表) 一律当救援."""
+    (含 macs 不是非空 MAC 列表) 一律当没解锁 (mode 仍叫 "rescue", 发默认菜单)."""
     now = time.time() if now is None else now
     try:
         with open(path) as f:
@@ -1065,8 +1127,8 @@ class TftpServer:
     def open_file(self, name, client):
         """-> (文件对象, 大小, 日志前缀). 找不到/越界抛 OSError.
         GRUB 会取的菜单 (grub.cfg*) 里带 inst.ks= 或 WinPE 项的 (unlock_only_menu), 只有已解锁、
-        没过期、文件名就是那台 MAC 时才照发, 否则换成救援菜单 (日志前缀不同, 车机不会当成菜单被取走).
-        超过 MENU_MAX 的 grub.cfg* 也按装机菜单对待.
+        没过期、文件名就是那台 MAC 时才照发, 否则换成默认菜单 (超时本地盘; 日志前缀不同, 车机不会当成菜单被取走).
+        默认项可能是救援的 (rescue_default_menu, #70 之前留下的; 已放行的解锁菜单也查), 一律换成默认菜单.
         pxelinux (#55, 白名单, pxelinux_cfg_gate): pxelinux.cfg/default 不读盘, 发 pxelinux_menu 生成的;
         pxelinux.cfg 下别的 (任意深度、别名) 一律找不到, pxelinux 会落到 default.
         文件名判断都先过 norm_name (大小写不敏感的文件系统). grub.cfg.* (GRUB 不会去取的备份) 和 private_name 一律找不到.
@@ -1081,18 +1143,28 @@ class TftpServer:
         base = norm_name(os.path.basename(path))
         if private_name(base) or base.startswith("grub.cfg."):
             raise FileNotFoundError(f"{name} 不发 (备份 / 临时文件)")
-        f = open(path, "rb")
-        size = os.fstat(f.fileno()).st_size
         if not base.startswith("grub.cfg"):
-            return f, size, f"TFTP RRQ {name}"
-        with f:
-            data = f.read()
-        if len(data) > self.MENU_MAX or unlock_only_menu(data.decode("utf-8", "replace")):
-            mac = menu_mac(base)
-            if not install_allowed(mac, pxe_mode(self.pxe_mode_path, self.now())):
-                data = grub_menu(self.ip).encode()
-                return io.BytesIO(data), len(data), f"TFTP RRQ {name} 未解锁, 回救援菜单"
-            self.event(f"装机菜单被取走 mac={mac} from {client[0]}")
+            f = open(path, "rb")
+            return f, os.fstat(f.fileno()).st_size, f"TFTP RRQ {name}"
+        why = None
+        if not stat.S_ISREG(os.stat(path).st_mode):        # FIFO / 设备: 不打开 (会卡住), 不当菜单发
+            why = "不是普通文件"
+        else:
+            with open(path, "rb") as f:
+                data = f.read(self.MENU_MAX + 1)           # 按读到的长度判断, 不信 fstat (可能还在写)
+            text = data.decode("utf-8", "replace")
+            if len(data) > self.MENU_MAX:
+                why = "菜单超长"
+            elif unlock_only_menu(text) and not install_allowed(menu_mac(base),
+                                                                pxe_mode(self.pxe_mode_path, self.now())):
+                why = "未解锁"
+            elif rescue_default_menu(text):
+                why = "默认项是救援"
+        if why:
+            data = grub_menu(self.ip).encode()
+            return io.BytesIO(data), len(data), f"TFTP RRQ {name} {why}, 回默认菜单"
+        if unlock_only_menu(text):
+            self.event(f"装机菜单被取走 mac={menu_mac(base)} from {client[0]}")
         return io.BytesIO(data), len(data), f"TFTP RRQ {name}"
 
     def _rrq(self, msg, addr):

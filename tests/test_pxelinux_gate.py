@@ -1,5 +1,5 @@
 """#55 审查第二、三轮: pxelinux 路径的门禁 (白名单).
-推车只生成 pxelinux.cfg/default (救援 + Memtest): TFTP 发它时不读磁盘, 直接发 pxelinux_menu 生成的内容;
+推车只生成 pxelinux.cfg/default (默认本地盘, 救援和 Memtest 手选): TFTP 发它时不读磁盘, 直接发 pxelinux_menu 生成的内容;
 pxelinux.cfg/ 下别的 (按 MAC/IP、子目录、符号链接别名) 一律找不到; HTTP 对 pxelinux.cfg/ 一律 404.
 上锁先删状态文件, 再清 pxelinux.cfg/, 清理失败只记事件."""
 
@@ -134,20 +134,14 @@ def test_tftp_symlink_alias_into_pxelinux_cfg_is_not_found(tmp_path, link):
 
 
 @pytest.mark.parametrize("armed", [False, True])
-def test_tftp_oversized_grub_cfg_is_treated_as_unlock_menu(tmp_path, armed):
-    """grub.cfg* 超过 MENU_MAX 不能当"普通大文件"原样发: 当装机菜单, 只给解锁那台."""
-    _w(tmp_path, "grub.cfg-01-02-00-00-00-00-02", "#" * (ps.TftpServer.MENU_MAX + 10) + "\n" + ROCKY)
-    srv, _ = _tftp(tmp_path, armed)
-    f, _size, tag = srv.open_file("grub.cfg-01-02-00-00-00-00-02", CLIENT)
-    assert f.read() == ps.grub_menu(IP).encode() and "未解锁" in tag
-
-
-def test_tftp_oversized_grub_cfg_for_armed_mac_is_sent(tmp_path):
+def test_tftp_oversized_grub_cfg_is_never_sent(tmp_path, armed):
+    """grub.cfg* 超过 MENU_MAX 不能当"普通大文件"原样发: 换默认菜单 (main #70: 解锁那台也不发, pxe_arm 本来就不写超长菜单)."""
     big = "#" * (ps.TftpServer.MENU_MAX + 10) + "\n" + ROCKY
-    _w(tmp_path, "grub.cfg-01-" + MAC.replace(":", "-"), big)
-    srv, events = _tftp(tmp_path, True)
-    f, _size, _tag = srv.open_file("grub.cfg-01-" + MAC.replace(":", "-"), CLIENT)
-    assert f.read() == big.encode() and events
+    for name in ("grub.cfg-01-02-00-00-00-00-02", "grub.cfg-01-" + MAC.replace(":", "-")):
+        _w(tmp_path, name, big)
+        srv, events = _tftp(tmp_path, armed)
+        f, _size, tag = srv.open_file(name, CLIENT)
+        assert f.read() == ps.grub_menu(IP).encode() and "菜单超长" in tag and not events
 
 
 # ---------------------------------------------------------------- HTTP (pxe-http-boot 出的就是 tftp 根)
@@ -195,8 +189,8 @@ def test_http_never_lists_directories(http):
     assert get("memtest/memtest64.efi") == (200, b"x")
 
 
-def test_http_oversized_grub_cfg_is_refused_unless_armed_mac(http):
-    """原来只看前 64KB 却发整个文件: 装机项塞在 64KB 之后就漏过去. 超过上限当装机菜单."""
+def test_http_oversized_grub_cfg_is_always_refused(http):
+    """原来只看前 64KB 却发整个文件: 装机项塞在 64KB 之后就漏过去. 超过上限一律 403 (解锁那台也是, 同 TFTP)."""
     root, get = http
     big = "#" * (64 * 1024 + 10) + "\n" + ROCKY
     _w(root, "grub.cfg-01-02-00-00-00-00-02", big)
@@ -204,7 +198,7 @@ def test_http_oversized_grub_cfg_is_refused_unless_armed_mac(http):
     _w(root, "grub.cfg-01-" + MAC.replace(":", "-"), big)
     assert get("grub.cfg-01-02-00-00-00-00-02")[0] == 403
     assert get("EFI/BOOT/grub.cfg")[0] == 403
-    assert get("grub.cfg-01-" + MAC.replace(":", "-")) == (200, big.encode())
+    assert get("grub.cfg-01-" + MAC.replace(":", "-"))[0] == 403
 
 
 # ---------------------------------------------------------------- pxe_disarm
@@ -268,3 +262,48 @@ def test_disarm_removes_state_before_anything_can_fail(tmp_path, env, monkeypatc
     monkeypatch.setattr(kc, "_scrub_tftp", lambda root: seen.append(state.exists()) or ([], []))
     kc.pxe_disarm(root=tmp_path / "tftp", path=state)
     assert seen == [False]
+
+
+# ---------------------------------------------------------------- 合 main (#70) 之后: 两边门禁叠在一起
+
+def test_tftp_fifo_grub_cfg_with_odd_case_does_not_hang(tmp_path):
+    """norm_name 认出 GRUB.CFG-01-…, 再走 main 的 S_ISREG 检查: FIFO 不打开 (会卡住), 换默认菜单."""
+    os.mkfifo(tmp_path / ("GRUB.CFG-01-" + MAC.replace(":", "-")))
+    srv, events = _tftp(tmp_path, True)
+    f, _size, tag = srv.open_file("GRUB.CFG-01-" + MAC.replace(":", "-"), CLIENT)
+    assert f.read() == ps.grub_menu(IP).encode() and "不是普通文件" in tag and not events
+
+
+def test_tftp_legacy_rescue_default_with_odd_case_falls_back(tmp_path):
+    from test_pxeserver import LEGACY_RESCUE
+    _w(tmp_path, "EFI/BOOT/Grub.Cfg", LEGACY_RESCUE)
+    srv, _ = _tftp(tmp_path)
+    f, _size, tag = srv.open_file("EFI/BOOT/Grub.Cfg", CLIENT)
+    assert f.read() == ps.grub_menu(IP).encode() and "默认项是救援" in tag
+
+
+def test_disarm_fifo_and_legacy_rescue_with_norm_name(tmp_path, env):
+    """上锁: FIFO 跳过不卡; 大小写变体的 #70 老救援菜单照删; EFI/Boot/GRUB.CFG 一律删; 救援默认的老备份不动."""
+    from test_pxeserver import LEGACY_RESCUE
+    root = tmp_path / "tftp"
+    root.mkdir()
+    os.mkfifo(root / "GRUB.CFG-C0000203")
+    _w(root, "GRUB.CFG-C0000201", LEGACY_RESCUE)
+    _w(root, "EFI/Boot/GRUB.CFG", ps.grub_menu(IP))
+    _w(root, "grub.cfg.bak-1", LEGACY_RESCUE)
+    _w(root, "grub.cfg.bak-2", ROCKY)
+    kc.pxe_disarm(root=root, path=tmp_path / "m.json")
+    assert (root / "GRUB.CFG-C0000203").exists()
+    assert not (root / "GRUB.CFG-C0000201").exists()
+    assert not (root / "EFI" / "Boot" / "GRUB.CFG").exists()
+    assert (root / "grub.cfg.bak-1").exists() and not (root / "grub.cfg.bak-2").exists()
+    assert not ps.rescue_default_menu((root / "grub.cfg").read_text())
+
+
+def test_http_legacy_rescue_and_fifo_refused_with_odd_case(http):
+    from test_pxeserver import LEGACY_RESCUE
+    root, get = http
+    _w(root, "Grub.Cfg-C0000201", LEGACY_RESCUE)
+    os.mkfifo(root / "GRUB.CFG-C0000202")
+    assert get("Grub.Cfg-C0000201")[0] == 403
+    assert get("GRUB.CFG-C0000202")[0] == 403

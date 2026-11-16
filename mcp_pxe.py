@@ -70,6 +70,17 @@ class Store:
                 atomicfile.write_text(self.path, book.dumps(), mode=0o600)
                 self._log(book.events)
 
+    def public_view(self):
+        """只读档用 (#49): 不加锁不写盘不写日志; 在内存里的 Book 上 tick 一次 (过期 / 急停作废进 history,
+        事件丢掉不落盘). secret=False: 绝不带确认码和摘要. 读不了 / 读不懂 = 没有申请."""
+        now = self.clock()
+        try:
+            b, stopped = pr.Book.from_text(_read(self.path), now), self.stopped()
+            b.tick(now, stopped)
+            return b.view(now, stopped=stopped, secret=False)
+        except Exception:               # noqa: BLE001
+            return {"pending": [], "history": []}
+
     def _log(self, events):
         for rec in events:
             try:
@@ -146,9 +157,10 @@ def read_clients(path=pxeserver.CLIENTS_PATH, now=None):
 
 
 def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disarm, retire=kc.pxe_retire,
-                who=mcp_serial.current_who, clients=read_clients):
+                who=mcp_serial.current_who, clients=read_clients, readonly=False):
     """plan(purpose, mac) -> 清单; mode() -> pxe_mode_read 的结果; disarm() 整个上锁; retire([mac]) 删这几台的菜单.
-    故意不收 pxe_arm: 解锁不在这里. 测试里全换成假的."""
+    故意不收 pxe_arm: 解锁不在这里. 测试里全换成假的.
+    readonly (#49): 只回只读工具, pxe_requests 走 store.public_view (不加锁不写盘, 不带码); 动手档照旧."""
 
     def _run(fn):
         try:
@@ -174,6 +186,9 @@ def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disa
         return [mc.json_content(res)]
 
     def pxe_requests(_a):
+        if readonly:
+            return [mc.json_content(store.public_view())]
+
         def go(b, now, st):
             b.tick(now, st)
             return b.view(now, st)
@@ -205,10 +220,10 @@ def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disa
     def pxe_clients(_a):
         return [mc.json_content({"clients": clients(), "note": "最近在 LAN1 上要过地址的机器. 防火墙挡住的看不到."})]
 
-    return [
+    tools = [
         mcp_serial.Tool(
             "pxe_clients", "最近在 LAN1 上要地址的机器 (只读): MAC、厂商串、架构、多久前. pxe_request 要 MAC 时先看这个.",
-            {}, pxe_clients, read_only=True),
+            {}, pxe_clients, kind=mc.READONLY),
         mcp_serial.Tool(
             "pxe_request", "申请 PXE 解锁 (只挂起, 不解锁): purpose = rocky (自动装 Rocky, 清空整块硬盘) / winpe "
             "(进 WinPE) / clone-save (整盘抓镜像到推车, 给 mac) / clone-restore (按推车上的克隆清单整批覆盖, "
@@ -217,20 +232,21 @@ def build_tools(store, plan=real_plan, mode=kc.pxe_mode_read, disarm=kc.pxe_disa
             {"purpose": {"type": "string", "enum": list(pr.PURPOSES), "required": True, "description": "用途"},
              "mac": dict(MAC_PARAM, description="目标机器 MAC (rocky / winpe / clone-save)"),
              "batch": {"type": "boolean", "description": "clone-restore 时给 true: 按推车上的克隆清单"}},
-            pxe_request),
+            pxe_request, kind=mc.ACT, destructive=True),
         mcp_serial.Tool(
             "pxe_requests", "看 PXE 解锁申请: 在等人确认的 (剩几秒) 和最近的结果 (armed 已解锁 / rejected / "
             "refused 清单变了等 / expired / dropped 急停或撤销). 只读. 解锁之后的状态用 pxe_status.",
-            {}, pxe_requests, read_only=True),
+            {}, pxe_requests, kind=mc.READONLY),
         mcp_serial.Tool(
             "pxe_retire", "提前上锁 (只收紧, 直接执行): 不给 mac = 整个装机口上锁、撤掉所有在等的申请; "
             "给 mac = 撤掉涉及它的申请, 它正解锁着就删它的菜单 (只剩它一台就整个上锁).",
-            {"mac": dict(MAC_PARAM, description="只收这一台; 不给 = 全部")}, pxe_retire),
+            {"mac": dict(MAC_PARAM, description="只收这一台; 不给 = 全部")}, pxe_retire, kind=mc.ACT, destructive=True),
     ]
+    return [t for t in tools if t.kind == mc.READONLY] if readonly else tools
 
 
-def real_tools():
-    return build_tools(Store())
+def real_tools(readonly=False):
+    return build_tools(Store(), readonly=readonly)
 
 
 # ------------------------------------------------------------ 车机上的人 (kiosk 后台线程调)

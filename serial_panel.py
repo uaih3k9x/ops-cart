@@ -13,6 +13,7 @@
 
 import os
 import queue
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -22,6 +23,7 @@ import time
 import tkinter as tk
 
 import kvm_core as kvm
+import observe_core
 import survey_core
 import theme as th
 from serial_core import (  # noqa: F401  界面要用的 + 给老调用方的兼容名
@@ -46,11 +48,43 @@ def _btn(parent, text, cmd, bg=None):
                      activebackground=th.ACTIVE, **th.RAISED, cursor="hand2", padx=10)
 
 
+def caps_view(on, line):
+    """标题栏 ⇪ 的 (文字, 颜色), line 是控制台光标所在行: 大写锁定开着就显示, 现场是 Password: 时换醒目颜色 (#88)."""
+    return (th.CAPS_MARK if on else "", th.BAD if observe_core.classify(line) == "password" else FG)
+
+
+def observe_vendor(cfg):
+    """观察用哪个厂商的解析器: survey_vendor 是 auto (#56 起的默认) 或没有解析器的厂商时按华为."""
+    v = cfg.get("survey_vendor")
+    return v if observe_core.parser_for(v) else "huawei"
+
+
+def _held_here(panel):
+    """面板当前选中的这一路是不是正在被观察 (#85; 登记在模块级, kiosk 切页新建的面板也看得到)."""
+    name = match_service(panel.port_var.get(), panel._serves)
+    return bool(name) and observe_core.is_observing(name)
+
+
 class SerialPanel(tk.Frame):
     """kiosk 里的 '串口会话' 页. 左控制台 (宽) | 右聊天 (窄), F2 切换焦点."""
 
+    def _held_here(self):
+        return _held_here(self)
+
+    def _auto_connect_ok(self):
+        return not _held_here(self)
+
+    def _wake_ok(self, wake):
+        return bool(wake) and not _held_here(self)
+
+    def _show_held(self):
+        if _held_here(self):
+            self.con_title.config(text=f"控制台 · {self.port_var.get()} 观察中 (观察窗口占着这一路, 退出观察后接回)",
+                                  fg=th.NOTICE)
+
     def __init__(self, master, want=None):
         super().__init__(master, bg=BG)
+        observe_core.register_panel(self)   # #85: 观察结束接回控制台时找当前活着的面板
         self.cfg = serial_conf_read()
         self.ddir = data_dir(self.cfg)
         self.sock = None
@@ -59,7 +93,7 @@ class SerialPanel(tk.Frame):
         self.term = TermFeed()
         self.chat_off = None
         self._serves, self._kvm_devs, self._byid, self._aliases = {}, set(), [], []
-        self._busy = self._pasting = self._reconnect = self._surveying = False
+        self._busy = self._pasting = self._reconnect = self._surveying = self._caps = False
         self._want = want                    # issue #5: 打开面板时点中的那一路, 列表回来后落位
         self._menu_ports = []                # 下拉列表当前列出的口
         self._build()
@@ -85,7 +119,8 @@ class SerialPanel(tk.Frame):
         self.baud_menu.pack(side="left", padx=6)
         for text, cmd in (("刷新", self.refresh_ports), ("开服务", self.start_serve),
                           ("停服务", self.stop_serve), ("唤醒(回车)", lambda: self._tx(b"\r")),
-                          ("Ctrl+C", lambda: self._tx(b"\x03")), ("巡检", self.survey)):
+                          ("Ctrl+C", lambda: self._tx(b"\x03")), ("巡检", self.survey),
+                          ("观察", self.observe)):
             _btn(bar, text, cmd).pack(side="left", padx=4)
         self.serve_label = tk.Label(bar, text="服务: 未知", font=FONT, bg=BG, fg=DIM)
         self.serve_label.pack(side="right")
@@ -96,8 +131,12 @@ class SerialPanel(tk.Frame):
 
         # 左: 控制台
         left = tk.Frame(pane, bg=BG)
-        self.con_title = tk.Label(left, text="控制台 · 未连接", font=FONT, bg=BG, fg=DIM, anchor="w")
-        self.con_title.pack(fill="x")
+        head = tk.Frame(left, bg=BG)
+        head.pack(fill="x")
+        self.caps_mark = tk.Label(head, text="", font=FONT, bg=BG, fg=FG)
+        self.caps_mark.pack(side="right")
+        self.con_title = tk.Label(head, text="控制台 · 未连接", font=FONT, bg=BG, fg=DIM, anchor="w")
+        self.con_title.pack(side="left", fill="x", expand=True)
         self.console = tk.Text(left, font=FONT_MONO, bg=BG2, fg=th.TEXT, **th.SUNKEN,
                                insertbackground=FG, wrap="char", highlightthickness=2,
                                highlightbackground=BG2, highlightcolor=th.PRIMARY)
@@ -123,8 +162,10 @@ class SerialPanel(tk.Frame):
         self.chat_entry = tk.Entry(row, textvariable=self.chat_var, font=FONT, bg=BG2, fg=FG,
                                    insertbackground=FG, **th.SUNKEN, highlightthickness=2,
                                    highlightbackground=BG2, highlightcolor=th.PRIMARY)
+        self.chat_entry.no_ime = True       # 发往串口的命令, 不接中文输入 (中文输入的 NO_IME 约定)
         self.chat_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self.chat_entry.bind("<Return>", lambda e: self.chat_send())
+        self.chat_entry.bind("<KeyPress>", self._note_caps, add="+")
         _btn(row, "发送", self.chat_send, bg=th.PRIMARY).pack(side="left", padx=(6, 0))
         pane.add(right, stretch="never", minsize=260, width=CHAT_WIDTH)
 
@@ -139,7 +180,16 @@ class SerialPanel(tk.Frame):
 
     # ------------------------------------------------------------ 控制台
 
+    def _note_caps(self, ev):
+        self._caps = th.caps_on(ev.state, ev.keysym)
+        self._paint_caps()
+
+    def _paint_caps(self):
+        text, fg = caps_view(self._caps, self.console.get("end-1c linestart", "end-1c"))
+        self.caps_mark.config(text=text, fg=fg)
+
     def _on_console_key(self, ev):
+        self._note_caps(ev)
         if ev.keysym == "F2":
             return self._toggle_focus()
         if ev.state & _CTRL and ev.keysym.lower() == "v":
@@ -184,6 +234,10 @@ class SerialPanel(tk.Frame):
             self._disconnect()
 
     def _connect(self, wake=True):
+        if _held_here(self):               # 这一路正在观察: 车机控制台不接 (接上就是 attach 着的人, 观察会一直停)
+            self._disconnect()
+            self._show_held()
+            return
         self._disconnect()
         dev = self.port_var.get()
         name = match_service(dev, self._serves)
@@ -199,11 +253,12 @@ class SerialPanel(tk.Frame):
             self.con_title.config(text=f"控制台 · 连接失败: {e}", fg=th.BAD)
             return
         self.sock, self._reconnect = s, False
+        self._conn_name, self._conn_dev = name, dev     # #85: 观察接管 / 接回控制台以这个为准
         self.term = TermFeed()
         self.con_title.config(text=f"控制台 · {dev} @ {self._serves.get(name, '?')} · 键盘直通串口",
                               fg=th.OK)
         threading.Thread(target=self._reader, args=(s,), daemon=True).start()
-        if wake:
+        if self._wake_ok(wake):
             self._tx(b"\r")
 
     def _reader(self, s):
@@ -271,6 +326,7 @@ class SerialPanel(tk.Frame):
             c.delete("1.0", "1000.0")
         c.mark_set("insert", "end-1c")
         c.see("end")
+        self._paint_caps()
 
     # ------------------------------------------------------------ 聊天
 
@@ -366,9 +422,15 @@ class SerialPanel(tk.Frame):
                 self.port_var.set((free or ports)[0])
             shown = [f"{os.path.basename(n)} @ {b}" for n, b in self._serves.items()]
             self.serve_label.config(text=f"服务: {', '.join(shown) or '未开'}")
-            if not self.sock and match_service(self.port_var.get(), self._serves):
-                self._connect(wake=wake)
+            self._after_refresh(wake)
         self._async(fetch, done)
+
+    def _after_refresh(self, wake):
+        """列表回来以后: 选中的口有服务就连上; 这一路正在观察 (#85) 就不连, 标题显示"观察中"."""
+        if not self.sock and self._auto_connect_ok() and match_service(self.port_var.get(), self._serves):
+            self._connect(wake=wake)
+        elif self._held_here():
+            self._show_held()
 
     def start_serve(self):
         """开服务: 防连点; 进程提前退出时把它的报错显示出来, 不再静默失败."""
@@ -414,7 +476,9 @@ class SerialPanel(tk.Frame):
     def survey(self):
         """#15 一键只读巡检: 后台跑 survey_core (走 conbroker send), 摘要经 self.ui 回主线程写进控制台.
 
-        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor, 默认 huawei.
+        选中的口没有在跑的服务就只提示, 不开服务也不跑. 厂商取 serial.conf 的 survey_vendor
+        (huawei / h3c / cisco / ruijie), 默认 auto (#56 先 show version 再 display version 自动认).
+        发第一条前先 conbroker tail 看最后一行, 不在提示符上 (Username / Password / [Y/N] ...) 就不跑.
         """
         if self._surveying:
             return
@@ -423,23 +487,48 @@ class SerialPanel(tk.Frame):
         if not name:
             self._con_write([("text", f"\n[巡检] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
             return
+        token = "survey-" + secrets.token_hex(4)               # 每次巡检一个令牌, 不能重入
+        if not observe_core.claim(name, token):             # #85: 同一路观察和巡检互斥, 命令不能互相插
+            busy = "正在巡检, 等这次巡检跑完" if (observe_core.holder(name) or "").startswith("survey-") \
+                else "正在观察, 先退出观察再巡检"
+            self._con_write([("text", f"\n[巡检] {dev} {busy}\n")], "mark")
+            return
         self._surveying = True
-        vendor = self.cfg.get("survey_vendor", "huawei")
+        vendor = self.cfg.get("survey_vendor", "auto")
         head = survey_core.safe_name(os.path.basename(dev))
         self._con_write([("text", f"\n[巡检] {dev} ({vendor}): 逐条发只读命令, 跑完前先别敲键\n")], "mark")
 
         def work():
             try:
-                r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head)
-            except Exception as e:                 # run_survey 本不抛; 兜住, 免得按钮一直锁着
-                r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
-            survey_core.record(r)
-            return r
+                try:
+                    r = survey_core.run_survey(name, vendor, send=survey_core.conbroker_send, head=head,
+                                               tail=survey_core.conbroker_tail, disabled=survey_core.gate_disabled())
+                except Exception as e:             # run_survey 本不抛; 兜住, 免得按钮一直锁着
+                    r = {"ok": False, "summary": f"巡检出错: {e}", "sections": [], "head": head, "error": str(e)}
+                survey_core.record(r)
+                return r
+            finally:
+                observe_core.release(name, token)   # 线程一结束就放: 面板可能已经切走, done 不一定跑得到
 
         def done(r):
             self._surveying = False
             self._con_write([("text", "\n[巡检] " + r["summary"].replace("\n", "\n       ") + "\n")], "mark")
         self._async(work, done)
+
+    def observe(self):
+        """#85 观察模式: 选中的口有在跑的服务才开窗 (看现场、确认设备、轮询都在 observe_panel 里).
+        厂商: serial.conf 的 survey_vendor 有 brief 解析器就用它, 否则 (auto / cisco ...) 按华为."""
+        dev = self.port_var.get()
+        name = match_service(dev, self._serves)
+        if not name:
+            self._con_write([("text", f"\n[观察] {dev} 上没有在跑的 conbroker 服务, 先点 开服务\n")], "mark")
+            return
+        if (observe_core.holder(name) or "").startswith("survey-"):
+            self._con_write([("text", f"\n[观察] {dev} 正在巡检, 等巡检跑完再观察\n")], "mark")
+            return
+        import observe_panel
+        if observe_panel.open_for(self, dev, name, observe_vendor(self.cfg), self.ddir) is None:
+            self._con_write([("text", f"\n[观察] {dev} 上一次观察还在收尾, 稍后再试\n")], "mark")
 
     def destroy(self):
         self._disconnect()

@@ -79,6 +79,7 @@ class PxeRequestDialog(tk.Toplevel):
         tk.Label(self.body, text=c["code_text"], font=th.font(40, bold=True, mono=True), bg=BG, fg=AMBER).pack()
         e = tk.Entry(self.body, font=th.font(22, mono=True), width=10, justify="center", bg=CARD, fg=FG,
                      insertbackground=FG, **th.SUNKEN)
+        e.no_ime = True                     # 确认码要人亲手敲 (中文输入的 NO_IME 约定)
         e.pack(pady=6, ipady=6)
         e.bind("<Return>", lambda _e: self._confirm(c))
         self._entry = e

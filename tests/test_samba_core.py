@@ -3,6 +3,7 @@
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 
@@ -177,12 +178,60 @@ def test_smb_dropin_requires_data_disk():
     assert "RequiresMountsFor=/srv/data" in u
 
 
-def test_nm_dispatcher_restarts_smb_on_lan1_up():
+LAN1_DROPIN = ROOT / "deploy" / "srv-data" / "smb-lan1.conf"
+
+
+def _exec_condition():
+    lines = [l for l in LAN1_DROPIN.read_text().splitlines() if l.startswith("ExecCondition=")]
+    assert len(lines) == 1
+    return shlex.split(lines[0].partition("=")[2])
+
+
+@pytest.mark.parametrize("ip_out,ip_rc,want", [
+    ("", 0, 1),                                                         # 没插线: NM 没给地址 -> 跳过
+    ("", 1, 1),                                                         # 没有 eno1 这块网卡 -> 跳过
+    ("2: eno1    inet 192.0.2.1/24 brd 192.0.2.255 scope global eno1\n", 0, 0),     # 有地址 -> 起
+])
+def test_smb_lan1_dropin_skips_cleanly_without_address(tmp_path, ip_out, ip_rc, want):
+    """#95 smb.conf 只绑 LAN1: LAN1 没地址时 smbd 起来找不到接口, smb_panic 出 core.
+    ExecCondition 不满足 = 单元跳过 (inactive, 不是 failed), 插线来地址时 NM 钩子再拉起."""
+    fake = tmp_path / "ip"
+    fake.write_text(f"#!/bin/sh\necho \"$*\" >> {tmp_path}/args\nprintf '%s' '{ip_out}'\nexit {ip_rc}\n")
+    fake.chmod(0o755)
+    r = subprocess.run(_exec_condition(), env={"PATH": f"{tmp_path}:/usr/bin:/bin"})
+    assert r.returncode == want
+    assert f"dev {sb.LAN1}" in (tmp_path / "args").read_text()
+
+
+def test_smb_lan1_dropin_is_condition_not_wait():
+    body = LAN1_DROPIN.read_text()
+    assert "[Service]" in body and "ExecStartPre" not in body     # 不在开机时干等 (拖慢开机 / 超时又是 failed)
+
+
+def test_nm_dispatcher_starts_smb_on_lan1_up():
     s = (ROOT / "deploy" / "srv-data" / "50-ops-cart-smb").read_text()
-    assert '"eno1"' in s and "try-restart smb" in s
+    # 开机没地址时 smbd 被跳过 (没在跑), try-restart 拉不起来; 要 restart, 但只对开了自启的 (没装 / 没启用不动)
+    assert '"eno1"' in s and "try-restart" not in s
+    assert ("{ systemctl is-enabled -q smb.service || systemctl is-active -q smb.service; } "
+            "&& systemctl restart smb.service") in s
     r = subprocess.run(["bash", "-n", str(ROOT / "deploy" / "srv-data" / "50-ops-cart-smb")],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("enabled,active,want_restart", [
+    (0, 1, True), (1, 0, True), (1, 1, False),          # 0 = 是 (systemctl 退出码); 手工起的没开自启也要重绑
+])
+def test_nm_dispatcher_restart_decision(tmp_path, enabled, active, want_restart):
+    log = tmp_path / "calls"
+    fake = tmp_path / "systemctl"
+    fake.write_text(f"#!/bin/sh\necho \"$*\" >> {log}\n"
+                    f"case \"$1\" in is-enabled) exit {enabled};; is-active) exit {active};; esac\nexit 0\n")
+    fake.chmod(0o755)
+    hook = ROOT / "deploy" / "srv-data" / "50-ops-cart-smb"
+    r = subprocess.run(["bash", str(hook), "eno1", "up"], env={"PATH": f"{tmp_path}:/usr/bin:/bin"})
+    assert r.returncode == 0
+    assert ("restart smb.service" in log.read_text()) == want_restart
 
 
 # ---------------------------------------------------------------- CLI
@@ -235,3 +284,12 @@ def test_cli_clone_password_twice_for_smbpasswd(tmp_path):
     cj.write_text(json.dumps(CLONE))
     r = _cli("clone-password", "--clone", str(cj), "clonesave")
     assert r.returncode == 0 and r.stdout == "Example-pass1\nExample-pass1\n"     # smbpasswd -s 要两遍
+
+
+def test_setup_samba_does_not_install_lan1_dropin():
+    """仓库生成的 smb.conf 带 lo, LAN1 没地址时 smbd 也有 127.0.0.1 可绑, 不会崩; 再装 lan1 drop-in 反而没插线时整个跳过.
+    lan1 drop-in 只给手工配置的推车 (docs/MIGRATE_95.md)."""
+    sh = (ROOT / "scripts" / "setup-samba.sh").read_text()
+    assert "srv-data/smb-lan1.conf" not in sh
+    assert "rm -f /etc/systemd/system/smb.service.d/ops-cart-lan1.conf" in sh      # 以前手工装过的也撤掉
+    assert sections(sb.smb_conf(IP, PREFIX, None))["global"]["interfaces"].split()[0] == "lo"

@@ -15,6 +15,8 @@ import tkinter as tk
 from subprocess import DEVNULL, Popen       # 只给 mpv 用
 from tkinter import messagebox, simpledialog
 
+import bigfish_core as bfc
+import bigfish_task_core as bft
 import cartlog
 import clone_core as cc
 import confirm_core as cfc
@@ -22,6 +24,7 @@ import dash_core as dc
 import kiosk_core as kc
 import kiosk_ui_core as kui
 import kvm_core as kvm
+import ime_tk
 import lamps_core as lc
 import mcp_pxe
 import mcp_kvm
@@ -29,11 +32,15 @@ import mcp_serial
 import sun_core
 import ups_core as uc
 import serial_core as sc
+import serial_write_core as sw
+import observe_panel
 from serial_panel import SerialPanel
 from ks_panel import KsPanel
 from wifi_panel import WifiPanel
 from netmode_panel import NetModePanel
 from wol_panel import WolPanel
+from bigfish_panel import BigfishPanel
+from label_panel import LabelPanel
 from confirm_panel import ConfirmDialog, KvmDialog
 from pxe_req_panel import PxeRequestDialog
 import theme as th
@@ -71,6 +78,7 @@ class Kiosk(tk.Tk):
         self.passthrough = False
         self._ssd, self._ssd_ts = None, 0.0
         self._check_rows, self._check_ts, self._checking = None, 0.0, False
+        self._pxe_toggled_at = 0.0          # 最近一次车机上启停 PXE 成功的时间; 之前开跑的自检结果作废
         self._fans_seen = set()
         self._combo = kc.ReleaseCombo()
         self._kb = kc.HidKeyboard()
@@ -92,6 +100,8 @@ class Kiosk(tk.Tk):
         # Agent PXE 解锁申请 (#24): 采样线程 peek 来的视图 (带确认码), 申请框, 弹过的编号 (人关掉了不再弹)
         self._pxe_view, self._pxe_req_win, self._pxe_seen, self._pxe_store = None, None, set(), mcp_pxe.Store()
         self.kvm = kvm.load()               # 画面源 <-> 键鼠绑定; 进透传时按当前画面源连
+        self._bf_watch, self._bf_note = None, ""   # 大肥鱼急停 (#53): 等它确认的看门, 面板上的一句进展
+        self._bf_desk = bft.Desk()                 # 车机派的任务 (#99): 放这里, 关面板 / 换主题不丢
 
         kc.kp_enter_as_return(self)
         kui.kp_digits_as_digits(self)
@@ -109,11 +119,11 @@ class Kiosk(tk.Tk):
         self._code = None
         self._boot_once = kui.Once(self._boot_finish)
         self._exit_once = kui.Once(self._disarm_quietly)
-        self._disarm_quietly()          # 开机即复位: PXE 默认只给救援菜单
+        self._disarm_quietly()          # 开机即复位: PXE 只给默认菜单 (超时本地盘)
         self.withdraw()                 # 主界面先藏着: 自检 -> 锁屏之间不能露出来
         self.after(50, self._boot_selftest)
         self._last_input = time.time()
-        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>"):
+        for seq in ("<Any-KeyPress>", "<Any-Motion>", "<Button>", "<<OpsCartImeInput>>"):   # 最后一个: 中文输入吃掉的键 (#54)
             self.bind_all(seq, self._note_input, add="+")
         # 透传的键盘走全局: Tk 把按键投给有焦点的窗口, 不是嵌着 mpv 的那个 Frame
         self.bind_all("<KeyPress>", lambda e: self.passthrough and self._on_key(e, True), add="+")
@@ -124,6 +134,8 @@ class Kiosk(tk.Tk):
         self.after(100, self.refresh)
         self.ui.repeat_bg(self._lamp_sample, self._lamp_sampled, every=lc.SAMPLE_MS / 1000)
         self.ui.repeat_bg(self._ups_sample, self._ups_sampled, every=1.0)
+        self._ime_state = None              # #100: 焦点框的输入法状态, 下一次 _lamp_tick 画
+        ime_tk.watch(lambda state: setattr(self, "_ime_state", state))
         self.after(lc.SAMPLE_MS // 2, self._lamp_tick)
         self.after(CH_REAP_MS, self._ch_reap_tick)
 
@@ -223,6 +235,12 @@ class Kiosk(tk.Tk):
                 if "do" in it and "arg" not in it:
                     self._menu_btns[it["do"]] = b
         self.show_page("main")
+        self._sync_toggles()
+
+    def _sync_toggles(self):
+        """UVC 预览 / 串口会话 / PXE 装机服务三颗按钮写当前状态: 面板开关时、自检出结果时刷新."""
+        for attr, text in kui.toggle_texts(self.pane.current, self._check_rows).items():
+            getattr(self, attr).config(text=text)
 
     def show_page(self, name):
         for page in self.pages.values():
@@ -246,11 +264,10 @@ class Kiosk(tk.Tk):
             rows = kc.selftest_run(kc.selftest_plan_read(), kc.selftest_context())
             return kc.net_probe(), rows + [kui.font_row(self.ui_family)]
 
+        started = time.time()
+
         def checks_done(res):
-            self._checking = False
-            if not isinstance(res, Exception):
-                self._render_net(*res[0])
-                self._check_rows = res[1]
+            self._checks_done(started, res)
 
         rows = self._check_rows
 
@@ -272,8 +289,25 @@ class Kiosk(tk.Tk):
             self._checking, self._check_ts = True, time.time()
             self.ui.run_bg(checks, checks_done)
         self.ui.run_bg(board, self._render, key="board")
+        self._reap_preview()
         self.clock.config(text=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.after(2000, self.refresh)
+
+    def _checks_done(self, started, res):
+        """自检结果回来. 在最近一次 PXE 启停之前开跑的那轮作废 (读到的是启停前的状态), 等下一轮."""
+        self._checking = False
+        if isinstance(res, Exception) or started < self._pxe_toggled_at:
+            return
+        self._render_net(*res[0])
+        self._check_rows = res[1]
+        self._sync_toggles()
+
+    def _reap_preview(self):
+        """mpv 自己退了 (起不来 / 采集卡拔了 / 设备还被占着): 关预览面板, 按钮回 "关"."""
+        rc = self.mpv.poll() if self.mpv else None
+        if kui.preview_died(self.pane.current, rc):
+            self._close_pane()
+            self.banner.config(text=kui.preview_exit_note(rc))
 
     # ------------------------------------------------------------ 执行器条 (issue #2)
 
@@ -327,6 +361,7 @@ class Kiosk(tk.Tk):
             self._lamps[key][2].config(text=name)
         block(uc.UPS_KEY, 9, None)              # issue #4: 电池, 只看不点
         self._lamps[uc.UPS_KEY][2].config(text="电池")
+        block(lc.IME_KEY, 5, None)              # #100: 输入法, 只看不点 (切换仍然只靠单按 Shift)
 
     def _open_pane(self, name, select=None):
         """select: 串口面板要选中的那一路 (issue #5 执行器条点操作头) / 网口模式面板要选中的口 (#12)."""
@@ -486,6 +521,7 @@ class Kiosk(tk.Tk):
         if self._kvm_view is not None:
             look = cfc.kvm_lamp(cfc.kvm_summary(self._kvm_view), on)
             views["kvm"] = look or views["kvm"]
+        views[lc.IME_KEY] = lc.ime_lamp(self._ime_state, on)
         for key, v in views.items():
             f, stripe, lab, last = self._lamps[key]
             text = v["text"]
@@ -518,7 +554,9 @@ class Kiosk(tk.Tk):
         def serial():
             self._close_confirm()
             self._open_pane("serial", lc.slot_for_lamp(f"con-{n}"))
-        self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial)
+        self._confirm_win = ConfirmDialog(self, n, self._sw_view, self._serial_action, on_serial=serial,
+                                          live=lambda k: mcp_serial.log_last_line(lc.SLOTS[k - 1]),
+                                          vendor=lambda k: (sw.load_rules().get("slots") or {}).get(k))
 
     def _close_confirm(self):
         if self._confirm_win is not None and self._confirm_win.winfo_exists():
@@ -535,9 +573,14 @@ class Kiosk(tk.Tk):
         """确认框和全部急停的按钮: 先按最近的视图看一眼 (不行就说为什么), 再到后台经 Store 执行.
         车机进程就是本机人, 确认 / 解除在这里允许; 确认会等到 conbroker 发完, 所以一定在后台."""
         why = cfc.check(self._sw_view if self._sw_view is not None else cfc.stopped_view(), op, arg)
+        if why and op == "resume" and arg is None and bfc.estop_active():
+            self._bigfish_resume()          # 串口那边已经没急停, 只剩大肥鱼的 estop.json (#97 审查中1): 同一道门放行
+            return
         if why:
             self._serial_say(why, ok=False)
             return
+        if op == "estop" and arg is None:   # 全部急停也停大肥鱼 (#53); 不等串口那边, 也不受它忙不忙影响
+            self._bigfish_ctl("estop")
         store = self._sw_store
 
         def work():
@@ -547,6 +590,8 @@ class Kiosk(tk.Tk):
         def done(res):
             ok = not isinstance(res, Exception)
             self._serial_say(str(res) if ok else f"不行: {res}", ok)
+            if ok and op == "resume" and arg is None:
+                self._bigfish_ctl("resume")
         if not self.ui.run_bg(work, done, key="serial-write"):
             self._serial_say("上一个操作还在处理中…", ok=False)
             return
@@ -590,6 +635,97 @@ class Kiosk(tk.Tk):
             self._kvm_say("上一个操作还在处理中…", ok=False)
             return
         self._kvm_say("处理中…")
+
+    # ------------------------------------------------------------ 大肥鱼面板 (#53): 不另起审批, 用现有确认框和急停
+
+    def _agent_states(self):
+        """(串口每槽位状态, 键鼠摘要); 还没采到串口按全部急停, 没采到键鼠 None."""
+        sw_view = self._sw_view if self._sw_view is not None else cfc.stopped_view()
+        return cfc.slot_states(sw_view), cfc.kvm_summary(self._kvm_view) if self._kvm_view is not None else None
+
+    def _bigfish_pending(self):
+        return bfc.pending_count(*self._agent_states())
+
+    def _bigfish_confirm(self):
+        target = bfc.pending_target(*self._agent_states())
+        if target is None:
+            self.banner.config(text="没有待确认的")
+        elif target[0] == "serial":
+            self._open_confirm(target[1])
+        else:
+            self._open_kvm()
+
+    def _bigfish_all_stopped(self):
+        """执行器全部急停 (含不写 estop.json 的终端急停) 也不让派任务 (#99); 还没采到按急停."""
+        return all(s["estop"] for s in self._agent_states()[0].values())
+
+    def _bigfish_estop(self):
+        """就是执行器条上的"Agent 全部急停" (写大肥鱼急停信号挂在它上面)."""
+        self._serial_action("estop", None)
+
+    def _bigfish_resume_ok(self):
+        """解除大肥鱼急停的门 (#97 L1/L2): 设了 PIN 验 PIN; 没设 PIN 也要人点一次"是"."""
+        if self.gate.required:
+            return self._confirm_pin("解除大肥鱼急停")
+        return messagebox.askyesno("解除大肥鱼急停", "删掉大肥鱼的急停信号, 让它重新接任务?", parent=self)
+
+    def _bigfish_resume(self):
+        """面板上的"解除大肥鱼急停"和只剩 estop.json 时的"解除全部急停": 过门后只删 estop.json, 不动串口."""
+        if not self._bigfish_resume_ok():
+            return
+        self._bigfish_ctl("resume")
+        self._serial_say("已解除大肥鱼急停")
+
+    def _bigfish_ctl(self, op):
+        """全部急停 -> 写 estop.json 并看它 10 秒内确认没有; 通道不在 / 写不了直接硬停. 解除全部急停 -> 删掉."""
+        if op == "resume":
+            self._bf_watch, self._bf_note = None, ""
+            try:
+                bfc.estop_clear()
+            except OSError as e:
+                self.banner.config(text=f"大肥鱼急停文件删不掉: {e}")
+            return
+        now = time.time()
+        if not bfc.channel_ready():
+            self._bf_watch = None
+            self._bigfish_hard("急停通道未就绪")
+            return
+        try:
+            seq = bfc.estop_write(now)
+        except OSError as e:
+            self._bf_watch = None
+            self._bigfish_hard(f"写不了急停文件: {e}")
+            return
+        self._bf_watch, self._bf_note = bfc.EstopWatch(now, seq=seq), "等大肥鱼确认急停…"
+        self.after(1000, self._bigfish_watch_tick)
+
+    def _bigfish_watch_tick(self):
+        w = self._bf_watch
+        if w is None:
+            return
+        now = time.time()
+        r = w.step(now, bfc.load(now))
+        if r == "seen":
+            self._bf_watch, self._bf_note = None, "大肥鱼已急停"
+        elif r == "hard":
+            self._bf_watch = None
+            self._bigfish_hard(f"{bfc.HARD_AFTER_S} 秒内没确认急停")
+        else:
+            self.after(1000, self._bigfish_watch_tick)
+
+    def _bigfish_hard(self, why):
+        """硬急停在后台跑 (systemctl stop 可能要等几秒); 恢复不归车机管."""
+        self._bf_note = "正在硬停…"
+
+        def work():
+            return bfc.hard_stop(lambda cmd: kc.run(cmd, timeout=30), bfc.bigfish_uid(), why)
+
+        def done(res):
+            ok = not isinstance(res, Exception) and res[0]
+            self._bf_note = "已硬停，需人工恢复" if ok else f"硬停失败: {res if isinstance(res, Exception) else res[1]}"
+            self.banner.config(text=f"大肥鱼{self._bf_note} ({why})")
+        if not self.ui.run_bg(work, done, key="bigfish-hard"):
+            self._bf_note = "硬停已在进行"
 
     # ------------------------------------------------------------ Agent PXE 解锁申请 (#24)
 
@@ -704,13 +840,21 @@ class Kiosk(tk.Tk):
                 w.destroy()
 
     def _pane_open(self, name, select=None):
+        self._sync_toggles()
         self.status_wrap.pack_forget()
         if name == "preview":
             self._start_preview()
             return
         try:
             # 串口面板: 打开时就指定要选的那一路, 列表回来后落位 (issue #5); 网口模式面板: 选中那个口 (#12)
-            if select and name in ("serial", "netmode"):
+            if name == "bigfish":           # #53: 确认 / 拒绝 / 急停都走现有入口
+                w = BigfishPanel(self.body, pending=self._bigfish_pending, on_confirm=self._bigfish_confirm,
+                                 on_estop=self._bigfish_estop, note=lambda: self._bf_note,
+                                 on_resume=self._bigfish_resume, desk=self._bf_desk, run_bg=self.ui.run_bg,
+                                 locked=lambda: self._lock_win is not None, agents_stopped=self._bigfish_all_stopped)
+            elif name == "label":           # #104: 渲染和写打印机都在后台
+                w = LabelPanel(self.body, run_bg=self.ui.run_bg)
+            elif select and name in ("serial", "netmode"):
                 w = PANE_CLASSES[name](self.body, want=select)
             else:
                 w = PANE_CLASSES[name](self.body)
@@ -725,6 +869,7 @@ class Kiosk(tk.Tk):
         self.banner.config(text=kui.PANES[name])
 
     def _show_status(self):
+        self._sync_toggles()
         self.status_wrap.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.banner.config(text="")
 
@@ -765,6 +910,7 @@ class Kiosk(tk.Tk):
             os.makedirs("/run/ops-cart", exist_ok=True)    # mpv 的 IPC socket 放这 (cart_snap.py 用)
             self.mpv = Popen(kc.mpv_cmd(wid, dev), stdout=DEVNULL, stderr=DEVNULL)
         except OSError as ex:
+            self._close_pane()                  # 不留开着的黑面板, 按钮回 "关"
             self.banner.config(text=f"mpv 起不来: {ex}")
             return
         self._banner_idle()
@@ -1060,10 +1206,21 @@ class Kiosk(tk.Tk):
             if not messagebox.askyesno("确认", f"确定要{verb} PXE 装机服务?"):
                 return
             cmd = ["systemctl", "stop" if active else "start", *units]
-            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30), lambda r: self.banner.config(
-                text=f"PXE 装机服务已{verb}" if not isinstance(r, Exception) and r[0] == 0
-                else f"PXE 装机服务{verb}失败, 详见 journalctl"), f"正在{verb} PXE 装机服务…")
+            self._bg_action("toggle_pxe", lambda: kc.run(cmd, timeout=30),
+                            lambda r: self._pxe_toggle_done(r, active), f"正在{verb} PXE 装机服务…")
         self._bg_action("toggle_pxe", lambda: kc.services_status(("pxe-server",)), asked, "读取服务状态…")
+
+    def _pxe_toggle_done(self, res, active):
+        """启停回来: 成功就先把自检结果里 PXE 那行改掉再刷按钮, 并作废之前开跑的自检; 都让下一轮立刻重跑校正."""
+        verb = "停止" if active else "启动"
+        self._check_ts = 0.0
+        if isinstance(res, Exception) or res[0] != 0:
+            self.banner.config(text=f"PXE 装机服务{verb}失败, 详见 journalctl")
+            return
+        self._pxe_toggled_at = time.time()
+        self._check_rows = kui.pxe_rows_set(self._check_rows, not active)
+        self._sync_toggles()
+        self.banner.config(text=f"PXE 装机服务已{verb}")
 
     def confirm_power(self, off):
         verb = "关机" if off else "重启"
@@ -1147,7 +1304,7 @@ class Kiosk(tk.Tk):
         """先盖锁屏, 再撤自检页, 最后在锁屏底下放出主界面 -- 中间不留空档."""
         self._last_input = time.time()
         if self.gate.required:
-            self.lock()
+            self.lock("boot")
         if self._boot_win:
             self._boot_win.destroy()
             self._boot_win = None
@@ -1157,14 +1314,16 @@ class Kiosk(tk.Tk):
 
     # ------------------------------------------------------------ PIN 锁屏
 
-    def lock(self):
-        """全屏锁屏; 已锁则只提到最前."""
+    def lock(self, reason):
+        """全屏锁屏; 已锁则只提到最前. reason: "manual" = 人点了锁屏; 别的 (idle / boot / rebuild) 都是自动锁的.
+        #85 观察模式: 人主动锁屏才停止观察; 闲置自动锁屏只把观察窗口藏起来, 轮询照跑 (维护者定)."""
         if self._lock_win:
             self._lock_win.lift()
             return
         self._release_passthrough()
         self._close_confirm()                   # 确认框是置顶窗口, 别浮在锁屏上
         self._close_pxe_req()
+        observe_panel.hide_all(stop=reason == "manual")   # 观察窗口也是置顶的: 藏起来; 主动锁屏还停止观察
         self._pxe_seen.clear()                  # 解锁后还在等的申请再弹一次
         w = tk.Toplevel(self, bg=th.BG)
         w.overrideredirect(True)
@@ -1189,6 +1348,9 @@ class Kiosk(tk.Tk):
         self._lock_ups = tk.Label(w, text=uc.label(self._ups), font=FONT, bg=th.BG,
                                   fg=self._ups_fg(uc.health(self._ups)))
         self._lock_ups.place(relx=0.985, rely=0.065, anchor="ne")
+        # 右上角第三行: 大肥鱼一行 (#53), 只有枚举出来的字, 不显示它说的话
+        self._lock_bigfish = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.DIM)
+        self._lock_bigfish.place(relx=0.985, rely=0.11, anchor="ne")
         # 底部一行: 昨夜整理 (cart_dream.py) 的标题
         self._lock_dream = tk.Label(w, text="", font=FONT, bg=th.BG, fg=th.FAINT)
         self._lock_dream.place(relx=0.5, rely=0.97, anchor="s")
@@ -1202,7 +1364,9 @@ class Kiosk(tk.Tk):
         e = tk.Entry(box, textvariable=self._pin_var, show="*", font=th.font(22, mono=True),
                      width=14, justify="center", bg=th.BG, fg=th.FG,
                      insertbackground=th.FG, **th.SUNKEN)
+        e.no_ime = True                     # 要人亲手敲, 不接中文输入 (中文输入的 NO_IME 约定)
         e.pack(ipady=8)
+        th.caps_hint(e)
         e.bind("<Return>", lambda _e: self._try_unlock())
         self._lock_msg = tk.Label(box, text="输入 PIN 后回车", font=FONT, bg=th.BG, fg=th.DIM)
         self._lock_msg.pack(pady=12)
@@ -1218,7 +1382,7 @@ class Kiosk(tk.Tk):
         if not self.gate.required:
             messagebox.showinfo("锁屏", "还没设 PIN, 先在终端跑 sudo kiosk-setpin")
             return
-        self.lock()
+        self.lock("manual")
 
     def _lock_tick(self, w):
         """锁屏每秒刷新时钟和公告; 解锁 / 这个锁屏窗口被换掉 (#32 重建) 后自动停."""
@@ -1230,6 +1394,7 @@ class Kiosk(tk.Tk):
         if text != self._lock_notice.cget("text"):     # 字号自适应: 时钟和 PIN 之间那块塞满
             px = kc.notice_font_px(text, self.winfo_screenwidth() * 0.9, self.winfo_screenheight() * 0.36)
             self._lock_notice.config(text=text, font=th.font(-px, bold=True))
+        self._lock_bigfish.config(text=bfc.lock_line(bfc.load(time.time())))
         dream = kc.dream_line()
         if dream != self._lock_dream.cget("text"):
             self._lock_dream.config(text=dream)
@@ -1243,6 +1408,7 @@ class Kiosk(tk.Tk):
             self._lock_win.destroy()
             self._lock_win, self._lock_net, self._lock_ups, self._lock_serve = None, None, None, None
             self._last_input = time.time()
+            observe_panel.show_all()                # 锁屏时藏起来的观察窗口放回来
         elif r == "locked":
             left = max(1, int(self.gate.locked_until - time.time()))
             self._lock_msg.config(text=f"错误次数过多，{left} 秒后再试", fg=th.BAD)
@@ -1269,7 +1435,7 @@ class Kiosk(tk.Tk):
         """闲置 IDLE_SECONDS 直接进锁屏 (时钟 + 公告 + PIN), 不再放屏保盖住公告."""
         if self.gate.required and kc.screensaver_due(self._last_input, time.time(), IDLE_SECONDS,
                                                      showing=self._lock_win is not None):
-            self.lock()
+            self.lock("idle")
         self._theme_tick()
         self.after(5000, self._idle_tick)
 
@@ -1320,7 +1486,7 @@ class Kiosk(tk.Tk):
         if self._lock_win is not None:
             self._lock_win.destroy()
             self._lock_win, self._lock_net, self._lock_ups, self._lock_serve = None, None, None, None
-            self.lock()
+            self.lock("rebuild")
         cartlog.event("theme", f"车机界面 {old} -> {self._theme} (锁屏时重建)")
 
     def _theme_setting(self):
@@ -1397,8 +1563,10 @@ class Kiosk(tk.Tk):
             lb.selection_set(0)
         lb.pack(fill="x", padx=24)
         mac_var = tk.StringVar()
-        tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg=th.BG, fg=th.FG,
-                 insertbackground=th.FG, **th.SUNKEN).pack(fill="x", padx=24, pady=(6, 6), ipady=4)
+        mac_e = tk.Entry(w, textvariable=mac_var, font=FONT_MONO, bg=th.BG, fg=th.FG,
+                         insertbackground=th.FG, **th.SUNKEN)
+        mac_e.no_ime = True
+        mac_e.pack(fill="x", padx=24, pady=(6, 6), ipady=4)
         # 克隆用途: 这一批放不放行的清单 (#18). 人看的就是要写的: 解锁时 pxe_arm 重算, digest 不同就拒绝
         plan_lb = tk.Listbox(w, font=FONT_MONO, height=4, bg=th.BG, fg=th.WARN, **th.SUNKEN,
                              exportselection=False)
@@ -1429,6 +1597,7 @@ class Kiosk(tk.Tk):
         code_var = tk.StringVar()
         e = tk.Entry(w, textvariable=code_var, font=th.font(22, mono=True), width=10,
                      justify="center", bg=th.BG, fg=th.FG, insertbackground=th.FG, **th.SUNKEN)
+        e.no_ime = True
         e.pack(pady=8, ipady=6)
         msg = tk.Label(w, text="", font=FONT, bg=th.PANEL, fg=th.BAD)
         msg.pack()

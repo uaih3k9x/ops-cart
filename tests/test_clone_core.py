@@ -412,3 +412,21 @@ def test_examples_make_a_valid_plan():
     assert "smb3://192.0.2.1/clone-ro/" in run and "change-me" not in run
     p = cc.plan("clone-save", conf, batch, IP, mac="02:00:00:00:00:01", image_exists=lambda n: False)
     assert p["error"] is None and "smb3://clonesave:change-me-example@192.0.2.1/clone-rw/" in " ".join(p["rows"][0]["params"])
+
+
+@pytest.mark.parametrize("name", ["win11-inst.2024", "inst.rescue", "INST.RESCUE"])
+def test_image_name_keywords_only_refused_for_save(name):
+    """#70: 只有抓镜像菜单的默认项是 Clonezilla 项; 镜像名原样带 inst.rescue / inst.sshd 会被当成救援默认.
+    别的 (inst. 前缀、大小写不同、恢复用途) 照常 - 已有的 win11-inst.2024 这类不能整批报错."""
+    assert cc.image_name_error(name) is None
+    assert cc.ocs_sr_cmd("clone-restore", name, "SERIALNO=SN-EXAMPLE-1")
+    if name == "inst.rescue":
+        with pytest.raises(ValueError):
+            cc.ocs_sr_cmd("clone-save", name, "SERIALNO=SN-EXAMPLE-1")
+    else:
+        assert cc.ocs_sr_cmd("clone-save", name, "SERIALNO=SN-EXAMPLE-1")
+
+
+def test_save_image_with_sshd_keyword_refused():
+    with pytest.raises(ValueError):
+        cc.ocs_sr_cmd("clone-save", "a-inst.sshd", "SERIALNO=SN-EXAMPLE-1")

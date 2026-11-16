@@ -5,7 +5,7 @@
 set -euo pipefail
 TFTP=/opt/pxe/tftp
 python3 /opt/pxe/memtest_core.py --root "$TFTP" "$@"
-# 菜单项不用另写: 救援 grub.cfg 由车机 (kiosk 启动 / 上锁) 和 setup-cart.sh 生成, 已带 Memtest86+;
+# 菜单项不用另写: 默认 grub.cfg (超时本地盘, Memtest 手选) 由车机 (kiosk 启动 / 上锁) 和 setup-cart.sh 生成, 已带 Memtest86+;
 # BIOS 的 pxelinux.cfg/default 由 setup-cart.sh 里的 kiosk_core.py --write-rescue 写.
 [ -f "$TFTP/pxelinux.0" ] && [ -f "$TFTP/ldlinux.c32" ] \
     || echo "提示: tftp 根下没有 pxelinux.0 / ldlinux.c32, BIOS 机器起不来 (UEFI 不受影响), 见 docs/MEMTEST.md"

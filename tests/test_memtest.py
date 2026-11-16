@@ -37,7 +37,8 @@ def test_memtest_entry_is_last_and_not_default():
     cfg = ps.grub_menu(IP)
     assert "set default=0" in cfg
     entries = _entries(cfg)
-    assert "inst.rescue" in entries[0] and "Memtest86+" in entries[-1]
+    assert ps.LOCAL_TITLE in entries[0] and "inst.rescue" in entries[1] and "Memtest86+" in entries[-1]
+    assert not ps.rescue_default_menu(cfg)          # #70: 默认项是本地盘, 救援 / Memtest 只能手选
 
 
 def test_memtest_title_warns_secure_boot():
@@ -46,7 +47,7 @@ def test_memtest_title_warns_secure_boot():
 
 
 def test_memtest_is_not_an_unlock_only_menu():
-    """Memtest 不动硬盘, 留在人人可取的救援菜单里; 不能因此被当成解锁菜单拦掉或删掉."""
+    """Memtest 不动硬盘, 留在人人可取的默认菜单里 (手选); 不能因此被当成解锁菜单拦掉或删掉."""
     assert not ps.unlock_only_menu(ps.grub_menu(IP))
 
 
@@ -55,9 +56,15 @@ def test_install_menu_has_no_memtest():
     assert "Memtest86+" not in ps.grub_menu(IP, install=True)
 
 
-def test_pxelinux_menu_default_rescue_and_memtest_label():
+def test_pxelinux_menu_default_local_and_rescue_memtest_manual():
+    """BIOS 也守 #70: 超时进本地盘, 救援 (root + sshd) 和 Memtest 只能在 boot: 下手敲."""
     cfg = ps.pxelinux_menu(IP)
-    assert re.search(r"^DEFAULT rescue$", cfg, re.M)
+    defaults = re.findall(r"^DEFAULT (\S+)$", cfg, re.M)
+    assert defaults == ["local"] and "rescue" not in defaults and "memtest" not in defaults
+    local = cfg.split("LABEL local", 1)[1].split("LABEL ", 1)[0]
+    assert "LOCALBOOT 0" in local and "KERNEL" not in local and "inst." not in local
+    assert "Local disk" in cfg.split("LABEL ", 1)[0]          # SAY 提示跟着改
+    assert not re.search(r"^ONTIMEOUT", cfg, re.M)            # 超时走的就是 DEFAULT, 没有另设
     rescue = cfg.split("LABEL rescue", 1)[1].split("LABEL ", 1)[0]
     assert "KERNEL vmlinuz" in rescue and "initrd=initrd.img" in rescue
     assert f"inst.stage2=http://{IP}:8000/rocky" in rescue and "inst.rescue" in rescue

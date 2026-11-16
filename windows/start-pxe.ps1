@@ -1,7 +1,7 @@
 # Start PXE services via WMI (survives ssh session). Idempotent-ish: kills old instances first.
 # Usage: powershell -ExecutionPolicy Bypass -File start-pxe.ps1
 # 需要 D:\pxe 下有 pxeserver.py + httpserve.py. 示例地址, 按实际装机网段改.
-# 菜单和 ks 只发给 pxe-mode.json 里解锁的机器; Windows 上没有解锁入口, 所以这套只提供救援.
+# 菜单和 ks 只发给 pxe-mode.json 里解锁的机器; Windows 上没有解锁入口, 所以这套只提供默认菜单 (超时本地盘, 救援要手选).
 $ErrorActionPreference = "Stop"
 
 # kill previous instances (matched by command line)

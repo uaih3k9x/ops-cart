@@ -151,3 +151,53 @@ def test_slot_status_has_log_mtime(tmp_path):
     assert row["mtime"] == pytest.approx(log.stat().st_mtime)
     assert lc.slot_status(str(tmp_path), devs=["/dev/con-2"], exists=lambda d: True)[0]["mtime"] is None
 
+
+
+# ------------------------------------------------------------ 输入法灯 (#100)
+
+def _ime(mode="en", status="ready"):
+    return {"mode": mode, "status": status}
+
+
+def test_ime_lamp_dark_when_focus_not_in_ime_entry():
+    v = lc.ime_lamp(None, on=True)
+    assert v["text"] == "" and v["bg"] == lc.EMPTY_BODY and v["bar"] == lc.HEALTH_COLOR[None]
+
+
+@pytest.mark.parametrize("status", ["off", "ready"])     # off: 还没切过中文, 引擎没开
+def test_ime_lamp_english(status):
+    v = lc.ime_lamp(_ime("en", status), on=True)
+    assert v["text"] == "ENG" and v["bg"] == lc.BODY and v["bar"] == lc.HEALTH_COLOR["OK"]
+
+
+def test_ime_lamp_chinese_is_lit_and_steady():
+    a, b = lc.ime_lamp(_ime("zh"), on=True), lc.ime_lamp(_ime("zh"), on=False)
+    assert a == b and a["text"] == "简" and a["bg"] == lc.HEALTH_COLOR["OK"] and a["fg"] == lc.LIT_FG
+
+
+def test_ime_lamp_loading_blinks():
+    lit, dark = lc.ime_lamp(_ime("en", "loading"), on=True), lc.ime_lamp(_ime("en", "loading"), on=False)
+    assert lit["text"] == dark["text"] == "简…"
+    assert lit["bg"] == lc.HEALTH_COLOR["OK"] and dark["bg"] == lc.BODY
+
+
+def test_ime_lamp_unavailable_is_steady_warning():
+    a, b = lc.ime_lamp(_ime("en", "unavailable"), on=True), lc.ime_lamp(_ime("en", "unavailable"), on=False)
+    assert a == b and a["text"] == "ENG!" and a["bg"] == lc.HEALTH_COLOR["WARN"]
+
+
+def test_ime_lamp_status_wins_over_mode():
+    assert lc.ime_lamp(_ime("zh", "unavailable"), on=True)["text"] == "ENG!"     # 同 mode_text 的先后
+    assert lc.ime_lamp(_ime("zh", "loading"), on=True)["text"] == "简…"
+
+
+@pytest.mark.parametrize("mode", ["dark", "light"])
+def test_ime_lamp_follows_theme(mode):
+    import theme as th
+    old = th.MODE
+    try:
+        th.use(mode)
+        assert lc.ime_lamp(_ime("zh"), on=True)["bg"] == th.LAMP["OK"]
+        assert lc.ime_lamp(None, on=True)["bg"] == th.LAMP_EMPTY
+    finally:
+        th.use(old)

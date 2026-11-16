@@ -135,9 +135,9 @@ class FakeAudit:
 
 
 def _server(audit=None):
-    tools = [mc.Tool("echo", "回显", {"slot": PARAMS["slot"]}, _echo),
-             mc.Tool("boom", "抛异常", {}, _boom),
-             mc.Tool("refuse", "业务上拒绝", {}, _refuse)]
+    tools = [mc.Tool("echo", "回显", {"slot": PARAMS["slot"]}, _echo, kind=mc.READONLY),
+             mc.Tool("boom", "抛异常", {}, _boom, kind=mc.READONLY),
+             mc.Tool("refuse", "业务上拒绝", {}, _refuse, kind=mc.READONLY)]
     return mc.Server(tools, audit=audit or FakeAudit(), version="9.9")
 
 
@@ -375,7 +375,7 @@ def test_menu_purpose():
     assert mc.menu_purpose(ps.grub_menu_winpe("192.0.2.1")) == "winpe"
     assert mc.menu_purpose(ps.grub_menu_clone("192.0.2.1", "clone-save", ["ocs_live_run=x"])) == "clone-save"
     assert mc.menu_purpose(ps.grub_menu_clone("192.0.2.1", "clone-restore", ["ocs_live_run=x"])) == "clone-restore"
-    assert mc.menu_purpose(ps.grub_menu("192.0.2.1")) is None       # 救援菜单不是解锁用途
+    assert mc.menu_purpose(ps.grub_menu("192.0.2.1")) is None       # 默认菜单不是解锁用途
     assert mc.menu_purpose("") is None
 
 
