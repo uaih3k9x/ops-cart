@@ -52,7 +52,8 @@ OCR_MIN_MEAN = 60.0             # 平均低于这个: 明说读不出, 叫 Agent
 OCR_HINT = "OCR 读不出 (没信号、纯图形画面都这样; 退回 Tesseract 时彩色桌面也读不出), 用 screenshot 看图"
 # 串口闸门的词表之外, 操作系统上常见的清盘 / 引导命令 (子串匹配: mkfs.ext4、Format-Volume 都算)
 DANGER_SUB = ("diskpart", "bcdedit", "mkfs", "wipefs", "fdisk", "sgdisk", "parted", "shred", "dd if=", "cipher /w",
-              "format-volume", "clear-disk", "remove-item", "reg delete", "initialize-disk", "remove-partition")
+              "format-volume", "clear-disk", "remove-item", "reg delete", "initialize-disk", "remove-partition",
+              "bootsect", "bootrec", "manage-bde", "reset-physicaldisk", "clear-tpm")
 # 高危组合键: 按下的键里包含其中一组就算 (多带 shift 等也算). SysRq 在 HID 上就是 alt+printscreen (+字母, Linux 魔术键).
 DANGER_KEYS = {frozenset(k) for k in (("ctrl", "alt", "delete"), ("ctrl", "alt", "del"), ("alt", "f4"),
                                       ("alt", "printscreen"), ("ctrl", "alt", "backspace"))}
@@ -60,31 +61,43 @@ _PATH_SEP = re.compile(r"[\\/]")
 _EXE = re.compile(r"\.(?:exe|com|bat|cmd|ps1|sh)\b")
 
 
-# #69: 按"模式"查 (对 _norm 之后的整行): 小写、去掉引号 / 反引号 / ^ / 反斜杠、空白并成一个空格.
-# 变量拼接、编码、别名、脚本文件拦不住, 这是减速带. 往多拦的方向错, 只读的看盘命令 (ls / lsblk / blkid / cat /dev/sda) 不拦.
-_B = r"(?:^|[\s;&|(])"                         # 命令名前: 行首或分隔符 (sudo xxx 也算)
-_DEV = r"/dev/(?:sd|hd|vd|xvd|nvme|mmcblk|md|dm-|mapper/|disk/|loop|sg|sr)"
-_SYS = r"/(?:\*|etc|usr|bin|sbin|boot|lib|lib64|var|root|home|opt|dev|sys|proc|srv)?/?(?:\s|$)"
+# #69: 按"模式"查. 先把整行规整成几种写法 (_norm_all), 每种都查; 宁可误拦不可漏放 (#71):
+#   - 小写, ${IFS} / $IFS 当空格, 空白并成一个;
+#   - 引号 / 反引号 / ^ 两种处理: 去掉 (bash 的 "r"m、tr^uncate) 和换成空格 (cmd /c"rd ...");
+#     反斜杠也两种: 去掉 (bash 的 \rm、续行) 和当路径分隔符 (C:\Windows\...\takeown.exe);
+#   - 路径: 连续 / 并成一个, /./ 去掉, 命令名后的 .exe / .com / .bat / .cmd 去掉; 目标路径里出现 .. 一律算命中.
+# 变量拼接、eval、编码、别名、脚本文件拦不住, 这是减速带. 只读的看盘命令 (ls / lsblk / blkid / cat /dev/sda) 不拦.
+_B = r"(?:^|[\s;&|(){}/]|/[ck])"               # 命令名前: 行首、分隔符、路径 (/usr/bin/x、c:/.../x), cmd /c、/k 之后
+_UP = r"\S*\.\.(?:/\S*)?(?=\s|$|[;&|)])"         # 带 .. 的路径: 推不出指到哪, 当危险
+# /dev/ 下除 null、zero、tty*、pts、stdout、stderr、fd/ 以外都算 (块设备、/dev/mem、/dev/port、LVM 的 /dev/vg/lv ...)
+_DEV = r"(?:/dev/(?!(?:null|zero|stdout|stderr)(?=\s|$|[;&|)])|tty|pts/|fd/)|" + _UP + r")"
+# 系统目录: / 本身、/*、以这些目录开头的任何路径; . .. * 也算 (不知道当前目录在哪). home 只算它本身和通配它下一层
+_SYSDIR = r"(?:etc|usr|bin|sbin|boot|lib|lib32|lib64|libx32|var|root|opt|dev|sys|proc|srv|run|mnt|media|efi|snap)"
+_SYS = r"(?:/\*?|/" + _SYSDIR + r"(?:/\S*)?|/home/?\*?|\.{1,2}/?|\*|" + _UP + r")(?=\s|$|[;&|)])"  # public-safe-ignore
+_ETC = r"(?:/(?:etc|boot)/\S*|" + _UP + r")"
+_REC = r"(?=(?:.*\s)?-(?:[a-z]*r[a-z]*|-recursive)\b)"          # 带 -R / --recursive (往多拦: -r 也算)
 DANGER_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
-    # Windows
-    ("rd /s", _B + r"(?:rd|rmdir)\s.*/s\b"),
-    ("del /s /q", _B + r"(?:del|erase)\s.*/[sq]\b"),
-    ("cipher /w", _B + r"cipher\s.*/w"),
+    # Windows. 开关可以紧贴命令名 (RD/S/Q、del/s); PowerShell 里 rd / del / erase 是 Remove-Item 的别名 (-r、-Recurse)
+    ("rd /s", _B + r"(?:rd|rmdir)(?=[\s/]).*?(?:/s\b|\s-r)"),
+    ("del /s /q", _B + r"(?:del|erase)(?=[\s/]).*?(?:/[sq]\b|\s-r)"),
+    ("cipher /w", _B + r"cipher(?=[\s/]).*?/w"),
     ("diskpart clean", r"^clean(?: all)?$"),
     ("diskpart convert", r"^convert (?:gpt|mbr|dynamic|basic)\b"),
     ("Remove-Item -Recurse", _B + r"ri\s.*-r"),
-    ("takeown /r", _B + r"takeown\s.*/r\b"),
+    ("takeown /r", _B + r"takeown(?=[\s/]).*?/r\b"),
     ("icacls /t", _B + r"icacls\s(?=.*/t\b)(?=.*/(?:reset|grant|deny|remove|setowner|inheritance|setintegritylevel))"),
-    # Linux: 把输出写到块设备
-    ("写块设备 >", r">\|?\s*" + _DEV),
-    ("tee 写块设备", r"\btee\b(?:\s+-\S+)*\s+" + _DEV),
-    ("of= 块设备", r"\bof=\s*" + _DEV),
-    ("拷到块设备", _B + r"(?:cp|mv|install|rsync)\s.*\s" + _DEV + r"\S*$"),
-    # Linux: 递归改系统目录的权限 / 属主, 截断 / 覆盖关键文件
-    ("chmod/chown -R 系统目录", _B + r"(?:chmod|chown|chgrp|setfacl)\s(?=(?:.*\s)?-(?:[a-z]*r[a-z]*|-recursive)\b).*\s" + _SYS),
+    ("Set-Disk -IsOffline", _B + r"set-disk\s.*-is(?:offline|readonly)\b"),
+    # Linux: 把输出写到设备
+    ("写设备 >", r">\|?\s*" + _DEV),
+    ("tee 写设备", r"\btee\b(?:\s+-\S+)*\s+" + _DEV),
+    ("of= 设备", r"\bof=\s*" + _DEV),
+    ("拷到设备", _B + r"(?:cp|mv|install|rsync|ln)\s(?:.*\s" + _DEV + r"\S*$|.*(?:-t\s*|--target-directory=?\s*)" + _DEV + r")"),
+    ("覆盖 /etc /boot", _B + r"(?:cp|mv|install|rsync|ln)\s.*\s" + _ETC + r"$"),
+    # Linux: 递归改系统目录的权限 / 属主 / 属性, 截断 / 覆盖关键文件
+    ("chmod/chown -R 系统目录", _B + r"(?:chmod|chown|chgrp|setfacl|chattr)\s" + _REC + r".*\s" + _SYS),
     ("truncate", _B + r"truncate\b"),
-    ("覆盖 /etc /boot", r"(?:^|[^>])>\|?\s*/(?:etc|boot)/"),
-    ("sysrq-trigger", r">\s*/proc/sysrq-trigger"),
+    ("覆盖 /etc /boot", r">\|?\s*" + _ETC),                # 追加 >> 也算
+    ("sysrq-trigger", r"sysrq-trigger"),
     ("find -delete", _B + r"find\s.*\s-delete\b"),
     # Linux: 抹盘 / 分区 / 卷 / 固件启动项
     ("抹盘 / 分区 / 卷", _B + r"(?:blkdiscard|gdisk|sfdisk|mke2fs|mkswap|mkntfs|mkdosfs|lvremove|vgremove|pvremove|lvreduce"
@@ -93,24 +106,42 @@ DANGER_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
     ("hdparm security-erase", r"--security-erase"),
     ("zpool/zfs destroy", _B + r"(?:zpool\s+(?:destroy|labelclear)|zfs\s+destroy)\b"),
     ("mdadm --zero-superblock", _B + r"mdadm\s.*--zero-superblock"),
-    ("cryptsetup luksFormat/erase", _B + r"cryptsetup\s.*\b(?:luksformat|erase|reencrypt)\b"),
-    ("efibootmgr 改启动项", _B + r"efibootmgr\s(?:.*\s)?-(?:b|o|n|c|a|-delete-bootnum|-bootorder|-bootnext|-create|-active)\b"),
+    ("cryptsetup 抹密钥", _B + r"cryptsetup\s.*\b(?:luksformat|lukserase|lukskillslot|luksremovekey|erase|reencrypt)\b"),
+    ("efibootmgr 改启动项", _B + r"efibootmgr\s(?:[^|;&>]*\s)?(?!(?:-v+|--verbose)(?:\s|$))[^\s|;&>]"),   # 除了 -v 都算
 ))
-_STRIP = re.compile(r"[\"'`^\\]")
+_QUOTE = re.compile(r"[\"'`^]")
+_DOTSEG = re.compile(r"/\.(?=/|\s|$)")
+_EXE_CMD = re.compile(r"\.(?:exe|com|bat|cmd)(?=\s|$|[;&|)])")
+_IFS = re.compile(r"\$\{?ifs\}?")
+
+
+def _path_norm(s):
+    s = re.sub(r"\s+", " ", _IFS.sub(" ", s))
+    s = _DOTSEG.sub("/", s)
+    s = re.sub(r"/{2,}", "/", s)
+    return _EXE_CMD.sub("", s).strip()
+
+
+def _norm_all(text):
+    """整行规整成几种写法 (见上). 去重保序."""
+    low = (text or "").lower()
+    outs = (_path_norm(_QUOTE.sub("", low).replace("\\", "")),
+            _path_norm(_QUOTE.sub(" ", low).replace("\\", "/")))
+    return list(dict.fromkeys(outs))
 
 
 def _norm(text):
-    return re.sub(r"\s+", " ", _STRIP.sub("", (text or "").lower())).strip()
+    return _norm_all(text)[0]
 
 
 def danger_of(text):
     """这行里的高危词 / 高危模式. 往多拦的方向错: 比如普通文字里带 write 也挂起.
     命令名带路径 / 扩展名 (/sbin/reboot、C:\\...\\shutdown.exe) 时把路径分隔符换成空格、去掉扩展名再查一遍."""
-    low, norm = (text or "").lower(), _norm(text)
+    low, norms = (text or "").lower(), _norm_all(text)
     out = sw.danger_words(text) + sw.danger_words(_EXE.sub("", _PATH_SEP.sub(" ", low))) + \
-        [w for w in DANGER_SUB if w in low or w in norm]
+        [w for w in DANGER_SUB if w in low or any(w in n for n in norms)]
     out = list(dict.fromkeys(out))
-    return out + [label for label, rx in DANGER_PATTERNS if rx.search(norm) and label not in out]
+    return out + [label for label, rx in DANGER_PATTERNS if label not in out and any(rx.search(n) for n in norms)]
 
 
 def danger_keys(keys):
@@ -204,8 +235,9 @@ def advance(line, blind, text, secret=False):
     segs = text.split("\n")
     done = [line + segs[0]] + segs[1:-1]           # 打了换行的整行
     blocked = bool(blind) and bool(segs[0]) or (blind == UNKNOWN and len(segs) > 1) or \
-        (len(segs) > 1 and any(_opaque(s) for s in done))
-    logical = (line + text).replace("\\\n", " ").split("\n")     # 行尾反斜杠续行 (#69): 拼起来再查一遍
+        (len(segs) > 1 and any(_opaque(s) for s in done)) or \
+        any(d.endswith(SOFT_CONT) and "".join(segs[i + 1:]) for i, d in enumerate(done[:len(segs) - 1]))
+    logical = _CONT.sub(" ", line + text).split("\n")     # 行尾 \ ^ ` 续行 (#69, #71): 拼起来再查一遍
     hits = _hits([line + segs[0]] + segs[1:] + logical)
     if secret:                                      # 不带换行 (sendable 保证)
         if not text:
@@ -213,12 +245,23 @@ def advance(line, blind, text, secret=False):
         mark = UNKNOWN if _opaque(line + text) or blind == UNKNOWN else PARTIAL
         return (hits, blocked) + _clip(line + SECRET_MARK, mark)
     tail = logical[-1] if len(segs) > 1 else line + segs[0]
-    return (hits, blocked) + _clip(tail, "" if len(segs) > 1 else blind)
+    soft = len(segs) > 1 and done[-1].endswith(SOFT_CONT)
+    return (hits, blocked) + _clip(tail, (PARTIAL if soft else "") if len(segs) > 1 else blind)
+
+
+# 续行 (#69, #71): bash 行尾 \ 拼起来查; cmd 行尾 ^、PowerShell 行尾反引号的规则没那么好推 (^ 吃掉换行后下一个字符照原样,
+# 反引号后面带空格就不算续行...), 除了拼起来查, 下一行接着打字也要人确认 (PARTIAL). 看不清的行再续行, 下一行也看不清.
+SOFT_CONT = ("^", "`")
+_CONT = re.compile(r"[\\^`]\n")
 
 
 def after_enter(line, blind):
-    """回车后的缓冲 -> (line, blind): 一般清空; 行尾是续行反斜杠时 shell 还在等下一行, 留着跟下一行拼."""
-    return (line[:-1] + " ", "") if line.endswith("\\") and not blind else ("", "")
+    """回车后的缓冲 -> (line, blind): 一般清空; 行尾是续行符时 shell 还在等下一行, 留着跟下一行拼."""
+    if not line.endswith(("\\",) + SOFT_CONT):
+        return "", ""
+    if blind:
+        return "", UNKNOWN
+    return line[:-1] + " ", (PARTIAL if line.endswith(SOFT_CONT) else "")
 
 
 def press(line, blind, keys):

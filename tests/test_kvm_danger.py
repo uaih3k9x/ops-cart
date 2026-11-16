@@ -200,3 +200,128 @@ def test_continuation_carried_over_enter():
 
 def test_plain_enter_still_resets():
     assert mk.press("ls", "", ["enter"])[2] == ""
+
+
+# ---- #71 审查: 绕过 (每条先写成失败用例再修). 安全底线: 宁可误拦不可漏放.
+BYPASSES = [
+    # 绝对路径 / .exe 命令名
+    "/usr/bin/truncate -s0 /etc/passwd",
+    "/sbin/blkdiscard /dev/sda",
+    "takeown.exe /f c:\\ /r",
+    "C:\\Windows\\System32\\takeown.exe /f c:\\ /r /d y",
+    "/usr/sbin/mkswap /dev/sdb2",
+    "/sbin/zpool destroy tank",
+    "icacls.exe C:\\ /reset /t",
+    # Windows 开关紧贴命令名 / PowerShell 别名 / cmd /c
+    "RD/S/Q C:\\",
+    "rmdir/s c:\\windows",
+    "del/s c:\\*",
+    "erase/q c:\\users",
+    "rd C:\\x -Recurse -Force",
+    "rd C:\\ -r",
+    "del C:\\x -Recurse",
+    'cmd /c"rd /s /q c:\\"',
+    'cmd /k"del /s /q c:\\*"',
+    "cmd /crd /s /q c:\\",
+    # 路径变形
+    "cat x > /dev//sda",
+    "cat x > ////dev/sda",
+    "cat x > /dev/./sda",
+    "chmod -R 000 /.",
+    "chmod -R 000 /etc/..",
+    "echo x > //etc/fstab",
+    "cat x > /dev/../dev/sda",
+    "cat x > /tmp/../etc/passwd",
+    "dd if=/dev/zero of=/dev//sda",
+    # 设备表: /dev/ 下除 null/zero/tty*/pts/stdout/stderr/fd 都算
+    "cat x > /dev/rbd0",
+    "cat x > /dev/nbd0",
+    "cat x > /dev/mem",
+    "cat x > /dev/port",
+    "cat x > /dev/zram0",
+    "cat x > /dev/vg0/root",
+    "dd if=/dev/zero of=/dev/rbd0",
+    # cryptsetup / efibootmgr / sysrq / cp 覆盖
+    "cryptsetup luksErase /dev/sdb",
+    "cryptsetup luksKillSlot /dev/sdb 0",
+    "efibootmgr -Bb0001",
+    "efibootmgr --delete-bootorder",
+    "efibootmgr -v -o 0001",
+    "echo b | tee /proc/sysrq-trigger",
+    "cp /dev/null /etc/passwd",
+    "cp -t /dev/sda x",
+    "cp --target-directory=/dev/sda x",
+    # Windows 引导 / 加密 / 磁盘
+    "bootsect /nt60 c: /mbr",
+    "bootrec /fixmbr",
+    "manage-bde -off c:",
+    "Set-Disk -Number 0 -IsOffline $true",
+    "Reset-PhysicalDisk -FriendlyName x",
+    # 递归改权限: 系统目录开头的任何路径, . * .., chattr
+    "chmod -R 777 /usr/lib",
+    "chown -R nobody /etc/ssh",
+    "chmod -R 000 /boot/efi",
+    "chmod -R 000 /run",
+    "chown -R x /mnt",
+    "chmod -R 000 /efi",
+    "chmod -R 000 .",
+    "chmod -R 000 *",
+    "chmod -R 000 ..",
+    "chattr -R +i /",
+    "chattr -R +i /etc/ssh",
+    # 绕过空白
+    "truncate${IFS}-s0${IFS}/etc/passwd",
+]
+
+
+@pytest.mark.parametrize("cmd", BYPASSES)
+def test_bypass_variants_hit(cmd):
+    assert mk.danger_of(cmd), cmd
+
+
+STILL_HARMLESS = [
+    "efibootmgr -v",
+    "efibootmgr -vv",
+    "efibootmgr -v | less",
+    "cat x > /dev/null",
+    "echo x > /dev/stderr",
+    "echo x > /dev/tty1",
+    "echo x > /dev/pts/0",
+    "echo x >&2 > /dev/fd/2",
+    "cat /dev/zero | head -c 10 > /tmp/z",
+    "chmod -R 755 ./build",
+    "chown -R user /home/user/project",
+]
+
+
+@pytest.mark.parametrize("cmd", STILL_HARMLESS)
+def test_still_harmless(cmd):
+    assert mk.danger_of(cmd) == [], (cmd, mk.danger_of(cmd))
+
+
+@pytest.mark.parametrize("cont", ["^", "`"])
+def test_cmd_caret_and_ps_backtick_continuation(cont):
+    """cmd 行尾 ^ / PowerShell 行尾反引号续行: 跟下一行拼起来查, 下一行要人确认."""
+    hits, *_ = mk.advance("", "", f"rd {cont}\n/s /q c:\\")
+    assert hits
+    hits, blocked, *_ = mk.advance("", "", f"echo {cont}\nhi")
+    assert blocked
+    _, _, after, blind = mk.press(f"rd {cont}", "", ["enter"])
+    assert after and blind
+    hits, blocked, *_ = mk.advance(after, blind, "/s /q c:\\")
+    assert hits and blocked
+    _, blocked, *_ = mk.advance(after, blind, "hi")
+    assert blocked
+
+
+def test_continuation_after_blind_line_stays_blind():
+    """看不清的行再续行: 下一行也看不清 (#71)."""
+    for cont in ("\\", "^", "`"):
+        assert mk.after_enter("x " + cont, mk.PARTIAL) == ("", mk.UNKNOWN)
+    assert mk.after_enter("ls", mk.UNKNOWN) == ("", "")
+
+
+def test_harmless_with_continuation_char_inside_text_is_not_held():
+    """一段 text 里续行符后面什么都没打: 这一段本身不挂起, 下一段才要人确认."""
+    hits, blocked, after, blind = mk.advance("", "", "echo ^\n")
+    assert not hits and not blocked and blind == mk.PARTIAL

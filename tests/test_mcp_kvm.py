@@ -1288,3 +1288,17 @@ def test_real_broker_queued_sums_status(monkeypatch):
     assert mk.broker_queued() == 0
     monkeypatch.setattr(mk.kvm_core, "ports", lambda: {})
     assert mk.broker_queued() == 0
+
+
+@pytest.mark.parametrize("cont", ["^", "`"])
+def test_caret_continuation_through_tool(rig, cont):
+    """#71: cmd 行尾 ^ / PowerShell 行尾反引号续行后回车, 下一行跟它拼起来查, 而且要人确认."""
+    tok = rig.lease()
+    assert not rig.call("kvm_type", text=f"rd {cont}", enter=True, lease=tok)[0]
+    err, r = rig.call("kvm_type", text="/s /q c:\\", enter=True, lease=tok)
+    assert not err and r["status"] == "pending" and r.get("danger")
+    rig.store.reject(r["id"], "human:kiosk")
+    rig.known()
+    assert not rig.call("kvm_type", text=f"echo {cont}", enter=True, lease=tok)[0]
+    err, r = rig.call("kvm_type", text="hi", enter=True, lease=tok)
+    assert not err and r["status"] == "pending"
