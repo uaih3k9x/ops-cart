@@ -430,3 +430,12 @@ def test_image_name_keywords_only_refused_for_save(name):
 def test_save_image_with_sshd_keyword_refused():
     with pytest.raises(ValueError):
         cc.ocs_sr_cmd("clone-save", "a-inst.sshd", "SERIALNO=SN-EXAMPLE-1")
+
+
+@pytest.mark.parametrize("name", ["memtest-lab", "Lab-MemTest", "mt86plus-img", "MT86PLUS"])
+def test_save_image_with_memtest_keyword_refused(name):
+    """#58 三审: 抓镜像的默认项是 Clonezilla 项, 镜像名带 memtest / mt86plus 会被当成 Memtest 默认 (只能手选) 拒发.
+    校验跟 pxeserver._manual_only 走, 在这里就报清楚, 不等生成菜单时才拒. 恢复用途不受影响."""
+    with pytest.raises(ValueError, match="Memtest"):
+        cc.ocs_sr_cmd("clone-save", name, "SERIALNO=SN-EXAMPLE-1")
+    assert cc.ocs_sr_cmd("clone-restore", name, "SERIALNO=SN-EXAMPLE-1")

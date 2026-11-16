@@ -1670,3 +1670,10 @@ def test_disarm_reports_unreadable_menu(tmp_path, monkeypatch):
         os.chmod(p, 0o644)
     if os.geteuid() != 0:
         assert "grub.cfg-C0000201" in events[-1] and "删不掉" in events[-1]
+
+
+def test_checked_menu_error_names_rescue_and_memtest():
+    """#58 三审: 被 rescue_default_menu 拒的原因可能是 Memtest, 提示别只说 inst.rescue / inst.sshd."""
+    menu = ("set default=0\nset timeout=3\n\nmenuentry 'x' {\n    linux /vmlinuz memtest-lab\n}\n")
+    with pytest.raises(ValueError, match="救援 / Memtest 关键字"):
+        kc._checked_menu(menu, "02:00:00:00:00:01")

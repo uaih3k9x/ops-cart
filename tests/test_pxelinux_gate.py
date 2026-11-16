@@ -356,8 +356,49 @@ def test_disarm_not_blocked_by_lock(tmp_path, env, monkeypatch, exc):
     _armed(state)
     kc.pxe_disarm(root=tmp_path / "tftp", path=state)
     assert not state.exists() and (tmp_path / "tftp" / "grub.cfg").exists()
-    assert calls and all(op & kc.fcntl.LOCK_NB for op in calls) and len(calls) <= kc.DISARM_LOCK_TRIES
+    nb = [op for op in calls if op & kc.fcntl.LOCK_NB]
+    assert nb and len(nb) <= kc.DISARM_LOCK_TRIES
     assert any("不加锁" in e for e in env)
+    if isinstance(exc, BlockingIOError):        # 占着超时: 照做完再阻塞等一次锁 (这里阻塞也抛, 记事件不卡死)
+        assert len(calls) == len(nb) + 1 and not calls[-1] & kc.fcntl.LOCK_NB
+    else:                                       # ENOLCK: 锁不可用, 不重做
+        assert len(calls) == len(nb) == 1
+
+
+def test_disarm_redoes_after_arm_held_lock_past_timeout(tmp_path, env, monkeypatch):
+    """#58 三审: 解锁持锁超过上锁的等待上限时, 上锁先不加锁照做, 解锁随后写完 MAC 菜单和状态文件.
+    上锁必须再阻塞等锁、拿到后整套重做: 最终没有状态文件、没有 MAC 菜单."""
+    import fcntl
+    root = tmp_path / "tftp"
+    root.mkdir()
+    state = tmp_path / "m.json"
+    menu = root / ("grub.cfg-01-" + MAC.replace(":", "-"))
+    fd = os.open(str(state) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)                  # "解锁" 正持锁
+    first_pass = threading.Event()
+    seen = []
+
+    def event(m):
+        seen.append(m)
+        if m.startswith("装机模式上锁"):
+            first_pass.set()
+    monkeypatch.setattr(kc, "_pxe_event", event)
+    monkeypatch.setattr(kc, "DISARM_LOCK_TRIES", 2)
+    monkeypatch.setattr(kc.time, "sleep", lambda s: None)
+
+    def slow_arm():
+        first_pass.wait(5)
+        menu.write_text(ps.grub_menu(IP, install=True))     # 解锁接着写完
+        _armed(state)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    t = threading.Thread(target=slow_arm)
+    t.start()
+    kc.pxe_disarm(root=root, path=state)
+    t.join(5)
+    assert not state.exists() and not menu.exists()
+    assert sum(m.startswith("装机模式上锁") for m in seen) == 2
+    assert not ps.rescue_default_menu((root / "grub.cfg").read_text())
 
 
 def test_disarm_leaves_pxelinux_cfg_under_win_and_clonezilla(tmp_path, env):

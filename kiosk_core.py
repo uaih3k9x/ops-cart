@@ -1098,11 +1098,11 @@ ARM_PURPOSES = ("rocky", "winpe") + clone_core.CLONE_PURPOSES
 
 def _checked_menu(menu, mac):
     """解锁菜单写之前自检: 服务端会当成救援默认 (rescue_default_menu) 或超长 (MENU_MAX) 而不发的, 直接报错不写.
-    比如克隆密码 / 镜像名里正好带 inst.sshd, 车机显示原因, 好过机器拿到默认菜单才发现."""
+    比如克隆密码 / 镜像名里正好带 inst.sshd 或 memtest, 车机显示原因, 好过机器拿到默认菜单才发现."""
     if len(menu.encode()) > pxeserver.MENU_MAX:
         raise ValueError(f"{mac} 的菜单超过 {pxeserver.MENU_MAX} 字节, 不写")
     if pxeserver.rescue_default_menu(menu):
-        raise ValueError(f"{mac} 的菜单会被当成救援默认菜单 (参数里带 inst.rescue / inst.sshd?), 不写")
+        raise ValueError(f"{mac} 的菜单会被当成只能手选的默认菜单 (参数里带救援 / Memtest 关键字: inst.rescue / inst.sshd / memtest / mt86plus?), 不写")
     return menu
 
 
@@ -1138,18 +1138,20 @@ DISARM_LOCK_TRIES = 50       # 上锁抢锁: LOCK_NB 每 0.1 秒试一次, 至�
 def _pxe_lock(path, required):
     """arm / disarm 共用的跨进程锁 (#55 审查): <状态文件>.lock 上 flock, 约定同 mcp_pxe / mcp_serial.
     车机 UI 的 pxe_arm 和 MCP 进程的 pxe_disarm 不会交错成"菜单删了、状态还是 install".
+    yield busy: True 只在"锁被别人占着、等到上限也没拿到"时 (调用方要等锁后重做, 见 pxe_disarm).
     required=True (解锁): 阻塞等锁, 打不开 / flock 出错就抛.
     required=False (上锁): 绝不能被锁挡住. LOCK_NB 有限次重试 (DISARM_LOCK_TRIES); 锁文件打不开、flock 出错
-    (如 ENOLCK)、一直被占着, 都不加锁照做, 记事件 (#58 审查)."""
+    (如 ENOLCK)、一直被占着, 都不加锁照做, 记事件 (#58 审查). 前两种锁本身不可用, busy=False 不重做."""
     try:
         fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as e:
         if required:
             raise
         _pxe_event(f"拿不到装机模式锁 {path}.lock ({e.strerror or e}), 不加锁照样上锁")
-        yield
+        yield False
         return
     try:
+        busy = False
         if required:
             fcntl.flock(fd, fcntl.LOCK_EX)
         else:
@@ -1166,8 +1168,10 @@ def _pxe_lock(path, required):
                     why = e.strerror or str(e)
                     break
             if why:
-                _pxe_event(f"拿不到装机模式锁 {path}.lock ({why}), 不加锁照样上锁")
-        yield
+                busy = why == "一直被占着"
+                _pxe_event(f"拿不到装机模式锁 {path}.lock ({why}), 不加锁照样上锁" +
+                           ("; 做完再等锁重做一遍" if busy else ""))
+        yield busy
     finally:
         os.close(fd)
 
@@ -1298,33 +1302,47 @@ def pxe_disarm(root=TFTP_ROOT, path=PXE_MODE):
     -> 写 grub.cfg -> 写 pxelinux.cfg/default. 每步都兜住, 一步失败不跳过后面的; 上锁事件一定写;
     最后抛第一个错误 (pxelinux.cfg/default 除外: TFTP 发的本来就是生成的, 写不进去只记事件).
     clonezilla/ 和 win/ 不删. boot.ipxe 和 win/ 留着: 菜单被取走就上锁, 那时 GRUB 还停在菜单上,
-    再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘."""
+    再选 WinPE 还得取得到; 能走到 boot.ipxe 的只有 WinPE 菜单项, 而 PE 本身不动硬盘.
+    锁被占着等到上限 (解锁正慢慢写菜单) 时先不加锁照做 (立即上锁不被挡), 做完再阻塞等锁, 拿到后整套重做一遍:
+    解锁在这期间写完的 MAC 菜单和状态文件也会被清掉, 最终一定是上锁 (#58 三审)."""
     root = str(root)
-    with _pxe_lock(path, required=False):
-        errors, notes = [], []
+    with _pxe_lock(path, required=False) as busy:
+        errors = _disarm_once(root, path)
+    if busy:
         try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+            with _pxe_lock(path, required=True):
+                errors = _disarm_once(root, path)
         except OSError as e:
-            errors.append(e)
-            notes.append(f"删不掉状态文件 {path}: {e}")
-        removed, failed = _scrub_tftp(root)
-        try:
-            _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
-        except Exception as e:      # noqa: BLE001 -- 记下来, 后面照做, 最后再抛
-            errors.append(e)
-            notes.append(f"grub.cfg 写失败: {e}")
-        _pxe_event("装机模式上锁" + ("" if errors else ", 只剩默认菜单 (超时本地盘)") +
-                   (f"; 删掉 {', '.join(sorted(removed))}" if removed else "") +
-                   (f"; 删不掉 {', '.join(sorted(failed))}" if failed else "") +
-                   "".join(f"; {n}" for n in notes))
-        try:
-            _write_atomic(os.path.join(root, "pxelinux.cfg", "default"), pxelinux_cfg_rescue())
-        except Exception as e:      # noqa: BLE001
-            _pxe_event(f"pxelinux.cfg/default 写失败 (TFTP 照样发生成的默认菜单): {e}")
+            _pxe_event(f"等装机模式锁失败 ({e.strerror or e}), 没能重做上锁; 第一遍已做完")
     if errors:
         raise errors[0]
+
+
+def _disarm_once(root, path):
+    """pxe_disarm 的一遍 (调用方持锁或已放弃加锁). -> 出错列表 (第一个由 pxe_disarm 抛)."""
+    errors, notes = [], []
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        errors.append(e)
+        notes.append(f"删不掉状态文件 {path}: {e}")
+    removed, failed = _scrub_tftp(root)
+    try:
+        _write_atomic(os.path.join(root, "grub.cfg"), grub_cfg_rescue())
+    except Exception as e:      # noqa: BLE001 -- 记下来, 后面照做, 最后再抛
+        errors.append(e)
+        notes.append(f"grub.cfg 写失败: {e}")
+    _pxe_event("装机模式上锁" + ("" if errors else ", 只剩默认菜单 (超时本地盘)") +
+               (f"; 删掉 {', '.join(sorted(removed))}" if removed else "") +
+               (f"; 删不掉 {', '.join(sorted(failed))}" if failed else "") +
+               "".join(f"; {n}" for n in notes))
+    try:
+        _write_atomic(os.path.join(root, "pxelinux.cfg", "default"), pxelinux_cfg_rescue())
+    except Exception as e:      # noqa: BLE001
+        _pxe_event(f"pxelinux.cfg/default 写失败 (TFTP 照样发生成的默认菜单): {e}")
+    return errors
 
 
 def pxe_retire(macs, root=TFTP_ROOT):

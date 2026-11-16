@@ -901,6 +901,8 @@ def _manual_only(text):
     认 memtest 这个词, 路径 memtest/memtest64.efi、mt86plus 都算)."""
     low = text.lower()
     return any(k in text for k in _RESCUE_KW) or "memtest" in low or "mt86plus" in low
+
+
 MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 不发 (TFTP 换默认菜单, HTTP 403), 上锁时删
 _TOP_DEFAULT = re.compile(r"set default=(0|[1-9][0-9]*)")
 _TOP_TIMEOUT = re.compile(r"set timeout=[0-9]+")
