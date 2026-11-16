@@ -193,7 +193,7 @@ def test_held_through_tool(tmp_path):
 def test_continuation_carried_over_enter():
     """行尾 \\ 再回车: shell 还在等下一行, 下一行跟它拼起来查."""
     _, _, after, blind = mk.press("chmod -R 000 \\", "", ["enter"])
-    assert blind == "" and mk.advance(after, blind, "/")[0]
+    assert blind == mk.PARTIAL and mk.advance(after, blind, "/")[0]     # #71: 续行后下一行要人确认
     hits, _, after, _ = mk.advance("", "", "cat /dev/zero \\\n")
     assert mk.advance(after, "", "> /dev/sda")[0]
 
@@ -317,7 +317,9 @@ def test_cmd_caret_and_ps_backtick_continuation(cont):
 def test_continuation_after_blind_line_stays_blind():
     """看不清的行再续行: 下一行也看不清 (#71)."""
     for cont in ("\\", "^", "`"):
-        assert mk.after_enter("x " + cont, mk.PARTIAL) == ("", mk.UNKNOWN)
+        assert mk.after_enter("x " + cont, mk.UNKNOWN) == ("", mk.UNKNOWN)
+        assert mk.after_enter(mk.SECRET_MARK + " " + cont, mk.PARTIAL) == ("", mk.UNKNOWN)
+        assert mk.after_enter("a " + cont + "\nx " + cont, mk.PARTIAL)[1] == mk.PARTIAL
     assert mk.after_enter("ls", mk.UNKNOWN) == ("", "")
 
 
@@ -325,3 +327,49 @@ def test_harmless_with_continuation_char_inside_text_is_not_held():
     """一段 text 里续行符后面什么都没打: 这一段本身不挂起, 下一段才要人确认."""
     hits, blocked, after, blind = mk.advance("", "", "echo ^\n")
     assert not hits and not blocked and blind == mk.PARTIAL
+
+
+# ---- 维护者拍板 (#71): .. 只在高危类命令里算; truncate 只拦文件截断
+DOTDOT_DANGEROUS = [
+    "cat x > /tmp/../etc/passwd",
+    "cat x > /dev/../dev/sda",
+    "cp x ../../etc/passwd",
+    "cp x ../../../dev/sda",
+    "echo x > ../../boot/grub/grub.cfg",
+    "chmod -R 000 ..",
+    "chmod -R 000 ../x",
+    "chown -R x /etc/..",
+]
+DOTDOT_HARMLESS = [
+    "cp a ../b",
+    "echo x > ../y",
+    "mv x ../",
+    "cat x > ../out.txt",
+    "cp -r build ../release",
+]
+TRUNCATE_DANGEROUS = [
+    "truncate -s0 /etc/passwd",
+    "truncate --size 0 x",
+    "truncate -r ref x",
+    "truncate --reference=ref x",
+    "truncate x",
+    "sudo truncate x",
+    "ls; truncate x",
+    "xargs truncate -s 0",
+]
+TRUNCATE_HARMLESS = [
+    "mysql -e 'truncate table t'",
+    'psql -c "TRUNCATE TABLE t"',
+    "echo truncate table t",
+    "TRUNCATE TABLE t;",
+]
+
+
+@pytest.mark.parametrize("cmd", DOTDOT_DANGEROUS + TRUNCATE_DANGEROUS)
+def test_decided_dangerous(cmd):
+    assert mk.danger_of(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", DOTDOT_HARMLESS + TRUNCATE_HARMLESS)
+def test_decided_harmless(cmd):
+    assert mk.danger_of(cmd) == [], (cmd, mk.danger_of(cmd))

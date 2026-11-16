@@ -68,13 +68,18 @@ _EXE = re.compile(r"\.(?:exe|com|bat|cmd|ps1|sh)\b")
 #   - 路径: 连续 / 并成一个, /./ 去掉, 命令名后的 .exe / .com / .bat / .cmd 去掉; 目标路径里出现 .. 一律算命中.
 # 变量拼接、eval、编码、别名、脚本文件拦不住, 这是减速带. 只读的看盘命令 (ls / lsblk / blkid / cat /dev/sda) 不拦.
 _B = r"(?:^|[\s;&|(){}/]|/[ck])"               # 命令名前: 行首、分隔符、路径 (/usr/bin/x、c:/.../x), cmd /c、/k 之后
-_UP = r"\S*\.\.(?:/\S*)?(?=\s|$|[;&|)])"         # 带 .. 的路径: 推不出指到哪, 当危险
+_P = r"[^\s;&|()<>#]*"                         # 路径里的字符: 到空白、分隔符、重定向、注释为止
+_END = r"(?=\s|$|[;&|()<>#])"                   # 路径结束
+_UP = r"[^\s;&|()<>#]*\.\.(?:/" + _P + r")?" + _END   # 带 .. 的路径: 推不出指到哪 (递归改权限里一律算)
+# 写设备 / 覆盖 /etc、/boot 时 .. 只在两种情况下算 (维护者拍板 #71): 绝对路径 (/tmp/../etc/x), 或 .. 之后又出现
+# etc / boot / dev (../../etc/passwd). 普通的 cp a ../b、echo x > ../y 不拦.
+_UP_HI = r"(?:/" + _P + r"\.\." + _P + r"|" + _P + r"\.\./" + _P + r"(?<=/)(?:etc|boot|dev)(?:/" + _P + r")?)" + _END
 # /dev/ 下除 null、zero、tty*、pts、stdout、stderr、fd/ 以外都算 (块设备、/dev/mem、/dev/port、LVM 的 /dev/vg/lv ...)
-_DEV = r"(?:/dev/(?!(?:null|zero|stdout|stderr)(?=\s|$|[;&|)])|tty|pts/|fd/)|" + _UP + r")"
+_DEV = r"(?:/dev/(?!(?:null|zero|stdout|stderr)" + _END + r"|tty|pts/|fd/)|" + _UP_HI + r")"
 # 系统目录: / 本身、/*、以这些目录开头的任何路径; . .. * 也算 (不知道当前目录在哪). home 只算它本身和通配它下一层
 _SYSDIR = r"(?:etc|usr|bin|sbin|boot|lib|lib32|lib64|libx32|var|root|opt|dev|sys|proc|srv|run|mnt|media|efi|snap)"
-_SYS = r"(?:/\*?|/" + _SYSDIR + r"(?:/\S*)?|/home/?\*?|\.{1,2}/?|\*|" + _UP + r")(?=\s|$|[;&|)])"  # public-safe-ignore
-_ETC = r"(?:/(?:etc|boot)/\S*|" + _UP + r")"
+_SYS = r"(?:/\*?|/" + _SYSDIR + r"(?:/" + _P + r")?|/home/?\*?|\.{1,2}/?|\*|" + _UP + r")" + _END  # public-safe-ignore
+_ETC = r"(?:/(?:etc|boot)(?:/" + _P + r")?" + _END + r"|" + _UP_HI + r")"          # /etc、/boot 本身和下面的文件
 _REC = r"(?=(?:.*\s)?-(?:[a-z]*r[a-z]*|-recursive)\b)"          # 带 -R / --recursive (往多拦: -r 也算)
 DANGER_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
     # Windows. 开关可以紧贴命令名 (RD/S/Q、del/s); PowerShell 里 rd / del / erase 是 Remove-Item 的别名 (-r、-Recurse)
@@ -88,15 +93,20 @@ DANGER_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
     ("icacls /t", _B + r"icacls\s(?=.*/t\b)(?=.*/(?:reset|grant|deny|remove|setowner|inheritance|setintegritylevel))"),
     ("Set-Disk -IsOffline", _B + r"set-disk\s.*-is(?:offline|readonly)\b"),
     # Linux: 把输出写到设备
-    ("写设备 >", r">\|?\s*" + _DEV),
+    ("写设备 >", r">[|&]?\s*" + _DEV),
     ("tee 写设备", r"\btee\b(?:\s+-\S+)*\s+" + _DEV),
+    ("tee 覆盖 /etc /boot", r"\btee\b(?:\s+-\S+)*\s+" + _ETC),
     ("of= 设备", r"\bof=\s*" + _DEV),
-    ("拷到设备", _B + r"(?:cp|mv|install|rsync|ln)\s(?:.*\s" + _DEV + r"\S*$|.*(?:-t\s*|--target-directory=?\s*)" + _DEV + r")"),
-    ("覆盖 /etc /boot", _B + r"(?:cp|mv|install|rsync|ln)\s.*\s" + _ETC + r"$"),
+    # cp / mv ... 的参数里有设备或 /etc、/boot 就算 (不分源和目标, 往多拦: cp /etc/fstab ~/x 也挂起)
+    ("拷到设备", _B + r"(?:cp|mv|install|rsync|ln)\s(?:.*\s|.*(?:-t|--target-directory=?))\s*" + _DEV),
+    ("覆盖 /etc /boot", _B + r"(?:cp|mv|install|rsync|ln)\s(?:.*\s|.*(?:-t|--target-directory=?))\s*" + _ETC),
     # Linux: 递归改系统目录的权限 / 属主 / 属性, 截断 / 覆盖关键文件
     ("chmod/chown -R 系统目录", _B + r"(?:chmod|chown|chgrp|setfacl|chattr)\s" + _REC + r".*\s" + _SYS),
-    ("truncate", _B + r"truncate\b"),
-    ("覆盖 /etc /boot", r">\|?\s*" + _ETC),                # 追加 >> 也算
+    # truncate 只拦文件截断 (维护者拍板 #71): 带 -s / --size / -r / --reference, 或在命令的位置 (行首、; | & ( 之后、
+    # sudo / 路径之后); SQL 的 truncate table 不拦 (mysql -e 'truncate table t').
+    ("truncate", _B + r"truncate\s(?:.*\s)?(?:-[a-z]*[sr]|--size|--reference)"),
+    ("truncate", r"(?:^|[;&|(]\s*|\bsudo\s+|/)truncate\b(?!\s+table\b)"),
+    ("覆盖 /etc /boot", r">[|&]?\s*" + _ETC),             # 追加 >>、>& 也算
     ("sysrq-trigger", r"sysrq-trigger"),
     ("find -delete", _B + r"find\s.*\s-delete\b"),
     # Linux: 抹盘 / 分区 / 卷 / 固件启动项
@@ -113,11 +123,13 @@ _QUOTE = re.compile(r"[\"'`^]")
 _DOTSEG = re.compile(r"/\.(?=/|\s|$)")
 _EXE_CMD = re.compile(r"\.(?:exe|com|bat|cmd)(?=\s|$|[;&|)])")
 _IFS = re.compile(r"\$\{?ifs\}?")
+_TILDE_ROOT = re.compile(r"(?<![^\s=:])~root(?=/|\s|$|[;&|()<>#])")
+_SEG = re.compile(r"\s*(?:;|&&|\|\||\||&)\s*")           # 按 ; && || | & 切段, 每段也单独查
 
 
 def _path_norm(s):
     s = re.sub(r"\s+", " ", _IFS.sub(" ", s))
-    s = _DOTSEG.sub("/", s)
+    s = _TILDE_ROOT.sub("/root", _DOTSEG.sub("/", s))
     s = re.sub(r"/{2,}", "/", s)
     return _EXE_CMD.sub("", s).strip()
 
@@ -127,7 +139,8 @@ def _norm_all(text):
     low = (text or "").lower()
     outs = (_path_norm(_QUOTE.sub("", low).replace("\\", "")),
             _path_norm(_QUOTE.sub(" ", low).replace("\\", "/")))
-    return list(dict.fromkeys(outs))
+    segs = [g for o in outs for g in _SEG.split(o) if g]
+    return list(dict.fromkeys(list(outs) + segs))
 
 
 def _norm(text):
@@ -231,37 +244,71 @@ def _hits(lines):
 
 def advance(line, blind, text, secret=False):
     """打一段字 -> (高危词, 是否因看不全要人确认, 新 line, 新 blind). text 里每个换行切出的整行都查,
-    第一行跟缓冲拼起来查. secret 的内容照样查, 但新 line 里只留 SECRET_MARK."""
+    第一行跟缓冲拼起来查; 续行拼成的逻辑行也查 (见 _logical). secret 的内容照样查, 但新 line 里只留 SECRET_MARK.
+    line 里可能带续行留下的 "续行符 + 换行" (after_enter)."""
     segs = text.split("\n")
     done = [line + segs[0]] + segs[1:-1]           # 打了换行的整行
     blocked = bool(blind) and bool(segs[0]) or (blind == UNKNOWN and len(segs) > 1) or \
         (len(segs) > 1 and any(_opaque(s) for s in done)) or \
-        any(d.endswith(SOFT_CONT) and "".join(segs[i + 1:]) for i, d in enumerate(done[:len(segs) - 1]))
-    logical = _CONT.sub(" ", line + text).split("\n")     # 行尾 \ ^ ` 续行 (#69, #71): 拼起来再查一遍
-    hits = _hits([line + segs[0]] + segs[1:] + logical)
+        any(_is_cont(d) and "".join(segs[i + 1:]) for i, d in enumerate(done[:len(segs) - 1]))
+    logical = _logical(line + text)
+    hits = _hits([line + segs[0]] + segs[1:] + [v for raw in logical for v in _joins(raw)])
     if secret:                                      # 不带换行 (sendable 保证)
         if not text:
             return hits, blocked, line, blind
         mark = UNKNOWN if _opaque(line + text) or blind == UNKNOWN else PARTIAL
         return (hits, blocked) + _clip(line + SECRET_MARK, mark)
-    tail = logical[-1] if len(segs) > 1 else line + segs[0]
-    soft = len(segs) > 1 and done[-1].endswith(SOFT_CONT)
-    return (hits, blocked) + _clip(tail, (PARTIAL if soft else "") if len(segs) > 1 else blind)
+    if len(segs) == 1:
+        return (hits, blocked) + _clip(line + segs[0], blind)
+    return (hits, blocked) + _clip(logical[-1], PARTIAL if _is_cont(done[-1]) else "")
 
 
-# 续行 (#69, #71): bash 行尾 \ 拼起来查; cmd 行尾 ^、PowerShell 行尾反引号的规则没那么好推 (^ 吃掉换行后下一个字符照原样,
-# 反引号后面带空格就不算续行...), 除了拼起来查, 下一行接着打字也要人确认 (PARTIAL). 看不清的行再续行, 下一行也看不清.
+# 续行 (#69, #71): 行尾 \ (bash)、^ (cmd)、反引号 (PowerShell) 后回车, shell 还在等下一行. 推车把这几行拼起来查,
+# 两种拼法都查: 无缝 (bash 的 \ 续行就是无缝的: trun\⏎cate) 和加空格; 下一行接着打字要人确认 (PARTIAL):
+# 续行后的退格删不到上一行, 推车推不准. 看不清的行再续行, 下一行也看不清.
+# 行尾 \ 不算续行: 偶数个反斜杠 (bash 里是字面的 \), 或者紧跟盘符 (cmd 的 cd C:\). 盘符这条是取舍:
+# bash 里 x:\⏎ 只能接在以冒号结尾的词后面, 拆不开命令名; 下一行照样单独查.
 SOFT_CONT = ("^", "`")
-_CONT = re.compile(r"[\\^`]\n")
+_DRIVE_ROOT = re.compile(r"(?:^|[\s=\"'(])[a-z]:\\$", re.I)
+_EVEN_BS = re.compile(r"(?<!\\)(?:\\\\)+$")
+
+
+def _is_cont(ln):
+    if ln.endswith(SOFT_CONT):
+        return True
+    return ln.endswith("\\") and not _EVEN_BS.search(ln) and not _DRIVE_ROOT.search(ln)
+
+
+def _logical(full):
+    """按换行切, 续行的几行合成一条 (保留 "续行符 + 换行" 原样, 由 _joins 拼)."""
+    out, cur = [], []
+    for ln in full.split("\n"):
+        cur.append(ln)
+        if not _is_cont(ln):
+            out.append("\n".join(cur))
+            cur = []
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def _joins(raw):
+    """一条逻辑行的两种拼法: 去掉 "续行符 + 换行" 无缝拼, 和换成空格拼."""
+    if "\n" not in raw:
+        return [raw]
+    parts = raw.split("\n")
+    heads = [p[:-1] if _is_cont(p) else p for p in parts[:-1]]
+    return ["".join(heads + parts[-1:]), " ".join(heads + parts[-1:])]
 
 
 def after_enter(line, blind):
-    """回车后的缓冲 -> (line, blind): 一般清空; 行尾是续行符时 shell 还在等下一行, 留着跟下一行拼."""
-    if not line.endswith(("\\",) + SOFT_CONT):
+    """回车后的缓冲 -> (line, blind): 一般清空; 行尾是续行符时 shell 还在等下一行, 留着 (连同换行) 跟下一行拼,
+    下一行接着打字要人确认."""
+    if not _is_cont(line):
         return "", ""
-    if blind:
+    if blind == UNKNOWN or (blind and SECRET_MARK in line):    # 看不清 / 带 secret 的行再续行: 下一行也看不清
         return "", UNKNOWN
-    return line[:-1] + " ", (PARTIAL if line.endswith(SOFT_CONT) else "")
+    return line + "\n", PARTIAL                    # 续行接着续行: 照样拼
 
 
 def press(line, blind, keys):
