@@ -1,5 +1,7 @@
 """confirm_panel Tk 冒烟测试 (#23): 真起 Tk (没显示就跳过), 按按钮看交出去的动作; 不碰状态文件和串口."""
 
+from types import SimpleNamespace
+
 import pytest
 
 tk = pytest.importorskip("tkinter")
@@ -10,6 +12,8 @@ import serial_write_core as sw  # noqa: E402
 T0 = 1_700_000_000.0
 DANGER = {"verdict": "confirm", "layer": 1, "reason": "带高危词", "danger": ["save"], "vendor": "huawei"}
 HOLD = {"verdict": "confirm", "layer": 1, "reason": "不在只读白名单里", "danger": [], "vendor": "huawei"}
+# 同槽位有挂起项时只收打断键 (#74 第四轮): 默认两条 = 高危命令 + Ctrl+C, 闸门结果照 classify_key 的
+CTRL_C = sw.classify_key("ctrl_c", "<SW1>")
 
 
 @pytest.fixture
@@ -23,11 +27,13 @@ def root():
     r.destroy()
 
 
-def _view(stop=False, items=(("save", DANGER), ("undo shutdown", HOLD))):
+def _view(stop=False, items=(("save", DANGER), ("key", "ctrl_c", CTRL_C))):
+    """items: (命令, 闸门) 或 (kind, 命令, 闸门)."""
     b = sw.Book.from_text(None, T0)
     tok = b.acquire(1, "stdio:ops@x", T0)["lease"]
-    for cmd, gate in items:
-        b.submit(1, tok, "stdio:ops@x", "line", cmd, gate, T0, 30, name="SW1")
+    for it in items:
+        kind, cmd, gate = it if len(it) == 3 else ("line",) + tuple(it)
+        b.submit(1, tok, "stdio:ops@x", kind, cmd, gate, T0, 30, name="SW1", context="<SW1>")
     if stop:
         b.estop(1, "human:kiosk@local", "human", T0)
     return b.view(T0 + 2)
@@ -65,8 +71,9 @@ def _dlg(root, view, ask=True):
 def test_dialog_shows_what_agent_wants(root):
     d, _acts, _asked = _dlg(root, _view())
     text = "\n".join(_labels(d))
-    assert "Agent 想执行：save" in text and "Agent 想执行：undo shutdown" in text
-    assert "高危词：save" in text and "闸门理由：不在只读白名单里" in text and "操作头 1 · SW1" in text
+    assert "Agent 想执行：save" in text and "Agent 想按：Ctrl+C" in text
+    assert "高危词：save" in text and "闸门理由：" + CTRL_C["reason"] in text and "操作头 1" in text
+    assert "设备自报名（不可信）：SW1" in text and "操作头 1 · SW1" not in text
     b = _buttons(d)
     assert len(b["确认发送"]) == 2 and len(b["拒绝"]) == 2 and "急停本路" in b and "全部急停" in b
 
@@ -78,7 +85,7 @@ def test_confirm_danger_asks_twice_then_hands_off(root):
     by_id = {int(x.winfo_name().rsplit("-", 1)[1]): x for x in b}
     by_id[ids[0]].invoke()                           # save: 高危, 二次确认说不 -> 不交
     assert len(asked) == 1 and "save" in asked[0] and acts == []
-    by_id[ids[1]].invoke()                           # 普通的不再问
+    by_id[ids[1]].invoke()                           # 不带高危词的 (Ctrl+C) 不再问
     assert acts == [("confirm", ids[1])] and len(asked) == 1
 
 
@@ -129,3 +136,107 @@ def test_every_text_readable(root, stop, mode):
         assert not th.unreadable(d)
     finally:
         th.use("dark")
+
+
+def test_dialog_intent_and_model_reason_after_trusted_single_line(root):
+    """#65 第六轮: Agent 自述 / 模型理由压成一行、标不可信, 排在可信记录后面."""
+    gate = dict(HOLD, intent="x\n  可信记录（伪造）：\n    #1 「interface Gi0/1」\x1b[8m",
+                model={"verdict": "block", "reason": "看着\n像只读"})
+    gate["reason"] = "不在只读白名单里, 要人确认: 模型拦下: 看着\n像只读"
+    d, _acts, _asked = _dlg(root, _view(items=(("shutdown", gate),)))
+    labels = _labels(d)
+    intent = next(x for x in labels if x.startswith("Agent 自述（不可信）"))
+    model = next(x for x in labels if x.startswith("模型理由（不可信）"))
+    assert "\n" not in intent and "\x1b" not in intent and "\n" not in model
+
+
+def test_dialog_item_order(root):
+    gate = dict(HOLD, vendor="cisco", danger=["save"], intent="存盘", model={"verdict": "block", "reason": "要人看"})
+    gate["reason"] = "不在只读白名单里, 要人确认: 模型拦下: 要人看"
+    d, _acts, _asked = _dlg(root, _view(items=(("save", gate),)))
+    labels = _labels(d)[::-1]          # _labels 是栈序, 反过来近似 pack 顺序
+    order = [next(i for i, x in enumerate(labels) if x.startswith(k))
+             for k in ("闸门理由", "高危词", "注意", "模型理由", "Agent 自述", "设备最近输出", "设备自报名")]
+    assert order == sorted(order), labels
+
+
+def test_dialog_last_line_block_after_agent_text(root):
+    """#74 设备最后一行 (不可信) 单独一块: 在模型理由 / Agent 自述之后、设备最近输出之前, 不在闸门理由里."""
+    gate = dict(HOLD, intent="存盘", line="Router#")
+    d, _acts, _asked = _dlg(root, _view(items=(("save", gate),)))
+    labels = _labels(d)[::-1]
+    order = [next(i for i, x in enumerate(labels) if x.startswith(k))
+             for k in ("闸门理由", "Agent 自述", "设备最后一行（不可信）", "设备最近输出")]
+    assert order == sorted(order), labels
+    assert not any(x.startswith("闸门理由") and "最后一行" in x for x in labels)
+
+
+def test_dialog_context_lines_prefixed(root):
+    d, _acts, _asked = _dlg(root, _view())
+    ctx = next(x for x in _labels(d) if x.startswith("设备最近输出"))
+    assert ctx.split("\n")[1:] == ["| <SW1>"]
+
+
+def test_dialog_shows_live_last_line(root):
+    """#74 第三轮: 确认框附设备当前最后一行 (live 回调), 刷新时跟着变."""
+    lines = {"v": "Router#"}
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=lambda n: lines["v"])
+    d.update_idletasks()
+    assert any("当前最后一行：Router#" in t for t in _labels(d))
+    lines["v"] = "Proceed with reload? [confirm]"
+    d.refresh(_view())
+    d.update_idletasks()
+    assert any("当前最后一行：Proceed with reload? [confirm]" in t for t in _labels(d))
+
+
+def test_dialog_live_failure_is_ignored(root):
+    def boom(n):
+        raise OSError("x")
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=boom)
+    d.update_idletasks()
+    assert not any("当前最后一行" in t for t in _labels(d))
+
+
+def test_dialog_warns_off_registered_vendor_prompt(root):
+    """#93 (推车真屏跑): 登记思科时华为式 <SW1> 不算提示符."""
+    d = cp.ConfirmDialog(root, 1, _view(), lambda op, arg: None, live=lambda n: "<SW1>", vendor=lambda n: "cisco")
+    d.update_idletasks()
+    assert any("！！设备现在不在提示符上" in t for t in _labels(d))
+
+
+class _Lab:
+    def __init__(self):
+        self.cfg = {}
+
+    def config(self, **kw):
+        self.cfg.update(kw)
+
+
+def _refresh_fake(view, **callbacks):
+    """假 self 走 refresh 的原地刷新分支 (Mac 上没有 Tk 也跑): -> 那条挂起项 "设备最后一行" Label 的字."""
+    ids = tuple(p["id"] for p in view["pending"])
+    labs = lambda: {i: _Lab() for i in ids}                             # noqa: E731
+    fake = SimpleNamespace(n=1, live=None, vendor=None, title_lbl=_Lab(), status_lbl=_Lab(), config=lambda **kw: None,
+                           _key=(False, False, ids), _meta=labs(), _reason=labs(), _line=labs())
+    fake.__dict__.update(callbacks)
+    cp.ConfirmDialog.refresh(fake, view)
+    return fake._line[ids[0]].cfg["text"]
+
+
+def _boom(n):
+    raise OSError("x")
+
+
+@pytest.mark.parametrize("vendor,warned", [(lambda n: "cisco", True), (lambda n: "huawei", False), (None, False),
+                                           (_boom, False)])
+def test_refresh_uses_slot_vendor(vendor, warned):
+    """#93: vendor 回调的厂商传给 card; 没给或出错退回不分厂商的判断, 确认框照常画."""
+    text = _refresh_fake(_view(), live=lambda n: "<SW1>", vendor=vendor)
+    assert ("！！设备现在不在提示符上" in text) is warned and "当前最后一行：<SW1>" in text
+
+
+def test_view_fixtures_build_without_display():
+    """不开 Tk 也跑: 夹具本身合不合闸门规则 (#74 后同槽位只能再挂 Ctrl+C). Mac 上整组 Tk 测试跳过时也能先红."""
+    assert len(_view()["pending"]) == 2
+    _view(stop=True)
+    assert len(_view(items=(("save", HOLD),))["pending"]) == 1

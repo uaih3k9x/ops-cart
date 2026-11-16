@@ -114,6 +114,7 @@ def judge_build(text, expect=None):
 
 THIRD_PARTY = ("PIL", "usb")             # 只有副屏用, 装在 /opt/pxe/venv
 OCR_THIRD_PARTY = ("rapidocr_openvino",)        # 只有 ocr_rapid_worker 用, 装在 /opt/pxe/ocr-venv (#47)
+BLE_THIRD_PARTY = ("dbus", "gi")                # 只有 ble_input 用, 系统包 python3-dbus / python3-gobject, 可选 (#52)
 _PYREF = re.compile(r"\b(\w+)\.py\b")
 _OPTREF = re.compile(r"/opt/pxe/(\w+)\.py\b")
 
@@ -249,16 +250,19 @@ def _not_stdlib(names):
 
 # ---- 以下常量由 `python3 scripts/cart_accept.py --print-manifest` 生成, 测试比对仓库 ----
 REQUIRED_PY = (
-    "atomicfile", "cart_dream", "cart_label", "cart_mcp", "cart_ocr", "cart_snap",
-    "cartlog", "ch9329", "clone_core", "confirm_core", "confirm_panel", "dash_core",
-    "dash_render", "dash_service", "ocr_rapid_worker", "pet_core", "pet_render", "pet_sprites", "hidpdc", "httpserve", "kiosk", "kiosk_core",
-    "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core", "lamps_core",
-    "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe", "mcp_serial", "netmode_core",
-    "netmode_panel", "netprof_core", "notify_core", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
-    "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_core", "serial_gate_model",
-    "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme", "tspl_preview",
-    "udisp", "udisp_usb", "ups_core", "web_core", "webkiosk", "wifi_core",
-    "wifi_panel", "wifi_prefer", "wol_core", "wol_panel",
+    "atomicfile", "bigfish_core", "bigfish_panel", "bigfish_task_core", "ble_input", "ble_input_core", "cart_dream", "cart_label", "cart_mcp",
+    "cart_ocr", "cart_snap", "cartlog", "ch9329", "clone_core", "confirm_core",
+    "confirm_panel", "dash_core", "dash_render", "dash_service", "hidpdc", "httpserve",
+    "ime_core", "ime_proc", "ime_rime", "ime_tk", "ime_worker", "kiosk",
+    "kiosk_core", "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core",
+    "label_core", "label_device", "label_panel", "label_render",
+    "lamps_core", "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe",
+    "mcp_serial", "netmode_core", "netmode_panel", "netprof_core", "notify_core", "observe_core", "observe_panel", "ocr_rapid_worker",
+    "pet_core", "pet_render", "pet_sprites", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
+    "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_allowlist", "serial_core",
+    "serial_gate_model", "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme",
+    "tspl_preview", "udisp", "udisp_usb", "ups_core", "web_core", "webkiosk",
+    "wifi_core", "wifi_panel", "wifi_prefer", "wol_core", "wol_panel",
 )
 VENV_PY = (
     "dash_render", "dash_service", "pet_render", "udisp_usb",
@@ -277,12 +281,14 @@ SYSTEM_FILES = {
     "/etc/systemd/journald.conf.d/ops-cart.conf": "deploy/journald.conf.d/ops-cart.conf",
     "/etc/systemd/system/campus-auth.service": "deploy/systemd/campus-auth.service",
     "/etc/systemd/system/campus-auth.timer": "deploy/systemd/campus-auth.timer",
+    "/etc/systemd/system/cart-ble-input.service": "deploy/systemd/cart-ble-input.service",
     "/etc/systemd/system/cart-boot-success.service": "deploy/systemd/cart-boot-success.service",
     "/etc/systemd/system/cart-boot-success.timer": "deploy/systemd/cart-boot-success.timer",
     "/etc/systemd/system/cart-dash.service": "deploy/systemd/cart-dash.service",
     "/etc/systemd/system/cart-dream.service": "deploy/systemd/cart-dream.service",
     "/etc/systemd/system/cart-dream.timer": "deploy/systemd/cart-dream.timer",
     "/etc/systemd/system/cart-fan-curve.service": "deploy/systemd/cart-fan-curve.service",
+    "/etc/systemd/system/cart-mcp-ro.service": "deploy/systemd/cart-mcp-ro.service",
     "/etc/systemd/system/cart-mcp.service": "deploy/systemd/cart-mcp.service",
     "/etc/systemd/system/cart-ocr.service": "deploy/systemd/cart-ocr.service",
     "/etc/systemd/system/cart-notify.service": "deploy/systemd/cart-notify.service",
@@ -323,7 +329,9 @@ UNITS = {
     "pxe-http-repo.service": _u(None, None, "#11"),
     "webkiosk.service": _u(None, None, "#24", note="网页口 (含 PXE 日志页)"),
     "cart-mcp.service": _u(None, None, "#19", note="MCP HTTP; 默认不开, 只用 stdio"),
+    "cart-mcp-ro.service": _u(None, None, "#49", note="MCP HTTP 只读档; 默认不开"),
     "cart-ocr.service": _u(None, None, "#47", note="OCR 常驻服务; 不开退回 Tesseract"),
+    "cart-ble-input.service": _u(None, None, "#52", note="蓝牙隔空打字; 草稿, 默认不开"),
     "cart-serial-req.path": _u(None, None, "#23", note="网页急停 / 拒绝"),
     "cart-serial-req.service": _u(None, None, "#23", oneshot=True),
     "cart-notify.timer": _u(True, True, "#4", note="关键事件推手机 (UPS 预告也走它)"),
@@ -338,6 +346,11 @@ UNITS = {
     "cart-dream.service": _u(None, None, "-", oneshot=True),
     "cart-fan-curve.service": _u(None, None, "-", oneshot=True),
     "cart-revtunnel.service": _u(None, None, "-", note="备用远程通道; 没 revtunnel.env 就不起"),
+}
+# 系统自带、不在 deploy/systemd 里的单元 (#95): smb 由 judge_smb 判 (要看 LAN1 有没有地址), logrotate 只看上次跑成没成
+SYSTEM_UNITS = {
+    "smb.service": _u(None, None, "#95", note="装机共享; 只绑 LAN1"),
+    "logrotate.service": _u(None, None, "#95", oneshot=True),
 }
 SHOW_PROPS = "Id,LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainStatus,NeedDaemonReload"
 _ENABLED = ("enabled", "enabled-runtime", "alias", "linked", "linked-runtime")
@@ -380,6 +393,38 @@ def judge_unit(spec, props):
     if enabled and act not in ("active", "activating", "reloading"):
         return FAIL, f"{state}: 开了自启却没在跑"
     return PASS, state
+
+
+LAN1_DROPIN = "ops-cart-lan1.conf"
+
+
+def is_hand_smb_conf(text):
+    """smb.conf 不是 setup-samba.sh 生成的 (头注释没写它) = 手工配置; 读不到 (None) 不算."""
+    return text is not None and "setup-samba.sh" not in text
+
+
+def judge_smb(props, lan1_up, hand_conf=False):
+    """已停用 (disabled + inactive, 推车不用 smb 时) = SKIP.
+    smb.conf 只绑 LAN1: 没地址时 smb.service.d/ops-cart-lan1.conf 让它跳过 (inactive), 这时 SKIP.
+    failed 不管有没有链路都 FAIL —— 跳过不会留下 failed, 有就是又崩了 / drop-in 没装 / smb.conf 没带 lo.
+    lan1 drop-in 只给手工配置装 (仓库生成的带 lo, 不装), 所以只对 hand_conf 提示."""
+    if not props or props.get("LoadState") != "loaded":
+        return SKIP, "没装 Samba"
+    act = props.get("ActiveState")
+    if act == "inactive" and props.get("UnitFileState", "") not in _ENABLED:
+        return SKIP, (f"已停用 (自启={props.get('UnitFileState') or '-'}, inactive); "
+                      "要用时照 docs/MIGRATE_95.md 第 2 节恢复")
+    if not lan1_up and act != "failed":
+        return SKIP, f"LAN1 没地址 (没插线), smbd 等插线来地址再起 ({act}); 刚开机的话稍等再跑"
+    st, why = judge_unit(SYSTEM_UNITS["smb.service"], props)
+    if act == "failed" and hand_conf and LAN1_DROPIN not in props.get("DropInPaths", ""):
+        why += f"; 没装 smb.service.d/{LAN1_DROPIN}, smb.conf 的 interfaces 也该带 lo (docs/MIGRATE_95.md)"
+    return st, why
+
+
+def judge_logrotate(props):
+    st, why = judge_unit(SYSTEM_UNITS["logrotate.service"], props)
+    return (st, why + "; 看 journalctl -u logrotate (多半是哪份日志打不开)") if st == FAIL else (st, why)
 
 
 # ============================================================ SELinux / 字体 / 权限 / 配置
@@ -544,6 +589,7 @@ MCP_TOOLS = {
     "#24": ("pxe_request", "pxe_requests", "pxe_retire"),
     "#41": ("kvm_status", "kvm_lease_acquire", "kvm_lease_renew", "kvm_lease_release", "kvm_key", "kvm_type",
             "screen_ocr", "wol_send", "pxe_clients"),
+    "#75": ("gate_allowlist",),
 }
 
 
@@ -611,20 +657,72 @@ def netmode_summary(doc):
     return "托管: " + (", ".join(parts) or "无")
 
 
+PXE_ZONE = "pxe"
 PXE_PORTS = ("67/udp", "68/udp", "69/udp", "4011/udp", "80/tcp", "8000/tcp")
 
 
-def judge_pxe_zone(zone, ports):
-    """LAN1 所在 firewalld 区放没放行 PXE (#38). zone=None = firewalld 没开; 没放行时 DHCP 请求到不了服务."""
+LINK_DOWN = ("unavailable", "disconnected")      # nmcli device 状态: 没插线 / 没激活, 接口不进任何区
+
+
+def judge_pxe_zone(zone, ports, link=None, profile_zones=None):
+    """LAN1 所在 firewalld 区放没放行 PXE (#38). zone=None = firewalld 没开; 没放行时 DHCP 请求到不了服务.
+    link = nmcli 里 eno1 的设备状态; profile_zones = 绑 eno1 的各个连接配置 [(名字, connection.zone)].
+    没链路时连接没激活, 接口本来就不在任何区: 绑 eno1 的配置全写了 pxe 才等插线, 有一个不是就报 (插线后哪个先起来不一定)."""
     if zone is None:
         return SKIP, "firewalld 没在跑"
     fix = "修: sudo nmcli con mod <LAN1 配置> connection.zone pxe 后重新 up"
+    if not zone and link in LINK_DOWN:
+        profiles = list(profile_zones or [])
+        if not profiles:
+            return SKIP, (f"eno1 没链路 ({link}), 也没找到写了 ifname=eno1 的连接配置, 插线建好配置后再验; "
+                          "如果有不写 ifname、只按 MAC 匹配的配置, 要手动核对它的 connection.zone")
+        bad = [(n, z) for n, z in profiles if z != PXE_ZONE]
+        if not bad:
+            return SKIP, f"eno1 没链路 ({link}), 现在不在任何区是正常的; 配置已设 pxe，插线后生效"
+        shown = ", ".join(f"{n} (区: {z or '空'})" for n, z in bad)
+        return FAIL, f"eno1 没链路 ({link}), 但绑 eno1 的配置 {shown} 不是 pxe, 插线后可能落进别的区. {fix}"
     if not zone:
         return FAIL, f"eno1 不在任何防火墙区. {fix}"
     miss = [p for p in PXE_PORTS if p not in (ports or "").split()]
     if miss:
         return FAIL, f"eno1 在 {zone} 区, 没放行 {' '.join(miss)}, 新机器拿不到地址. {fix}"
     return PASS, f"eno1 在 {zone} 区, PXE 端口都放行"
+
+
+def nm_split(line):
+    """nmcli -t 一行: 字段用 ':' 分, 字段里的 ':' 和 '\\' 被转义成 '\\:' '\\\\'."""
+    out, cur, esc = [], [], False
+    for ch in line:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return out
+
+
+def nm_field(dump, key):
+    """`nmcli -t con show uuid <u>` 的输出里取一个字段 (key:value 一行一个); 没这个字段 None."""
+    for line in (dump or "").splitlines():
+        k, sep, v = line.partition(":")
+        if sep and k == key:
+            return v.strip()
+    return None
+
+
+def nm_device_state(out, dev):
+    """`nmcli -t -f DEVICE,STATE device` 的输出 -> dev 的状态第一个词 (connected / unavailable ...); 没有这个设备 None."""
+    for line in (out or "").splitlines():
+        f = nm_split(line)
+        if len(f) >= 2 and f[0] == dev:
+            return (f[1].split() or [""])[0]
+    return None
 
 
 def judge_rapid(installed, rc, out):

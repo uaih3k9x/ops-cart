@@ -38,13 +38,24 @@ OPT = OPT_DEFAULT                   # --opt 可换 (开发机上拿仓库目录�
 ETC = "/etc/ops-cart"
 RUN = "/run/ops-cart"
 LOG = "/var/log/ops-cart"
-EXPECT_VERSION = "1.15.01"          # 没有仓库的 VERSION 可读时用 (推车上单独拷过去跑)
+EXPECT_VERSION = "1.16.05"          # 没有仓库的 VERSION 可读时用 (推车上单独拷过去跑)
 MANIFEST = os.path.join(HERE, "accept-manifest.json")
 PY_ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
 PY_ENV.pop("PYTHONSTARTUP", None)
 
 
 # ============================================================ 小工具
+
+def _netmode():
+    """按 uuid 读连接详情复用 /opt/pxe/netmode_core (cmd_con_detail / _ifname), 不在验收里另写一套. 导不进来 None."""
+    import importlib
+    if OPT not in sys.path:
+        sys.path.append(OPT)                 # 放最后: 不盖过验收脚本自己目录里的 accept_core
+    try:
+        return importlib.import_module("netmode_core")
+    except Exception:
+        return None
+
 
 def sh(cmd, timeout=10, inp=None):
     """-> (rc, stdout, stderr). 命令不在 127, 超时 124. 不抛."""
@@ -254,6 +265,29 @@ def unit_checks():
     return [ac.Check(f"单元 {n}", spec["issue"], one(n)) for n, spec in ac.UNITS.items()]
 
 
+def system_unit_checks():
+    """系统自带的单元 (#95): smb 只绑 LAN1, 没地址时跳过算 SKIP; logrotate 每天 0 点跑, 上次失败 = 有日志没轮转."""
+    def show():
+        rc, out, _ = sh(["systemctl", "show", "-p", ac.SHOW_PROPS + ",DropInPaths"] + sorted(ac.SYSTEM_UNITS))
+        return None if rc == 127 else ac.parse_show(out)
+
+    def smb():
+        d = show()
+        if d is None:
+            return ac.SKIP, "没有 systemctl (不是推车)"
+        lan1_up = " inet " in sh(["ip", "-4", "-o", "addr", "show", "dev", "eno1"])[1]
+        return ac.judge_smb(d.get("smb.service"), lan1_up, ac.is_hand_smb_conf(read("/etc/samba/smb.conf")))
+
+    def logrotate():
+        d = show()
+        if d is None:
+            return ac.SKIP, "没有 systemctl (不是推车)"
+        return ac.judge_logrotate(d.get("logrotate.service"))
+
+    return [ac.Check("单元 smb.service (装机共享)", "#95", smb),
+            ac.Check("单元 logrotate.service (日志轮转)", "#95", logrotate)]
+
+
 def chk_selinux():
     rc, out, _ = sh(["getenforce"])
     if rc == 127:
@@ -302,7 +336,7 @@ def log_checks():
             ac.Check("pxe-req.log (PXE 申请)", "#24", one(LOG + "/pxe-req.log", False)),
             ac.Check("serial-slot*.log (Agent 写串口)", "#21", slots),
             ac.Check("巡检存档 survey/", "#15", survey),
-            ac.Check("pxeserver.log", "#11", one(OPT + "/pxeserver.log", pxe)),
+            ac.Check("pxeserver.log (装机口)", "#95", one(LOG + "/pxeserver.log", pxe)),
             ac.Check("journald 落盘", "-", journal)]
 
 
@@ -451,7 +485,19 @@ def config_checks():
             return ac.judge_pxe_zone(None, None)
         zone = sh(["firewall-cmd", "--get-zone-of-interface=eno1"])[1].strip()
         ports = sh(["firewall-cmd", f"--zone={zone}", "--list-ports"])[1] if zone else ""
-        return ac.judge_pxe_zone(zone, ports)
+        link = ac.nm_device_state(sh(["nmcli", "-t", "-f", "DEVICE,STATE", "device"])[1], "eno1")
+        zones = []
+        if not zone and link in ac.LINK_DOWN:          # 没激活: 看绑 eno1 的配置里写的区
+            nm = _netmode()
+            if nm is None:
+                return ac.SKIP, f"eno1 没链路 ({link}); 读不了 {OPT}/netmode_core.py, 没法核对连接配置的区"
+            for line in sh(["nmcli", "-t", "-f", "UUID,TYPE", "con", "show"])[1].splitlines():
+                f = ac.nm_split(line)
+                if len(f) >= 2 and f[1] == "802-3-ethernet":
+                    dump = sh(nm.cmd_con_detail(f[0]))[1]
+                    if nm._ifname(dump) == "eno1":
+                        zones.append((ac.nm_field(dump, "connection.id") or f[0], ac.nm_field(dump, "connection.zone") or ""))
+        return ac.judge_pxe_zone(zone, ports, link=link, profile_zones=zones)
 
     return [ac.Check("pxe.env", "#11", pxeenv),
             ac.Check("LAN1 防火墙区放行 PXE", "#38", pxe_zone),
@@ -767,7 +813,7 @@ def main(argv=None):
         print("清单读不懂, 不比对 sha256:", err)
     checks = ([ac.Check("以 root 运行", "-", chk_root), ac.Check("平台", "-", chk_platform)]
               + make_version_checks(expect, a.expect_build, manifest)
-              + unit_checks()
+              + unit_checks() + system_unit_checks()
               + [ac.Check("SELinux 模块 ops_cart_mounton (webkiosk 要)", "-", chk_selinux, timeout=70)]
               + log_checks() + font_checks() + config_checks() + import_checks()
               + issue_checks(expect))

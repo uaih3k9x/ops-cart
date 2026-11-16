@@ -1,16 +1,18 @@
 {
-  "_说明": "串口写闸门规则 (#21 第 1 层 / #22 第 2 层, serial_write_core.load_rules). 拷到 /etc/ops-cart/serial-gate.json (root 0644) 生效, 每条命令都重读, 改了不用重启. 只能加不能放松: 只读白名单的语法规则 (全称、小写、禁 ; & < > ` $ # !、管道只许 include/exclude/...) 写死在 survey_core 里; 这里只能给内置厂商 (huawei / cisco) 追加只读动词、追加高危词、给槽位登记厂商. 高危词内置的删不掉 (save reboot reset format delete ...). 文件坏了 = 内置默认 (模型不开).",
-  "_slots": "槽位 -> 厂商 (huawei / cisco / ruijie / linux). 没登记的槽位: auto_huawei=true 时最后一行是华为 <名>/[名] 提示符才按华为算; 思科 / 锐捷式 名# 和 Linux 的 bash# 分不开, 要用就在这里登记. 登记了的槽位也得停在该厂商的提示符上才放行. ruijie / linux 没有第 1 层只读白名单, 只走第 2 层或人确认.",
+  "_说明": "串口写闸门规则 (#21 第 1 层 / #22 第 2 层, serial_write_core.load_rules). 拷到 /etc/ops-cart/serial-gate.json (root 0644) 生效, 每条命令都重读, 改了不用重启. 只能加不能放松: 只读白名单的语法规则 (全称、小写、禁 ; & < > ` $ # !、管道只许 include/exclude/...) 写死在 survey_core 里; 这里只能给内置厂商 (huawei / h3c / cisco / ruijie) 追加只读动词、追加高危词、给槽位登记厂商. 高危词内置的删不掉 (save reboot reset format delete ...). 文件坏了 = 内置默认 (模型不开).",
+  "_slots": "槽位 -> 厂商 (huawei / cisco / ruijie / linux). 没登记的槽位: auto_huawei=true 时最后一行是华为 <名>/[名] 提示符才按华为算; 思科 / 锐捷式 名# 和 Linux 的 bash# 分不开, 要用就在这里登记. 登记了的槽位也得停在该厂商的提示符上才放行. ruijie 用 survey_core 的 show 只读白名单 (#56); linux 没有第 1 层只读白名单, 只走第 2 层或人确认.",
   "slots": {},
   "auto_huawei": true,
-  "_vendors": "extra_verbs: 第 1 层追加只读动词 (只认 huawei / cisco). model: false 关掉这个厂商的第 2 层. notes: 给决策模型的现场补充说明 (最多 500 字).",
+  "_vendors": "extra_verbs: 第 1 层追加只读动词 (只认 huawei / h3c / cisco / ruijie). 只加动词: 动词后面的参数不受只读关键词字符集约束, 只受通用规则 (禁 ; & < > ` $ # ! ? [ ] { }、不许写文件参数和带冒号的词), 所以别加会写东西的动词. 改配置 / 进交互 / 连别处 / 清东西的动词 (terminal debugging undo no clear test telnet ssh system-view configure reload reboot copy write save delete format reset erase ...) 及其缩写写死不让加; 这张禁用表是尽力而为, 列不全各厂商的命令, 加动词前自己确认它只读、不进交互、参数有上限. 样例不再开 ping / traceroute / tracert: 它们参数没上限 (ping -c 100000、ping 不带地址会进交互问答), 思科要 Ctrl+Shift+6 才打断, 按键表里没有. 真要开, 建议只配合第 2 层模型或人确认使用, 并在 notes 里写明只许「ping 地址」加次数 / 超时上限 (如 huawei ping -c 4 -t 1000, cisco ping 地址 repeat 4 timeout 1), 不许不带地址. H3C 设备按华为处理: 槽位登记成 huawei, extra_verbs / notes 也写进 huawei (写在 h3c 下会被忽略). 加的动词只在用户视图 (华为 <名>, 思科 / 锐捷不带括号的 名# / 名>) 生效. model: false 关掉这个厂商的第 2 层. notes: 给决策模型的现场补充说明 (最多 500 字).",
   "vendors": {
-    "huawei": {"extra_verbs": ["ping", "tracert"]},
-    "cisco": {"extra_verbs": ["ping", "traceroute"]},
+    "huawei": {},
+    "cisco": {},
     "ruijie": {},
     "linux": {"model": false}
   },
   "danger": ["license", "patch"],
+  "_allowlist": "#75 第 1 层命令前缀白名单 (serial_allowlist, 现在是影子期: 只记录进 gate.shadow, 放行仍按上面的只读规则). 只能按条目 id 禁用, 不能新增; id 写成 <厂商>:<条目原文>, 如 huawei:display interface {ifname} (禁用它的全部取值). 不认识的 id 忽略, gate_allowlist 里看得到. 条目清单: MCP 工具 gate_allowlist 或 serial_allowlist.py.",
+  "allowlist": {"disable": []},
   "_model": "第 2 层决策模型 (#22): 第 1 层不放行、又不带高危词的命令交模型判, 判放行直接发, 判拦 / 超时 / 报错 / 格式不对 / 预算超限一律人确认. 以 serial.conf 的 user 身份跑它 ~/.claude 配的线路 (同 cart_dream). enabled 默认 false = 第 1 层之外全人确认. timeout_s 5-120; budget_usd 单次花费上限 (美元, 最多 1); context_chars 给模型看的设备最近输出字数 (最多 8000); model 可选, 传给 claude --model.",
   "model": {"enabled": false, "timeout_s": 30, "budget_usd": "0.2", "context_chars": 3000}
 }

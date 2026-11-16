@@ -135,7 +135,7 @@ def test_third_party_imports_are_only_venv_ones():
     if not hasattr(sys, "stdlib_module_names"):
         pytest.skip("要 3.10+ 才有标准库清单")
     d = ac.derive(ROOT)
-    assert d["third_party"] <= set(ac.THIRD_PARTY) | set(ac.OCR_THIRD_PARTY)
+    assert d["third_party"] <= set(ac.THIRD_PARTY) | set(ac.OCR_THIRD_PARTY) | set(ac.BLE_THIRD_PARTY)
 
 
 def test_system_files_cover_every_unit():
@@ -155,6 +155,7 @@ def test_units_table_matches_deploy():
         assert spec["oneshot"] == ("Type=oneshot" in text), name
         assert spec["issue"], name
     assert ac.UNITS["cart-mcp.service"]["enabled"] is None          # 默认不开, 开了也行
+    assert ac.UNITS["cart-mcp-ro.service"]["enabled"] is None       # 只读档 (#49) 同样按需
 
 
 SHOW = """Id=kiosk.service
@@ -443,6 +444,61 @@ def test_pxe_zone_firewalld_off_is_skip():
     assert ac.judge_pxe_zone(None, None)[0] == ac.SKIP
 
 
+@pytest.mark.parametrize("link", ["unavailable", "disconnected"])
+def test_pxe_zone_no_link_is_skip_and_says_profile_is_pxe(link):
+    """LAN1 没插线: 连接没激活, 接口不在任何区是正常的; 配置里写了 pxe 就说插线后生效 (#38)."""
+    st, why = ac.judge_pxe_zone("", "", link=link, profile_zones=[("cart-eno1-static", "pxe")])
+    assert st == ac.SKIP and link in why and "配置已设 pxe，插线后生效" in why
+
+
+def test_pxe_zone_no_link_profile_without_pxe_fails():
+    """没链路但配置写的不是 pxe: 插线后照样落进默认区, 现在就报."""
+    st, why = ac.judge_pxe_zone("", "", link="unavailable", profile_zones=[("lan1-old", "")])
+    assert st == ac.FAIL and "插线后" in why and "nmcli" in why and "lan1-old" in why
+
+
+def test_pxe_zone_no_link_any_profile_not_pxe_fails_and_names_it():
+    """绑 eno1 的配置全是 pxe 才 SKIP; 有一个不是 (插线后哪个先起来不一定) 就报, 写出名字."""
+    st, why = ac.judge_pxe_zone("", "", link="unavailable",
+                                profile_zones=[("cart-eno1-static", "pxe"), ("Wired connection 1", "public")])
+    assert st == ac.FAIL and "Wired connection 1" in why and "public" in why and "cart-eno1-static" not in why
+
+
+def test_pxe_zone_no_link_no_profile_is_skip():
+    st, why = ac.judge_pxe_zone("", "", link="unavailable", profile_zones=[])
+    assert st == ac.SKIP and "没找到" in why and "MAC" in why
+
+
+def test_pxe_zone_link_up_without_zone_still_fails():
+    assert ac.judge_pxe_zone("", "", link="connected", profile_zones=[("cart-eno1-static", "pxe")])[0] == ac.FAIL
+
+
+def test_pxe_zone_no_link_but_zone_set_judged_as_before():
+    assert ac.judge_pxe_zone("pxe", PXE_PORTS, link="unavailable")[0] == ac.PASS
+    assert ac.judge_pxe_zone("public", "", link="unavailable")[0] == ac.FAIL
+
+
+def test_nm_device_state():
+    out = "wlp4s0:connected\ntailscale0:connected (externally)\neno1:unavailable\n"
+    assert ac.nm_device_state(out, "eno1") == "unavailable"
+    assert ac.nm_device_state(out, "tailscale0") == "connected"
+    assert ac.nm_device_state(out, "eno2") is None
+
+
+def test_nm_split_terse_unescapes():
+    assert ac.nm_split(r"my\:con:802-3-ethernet:") == ["my:con", "802-3-ethernet", ""]
+    assert ac.nm_split(r"a\\:b") == ["a" + "\\", "b"]                # 字段里的一个反斜杠转义成 \\
+    assert ac.nm_split(r"a\\\:b:c") == ["a" + "\\" + ":b", "c"]       # \\ 后面紧跟 \:
+
+
+def test_nm_field():
+    dump = "connection.id:cart-eno1-static\nconnection.uuid:u-1\nconnection.zone:pxe\nconnection.interface-name:eno1\n"
+    assert ac.nm_field(dump, "connection.zone") == "pxe"
+    assert ac.nm_field(dump, "connection.id") == "cart-eno1-static"
+    assert ac.nm_field("connection.zone:\n", "connection.zone") == ""
+    assert ac.nm_field("", "connection.zone") is None
+
+
 # ---- RapidOCR (#46): 可选, 没装不算错
 
 def test_judge_rapid():
@@ -450,3 +506,71 @@ def test_judge_rapid():
     assert ac.judge_rapid(True, 0, "1.4.4")[0] == ac.PASS
     st, why = ac.judge_rapid(True, 1, "ImportError: libGL")
     assert st == ac.FAIL and "libGL" in why
+
+
+# ------------------------------------------------------------ 系统自带单元 (#95)
+
+def _props(act="inactive", sub="dead", en="enabled", result="success", status="0", load="loaded"):
+    return {"LoadState": load, "ActiveState": act, "SubState": sub, "UnitFileState": en,
+            "Result": result, "ExecMainStatus": status}
+
+
+def test_judge_smb_no_lan1_address_is_skip():
+    st, why = ac.judge_smb(_props(), lan1_up=False)
+    assert st == S and "LAN1" in why and "稍等" in why
+
+
+def test_judge_smb_failed_hints_missing_lan1_dropin_only_for_hand_conf():
+    crashed = _props("failed", "failed", result="core-dump", status="6")
+    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False, hand_conf=True)
+    assert st == F and "ops-cart-lan1.conf" in why and " lo" in why
+    st, why = ac.judge_smb(dict(crashed, DropInPaths="/etc/systemd/system/smb.service.d/ops-cart-lan1.conf"),
+                           lan1_up=False, hand_conf=True)
+    assert st == F and "没装" not in why
+    st, why = ac.judge_smb(dict(crashed, DropInPaths=""), lan1_up=False, hand_conf=False)    # 仓库配置不该装它
+    assert st == F and "ops-cart-lan1.conf" not in why
+
+
+@pytest.mark.parametrize("text,want", [
+    ("# /etc/samba/smb.conf —— setup-samba.sh 按 ... 生成\n[global]\n", False),
+    ("# 手工写的\n[global]\n   interfaces = 192.0.2.1/24\n", True),
+    (None, False),                                                  # 读不到: 不下结论, 不提示
+])
+def test_is_hand_smb_conf(text, want):
+    assert ac.is_hand_smb_conf(text) is want
+
+
+def test_judge_smb_lan1_up_must_run_when_enabled():
+    assert ac.judge_smb(_props(), lan1_up=True)[0] == F
+    assert ac.judge_smb(_props("active", "running"), lan1_up=True)[0] == P
+
+
+@pytest.mark.parametrize("lan1_up", [False, True])
+def test_judge_smb_disabled_and_inactive_is_skip_marked_stopped(lan1_up):
+    """推车不用 smb 时 disable --now 停掉 (1.16.01): 不算 FAIL, 写明已停用、怎么恢复."""
+    st, why = ac.judge_smb(_props(en="disabled"), lan1_up=lan1_up, hand_conf=True)
+    assert st == S and "已停用" in why and "MIGRATE_95" in why
+
+
+def test_judge_smb_disabled_but_failed_or_running_is_not_hidden():
+    assert ac.judge_smb(_props("failed", "failed", en="disabled", result="core-dump", status="6"), lan1_up=False)[0] == F
+    st, why = ac.judge_smb(_props("active", "running", en="disabled"), lan1_up=True)
+    assert "已停用" not in why
+
+
+def test_judge_smb_not_installed_is_skip():
+    assert ac.judge_smb(_props(load="not-found", en=""), lan1_up=True)[0] == S
+    assert ac.judge_smb(None, lan1_up=True)[0] == S
+
+
+def test_logrotate_last_run_must_succeed():
+    st, why = ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"],
+                            _props("failed", "failed", en="static", result="exit-code", status="1"))
+    assert st == F
+    assert ac.judge_unit(ac.SYSTEM_UNITS["logrotate.service"], _props(en="static"))[0] == P
+
+
+def test_judge_logrotate_failed_points_to_journal():
+    st, why = ac.judge_logrotate(_props("failed", "failed", en="static", result="exit-code", status="1"))
+    assert st == F and "journalctl -u logrotate" in why
+    assert ac.judge_logrotate(_props(en="static"))[0] == P

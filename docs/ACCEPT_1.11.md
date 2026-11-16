@@ -174,7 +174,7 @@ sudo python3 /tmp/accept/cart_accept.py | tee ~/accept-1.11-run1.txt
 **应该看到**
 
 1. dry-run：终端打印认到的字（比如 "F12 Boot Menu"），**一个键都不发**；`/run/ops-cart/recipe-*` 下留了截图和 `log.jsonl`。
-2. 真跑：屏幕上出现启动菜单、自动选中网络启动（PXE / Network / IPv4）、回车，待装机开始 PXE，出现推车的救援菜单。退出码 0。
+2. 真跑：屏幕上出现启动菜单、自动选中网络启动（PXE / Network / IPv4）、回车，待装机开始 PXE，出现推车的默认菜单（倒计时后从本地盘启动，救援要手选）。退出码 0。
 3. 配方里没有进 BIOS 设置、没有"保存"类按键。
 
 **过了**：#17 可以关。不过的话把 `/run/ops-cart/recipe-*` 整个目录拷回来给 维护者（重启推车会清掉）。
@@ -233,7 +233,7 @@ claude mcp add cart -- ssh <推车> sudo python3 /opt/pxe/cart_mcp.py stdio
 2. **Agent 的回复里没有确认码**，也没有清单摘要。
 3. 抄错：被拒，确认码原地换一个（输错不限次数）。
 4. 抄对：解锁，待装机重启 PXE 能看到对应菜单。
-5. `pxe_requests` 显示 armed；`pxe_retire` 后菜单清掉，待装机再 PXE 只有救援菜单。
+5. `pxe_requests` 显示 armed；`pxe_retire` 后菜单清掉，待装机再 PXE 只有默认菜单（超时本地盘）。
 6. 全部急停后，在等的申请作废（dropped）。之后到车机上解除急停。
 7. 网页「PXE 日志」按 MAC 分组列出刚才这些事；**网页上没有确认 / 拒绝按钮，也看不到确认码**。
 

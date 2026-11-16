@@ -3,11 +3,13 @@
 - 执行绪命名: 从串口输出的提示符认名字 (华为 <名> / [名]), 调用和日志永远带槽位号, 名字只是标签
 - 参数校验: 工具参数用一张小表声明, 同一张表导出 inputSchema; 不认识的参数、类型不对一律拒
 - 协议: JSON-RPC 2.0 (initialize / ping / tools/list / tools/call), 不依赖 mcp SDK; 传输在 cart_mcp
-- 审计: 每次 tools/call 一行 JSON (谁、哪个工具、参数、成没成、耗时), 落 /var/log/ops-cart/
+- 审计: 每次 tools/call 一行 JSON (谁、档位、哪个工具、参数、成没成、耗时), 落 /var/log/ops-cart/
+- 档位 (#49): 每个工具显式标 readonly / act; 只读档的 Server 根本不注册 act 工具, HTTP 两档令牌分开
 """
 
 import base64
 import hmac
+import fcntl
 import json
 import os
 import re
@@ -195,10 +197,12 @@ def _clip(v):
     return s if len(s) <= AUDIT_CLIP else s[:AUDIT_CLIP] + "…"
 
 
-def audit_line(who, tool, args, ok, error=None, ms=None, now=None):
-    """'谁、哪个工具、参数、成没成' 一行 JSON (json.dumps 把换行转义掉, 不会断行)."""
+def audit_line(who, tool, args, ok, error=None, ms=None, now=None, profile=None):
+    """'谁、哪个档位、哪个工具、参数、成没成' 一行 JSON (json.dumps 把换行转义掉, 不会断行)."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() if now is None else now))
     d = {"ts": ts, "who": _clip(who), "tool": _clip(tool), "args": _clip(args), "ok": bool(ok)}
+    if profile is not None:
+        d["profile"] = profile
     if ms is not None:
         d["ms"] = int(ms)
     if error is not None:
@@ -230,6 +234,57 @@ INSTRUCTIONS = ("运维推车 (ops-cart) 的工具: 只读的看串口操作头 
                 "看推车状态和 PXE 装机模式. 写串口要先 lease_acquire 拿写租约并按时续期; 只读命令直接发, "
                 "其余挂起等人在推车上确认 (pending_list 看结果); 拿不准就 estop. 说到执行绪时永远带上槽位号, 名字只是标签. "
                 "PXE 解锁只能 pxe_request 申请, 人在推车上照抄确认码才生效.")
+READONLY_INSTRUCTIONS = ("运维推车 (ops-cart) 只读档: 只能看串口操作头 (槽位 1-4) 的输出、截图 / OCR 被测机器画面、"
+                         "看推车、键鼠、PXE 状态和挂起的申请. 这个服务里没有任何会动手的工具 (键鼠、写串口、网络唤醒、"
+                         "PXE 申请、打印都不在), 要动手得由人另接动手档. 说到执行绪时永远带上槽位号, 名字只是标签.")
+
+# ------------------------------------------------------------ 档位 (#49)
+
+READONLY, ACT = "readonly", "act"           # 工具的标注: 只看 / 会产生副作用
+KINDS = (READONLY, ACT)
+PROFILES = {READONLY: (READONLY,), ACT: (READONLY, ACT)}     # 档位 -> 注册哪些标注的工具; act 档 = 现在的全部工具
+DEFAULT_PROFILE = ACT       # 现有 `cart_mcp.py stdio` 接法依赖全部工具, 先不改 (待拍板)
+READONLY_PORT = 8766        # 只读档 HTTP 默认端口 (动手档沿用 mcp.json 顶层 port)
+SERVER_NAMES = {READONLY: "ops-cart-readonly", ACT: "ops-cart"}
+
+
+def check_profile(profile):
+    if profile not in PROFILES:
+        raise ValueError(f"不认识的档位 {profile!r}, 只有 {', '.join(PROFILES)}")
+    return profile
+
+
+def select_tools(tools, profile):
+    """按档位挑工具. 标注不认识的一律报错 (宁可起不来, 不猜它会不会动手)."""
+    allow = PROFILES[check_profile(profile)]
+    out = []
+    for t in tools:
+        if getattr(t, "kind", None) not in KINDS:
+            raise ValueError(f"工具 {getattr(t, 'name', t)!r} 没有标 readonly / act")
+        if t.kind in allow:
+            out.append(t)
+    return out
+
+
+def profile_tokens(cfg, profile):
+    """mcp.json -> 这一档认的令牌. 动手档 = 顶层 tokens (兼容现有配置), 只读档 = readonly.tokens;
+    只读档没配就是空 (不借动手令牌); 动手档不认和任何只读令牌同值的 (手抖填重了也拿不到动手权限)."""
+    check_profile(profile)
+    ro = cfg.get("readonly")
+    ro = ro.get("tokens") if isinstance(ro, dict) else None
+    ro = ro if isinstance(ro, dict) else {}
+    if profile == READONLY:
+        return dict(ro)
+    act = cfg.get("tokens")
+    bad = {v for v in ro.values() if isinstance(v, str)}
+    return {k: v for k, v in (act if isinstance(act, dict) else {}).items() if v not in bad}
+
+
+def profile_port(cfg, profile):
+    if check_profile(profile) == READONLY:
+        ro = cfg.get("readonly")
+        return int((ro if isinstance(ro, dict) else {}).get("port", READONLY_PORT))
+    return int(cfg.get("port", 8765))
 
 
 class ToolError(Exception):
@@ -237,12 +292,19 @@ class ToolError(Exception):
 
 
 class Tool:
-    def __init__(self, name, description, params, fn):
-        self.name, self.description, self.params, self.fn = name, description, params, fn
+    """kind 必填: READONLY (只看) / ACT (会产生副作用). 只读档靠它决定注册不注册, 所以不给默认值."""
+
+    def __init__(self, name, description, params, fn, *, kind):
+        if kind not in KINDS:
+            raise ValueError(f"工具 {name!r} 的标注要是 readonly / act, 给的是 {kind!r}")
+        self.name, self.description, self.params, self.fn, self.kind = name, description, params, fn, kind
 
     def spec(self):
+        ann = {"readOnlyHint": self.kind == READONLY, "openWorldHint": False}
+        if self.kind == READONLY:
+            ann["destructiveHint"] = False      # 动手工具不默认写 False: 不写 = 客户端按可能有破坏处理 (#49)
         return {"name": self.name, "description": self.description, "inputSchema": input_schema(self.params),
-                "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}}
+                "annotations": ann}
 
 
 def _error(rid, code, msg):
@@ -253,12 +315,104 @@ def _result(rid, res):
     return {"jsonrpc": "2.0", "id": rid, "result": res}
 
 
-class Server:
-    """消息进, 回包出; 不管传输 (stdio / HTTP 在 cart_mcp). 多线程 HTTP 共用一个实例, 本身无状态."""
+RO_RATE = 3.0       # 只读档 tools/call 整体限速: 每秒补几次 (#60 第三轮)
+RO_BURST = 10       # 桶容量: 一口气最多几次
+RO_AUDIT_EVERY_S = 1.0  # 被限速的调用审计合并: 这么久最多记一条, 带上中间没逐条记的次数
 
-    def __init__(self, tools, audit=None, version="", clock=time.monotonic):
-        self.tools = {t.name: t for t in tools}
-        self.audit, self.version, self.clock = audit, version, clock
+
+RO_SLOTS = 2        # 只读档同时最多几个进程 (stdio 每个 ssh 会话一个 + HTTP 单元一个), 见 take_ro_slot
+RO_SLOT_DIR = "/run/ops-cart"
+
+
+class SlotBusy(Exception):
+    """只读档进程槽位满了 / 槽位文件打不开."""
+
+
+def take_ro_slot(d=None, n=None):
+    """只读档进程启动时抢一个跨进程槽位 (flock, 不等): 拿到返回 fd (进程活着就一直拿着, 退出自动放);
+    满了或文件打不开抛 SlotBusy (fail-closed). 令牌桶是进程内的, 槽位把"多开会话成倍放大"封顶在 n 倍 (#60)."""
+    d, n = d or RO_SLOT_DIR, n or RO_SLOTS
+    for i in range(n):
+        path = os.path.join(d, f"mcp-ro-slot{i}.lock")
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as e:
+            raise SlotBusy(f"只读档槽位文件 {path} 打不开 ({e}), 不起服务") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            os.close(fd)
+    raise SlotBusy(f"只读档已经有 {n} 个进程在跑 (stdio 会话或 cart-mcp-ro), 同时最多 {n} 个; 先关掉一个再连")
+
+
+AUDIT_SRC_CAP = 1000    # 合并审计里"来自几个不同来源"最多数到多少 (只记个数, 集合有上限)
+
+
+class AuditMerge:
+    """同一类审计 (key) 每 every 秒最多记一条. note(key, src) -> (这次记不记, 上次之后有几次没逐条记, 那几次来自几个
+    不同来源); flush(emit) 把还没落盘的尾巴计数交给 emit(key, 次数, 来源数) 写出 (进程退出 / 定时).
+    限速调用和 HTTP 认证失败都用它: 刷请求不能把审计写满磁盘、借轮转冲掉真实记录 (#60)."""
+
+    def __init__(self, clock, every=RO_AUDIT_EVERY_S):
+        self.clock, self.every, self.lock = clock, every, threading.Lock()
+        self.last, self.quiet, self.srcs = {}, {}, {}
+
+    def note(self, key, src=None):
+        with self.lock:
+            now = self.clock()
+            last = self.last.get(key)
+            if last is not None and now - last < self.every:
+                self.quiet[key] = self.quiet.get(key, 0) + 1
+                seen = self.srcs.setdefault(key, set())
+                if src is not None and len(seen) < AUDIT_SRC_CAP:
+                    seen.add(src)
+                return False, 0, 0
+            self.last[key] = now
+            return True, self.quiet.pop(key, 0), len(self.srcs.pop(key, ()))
+
+    def flush(self, emit):
+        with self.lock:
+            pend = [(k, q, len(self.srcs.pop(k, ()))) for k, q in self.quiet.items() if q]
+            self.quiet.clear()
+        for k, q, n in pend:
+            emit(k, q, n)
+
+
+class _Bucket:
+    """令牌桶; clock 单调时钟. 线程安全 (HTTP 多线程共用一个 Server)."""
+
+    def __init__(self, rate, burst, clock):
+        self.rate, self.burst, self.clock = rate, burst, clock
+        self.tokens, self.t, self.lock = float(burst), clock(), threading.Lock()
+
+    def take(self):
+        with self.lock:
+            now = self.clock()
+            self.tokens = min(self.burst, self.tokens + max(0.0, now - self.t) * self.rate)
+            self.t = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
+
+
+class Server:
+    """消息进, 回包出; 不管传输 (stdio / HTTP 在 cart_mcp). 多线程 HTTP 共用一个实例, 本身无状态.
+    profile 决定收哪些工具: 给了档位不允许的工具直接报错, 不是注册了再拒."""
+
+    def __init__(self, tools, audit=None, version="", clock=time.monotonic, profile=DEFAULT_PROFILE):
+        tools = list(tools)
+        picked = select_tools(tools, profile)
+        if len(picked) != len(tools):
+            extra = sorted(t.name for t in tools if t not in picked)
+            raise ValueError(f"{profile} 档不收这些工具: {', '.join(extra)}")
+        self.tools = {t.name: t for t in picked}
+        self.audit, self.version, self.clock, self.profile = audit, version, clock, profile
+        # 只读档 (#60): 不收批量, tools/call 整体令牌桶; 动手档照旧 (那边有租约 / 闸门 / 人确认)
+        self.bucket = _Bucket(RO_RATE, RO_BURST, clock) if profile == READONLY else None
+        self._merge = AuditMerge(clock)
 
     def handle_text(self, text, who="-"):
         """一段 JSON 文本 -> 回包文本 (单行); 全是通知时返回 None."""
@@ -270,6 +424,12 @@ class Server:
         return None if out is None else json.dumps(out, ensure_ascii=False)
 
     def handle(self, msg, who="-"):
+        if isinstance(msg, list) and self.profile == READONLY:
+            if not self.bucket.take():                  # 被拒的批量也先扣令牌, 审计跟限速合并 (#60 第四轮)
+                self._limited(who, None)
+            else:
+                self._log(who, None, {"batch": len(msg)}, False, error="只读档不接受批量请求")
+            return _error(None, -32600, "只读档不接受 JSON-RPC 批量请求, 一次发一条")
         if isinstance(msg, list) and msg:
             outs = [r for r in (self._one(m, who) for m in msg) if r is not None]
             return outs or None
@@ -288,8 +448,8 @@ class Server:
             return _result(rid, {
                 "protocolVersion": want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "ops-cart", "version": self.version},
-                "instructions": INSTRUCTIONS})
+                "serverInfo": {"name": SERVER_NAMES[self.profile], "version": self.version},
+                "instructions": READONLY_INSTRUCTIONS if self.profile == READONLY else INSTRUCTIONS})
         if method == "ping":
             return _result(rid, {})
         if method == "tools/list":
@@ -298,12 +458,29 @@ class Server:
             return self._call(rid, params, who)
         return _error(rid, -32601, f"不支持的方法: {method}")
 
+    def _limited(self, who, name):
+        """被限速的调用: RO_AUDIT_EVERY_S 内只记一条, 下一条带上中间没逐条记的次数."""
+        log, quiet, srcs = self._merge.note("limited", who)
+        if not log:
+            return
+        more = f" (之前另有 {quiet} 次被限速, 来自 {srcs} 个不同来源, 没逐条记)" if quiet else ""
+        self._log(who, name, {}, False, error=f"调用太频繁, 已限速{more}")
+
+    def flush_audit(self):
+        """把合并后还没落盘的限速计数写出 (进程退出时 atexit 调)."""
+        self._merge.flush(lambda key, q, n: self._log(
+            "-", None, {}, False, error=f"调用太频繁, 已限速 (另有 {q} 次被限速, 来自 {n} 个不同来源, 没逐条记)"))
+
     def _log(self, who, tool, args, ok, error=None, ms=None):
         if self.audit is not None:
-            self.audit.write(audit_line(who, tool, args, ok, error=error, ms=ms))
+            self.audit.write(audit_line(who, tool, args, ok, error=error, ms=ms, profile=self.profile))
 
     def _call(self, rid, params, who):
         name, args = params.get("name"), params.get("arguments", {})
+        if self.bucket is not None and not self.bucket.take():     # 先限速再查工具名: 乱填名字也写不满审计
+            self._limited(who, name)
+            return _result(rid, {"content": [text_content(
+                f"调用太频繁 (只读档每秒最多 {RO_RATE:g} 次, 一口气最多 {RO_BURST} 次), 稍后再试")], "isError": True})
         tool = self.tools.get(name) if isinstance(name, str) else None
         if tool is None:
             self._log(who, name, args, False, error="没有这个工具")
