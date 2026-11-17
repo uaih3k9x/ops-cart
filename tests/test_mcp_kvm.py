@@ -1288,3 +1288,106 @@ def test_real_broker_queued_sums_status(monkeypatch):
     assert mk.broker_queued() == 0
     monkeypatch.setattr(mk.kvm_core, "ports", lambda: {})
     assert mk.broker_queued() == 0
+
+
+@pytest.mark.parametrize("cont", ["^", "`"])
+def test_caret_continuation_through_tool(rig, cont):
+    """#71: cmd 行尾 ^ / PowerShell 行尾反引号续行后回车, 下一行跟它拼起来查, 而且要人确认."""
+    tok = rig.lease()
+    assert not rig.call("kvm_type", text=f"rd {cont}", enter=True, lease=tok)[0]
+    err, r = rig.call("kvm_type", text="/s /q c:\\", enter=True, lease=tok)
+    assert not err and r["status"] == "pending" and r.get("danger")
+    rig.store.reject(r["id"], "human:kiosk")
+    rig.known()
+    assert not rig.call("kvm_type", text=f"echo {cont}", enter=True, lease=tok)[0]
+    err, r = rig.call("kvm_type", text="hi", enter=True, lease=tok)
+    assert not err and r["status"] == "pending"
+
+
+# ---- #71 第二轮审查: 端到端 (经 kvm_type / kvm_key). 一串操作里只要有一步挂起就算拦住了.
+
+def _run_steps(rig, steps):
+    """steps: ("t", 文字) 打字不回车 / ("T", 文字) 打字带回车 / ("k", 键名). 返回第一次挂起的结果, 都没挂起返回 None."""
+    tok = rig.lease()
+    for kind, v in steps:
+        if kind == "k":
+            err, r = rig.call("kvm_key", keys=v, lease=tok)
+        else:
+            err, r = rig.call("kvm_type", text=v, enter=(kind == "T"), lease=tok)
+        assert not err, (steps, r)
+        if r.get("status") == "pending":
+            return r
+    return None
+
+
+def test_backspace_across_continuation_is_held(rig):
+    """H1: 续行后退格, shell 删不到上一行; 推车不能以为删掉了 'x \\' 再放过 /dev/sda."""
+    steps = [("T", "cp x \\")] + [("k", "backspace")] * 6 + [("T", "/dev/sda")]
+    assert _run_steps(rig, steps) is not None
+
+
+@pytest.mark.parametrize("parts", [
+    ["trun\\", "cate -s0 /etc/passwd"],
+    ["blk\\", "discard /dev/sda"],
+    ["/sbin/blk\\", "discard x"],
+    ["chmod -R 0 /e\\", "tc"],
+    ["tru\\", "nc\\", "ate x"],
+])
+def test_seamless_backslash_continuation_is_held(rig, parts):
+    """H2: bash 的 \\ 续行是无缝拼接, 拆开词也要查出来 (跨调用和同一次 text 里都算)."""
+    assert _run_steps(rig, [("T", p) for p in parts]) is not None
+    rig2 = type(rig)(rig.log.parent / "b")
+    (rig.log.parent / "b").mkdir(exist_ok=True)
+    r = _run_steps(rig2, [("T", "\n".join(parts))])
+    assert r is not None and r.get("danger")
+
+
+@pytest.mark.parametrize("cmd", [
+    # M1: cp / mv / install / ln / rsync 的目标后面还跟着别的
+    "cp x /dev/sda ; true",
+    "ln -sf x /dev/sda && ls",
+    "cp x /dev/sda > /dev/null",
+    "cp /dev/null /etc/passwd && echo ok",
+    "cp /dev/null /etc/passwd # x",
+    "mv x /etc/shadow | cat",
+    "install x /boot/grub/grub.cfg -v",
+    "cp -r x /boot",
+    # M2: >& 重定向
+    "cat x >&/dev/sda",
+    "echo x >&/etc/passwd",
+    # M3: tee 写 /etc /boot
+    "cat x | tee /etc/shadow",
+    "tee /etc/passwd < x",
+    "tee -a /etc/fstab",
+    # L1
+    "chmod -R 0 /etc>/dev/null",
+    "chmod -R 0 /etc<x",
+    "chmod -R 0 ~root",
+])
+def test_round2_patterns_held_through_tool(rig, cmd):
+    r = _run_steps(rig, [("T", cmd)])
+    assert r is not None and r.get("danger"), cmd
+
+
+def test_windows_drive_root_is_not_continuation(rig):
+    """L2: cmd 里 cd C:\\ 回车不是续行, 缓冲不该留着 'cd C: '."""
+    tok = rig.lease()
+    assert not rig.call("kvm_type", text="cd C:\\", enter=True, lease=tok)[0]
+    with rig.store._tx() as (st, _now, _evs):
+        assert (st["line"], st["blind"]) == ("", "")
+    err, r = rig.call("kvm_type", text="dir", enter=True, lease=tok)
+    assert not err and r.get("status") != "pending"
+
+
+def test_multi_line_continuation_hits_after_human_confirms(rig):
+    """H2: 人一条条确认续行, 最后拼出 truncate 时照样报高危词 (不能因为前面确认过就只当看不清)."""
+    tok = rig.lease()
+    dangers = []
+    for part in ("tru\\", "nc\\", "ate x"):
+        err, r = rig.call("kvm_type", text=part, enter=True, lease=tok)
+        assert not err, r
+        if r.get("status") == "pending":
+            dangers += r.get("danger") or []
+            item = rig.store.take(r["id"], "human:kiosk")
+            rig.store.finish("human:kiosk", "type", part, True, send=item["send"])
+    assert "truncate" in dangers
