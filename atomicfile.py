@@ -9,6 +9,10 @@ import os
 
 
 def write_text(path, text, mode=None):
+    write_bytes(path, text.encode("utf-8"), mode)
+
+
+def write_bytes(path, data, mode=None):
     path = str(path)
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
@@ -20,8 +24,8 @@ def write_text(path, text, mode=None):
     tmp = f"{path}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, mode)

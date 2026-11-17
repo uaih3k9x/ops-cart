@@ -84,6 +84,7 @@ USB 副屏 (800×1280) ◄── USB bulk ────────────�
 | LAN1 防火墙区 | 待真机验收 | 网口模式建连接时写 `pxe` 区；断线重连的实机确认未记录（#38） |
 | 停发横条收起 | 待真机验收 | 到时停发的提示 10 分钟后收起，之后点 PXE 灯续期（#33） |
 | Windows PE | 已实现 | GRUB → iPXE → wimboot，被测机要关 Secure Boot，见 [WINPE](docs/WINPE.md) |
+| Memtest86+ | 待实机验证 | 默认菜单（超时本地盘）的最后一项，手选进入。UEFI 走 HTTP chainloader，BIOS 走 pxelinux；固定官方 8.10，zip 和解出文件各校验 sha256。见 [MEMTEST](docs/MEMTEST.md) |
 | 整盘克隆 | 部分实现 | Clonezilla 单播抓取和恢复，目标盘显式匹配。组播未实现，实机结果未记录，见 [CLONE](docs/CLONE.md) |
 | 数据盘和 Samba | 已实现 | 见 [DATA_DISK](docs/DATA_DISK.md)。LAN1 无链路时的 smbd 处理见 [MIGRATE_95](docs/MIGRATE_95.md) |
 | KVM | 已实现 | HDMI 采集预览，CH9329 透传键鼠，开机选有信号的画面源 |
@@ -338,7 +339,7 @@ python3 scripts/check_public_safe.py .       # 公开仓库脱敏检查, 本地�
 | `dash_service.py` · `dash_core.py` · `dash_render.py` · `udisp.py` · `udisp_usb.py` | 副屏服务、快照、渲染、USB 协议 |
 | `pet_core.py` · `pet_render.py` · `pet_sprites.py` | 副屏桌宠 |
 | `ups_core.py` · `hidpdc.py` | UPS 判断；HID Power Device 解析 |
-| `lldp_core.py` · `notify_core.py` · `clone_core.py` | LLDP；事件推送；整盘克隆 |
+| `lldp_core.py` · `notify_core.py` · `clone_core.py` · `memtest_core.py` | LLDP；事件推送；整盘克隆；Memtest86+ 下载校验 |
 | `srv_data_core.py` · `samba_core.py` | 数据盘和 Samba |
 | `cart_dream.py` · `cartlog.py` · `atomicfile.py` | 夜间小结；日志分层；原子写 |
 
@@ -364,7 +365,7 @@ python3 scripts/check_public_safe.py .       # 公开仓库脱敏检查, 本地�
 | [REMOTE_APPROVAL](docs/REMOTE_APPROVAL.md) | 远程审批第一阶段 |
 | [BIGFISH_PANEL](docs/BIGFISH_PANEL.md) | 大肥鱼面板接口约定 |
 | [NETMODE](docs/NETMODE.md) | 网口模式 |
-| [CLONE](docs/CLONE.md) · [DATA_DISK](docs/DATA_DISK.md) · [WINPE](docs/WINPE.md) | 克隆、数据盘、Windows PE |
+| [CLONE](docs/CLONE.md) · [DATA_DISK](docs/DATA_DISK.md) · [WINPE](docs/WINPE.md) · [MEMTEST](docs/MEMTEST.md) | 克隆、数据盘、Windows PE、Memtest86+ |
 | [IME_RIME](docs/IME_RIME.md) · [BLE_INPUT](docs/BLE_INPUT.md) | 中文输入、蓝牙打字 |
 | [REMOTE_TUNNEL](docs/REMOTE_TUNNEL.md) · [udisp-protocol](docs/udisp-protocol.md) | 备用远程通道、USB 副屏协议 |
 | [PUBLIC_SAFETY](docs/PUBLIC_SAFETY.md) | 公开仓库约定和救援环境风险 |

@@ -150,6 +150,16 @@ def sha256(path):
     return h.hexdigest()
 
 
+def memtest_file():
+    """#55: 推车上装的 memtest_core 钉的 sha256 对 tftp/ 下实际文件."""
+    rc, out, e = py("import memtest_core as m, pxeserver as p; print(p.MEMTEST_EFI, m.MEMBER_SHA256)")
+    if rc != 0 or len(out.split()) != 2:
+        return ac.FAIL, f"memtest_core 读不了: {last_err(e) or out}"
+    rel, want = out.split()
+    path = f"{OPT}/tftp/{rel}"
+    return ac.judge_memtest(sha256(path) if os.path.isfile(path) else None, want)
+
+
 @functools.lru_cache(maxsize=None)
 def units_show():
     rc, out, err = sh(["systemctl", "show", "-p", ac.SHOW_PROPS] + sorted(ac.UNITS))
@@ -745,6 +755,7 @@ def issue_checks(expect_version):
         ac.Check("内置配方 boot-pxe", "#17", recipe_builtin),
         ac.Check("采集卡 /dev/video*", "#17", capture),
         ac.Check("Clonezilla 文件", "#18", clone_files),
+        ac.Check("Memtest86+ 文件", "#55", memtest_file),
         ac.Check("网口模式状态 netmode.json", "#13", netmode),
     ]
 

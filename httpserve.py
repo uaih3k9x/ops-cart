@@ -11,7 +11,12 @@
   MAC (恢复一批时是 pxe-mode.json 的 macs 名单, pxeserver.install_allowed 判断);
   boot.ipxe、win/、clonezilla/ 不拦 (PE / live 系统本身不动硬盘, 写不写盘全看菜单里的参数;
   而且菜单被取走就上锁, 之后还得取得到)
-- *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希) 永远 404
+- pxelinux.cfg/ 下任何东西 (#55, 含 default、子目录、别名) 一律 404: pxelinux.0 只走 TFTP, TFTP 发的是生成的
+- grub.cfg* 超过 pxeserver.MENU_MAX 的、不是普通文件的 (FIFO / 设备) 一律 403
+- 默认项可能是救援的 grub.cfg* (pxeserver.rescue_default_menu, #70 之前的老菜单) 403: 救援只能手选
+- 不列目录 (一律 404)
+- *.bak* 备份 (ks_write 轮换出来的, 里面有旧 root 密码哈希)、*.tmp (atomicfile 临时文件)、grub.cfg.* 永远 404
+- 文件名判断都先过 pxeserver.norm_name (Windows 部署 NTFS 大小写不敏感: KS.CFG、Grub.cfg-01-… 是同一个文件)
 
 这是防"误装"的核对, 不是访问控制: MAC 头 (和 TFTP 的文件名一样) 是客户端自己报的, LAN1 上能抓到
 DHCP 的机器可以冒充. 真正的边界是物理的 —— LAN1 只接一台被测机、守卫发现别的 DHCP 就停服、
@@ -27,8 +32,8 @@ import socket
 import sys
 import time
 
-from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, pxe_mode,
-                       rescue_default_menu, unlock_only_menu)
+from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, norm_name,
+                       private_name, pxe_mode, pxelinux_cfg_gate, rescue_default_menu, unlock_only_menu)
 
 log = logging.getLogger("httpserve")
 
@@ -43,7 +48,9 @@ def parse_args(argv):
 
 
 def is_ks(base):
-    return base.startswith("ks") and base.endswith(".cfg")
+    """归一后 ks 开头、带 .cfg 的都走 ks 门禁 (ks.cfg、ks-x.cfg、KS.CFG、ks.cfg.tmp…); ksh-*.rpm 这类仓库包不算."""
+    n = norm_name(base)
+    return n.startswith("ks") and ".cfg" in n
 
 
 def request_macs(headers):
@@ -65,8 +72,11 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
 
     def send_head(self):
         path = self.translate_path(self.path)
-        base = os.path.basename(path)
-        if ".bak" in base:
+        base = norm_name(os.path.basename(path))
+        if private_name(base) or base.startswith("grub.cfg."):
+            self.send_error(404, "File not found")
+            return None
+        if pxelinux_cfg_gate(os.path.abspath(self.directory), path) is not None:
             self.send_error(404, "File not found")
             return None
         if is_ks(base):
@@ -80,8 +90,8 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
                 return None
             self.event(f"ks 被取走 {base} mac={mac} from {self.client_address[0]}")
         elif base.startswith("grub.cfg") and os.path.lexists(path):
-            # 跟 TFTP 的差别: TFTP 只查 grub.cfg / grub.cfg-* (grub.cfg.* GRUB 不取, 原样发);
-            # HTTP 这里连 grub.cfg.* 一起查 (.bak 上面已经 404), 宁严. 不是普通文件的一律 403 (不打开 FIFO).
+            # grub.cfg.* 和 .bak 上面已经 404, 走到这里的是 grub.cfg / grub.cfg-*, 同 TFTP.
+            # 不是普通文件的一律 403 (不打开 FIFO).
             if not os.path.isfile(path):
                 self.send_error(403, "Not a regular file")
                 return None
@@ -98,11 +108,16 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
                                                               pxe_mode(self.pxe_mode_path, self.now())):
                 self.send_error(403, "Install mode is locked")
                 return None
-            if rescue_default_menu(text):                   # #70: 默认项可能是救援 (root + sshd), 同 TFTP 不发
-                log.warning("拒绝 %s 取 %s: 默认项是救援", self.client_address[0], base)
+            if rescue_default_menu(text):                   # #70: 默认项可能是救援 (root + sshd) 或 Memtest, 同 TFTP 不发
+                log.warning("拒绝 %s 取 %s: 默认项是救援或 Memtest", self.client_address[0], base)
                 self.send_error(403, "Rescue default menu refused")
                 return None
         return super().send_head()
+
+    def list_directory(self, path):
+        """不列目录 (#55 审查): 装机文件布局不对外展示; 要的文件名都写在菜单里."""
+        self.send_error(404, "File not found")
+        return None
 
 
 def make_server(ip, port, directory, sleep=time.sleep, sock_factory=None, activate=True,

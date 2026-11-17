@@ -1124,13 +1124,13 @@ def test_disarm_scrubs_install_menus_anywhere_in_tree(tmp_path):
     (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text(auto)
     (tmp_path / "grub.cfg-C000020A").write_text(auto)              # 按 IP (十六进制) 命名的菜单
     (tmp_path / "grub.cfg").write_text(auto)
-    (tmp_path / "grub.cfg.bak-20261021").write_text(auto)          # 手工备份: GRUB 不会自己去取, 留着
+    (tmp_path / "grub.cfg.bak-20261021").write_text(auto)          # 带装机项的手工备份: 也删 (#55 审查)
     kc.pxe_disarm(root=tmp_path, path=tmp_path / "pxe-mode.json")
     menus = {str(p.relative_to(tmp_path)): p.read_text() for p in tmp_path.rglob("grub.cfg*")
              if not p.name.startswith("grub.cfg.")}
     assert not any("inst.ks" in t for t in menus.values()), menus
     assert set(menus) == {"grub.cfg"}
-    assert (tmp_path / "grub.cfg.bak-20261021").exists()
+    assert not (tmp_path / "grub.cfg.bak-20261021").exists()
 
 
 # ------------------------------------------------------------ PinGate 退避 + 线程安全 (1.06.00)
@@ -1388,12 +1388,12 @@ def test_disarm_scrubs_winpe_menus_anywhere_in_tree(tmp_path):
     winpe = "set default=0\nmenuentry 'WinPE' {\n    chainloader (http,192.0.2.1)/win/ipxe.efi\n}\n"
     (tmp_path / "EFI" / "BOOT" / "grub.cfg").write_text(winpe)             # 手写进共享位置的 WinPE 菜单
     (tmp_path / "grub.cfg-C000020A").write_text(winpe)
-    (tmp_path / "grub.cfg.bak-20261030").write_text(winpe)                 # 手工备份: 不动
+    (tmp_path / "grub.cfg.bak-20261030").write_text(winpe)                 # 带装机项的手工备份: 也删 (#55 审查)
     kc.pxe_disarm(root=tmp_path, path=tmp_path / "m.json")
     menus = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("grub.cfg*")
              if not p.name.startswith("grub.cfg.")}
     assert menus == {"grub.cfg"}
-    assert (tmp_path / "grub.cfg.bak-20261030").exists()
+    assert not (tmp_path / "grub.cfg.bak-20261030").exists()   # #55 审查: 带装机项的备份也清
     assert (tmp_path / "boot.ipxe").exists() and (tmp_path / "win" / "boot.wim").exists()
 
 
@@ -1615,7 +1615,7 @@ def test_disarm_robust_oversized_fifo_and_state_first(tmp_path, monkeypatch):
     kc.pxe_disarm(root=tmp_path, path=state)
     assert not (tmp_path / "grub.cfg-C0000201").exists()
     assert (tmp_path / "grub.cfg-C0000202").exists()                # FIFO 不碰
-    assert seen == [False] and not state.exists()
+    assert seen == [False, False] and not state.exists()     # grub.cfg + pxelinux.cfg/default (#55), 都在删状态之后
 
 
 def test_disarm_one_failed_remove_does_not_stop_others(tmp_path, monkeypatch):
@@ -1654,7 +1654,7 @@ def test_arm_refuses_bad_generated_menu_and_writes_nothing(tmp_path, monkeypatch
     monkeypatch.setattr(kc, "grub_cfg_install", lambda env_path=None: menu)
     with pytest.raises(ValueError):
         kc.pxe_arm(MAC, now=1000, root=tmp_path, path=tmp_path / "m.json")
-    assert list(tmp_path.iterdir()) == []
+    assert [p.name for p in tmp_path.iterdir() if p.name != "m.json.lock"] == []    # 锁文件 (#55) 不算写菜单
 
 
 def test_disarm_reports_unreadable_menu(tmp_path, monkeypatch):
@@ -1670,3 +1670,10 @@ def test_disarm_reports_unreadable_menu(tmp_path, monkeypatch):
         os.chmod(p, 0o644)
     if os.geteuid() != 0:
         assert "grub.cfg-C0000201" in events[-1] and "删不掉" in events[-1]
+
+
+def test_checked_menu_error_names_rescue_and_memtest():
+    """#58 三审: 被 rescue_default_menu 拒的原因可能是 Memtest, 提示别只说 inst.rescue / inst.sshd."""
+    menu = ("set default=0\nset timeout=3\n\nmenuentry 'x' {\n    linux /vmlinuz memtest-lab\n}\n")
+    with pytest.raises(ValueError, match="救援 / Memtest 关键字"):
+        kc._checked_menu(menu, "02:00:00:00:00:01")
