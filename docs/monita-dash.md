@@ -25,7 +25,7 @@
 
 保险：后端在 HELLO_ACK 里校验 `proto_ver == 0`、`width == 800`、`height == 1280`、`pixfmt == 1`，不符就当“打不开”（打日志，3 s 后重试），不去硬缩放。
 
-屏在车上怎么装（竖装还是横装）还没定，见第 11 节。若横装，再在出口加一次转向即可，版面仍不动。
+屏在车上怎么装（竖装还是横装）还没定，见第 12 节。若横装，再在出口加一次转向即可，版面仍不动。
 
 ## 2. 后端抽象：并存的最小改法
 
@@ -165,17 +165,19 @@ Mac 上实测（Pillow 11.1，800×1280）：整帧转 RGB565 约 8 ms，差分 
 
 ## 7. 热插拔、SLEEP
 
-**发现设备。** Linux 上 CS80 是 Quectel 模组口 `2c7c:0901`，协议走接口 7（厂商类 0xFF，bulk IN 0x8A / OUT 0x07）。v1 选**串口节点**这一条路：扫 `/sys/class/tty/ttyUSB*` 和 `ttyACM*`，按 `device/../idVendor`、`idProduct` 和接口号 `bInterfaceNumber == 07` 找节点，用标准库 `os.open` + `termios` 设 raw（不设波特率、不要 DTR）。也接受 `--cs80-port PATH` 直接指定（fwsim 开的是 PTY，联调必须走这条）。不加 pyserial。
+**发现设备。** Linux 上 CS80 是 Quectel 模组口 `2c7c:0901`，协议走接口 7（厂商类 0xFF，bulk IN 0x8A / OUT 0x07）。v1 选**串口节点**这一条路：扫 `/sys/class/tty/ttyUSB*` 和 `ttyACM*`，从各节点的 `device` 往上走到 USB 接口和 USB 设备两层，比对接口号 `bInterfaceNumber == 07` 和设备的 `idVendor` / `idProduct`（ttyUSB 和 ttyACM 在 sysfs 里的层级不同，按目录里有没有这些文件判断，不写死相对路径；未在推车上验证），用标准库 `os.open` + `termios` 设 raw（不设波特率、不要 DTR）。也接受 `--cs80-port PATH` 直接指定（fwsim 开的是 PTY，联调必须走这条）。不加 pyserial。
 
-推车上没验证的：Rocky 9 是 `option` 驱动绑成 `ttyUSB*` 还是别的；ModemManager 会不会去探这个口（会发 AT 命令，打乱协议帧）。上车时要补一条 udev 规则（`ENV{ID_MM_DEVICE_IGNORE}="1"`，可选 `SYMLINK+="monita-cs80"`），仓库里目前没有 udev 目录，放哪里见第 11 节。备选是 pyusb 直接 claim 接口 7（venv 里已有 pyusb），v1 不做。
+推车上没验证的：Rocky 9 是 `option` 驱动绑成 `ttyUSB*` 还是别的；ModemManager 会不会去探这个口（会发 AT 命令，打乱协议帧）。上车时要补一条 udev 规则（`ENV{ID_MM_DEVICE_IGNORE}="1"`，可选 `SYMLINK+="monita-cs80"`），仓库里目前没有 udev 目录，放哪里见第 12 节。备选是 pyusb 直接 claim 接口 7（venv 里已有 pyusb），v1 不做。
 
-**拔插。** 打开失败、写失败、等 ACK 超时都当“没插”：关掉，3 s 后按 VID/PID 重新找节点（拔插后编号会变）。重连后 HELLO → 灯 → 整帧。
+**本机能测到哪。** macOS 不给这个接口建串口设备（厂商类 0xFF，系统不绑驱动，协议文档原话），Mac 参考上位机是用 IOKit 直接开接口 7 的。所以在 Mac 上，ops-cart 的串口后端**只能对 fwsim 的 PTY 测**；真机那一遍要在一台 Linux 机器上跑（任意 Linux 主机或 Linux 虚拟机直通 USB，不是推车），顺带验证 sysfs 发现和 ModemManager 的问题。若届时不方便找 Linux，再把 pyusb claim 接口 7 从备选提成第二个传输（Mac 上也能用）。
+
+**拔插。** 打开失败、写失败、等 ACK 超时都当“没插”：关掉，3 s 后按 VID/PID 重新找节点（拔插后编号会变）。重连后 HELLO → 灯 → 背光 → 整帧。主机走了时固件会把背光重新打开、把灯改回心跳，所以每次 HELLO 之后，后端都按自己记的状态重发灯和背光（背光是开着的就不用发）。
 
 **SLEEP。** `dash_service` 没有信号处理，SIGTERM 直接结束进程；SLEEP 也不能放进 `close()`（出错重连时也会走 `close()`，下一条帧又会把设备叫醒并闪一下 `888888`）。所以 v1 **不发 SLEEP**：cart-dash 停了，设备 5 s 后自己回开机页，10 min 后自己睡。空闲时要不要主动关屏，快照里目前没有可靠的“该关屏”信号，列为待定。
 
 ## 8. 现有代码里要先修的一处
 
-**问题 1：没猫时拔屏，重连要等到下一分钟。** `_connect` 放在 `if want and ...` 里面；打开失败和非猫路径的 `send` 失败都不置 `retry`。版面不变时 `want` 只在跳分钟时为真，所以实际重连间隔是“下一次版面变化或跳分钟”，不是 3 s。udisp 上影响小（最多晚 1 分钟），CS80 上会让开机页多停一会。
+**问题 1：没猫时拔屏，重连要等到下一分钟。**（已用假时钟复现：注入一个打开总是失败的 `FakeFactory`、不带猫，从整分钟后 1 s 起空跑约 30 s，`open_display` 只被调了 1 次。） `_connect` 放在 `if want and ...` 里面；打开失败和非猫路径的 `send` 失败都不置 `retry`。版面不变时 `want` 只在跳分钟时为真，所以实际重连间隔是“下一次版面变化或跳分钟”，不是 3 s。udisp 上影响小（最多晚 1 分钟），CS80 上会让开机页多停一会。
 
 实现时先写一条假时钟红测试复现，再改成：`disp is None and now >= next_try` 时就尝试连，连上后把 `want` 置真推一帧。udisp 的推帧内容和日志措辞不变，只是重连更及时。
 
@@ -218,7 +220,7 @@ TDD，假设备，不打真机。每一步 3.13 全绿，`tests/test_py39_compat
 1. **许可证。** ops-cart 是 MIT，Monita 是 PolyForm Noncommercial。本稿选择在 ops-cart 里按协议文档独立实现最小编码器（第 3 节），不依赖 Monita 代码。是否把两边的协议参考实现统一到同一许可证（比如 Monita 的协议文档和 host-ref 改成 MIT，或单独抽一个 MIT 的协议包做可选依赖），待定。
 2. **默认用哪块屏。** 本稿默认 `udisp`，CS80 要显式 `--display cs80` 或 `auto`。上车后是否改默认值。
 3. **屏怎么装。** 竖装则版面直接用；横装要在 CS80 出口加转向，并重新确认桌宠坐标。
-4. **上车时机。** 固件 v8–v10 的 KEY / LED / SLEEP / 主机走了在协议文档里标着“未上真机测”。建议先在 Mac 上过 fwsim，再在真机过一遍，再上车。
+4. **上车时机。** 固件 v8–v10 的 KEY / LED / SLEEP / 主机走了在协议文档里标着“未上真机测”。建议先在 Mac 上过 fwsim，再在一台 Linux 机器上接真机过一遍（Mac 上没有串口节点，见第 7 节），再上车。
 5. **udev 规则放哪。** 仓库里还没有 `deploy/udev/`；CS80 需要屏蔽 ModemManager 的规则，要不要连同 udisp、UPS、串口头的规则一起收进仓库。
 6. **空闲关屏 / SLEEP。** 要不要在某种条件下（夜间、长时间锁屏）主动关背光或 SLEEP；需要先有一个可靠的信号。
 7. **正常时灯亮不亮。** 本稿正常时绿常亮；若嫌晃眼，可改成正常时灭灯、只在注意 / 告警时亮。
