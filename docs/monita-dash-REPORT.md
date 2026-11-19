@@ -30,11 +30,14 @@
 
 ## 上车步骤草案（纸面，未执行）
 
-0. 先在一台 Linux（不是推车）接真机过一遍：`ls /sys/class/tty/`，插上后应多出 `ttyUSB*` 或 `ttyACM*`；然后 `python3 dash_service.py --display cs80` 看画面、段码屏、灯、+ / − 键。
+0. 先在一台 Linux（不是推车）接真机过一遍。在仓库目录、装了 Pillow 的 Python 下操作：
+   - 插拔前后各跑一次 `ls /sys/class/tty/` 和 `ip link`。应多出 `ttyUSB*` 或 `ttyACM*`；再用 `lsusb -v -d 2c7c:0901` 看全部接口（见下面第 3 步的网卡问题）。
+   - `sudo python3 dash_service.py --display cs80 --state /tmp/cs80-state.json`。默认快照路径是 `/run/ops-cart/state.json`，普通用户写不了会直接退出；串口节点一般要 root 或 `dialout` 组。
+   - 看画面、段码屏、灯、+ / − 键，拔插一次看 3 s 内恢复。
 1. 随下一个版本打包。新模块会被 `pack-*.sh` 自动带上，`accept_core` 清单已加；但新版本号的 install / pack / 部署文档还没写。
 2. 推车上确认 venv 里的 Pillow ≥ 8.2：`/opt/pxe/venv/bin/python -c "import PIL; print(PIL.__version__)"`。这是 main 上 `dash_render` 原有的要求。
-3. 插屏，看 `ls /sys/class/tty/ | grep -E 'ttyUSB|ttyACM'`。没有节点就停在这里，说明 `option` 驱动不认这个口，回来定是 `new_id` 还是改用 pyusb。
-4. 屏蔽 ModemManager（若在跑）。在 `/etc/udev/rules.d/` 下加一条：`ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0901", ENV{ID_MM_DEVICE_IGNORE}="1"`，然后 `udevadm control --reload` 并重新插拔。
+3. 插屏，看 `ls /sys/class/tty/ | grep -E 'ttyUSB|ttyACM'`。没有节点就停在这里，说明 `option` 驱动不认这个口，回来定是 `new_id` 还是改用 pyusb。同时对比插屏前后的 `ip link` / `nmcli device`：这是 Quectel 复合设备，协议文档只写了 AT、NMEA、modem（接口 7）几个口，有没有 RNDIS / ECM 网卡接口没写。要是多出一块网卡被 NetworkManager 接管，就先拔掉，回来加 unmanaged 规则再上。
+4. 屏蔽 ModemManager（若在跑）。**规则是草稿，没测过**：在 `/etc/udev/rules.d/` 下加一条：`ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0901", ENV{ID_MM_DEVICE_IGNORE}="1"`，然后 `udevadm control --reload` 并重新插拔。
 5. 切换：`systemctl edit cart-dash`，写入
    ```ini
    [Service]
@@ -42,7 +45,7 @@
    ExecStart=/opt/pxe/venv/bin/python /opt/pxe/dash_service.py --display cs80
    ```
    然后 `systemctl restart cart-dash`，用 `journalctl -u cart-dash -f` 应能看到 `副屏已连接 'Monita-CS80 fw v10 ...'`。
-6. 量一下：`dc.collect` 最长耗时，以及猫动的时候 CPU 占用（设计稿 TODO 第 6 条）。
+6. 量一下：`dc.collect` 最长耗时，以及猫动的时候 CPU 占用（设计稿 TODO 第 8 条）。
 7. 回滚：`systemctl revert cart-dash && systemctl restart cart-dash`，就回到 udisp。
 
 ## 待你决定

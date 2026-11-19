@@ -364,17 +364,19 @@ CS80_FWSIM=/path/to/fwsim python3 -m pytest tests/test_cs80_fwsim.py
 1. **真机 + Linux 过一遍。** 串口后端只对 fwsim 的 PTY 测过，sysfs 发现只用假的 sysfs 树测过。找一台 Linux（不是推车）接真机：看插上后有没有 `ttyUSB*` / `ttyACM*`，`find_port()` 能不能找到接口 07，然后 `--display cs80` 跑起来看画面、段码屏、灯、+ / − 键。
 2. **Rocky 9 有没有 tty 节点。** 内核 `option` 驱动不一定认 `2c7c:0901` 的接口 7（第 12 节第 8 条）。没有节点时 cart-dash 每 3 s 打不开、日志只打一行“没找到 Monita-CS80”，不会崩，但屏上只有开机页。
 3. **ModemManager。** Rocky 9 上若开着 ModemManager，会去探 Quectel 的口、发 AT 命令打乱协议帧。要一条 udev 规则 `ENV{ID_MM_DEVICE_IGNORE}="1"`；仓库里还没有 udev 目录（第 12 节第 5 条）。
-4. **切换方式。** `cart-dash.service` 的 `ExecStart` 没带参数，默认 udisp。切 CS80 要加一个 systemd drop-in 覆盖 `ExecStart`（步骤见 `monita-dash-REPORT.md`），仓库里没放这个 drop-in。
-5. **打包。** 新模块会被 `pack-*.sh` 按 `git ls-files *.py` 带上，`accept_core` 清单已加；但下一个版本号的 `install-*.sh` / `pack-*.sh` / 部署文档还没写，等决定上车时机再一起出。
+4. **复合设备的其他接口。** `2c7c:0901` 是 Quectel 模组的复合设备。协议文档只写了 AT、NMEA、modem（接口 7）几个口，没列全部接口。若带 RNDIS / ECM 网卡接口，插上推车会多一块网卡，可能被 NetworkManager 接管、影响推车的路由。真机那一遍用 `lsusb -v` 看清楚；插拔前后对比 `ip link`，有网卡就加 unmanaged 规则。
+5. **Linux 上手跑的权限。** 默认快照路径 `/run/ops-cart/state.json`，普通用户写不了会直接退出。在非推车机器上要加 `--state /tmp/...`，串口节点要 root 或 `dialout` 组。
+6. **切换方式。** `cart-dash.service` 的 `ExecStart` 没带参数，默认 udisp。切 CS80 要加一个 systemd drop-in 覆盖 `ExecStart`（步骤见 `monita-dash-REPORT.md`），仓库里没放这个 drop-in。
+7. **打包。** 新模块会被 `pack-*.sh` 按 `git ls-files *.py` 带上，`accept_core` 清单已加；但下一个版本号的 `install-*.sh` / `pack-*.sh` / 部署文档还没写，等决定上车时机再一起出。
 
 上车后要量的：
 
-6. 在推车上量 `dc.collect` 一轮的最长耗时（超过 2 s 保活会漏拍，靠 3.5 s 重新 HELLO 兜底，开机页可能闪一下），以及整帧 / 差分转 RGB565 的 CPU 开销，再定猫在 CS80 上要不要降到 4 fps（第 4、5 节）。
+8. 在推车上量 `dc.collect` 一轮的最长耗时（超过 2 s 保活会漏拍，靠 3.5 s 重新 HELLO 兜底，开机页可能闪一下），以及整帧 / 差分转 RGB565 的 CPU 开销，再定猫在 CS80 上要不要降到 4 fps（第 4、5 节）。
 
 设计里写了、v1 没做的：
 
-7. ≡ 键翻到自检明细页（第 6 节）：要 `dash_render` 加一个只吃 `view` 的页面函数，锁屏时不翻、60 s 无按键回主页。
-8. 空闲关屏 / SLEEP（第 7 节、第 12 节第 6 条）：先要有可靠的“该关屏”信号。
-9. 屏横装时出口转向（第 12 节第 3 条）。
-10. README 加 CS80 这一行和三个新模块（等下次 README 整理）。`cart-dash.service` 的 Description 仍写着 udisp，切 CS80 时 journal 标题会有点误导，可顺手改。
-11. 许可证是否统一（第 12 节第 1 条）。
+9. ≡ 键翻到自检明细页（第 6 节）：要 `dash_render` 加一个只吃 `view` 的页面函数，锁屏时不翻、60 s 无按键回主页。
+10. 空闲关屏 / SLEEP（第 7 节、第 12 节第 6 条）：先要有可靠的“该关屏”信号。
+11. 屏横装时出口转向（第 12 节第 3 条）。
+12. README 加 CS80 这一行和三个新模块（等下次 README 整理）。`cart-dash.service` 的 Description 仍写着 udisp，切 CS80 时 journal 标题会有点误导，可顺手改。
+13. 许可证是否统一（第 12 节第 1 条）。
