@@ -336,7 +336,7 @@ CS80_FWSIM=/path/to/fwsim python3 -m pytest tests/test_cs80_fwsim.py
 - 设备报错后 `tick` 自己补整帧（限 1 s 一次）。
 - 打不开 / 掉线的日志带上原因（`ValueError: Monita-CS80 不兼容: proto_ver 2`），原因变了再打一行。
 - HELLO 超时重连退避到 30 s。
-- 串口加 `TIOCEXCL`：开着时别的非 root 进程再开同一个节点直接失败，不悄悄抢字节（root / ModemManager 绕得过，仍要 udev 规则）。
+- 串口加 `TIOCEXCL`：开着时别的非 root 进程再开同一个节点直接失败，不悄悄抢字节（root / ModemManager 绕得过，仍要 udev 规则）。这个标志挂在 tty 上，`close()` 时先 `TIOCNXCL` 撤掉。macOS 的 PTY 不认这个 ioctl，EBUSY 行为只在 Linux 上能测（那条用例在 Mac 上 skip）。
 
 ### 和最初任务描述不同的地方
 
@@ -351,6 +351,6 @@ CS80_FWSIM=/path/to/fwsim python3 -m pytest tests/test_cs80_fwsim.py
 
 - 没上真机：串口后端只对 fwsim 的 PTY 测过。sysfs 发现只用假的 sysfs 树测过，Rocky 9 上会不会出现 tty 节点还不知道（第 12 节第 8 条）。
 - 没在推车上量过 `dc.collect` 的最长耗时，也没量过整帧 / 差分的 CPU 开销（第 4、5 节）。
-- 安装 / 打包脚本还没收新模块：现有的 `install-*.sh` / `pack-*.sh` 按版本号命名，等下一版一起加。udev 规则（屏蔽 ModemManager）也还没写。
+- 打包脚本按 `git ls-files *.py` 收顶层模块，三个新模块会自动带上；`accept_core` 的模块清单已同步。udev 规则（屏蔽 ModemManager）还没写。
 - README 没改：README 按 PR 数定期整理，下次整理时再加 CS80 这一行和新模块。
 - 许可证是否统一仍待定（第 12 节第 1 条）。

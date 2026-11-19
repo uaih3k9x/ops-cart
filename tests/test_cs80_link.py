@@ -60,7 +60,7 @@ def test_port_sets_tiocexcl(monkeypatch):
     master, path, slave = _pty()
     try:
         cl.Port(path).close()
-        assert calls == [termios.TIOCEXCL]
+        assert calls == [termios.TIOCEXCL, termios.TIOCNXCL]    # 独占标志挂在 tty 上: 关之前撤掉, 重连才开得开
     finally:
         os.close(master)
         os.close(slave)

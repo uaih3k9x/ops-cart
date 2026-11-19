@@ -84,6 +84,10 @@ class Port:
 
     def close(self):
         if self.fd is not None:
+            try:                            # TIOCEXCL 挂在 tty 上不跟 fd 走: 不撤的话 tty 还活着 (PTY) 时自己重连也 EBUSY
+                fcntl.ioctl(self.fd, termios.TIOCNXCL)
+            except OSError:
+                pass                        # 拔掉了: 节点已经没了
             os.close(self.fd)
             self.fd = None
 

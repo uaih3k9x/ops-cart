@@ -425,3 +425,12 @@ def test_tick_full_frame_retry_is_rate_limited():
     m = len(dev.frames)
     d.tick(WALL, {}, VIEW)
     assert dev.types()[m:].count(p.RECT) == 80
+
+
+def test_silent_device_raises_builtin_timeout_error():
+    """节点在但 HELLO 不应答: 必须抛内置 TimeoutError, dash_service 靠它判断要不要退避."""
+    dev = FakeDevice()
+    dev.silent.add(p.HELLO)
+    with pytest.raises(TimeoutError):
+        mc.open_display(port="/dev/x", opener=lambda path: dev, clock=dev.clock, wall=lambda: WALL)
+    assert dev.closed
