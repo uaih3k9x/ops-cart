@@ -34,6 +34,7 @@ import theme as th
 
 SAMPLE_S = 0.2          # 快照节奏
 RECONNECT_S = 3.0       # 拔线后重连间隔
+SLOW_RETRY_MAX_S = 30.0 # 节点在但 HELLO 超时 (每次卡采集线程 1 s): 间隔翻倍退避到这么久
 DEFAULT_FPS = 2.0       # 副屏推送上限: 仪表板不是视频
 
 
@@ -43,16 +44,28 @@ def _view_key(view):
                       sort_keys=True, ensure_ascii=False)
 
 
-def _connect(factory, out, quiet=False):
-    """quiet: 上一次已经报过没插了. 每 3 s 重试一次, 连续失败只在第一次打日志, 不刷 journal."""
+def _why(e):
+    return "%s: %s" % (type(e).__name__, e)
+
+
+def _connect(factory, out, last=None):
+    """返回 (显示对象, None) 或 (None, 异常). last: 上一次失败的 _why; 原因没变就不再打日志, 不刷 journal
+    (没插 → 插上个不兼容的, 原因变了照打一行)."""
     try:
         disp = factory().open_display()
         print("副屏已连接 %r" % (getattr(disp, "cfg_text", "") or "").strip("\x00"), file=out)
-        return disp
-    except Exception as e:                     # 没插 / 权限 / libusb 忙
-        if not quiet:
-            print("副屏没插/打不开: %s" % type(e).__name__, file=out)
-        return None
+        return disp, None
+    except Exception as e:                     # 没插 / 权限 / libusb 忙 / 不兼容 / HELLO 超时
+        if _why(e) != last:
+            print("副屏没插/打不开: %s" % _why(e), file=out)
+        return None, e
+
+
+def _retry_gap(e, gap):
+    """下一次重连等多久. TimeoutError = 节点在但不应答 (旧固件 / 口被占), 翻倍退避; 别的 (没插等) 照旧 3 s."""
+    if isinstance(e, TimeoutError):
+        return min(SLOW_RETRY_MAX_S, gap * 2) if gap else RECONNECT_S
+    return RECONNECT_S
 
 
 def pick_display(display, cs80_port=None, out=sys.stdout):
@@ -129,7 +142,7 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, factory, render, p
         return dash_render.render(v) if img else dash_render.make_frame(v)
 
     def drop(why, e, at):
-        print("%s, 稍后重连: %s" % (why, type(e).__name__), file=out)
+        print("%s, 稍后重连: %s" % (why, _why(e)), file=out)
         try:
             disp.close()
         except Exception:
@@ -141,7 +154,8 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, factory, render, p
     seq = pushed = 0
     last_key = last_clock = last_view = None
     retry = False                           # 刚连上: 不管版面变没变都推一帧
-    quiet = False                           # 已经报过没插了, 连续失败不再打
+    fail_why = None                         # 上一次打不开的原因: 没变就不再打日志
+    fail_gap = 0.0                          # 上一次的重连间隔 (HELLO 超时时翻倍)
     last_push = 0.0
     disp = None
     next_try = 0.0
@@ -162,11 +176,12 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, factory, render, p
         _pet_sync(box, view, out)
 
         if not preview and disp is None and now >= next_try:      # 重连按时间走, 不等版面变 (设计稿第 8 节)
-            disp = _connect(factory, out, quiet)
+            disp, err = _connect(factory, out, fail_why)
             if disp is None:
-                next_try, quiet = now + RECONNECT_S, True
+                fail_gap = _retry_gap(err, fail_gap)
+                next_try, fail_why = now + fail_gap, _why(err)
             else:
-                retry, quiet = True, False
+                retry, fail_why, fail_gap = True, None, 0.0
 
         want = key != last_key or view.get("clock") != last_clock or view.get("stale") or retry
         if want and now - last_push >= max_gap:

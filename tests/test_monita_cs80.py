@@ -76,7 +76,7 @@ def test_open_display_explicit_port_skips_discovery(tmp_path):
     seen = []
     d = mc.open_display(port="/dev/pts/9", sys_root=str(tmp_path / "nothing"),
                         opener=lambda path: seen.append(path) or dev, clock=dev.clock, wall=lambda: WALL)
-    assert seen == ["/dev/pts/9"] and d.wants_image and dev.types() == [p.HELLO]
+    assert seen == ["/dev/pts/9"] and d.wants_image and dev.types() == [p.HELLO, p.BACKLIGHT]
 
 
 def test_open_display_closes_port_when_incompatible():
@@ -278,15 +278,16 @@ def test_boot_view_ticks_without_crashing():
 
 def test_minus_and_plus_toggle_backlight_on_up_only():
     d, dev, _ = _disp()
+    n = len(dev.frames)                           # HELLO 后那一条 (背光开) 不算
     dev.press(p.KEY_MINUS, p.EV_DOWN)
     d.tick(WALL, {}, VIEW)
-    assert p.BACKLIGHT not in dev.types()
+    assert p.BACKLIGHT not in dev.types()[n:]
     dev.press(p.KEY_MINUS, p.EV_UP)
     d.tick(WALL, {}, VIEW)
     assert dev.last(p.BACKLIGHT) == b"\x00"
     dev.press(p.KEY_MINUS, p.EV_UP)               # 已经关了, 不重复发
     d.tick(WALL, {}, VIEW)
-    assert dev.types().count(p.BACKLIGHT) == 1
+    assert dev.types()[n:].count(p.BACKLIGHT) == 1
     dev.press(p.KEY_PLUS, p.EV_UP)
     d.tick(WALL, {}, VIEW)
     assert dev.last(p.BACKLIGHT) == b"\x01"
@@ -373,3 +374,54 @@ def test_dash_render_lands_unrotated_in_both_themes(mode):
     want = ((rgb[0] >> 3) << 11) | ((rgb[1] >> 2) << 5) | (rgb[2] >> 3)
     corner = ((p.PANEL_H // 2) * p.PANEL_W + 2) * 2              # 左边距里, 只有底色
     assert struct.unpack_from("<H", dev.fb, corner)[0] == want
+
+
+# ---- 评审修复: 快速重连后的背光 / 坏帧后 tick 自己补整帧
+
+def test_fast_reconnect_resends_backlight_so_plus_key_works():
+    """− 关了背光, 5 s 看门狗之前就重连 (新 Display): 固件 HELLO 不动背光, 主机必须按自己想要的重发."""
+    d, dev, _ = _disp()
+    dev.press(p.KEY_MINUS)
+    d.tick(WALL, {}, VIEW)
+    assert dev.backlight == 0
+    d.close()
+    d2 = mc.Display(cl.Link(dev, clock=dev.clock), clock=dev.clock, wall=lambda: WALL, log=lambda s: None)
+    assert dev.backlight == 1                     # 新会话默认开, HELLO 后就发了
+    dev.press(p.KEY_MINUS)
+    d2.tick(WALL, {}, VIEW)
+    assert dev.backlight == 0
+    dev.press(p.KEY_PLUS)
+    d2.tick(WALL, {}, VIEW)
+    assert dev.backlight == 1
+
+
+def test_tick_repushes_full_frame_after_device_error():
+    """diff 的 RECT 被设备丢了 (计数涨): 不等下一次 send, 下一轮 tick 就推整帧补上."""
+    d, dev, _ = _disp()
+    d.send(_img())
+    dev.reject_rects = 1
+    b = _img()
+    b.putpixel((0, 0), (255, 0, 0))
+    d.send(b)
+    assert bytes(dev.fb) != p.rgb565(b) and d.full
+    n = len(dev.frames)
+    d.tick(WALL, {}, VIEW)
+    assert dev.types()[n:].count(p.RECT) == 80 and bytes(dev.fb) == p.rgb565(b) and not d.full
+
+
+def test_tick_full_frame_retry_is_rate_limited():
+    """设备每条 RECT 都拒: tick 不能每 0.2 s 推一张 2 MB 整帧, 最多 1 s 一次."""
+    d, dev, _ = _disp()
+    d.send(_img())
+    dev.reject_rects = 10 ** 9
+    b = _img((5, 5, 5))
+    d.send(b)
+    n = len(dev.frames)
+    for _ in range(4):                            # 0.8 s 里 4 轮
+        d.tick(WALL, {}, VIEW)
+        dev.clock.advance(0.2)
+    assert dev.types()[n:].count(p.RECT) == 80    # 只补了第一次
+    dev.clock.advance(0.3)
+    m = len(dev.frames)
+    d.tick(WALL, {}, VIEW)
+    assert dev.types()[m:].count(p.RECT) == 80

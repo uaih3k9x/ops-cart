@@ -5,6 +5,7 @@ Port: 打开一个串口节点 (Linux 上的 ttyUSB / ttyACM, 或 fwsim 的 PTY)
 Link: 帧序号、按 type+seq 等应答、等应答时把 KEY 分出来、超时抛 OSError (上层当"没插"处理).
 """
 
+import fcntl
 import os
 import select
 import termios
@@ -33,12 +34,14 @@ def raw_attrs(attrs):
 
 class Port:
     """一个已打开的串口节点. O_NOCTTY: root 跑也不变成控制终端; O_NONBLOCK + CLOCAL: 没载波不卡 open.
-    不设波特率 (USB 虚拟串口), 不动 DTR."""
+    不设波特率 (USB 虚拟串口), 不动 DTR. TIOCEXCL: 开着时别的非 root 进程再开同一个节点直接 EBUSY,
+    不会两边悄悄抢字节 (root / ModemManager 绕得过, 不能代替 udev 规则)."""
 
     def __init__(self, path):
         self.path = path
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         try:
+            fcntl.ioctl(self.fd, termios.TIOCEXCL)
             termios.tcsetattr(self.fd, termios.TCSANOW, raw_attrs(termios.tcgetattr(self.fd)))
             self.flush()
         except Exception:

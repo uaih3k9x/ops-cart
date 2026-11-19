@@ -19,6 +19,7 @@ VENDOR_ID, PRODUCT_ID, INTERFACE = "2c7c", "0901", 7
 SEG_S = 1.0             # 段码屏 1 s 一次, 顺带喂看门狗
 PING_S = 2.0            # 这么久没发过任何帧就 PING
 REHELLO_S = 3.5         # 这么久没发过: 设备可能已回开机页, 先 HELLO 再推整帧
+FULL_RETRY_S = 1.0      # 设备报了错 (该推整帧) 时 tick 自己补推; 补了还错的话最多这么久一次
 
 
 def _read(path):
@@ -94,6 +95,7 @@ class Display:
         self.backlight = True
         self.disabled = set()           # 设备回 status 1 / 3 的功能, 本次会话不再发
         self.frame_id = 0
+        self.retry_at = 0.0             # tick 下一次可以自己补推整帧的时刻
         self._hello()
 
     # ---------------------------------------------------------------- 会话
@@ -114,8 +116,8 @@ class Display:
         self.key_n = None               # HELLO 把 KEY 计数清零
         self.cfg_text = "Monita-CS80 fw v%d caps 0x%02x max_payload %d" % (
             info["fw_ver"], info["caps"], info["max_payload"])
-        if not self.backlight:          # 主机走了时固件会把背光打开; 按自己记的状态重发
-            self._feature(p.BACKLIGHT, b"\x00", "BACKLIGHT")
+        # HELLO 不动背光: 5 s 看门狗之前重连时设备可能还关着 (主机走了时固件才会打开). 不管开关都按自己记的重发
+        self._feature(p.BACKLIGHT, b"\x01" if self.backlight else b"\x00", "BACKLIGHT")
 
     def _idle(self):
         last = self.link.last_tx
@@ -170,8 +172,9 @@ class Display:
             self._key(k)
         if self._idle() >= REHELLO_S:
             self._hello()
-            if self.last_img is not None:
-                self._push(self.last_img)
+        if self.full and self.last_img is not None and self.clock() >= self.retry_at:
+            self._push(self.last_img)       # 重新 HELLO 过, 或上一帧设备报了错: 不等下一次 send
+            self.retry_at = self.clock() + FULL_RETRY_S if self.full else 0.0
         if self.led_ok:
             st = p.led_state(snap, view)
             if st != self.led_sent:

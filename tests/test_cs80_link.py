@@ -2,6 +2,7 @@
 
 import os
 import struct
+import sys
 import termios
 import threading
 
@@ -46,6 +47,34 @@ def test_port_on_pty_is_raw_no_echo_and_binary_clean():
         assert port.read(1.0) == b"\x0d\x0a\xa5\x5a"
         port.write(b"x")
         assert os.read(master, 10) == b"x"          # 设备发来的字节没被回显回设备
+        port.close()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_port_sets_tiocexcl(monkeypatch):
+    calls = []
+    real = cl.fcntl.ioctl
+    monkeypatch.setattr(cl.fcntl, "ioctl", lambda fd, req, *a: calls.append(req) or real(fd, req, *a))
+    master, path, slave = _pty()
+    try:
+        cl.Port(path).close()
+        assert calls == [termios.TIOCEXCL]
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or os.geteuid() == 0,
+                    reason="macOS 的 pty 不认 TIOCEXCL; root 绕得过")
+def test_port_is_exclusive_second_open_fails():
+    """开着时别的进程 (调试用的 picocom / 别的上位机) 再开同一个节点要立刻失败, 不能悄悄抢字节."""
+    master, path, slave = _pty()
+    try:
+        port = cl.Port(path)
+        with pytest.raises(OSError):
+            cl.Port(path)
         port.close()
     finally:
         os.close(master)

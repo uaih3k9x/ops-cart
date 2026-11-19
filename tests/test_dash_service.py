@@ -519,3 +519,54 @@ def test_args_default_udisp_and_cs80_choice():
     assert a.display == "cs80" and a.cs80_port == "/dev/pts/3"
     with pytest.raises(SystemExit):
         ds.parse_args(["--display", "auto"])
+
+
+# ---- 评审修复: 打不开的原因要进日志; 设备在但不应答 HELLO 时退避
+
+class SeqFactory:
+    """按顺序抛这些异常 (最后一个一直抛)."""
+
+    def __init__(self, errs):
+        self.errs, self.calls = errs, 0
+
+    def open_display(self):
+        self.calls += 1
+        raise self.errs[min(self.calls - 1, len(self.errs) - 1)]
+
+
+def test_connect_failure_logs_reason_and_relogs_when_it_changes(tmp_path, monkeypatch):
+    """先没插, 后来插上个不兼容的: 原因变了要再打一行 (带上为什么), 原因不变不刷."""
+    f = SeqFactory([FileNotFoundError("没找到 Monita-CS80")] * 3 + [ValueError("Monita-CS80 不兼容: proto_ver 2")])
+    out = io.StringIO()
+    Stop = _stopping_clock(monkeypatch, 40)
+    with pytest.raises(Stop):
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(now=lambda: ds.time.time()), out=out,
+               display_factory=lambda: f, render=lambda v: b"x")
+    log = out.getvalue()
+    assert f.calls >= 5
+    assert log.count("副屏没插/打不开") == 2
+    assert "FileNotFoundError: 没找到 Monita-CS80" in log and "ValueError: Monita-CS80 不兼容: proto_ver 2" in log
+
+
+def test_drop_logs_reason(tmp_path, monkeypatch):
+    disp = FakeImgDisp(tick_fail_at=2)
+    out = io.StringIO()
+    Stop = _stopping_clock(monkeypatch, 6)
+    with pytest.raises(Stop):
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(now=lambda: ds.time.time()), out=out,
+               display_factory=lambda: FakeFactory(disp), render=lambda v: b"x")
+    assert "稍后重连: OSError: ack timeout" in out.getvalue()
+
+
+def test_hello_timeouts_back_off_but_unplugged_keeps_3s(tmp_path, monkeypatch):
+    """节点在但 HELLO 一直超时 (每次在采集线程上卡 1 s): 退避到最多 30 s 一次; 没插 (找不到) 照旧 3 s."""
+    def calls(err):
+        f = SeqFactory([err])
+        Stop = _stopping_clock(monkeypatch, 120)
+        with pytest.raises(Stop):
+            ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(now=lambda: ds.time.time()), out=io.StringIO(),
+                   display_factory=lambda: f, render=lambda v: b"x")
+        return f.calls
+    plain, slow = calls(FileNotFoundError("no dev")), calls(TimeoutError("等 0x01 的应答超时"))
+    assert plain >= 5 * slow                    # 假时钟下约 120 次 vs 15 次
+    assert slow >= 8                            # 封顶 30 s, 不是越退越久

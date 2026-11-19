@@ -205,3 +205,48 @@ def test_dash_service_end_to_end(sim, tmp_path, monkeypatch):
     assert "副屏已连接" in out.getvalue() and "Monita-CS80" in out.getvalue()
     assert st["presents"] >= 1 and st["bad_param"] == 0 and st["seg_host_seen"] == 1
     assert st["led_mask"] == p.LED_GREEN and st["link_up"] == 1
+
+
+def test_fast_reconnect_resends_backlight(sim):
+    """− 关背光后不到 5 s 就重连: 固件 HELLO 不动背光, 新会话得自己发背光开, 之后 + / − 照常."""
+    d = _open(sim)
+    d.send(_img(8))
+    sim.tap(p.KEY_MINUS)
+    _ticks(d, 0.6, VIEW)
+    assert sim.stat()["backlight"] == 0
+    d.close()
+    d = _open(sim)
+    assert sim.stat()["backlight"] == 1
+    sim.tap(p.KEY_MINUS)
+    _ticks(d, 0.6, VIEW)
+    assert sim.stat()["backlight"] == 0
+    sim.tap(p.KEY_PLUS)
+    _ticks(d, 0.6, VIEW)
+    assert sim.stat()["backlight"] == 1
+    d.close()
+
+
+def test_bad_diff_rect_repaired_by_next_tick(sim, monkeypatch):
+    """diff 里一条 RECT 的 CRC 坏了: 设备丢掉、计数; 下一轮 tick 就推整帧补上, 不等下一次 send."""
+    d = _open(sim)
+    a = _img(9)
+    d.send(a)
+    b = a.copy()
+    b.paste((255, 255, 255), (100, 600, 180, 630))
+    real = p.encode
+    hit = []
+
+    def bad(ptype, seq, payload=b""):
+        f = bytearray(real(ptype, seq, payload))
+        if ptype == p.RECT and not hit:
+            hit.append(1)
+            f[-1] ^= 0xFF
+        return bytes(f)
+    monkeypatch.setattr(p, "encode", bad)
+    d.send(b)
+    monkeypatch.setattr(p, "encode", real)
+    st = sim.stat()
+    assert st["crc_err"] == 1 and st["screen_crc"] != _crc(b)
+    d.tick(time.time(), {}, VIEW)
+    assert sim.stat()["screen_crc"] == _crc(b)
+    d.close()

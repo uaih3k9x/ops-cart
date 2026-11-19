@@ -35,6 +35,7 @@ class FakeDevice:
         self.reject_rects = 0               # 接下来几条 RECT 当 bad_param
         self.closed = False
         self.unplugged = False
+        self.backlight = 1                  # 跟真固件一样: HELLO 不动背光
         self.reset()
         self.writes = 0
 
@@ -98,6 +99,9 @@ class FakeDevice:
             self.cnt["rects"] += 1
         elif t == p.PRESENT:
             self.cnt["presents"] += 1
+            self._ack(t, seq)
+        elif t == p.BACKLIGHT:
+            self.backlight = pl[0] if pl else 1
             self._ack(t, seq)
         elif t == p.LED and not self.hello["caps"] & p.CAP_LED:
             self._ack(t, seq, status=3)
