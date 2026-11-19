@@ -204,7 +204,7 @@ Mac 上实测（Pillow 11.1，800×1280）：整帧转 RGB565 约 8 ms，差分 
 
 - `dash_service.py --display udisp|cs80`，**默认 `udisp`**，推车现有行为不变，`cart-dash.service` 不用改。二选一，进程起来就定了，重连只重连同一种屏。
   - `auto` 不做（YAGNI）：车上只会接一块屏，显式指定就够；`auto` 每次重连换后端还会让日志和状态来回跳。
-- `--cs80-port PATH`：指定串口节点（fwsim 的 PTY、或 udev 符号链接）。
+- `--cs80-port PATH`：指定串口节点（fwsim 的 PTY、或 udev 符号链接）。只能配 `--display cs80`，配给 udisp 直接报参数错。
 - 新模块进下一版的 install / pack 清单（`scripts/install-*.sh`、`pack-*.sh`）。
 - 不做两块屏同时出。
 
@@ -347,10 +347,34 @@ CS80_FWSIM=/path/to/fwsim python3 -m pytest tests/test_cs80_fwsim.py
 - 不发 SLEEP（第 7 节）。编码器认识 0x32，但后端没有任何路径会发它，有测试锁住。
 - ≡ 键翻到明细页留到第二阶段，v1 只用 + / − 开关背光。
 
-### 已知缺口
+### 完整性检查（2026-11-19）
 
-- 没上真机：串口后端只对 fwsim 的 PTY 测过。sysfs 发现只用假的 sysfs 树测过，Rocky 9 上会不会出现 tty 节点还不知道（第 12 节第 8 条）。
-- 没在推车上量过 `dc.collect` 的最长耗时，也没量过整帧 / 差分的 CPU 开销（第 4、5 节）。
-- 打包脚本按 `git ls-files *.py` 收顶层模块，三个新模块会自动带上；`accept_core` 的模块清单已同步。udev 规则（屏蔽 ModemManager）还没写。
-- README 没改：README 按 PR 数定期整理，下次整理时再加 CS80 这一行和新模块。
-- 许可证是否统一仍待定（第 12 节第 1 条）。
+对照本稿逐节核了代码和测试，又按 README / `cart-dash.service` / 打包脚本在纸面上走了一遍上车流程（没碰推车）。
+
+- 补了两处小缺口（先写红测试）：`--cs80-port` 不配 `--display cs80` 时以前悄悄忽略，现在直接报参数错；“有猫 + 要图的副屏”走 `Stage.image` 而不是 `Stage.frame` 以前在 `dash_service` 层没有用例，补了一条。
+- 验证：3.13 全仓绿；系统自带 Python 3.9.6 + Pillow 11.3 全仓绿；fwsim 联调 11 条在 3.13 和 3.9 下都过。
+- 发现一个**不是本分支引入**的约束：`dash_render` 用了 `ImageDraw.rounded_rectangle`，要 Pillow ≥ 8.2。Python 3.9 + Pillow 8.1 下 udisp 和 CS80 都会推帧失败（日志 `AttributeError`）。按 README 的 `pip install pillow` 装出来的是新版，没问题；上车前确认一下 venv 里的版本即可。
+
+剩下的大缺口进下面的 TODO。
+
+## TODO
+
+上车前必须过的（不过就会卡住）：
+
+1. **真机 + Linux 过一遍。** 串口后端只对 fwsim 的 PTY 测过，sysfs 发现只用假的 sysfs 树测过。找一台 Linux（不是推车）接真机：看插上后有没有 `ttyUSB*` / `ttyACM*`，`find_port()` 能不能找到接口 07，然后 `--display cs80` 跑起来看画面、段码屏、灯、+ / − 键。
+2. **Rocky 9 有没有 tty 节点。** 内核 `option` 驱动不一定认 `2c7c:0901` 的接口 7（第 12 节第 8 条）。没有节点时 cart-dash 每 3 s 打不开、日志只打一行“没找到 Monita-CS80”，不会崩，但屏上只有开机页。
+3. **ModemManager。** Rocky 9 上若开着 ModemManager，会去探 Quectel 的口、发 AT 命令打乱协议帧。要一条 udev 规则 `ENV{ID_MM_DEVICE_IGNORE}="1"`；仓库里还没有 udev 目录（第 12 节第 5 条）。
+4. **切换方式。** `cart-dash.service` 的 `ExecStart` 没带参数，默认 udisp。切 CS80 要加一个 systemd drop-in 覆盖 `ExecStart`（步骤见 `monita-dash-REPORT.md`），仓库里没放这个 drop-in。
+5. **打包。** 新模块会被 `pack-*.sh` 按 `git ls-files *.py` 带上，`accept_core` 清单已加；但下一个版本号的 `install-*.sh` / `pack-*.sh` / 部署文档还没写，等决定上车时机再一起出。
+
+上车后要量的：
+
+6. 在推车上量 `dc.collect` 一轮的最长耗时（超过 2 s 保活会漏拍，靠 3.5 s 重新 HELLO 兜底，开机页可能闪一下），以及整帧 / 差分转 RGB565 的 CPU 开销，再定猫在 CS80 上要不要降到 4 fps（第 4、5 节）。
+
+设计里写了、v1 没做的：
+
+7. ≡ 键翻到自检明细页（第 6 节）：要 `dash_render` 加一个只吃 `view` 的页面函数，锁屏时不翻、60 s 无按键回主页。
+8. 空闲关屏 / SLEEP（第 7 节、第 12 节第 6 条）：先要有可靠的“该关屏”信号。
+9. 屏横装时出口转向（第 12 节第 3 条）。
+10. README 加 CS80 这一行和三个新模块（等下次 README 整理）。`cart-dash.service` 的 Description 仍写着 udisp，切 CS80 时 journal 标题会有点误导，可顺手改。
+11. 许可证是否统一（第 12 节第 1 条）。

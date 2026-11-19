@@ -284,7 +284,10 @@ def parse_args(argv=None):
     ap.add_argument("--display", choices=("udisp", "cs80"), default="udisp",
                     help="副屏: udisp (默认, xfz1986 USB 屏) 或 cs80 (Monita-CS80)")
     ap.add_argument("--cs80-port", help="CS80 串口节点 (不给就按 sysfs 找 2c7c:0901 接口 07)")
-    return ap.parse_args(argv)
+    a = ap.parse_args(argv)
+    if a.cs80_port and a.display != "cs80":
+        ap.error("--cs80-port 只配 --display cs80 用")
+    return a
 
 
 def main():

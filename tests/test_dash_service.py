@@ -570,3 +570,24 @@ def test_hello_timeouts_back_off_but_unplugged_keeps_3s(tmp_path, monkeypatch):
     plain, slow = calls(FileNotFoundError("no dev")), calls(TimeoutError("等 0x01 的应答超时"))
     assert plain >= 5 * slow                    # 假时钟下约 120 次 vs 15 次
     assert slow >= 8                            # 封顶 30 s, 不是越退越久
+
+
+# ---- 完整性检查补的两条
+
+def test_cs80_port_without_cs80_display_is_an_error(capsys):
+    """--cs80-port 只对 cs80 有意义; 配给 udisp 时悄悄忽略会让人以为指定的口在用."""
+    with pytest.raises(SystemExit):
+        ds.parse_args(["--cs80-port", "/dev/pts/3"])
+    assert "--cs80-port" in capsys.readouterr().err
+
+
+class _ImgStage(_Stage):
+    def image(self, view, pet):
+        return "pet-img"
+
+
+def test_pet_with_image_display_uses_stage_image_not_jpeg(tmp_path, monkeypatch):
+    pet = _FakePet()
+    disp = _run_pet(tmp_path, monkeypatch, pet, _ImgStage(), disp=FakeImgDisp())
+    assert disp.sent.count("pet-img") >= 14          # 猫照样 8 fps, 交出去的是图
+    assert b"pet" not in disp.sent                    # 没走 Stage.frame (转向 + JPEG)
