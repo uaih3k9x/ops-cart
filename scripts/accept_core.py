@@ -252,12 +252,12 @@ def _not_stdlib(names):
 REQUIRED_PY = (
     "atomicfile", "bigfish_core", "bigfish_panel", "bigfish_task_core", "ble_input", "ble_input_core", "cart_dream", "cart_label", "cart_mcp",
     "cart_ocr", "cart_snap", "cartlog", "ch9329", "clone_core", "confirm_core",
-    "confirm_panel", "dash_core", "dash_render", "dash_service", "hidpdc", "httpserve",
+    "confirm_panel", "cs80_link", "cs80_proto", "dash_core", "dash_render", "dash_service", "hidpdc", "httpserve",
     "ime_core", "ime_proc", "ime_rime", "ime_tk", "ime_worker", "kiosk",
     "kiosk_core", "kiosk_ui_core", "ks_panel", "kvm_broker", "kvm_broker_core", "kvm_core",
     "label_core", "label_device", "label_panel", "label_render",
     "lamps_core", "lldp_core", "mcp_core", "mcp_kvm", "mcp_label", "mcp_pxe",
-    "mcp_serial", "memtest_core", "netmode_core", "netmode_panel", "netprof_core", "notify_core", "observe_core", "observe_panel", "ocr_rapid_worker",
+    "mcp_serial", "memtest_core", "monita_cs80", "netmode_core", "netmode_panel", "netprof_core", "notify_core", "observe_core", "observe_panel", "ocr_rapid_worker",
     "pet_core", "pet_render", "pet_sprites", "pxe_log_core", "pxe_req_core", "pxe_req_panel",
     "pxeserver", "recipe", "recipe_core", "ruijie_portal", "serial_allowlist", "serial_core",
     "serial_gate_model", "serial_panel", "serial_write_core", "sun_core", "survey_core", "theme",
@@ -265,7 +265,7 @@ REQUIRED_PY = (
     "wifi_core", "wifi_panel", "wifi_prefer", "wol_core", "wol_panel",
 )
 VENV_PY = (
-    "dash_render", "dash_service", "pet_render", "udisp_usb",
+    "cs80_link", "cs80_proto", "dash_render", "dash_service", "monita_cs80", "pet_render", "udisp_usb",
 )
 ASSETS = (
     "icons/net-off.png",

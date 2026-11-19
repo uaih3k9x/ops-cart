@@ -1,6 +1,6 @@
 # cart-dash 接 Monita-CS80 副屏：设计稿
 
-状态：设计稿，未实现。分支 `feat/monita-dash`。
+状态：v1 已实现（2026-11-19），只对固件模拟器联调过，未上真机、未上车。分支 `feat/monita-dash`。实现记录见文末。
 
 目标：cart-dash 除了现有的 xfz1986 ESP32-P4 USB 副屏（下称 udisp），也能把状态板推到 Monita-CS80（收款机改造的 800×1280 屏 + 段码屏 + RGB 灯 + 4 个按键，下称 CS80）。只读展示，不加任何会改推车状态的操作。
 
@@ -281,3 +281,64 @@ Python 3.9 / 推车环境：
 - 段码屏文字渲染脚本：单测按段位断言就够（第 10 节）。
 
 保留未改、留给实现时确认的：采集线程一轮（`dc.collect`）如果在推车上偶尔超过 2 s，保活会漏拍；靠“≥ 3.5 s 先 HELLO + 整帧”兜底，开机页可能闪一下。上车前在推车上量一次 `dc.collect` 的最长耗时。
+
+## 实现记录（2026-11-19）
+
+按上面的设计实现，没有改设计结论。
+
+### 文件
+
+| 文件 | 内容 |
+|---|---|
+| `cs80_proto.py` | 纯函数：帧编码 / CRC / 流式拆包、HELLO_ACK / ACK / KEY 解码、RGB565、脏区、段码屏编码、`seg_state` / `led_state` |
+| `cs80_link.py` | `Port`（`os.open` + 手写 raw 标志 + `select` 带超时，整帧写完）和 `Link`（帧序号、按 type+seq 等应答、KEY 分流） |
+| `monita_cs80.py` | sysfs 发现、`open_display()`、`Display`（`wants_image`、`send`、`tick`、`close`） |
+| `dash_service.py` | `--display udisp` 或 `cs80`（默认 udisp）、`--cs80-port`；重连按时间走、日志只在状态变化时打；`tick` 每轮采集调一次；`--preview` 在 cs80 下存竖屏 PNG |
+| `pet_render.py` | 新增 `Stage.image()`；`Stage.frame()` 改成在它上面转向压 JPEG，没猫时仍缓存同一份 JPEG |
+| `tests/cs80_fakedev.py` | 测试用假设备（按协议文档行为应答，记录收到的帧和画面缓冲） |
+| `tests/test_cs80_proto.py` · `test_cs80_link.py` · `test_monita_cs80.py` | 编码器字节样例、PTY 上的 raw / 整帧写、会话、推帧 / 重连 / 保活 / 灯 / 段码屏 / 按键 / 不发 SLEEP |
+| `tests/test_cs80_fwsim.py` | 对 fwsim 的联调（可选，见下） |
+| `docs/img/monita-dash-dark.png` · `monita-dash-light.png` | 预览图 |
+
+### 预览
+
+推到 CS80 上的画面就是 `dash_render.render()` 的竖屏原图（下图已经过 RGB565 量化再还原，和设备上看到的一致）。数据是虚构的示例快照，地址用文档段。
+
+| 深色 | 浅色 |
+|---|---|
+| ![深色](img/monita-dash-dark.png) | ![浅色](img/monita-dash-light.png) |
+
+### fwsim 联调怎么跑
+
+fwsim 是 Monita 仓库的固件模拟器（PolyForm Noncommercial），不进本仓库。在仓库外的临时目录里，从固件 v10 分支导出 `fw/` 和 `tools/fwsim/` 后编译：
+
+```sh
+cc -std=c99 -Wall -Wextra -Werror -O2 -Ifw/link -o fwsim tools/fwsim/fwsim.c
+CS80_FWSIM=/path/to/fwsim python3 -m pytest tests/test_cs80_fwsim.py
+```
+
+没设 `CS80_FWSIM` 时这些用例 skip。测试只通过 fwsim README 里的 stdin 命令（`stat`、`tap`、`quit`）取状态，不用它的对拍脚本，也没有参考 Monita 的 Python / Swift 上位机代码。覆盖的点：
+
+- HELLO 的 `caps`、设备时钟。固件自己画的 `------ hh:mm:ss` 显存和本仓库独立写的 7 段 / 冒号编码逐字节一致。
+- 整帧 80 个 RECT 加 PRESENT 后，`bad_param == 0`，屏上 CRC 等于整帧 RGB565 的 CRC。差分帧之后 CRC 同样一致。
+- SEG 显存和 `seg_state` 一致，灯状态正确。`tap 4` 关背光，`tap 3` 开背光。
+- 停发 5.6 s 后固件回到开机页，下一次 `tick` 会重新 HELLO 并推整帧，屏上 CRC 回到推车画面，灯也重发。
+- 关掉 PTY 再打开后能重连。`--max-payload 16384`、`--nbuf 1`、`--no-led --no-keys` 三种设备配置都通过。
+- `dash_service.run(display="cs80", cs80_port=<PTY>)` 端到端跑 12 轮，推帧、段码屏接管、绿灯都到了设备上。
+
+### 和最初任务描述不同的地方
+
+都按本设计稿处理：
+
+- 版面不重排：CS80 本来就是竖屏 800×1280，和 `dash_render` 的坐标系一样（第 1 节）。
+- 只有 `--display udisp|cs80`，没有 `auto`（第 9 节）。
+- 不发 SLEEP（第 7 节）。编码器认识 0x32，但后端没有任何路径会发它，有测试锁住。
+- ≡ 键翻到明细页留到第二阶段，v1 只用 + / − 开关背光。
+
+### 已知缺口
+
+- 没上真机：串口后端只对 fwsim 的 PTY 测过。sysfs 发现只用假的 sysfs 树测过，Rocky 9 上会不会出现 tty 节点还不知道（第 12 节第 8 条）。
+- 没在推车上量过 `dc.collect` 的最长耗时，也没量过整帧 / 差分的 CPU 开销（第 4、5 节）。
+- 安装 / 打包脚本还没收新模块：现有的 `install-*.sh` / `pack-*.sh` 按版本号命名，等下一版一起加。udev 规则（屏蔽 ModemManager）也还没写。
+- README 没改：README 按 PR 数定期整理，下次整理时再加 CS80 这一行和新模块。
+- 许可证是否统一仍待定（第 12 节第 1 条）。

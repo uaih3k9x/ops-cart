@@ -392,3 +392,130 @@ def test_pet_usb_error_reconnects_instead_of_dying(tmp_path, monkeypatch):
         ds.run(ctx=_ctx(), state_path=str(tmp_path / "s.json"), out=out,
                          display_factory=lambda: FakeFactory(disp), pet=pet, stage=_Stage())
     assert "推送失败" in out.getvalue() and len(calls) > 3
+
+
+# ---- 拔屏重连按时间走 (docs/monita-dash.md 第 8 节)
+
+def _stopping_clock(monkeypatch, rounds):
+    """假时钟每次 time.time 走 1 s, sleep 数够轮数就停."""
+    t = {"v": T0 + 1}
+    n = {"round": 0}
+
+    class Stop(Exception):
+        pass
+
+    def fake_sleep(_s):
+        n["round"] += 1
+        if n["round"] >= rounds:
+            raise Stop()
+    monkeypatch.setattr(ds.time, "sleep", fake_sleep)
+    monkeypatch.setattr(ds.time, "time", lambda: t.__setitem__("v", t["v"] + 1) or t["v"])
+    return Stop
+
+
+def test_unplugged_display_retried_every_3s_without_waiting_for_minute(tmp_path, monkeypatch):
+    """没猫、版面不变: 以前要等跳分钟才重连; 现在到点 (3 s) 就试."""
+    factory = FakeFactory(raises=OSError("no dev"))
+    out = io.StringIO()
+    Stop = _stopping_clock(monkeypatch, 30)
+    with pytest.raises(Stop):
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(now=lambda: ds.time.time()), out=out,
+               display_factory=lambda: factory, render=lambda v: b"x")
+    assert factory.calls >= 6
+    assert out.getvalue().count("副屏没插") == 1            # 连续失败只打一行, 不刷 journal
+
+
+def test_reconnect_pushes_a_frame_and_logs_transitions(tmp_path, monkeypatch):
+    disp = FakeDisp()
+    seq = [OSError("no"), OSError("no"), None]
+
+    class Flaky:
+        calls = 0
+
+        def open_display(self):
+            Flaky.calls += 1
+            e = seq[min(Flaky.calls - 1, 2)]
+            if e:
+                raise e
+            return disp
+    out = io.StringIO()
+    Stop = _stopping_clock(monkeypatch, 20)
+    with pytest.raises(Stop):
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(now=lambda: ds.time.time()), out=out,
+               display_factory=Flaky, render=lambda v: b"x")
+    assert Flaky.calls == 3 and disp.sent[:1] == [b"x"]        # 连上马上推一帧, 不等版面变
+    log = out.getvalue()
+    assert log.count("副屏没插") == 1 and log.count("副屏已连接") == 1
+
+
+# ---- 要图的后端 (Monita-CS80): wants_image + tick
+
+class FakeImgDisp(FakeDisp):
+    wants_image = True
+
+    def __init__(self, tick_fail_at=None):
+        super().__init__()
+        self.ticks = []
+        self.tick_fail_at = tick_fail_at
+        self.cfg_text = "Monita-CS80 fake"
+
+    def send(self, img):
+        self.sent.append(img)
+
+    def tick(self, now, snap, view):
+        self.ticks.append((now, snap, view))
+        if self.tick_fail_at is not None and len(self.ticks) == self.tick_fail_at:
+            raise OSError("ack timeout")
+
+
+def test_image_display_gets_portrait_render_and_tick_every_round(tmp_path, monkeypatch):
+    import dash_render
+    disp = FakeImgDisp()
+    Stop = _stopping_clock(monkeypatch, 5)
+    with pytest.raises(Stop):
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(now=lambda: ds.time.time()), out=io.StringIO(),
+               display_factory=lambda: FakeFactory(disp))
+    img = disp.sent[0]
+    assert img.size == (dash_render.PANEL_W, dash_render.PANEL_H)        # 竖屏原样, 不转、不编 JPEG
+    v = disp.ticks[0][2]
+    assert img.tobytes() == dash_render.render(v).tobytes()
+    assert len(disp.ticks) == 5                                            # 每轮采集都调, 不管推没推帧
+    assert disp.ticks[0][1]["net"] == "on" and "checks" in v
+
+
+def test_tick_error_closes_and_reconnects(tmp_path, monkeypatch):
+    disp = FakeImgDisp(tick_fail_at=2)
+    factory = FakeFactory(disp)
+    out = io.StringIO()
+    Stop = _stopping_clock(monkeypatch, 12)
+    with pytest.raises(Stop):
+        ds.run(state_path=str(tmp_path / "s.json"), ctx=_ctx(now=lambda: ds.time.time()), out=out,
+               display_factory=lambda: factory, render=lambda v: b"x")
+    assert getattr(disp, "closed", False) and factory.calls >= 2
+    assert "稍后重连" in out.getvalue()
+
+
+def test_preview_with_cs80_writes_portrait_png(tmp_path):
+    from PIL import Image
+    pv = tmp_path / "p.png"
+    ds.run(once=True, preview=str(pv), state_path=str(tmp_path / "s.json"), ctx=_ctx(), out=io.StringIO(),
+           display="cs80")
+    img = Image.open(str(pv))
+    assert img.format == "PNG" and img.size == (800, 1280)
+
+
+def test_cs80_display_factory_passes_port(monkeypatch):
+    import monita_cs80
+    seen = {}
+    monkeypatch.setattr(monita_cs80, "open_display", lambda port=None, log=None: seen.setdefault("port", port))
+    ds.pick_display("cs80", "/dev/pts/7", io.StringIO())().open_display()
+    assert seen["port"] == "/dev/pts/7"
+
+
+def test_args_default_udisp_and_cs80_choice():
+    a = ds.parse_args([])
+    assert a.display == "udisp" and a.cs80_port is None
+    a = ds.parse_args(["--display", "cs80", "--cs80-port", "/dev/pts/3"])
+    assert a.display == "cs80" and a.cs80_port == "/dev/pts/3"
+    with pytest.raises(SystemExit):
+        ds.parse_args(["--display", "auto"])

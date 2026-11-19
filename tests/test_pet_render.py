@@ -182,3 +182,36 @@ def test_stage_draws_smoke_when_cats_are_hidden():
             break
     assert pet.effects() is not None
     assert stage.frame(view, pet) != r.make_frame(view)
+
+
+# ---- Monita-CS80 出口 (docs/monita-dash.md 第 2 节): 要图不要 JPEG
+
+def test_stage_image_without_cat_is_render_unrotated():
+    view = _view()
+    img = pr.Stage().image(view, None)
+    assert img.size == (r.PANEL_W, r.PANEL_H) and img.mode == "RGB"
+    assert img.tobytes() == r.render(view).convert("RGB").tobytes()
+
+
+def test_stage_image_with_cat_matches_frame_and_keeps_base_clean():
+    view = _view()
+    pet = pc.Pet(random.Random(1))
+    pet.sync(True, True, r.glyph_boxes(view))
+    for _ in range(100):
+        pet.tick(0.125)
+    stage = pr.Stage()
+    base = stage.image(view, None).tobytes()
+    img = stage.image(view, pet)
+    assert img.tobytes() != base                                   # 猫画上去了
+    assert stage.image(view, None).tobytes() == base               # 但没画到缓存底图上
+    assert stage.frame(view, pet) == r.encode_within_budget(r.rot90(img))
+
+
+def test_stage_frame_still_caches_plain_jpeg(monkeypatch):
+    calls = []
+    real = r.encode_within_budget
+    monkeypatch.setattr(r, "encode_within_budget", lambda img: (calls.append(1), real(img))[1])
+    stage = pr.Stage()
+    view = _view()
+    a = stage.frame(view, None)
+    assert stage.frame(view, None) is a and len(calls) == 1

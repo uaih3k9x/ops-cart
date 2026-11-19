@@ -170,15 +170,14 @@ class Stage:
             self.key, self.base, self.plain = key, r.render(view).convert("RGB"), None
         return self.base
 
-    def frame(self, view, pet):
+    def image(self, view, pet):
+        """贴好猫的竖屏 RGB 图 (Monita-CS80 出口要图不要 JPEG). 没猫时交出缓存底图本身: 调用方只能读不能画."""
         base = self._base(view)
         draws = pet.draws() if pet is not None else []
         smoke = pet.effects() if pet is not None else None
         if not draws and not smoke:
-            if self.plain is None:
-                self.plain = r.encode_within_budget(r.rot90(base))
-            return self.plain
-        from PIL import Image, ImageDraw
+            return base
+        from PIL import ImageDraw
         area = base.crop((0, AREA_TOP, r.PANEL_W, AREA_BOTTOM))
         layer = area.copy()
         for c in draws:
@@ -192,4 +191,13 @@ class Stage:
             _smoke(d, smoke, AREA_TOP)
         out = base.copy()
         out.paste(layer, (0, AREA_TOP))
-        return r.encode_within_budget(r.rot90(out))
+        return out
+
+    def frame(self, view, pet):
+        """udisp 出口: 转横屏压 JPEG. 没猫时缓存那一份 JPEG, 不每帧重压."""
+        img = self.image(view, pet)
+        if img is self.base:
+            if self.plain is None:
+                self.plain = r.encode_within_budget(r.rot90(img))
+            return self.plain
+        return r.encode_within_budget(r.rot90(img))

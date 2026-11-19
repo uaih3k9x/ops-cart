@@ -9,12 +9,17 @@
   - 车机 kiosk 没就绪 (没写 kiosk.json / 写它的进程没了) 画开机自检, 不画旧的锁屏/工作页 (#26)
   - 深浅 (#32): 每帧按快照里的 theme.mode 切配色, 模式一变下一帧整帧换
   - 桌宠 (#35): 锁屏且没事时副屏有只猫, 动的时候在采集间隙按 8 fps 推整帧; 猫出错就摘掉, 不影响状态板
+  - 两种副屏二选一 (docs/monita-dash.md): udisp (默认, JPEG 横屏) 或 Monita-CS80 (--display cs80):
+    CS80 后端声明 wants_image, 收竖屏原图自己按脏区推; 每轮采集调一次它的 tick() 做保活 / 段码屏 / 灯 / 按键
 
 用法:
   python3 dash_service.py                                  # 常驻
   python3 dash_service.py --once --preview /tmp/d.jpg      # 跑一轮, 导出画面(不推屏)
   python3 dash_service.py --fps 5                          # 推送上限 (猫不走这个, 见 pet_core)
   python3 dash_service.py --no-pet                         # 不要猫
+  python3 dash_service.py --display cs80                   # 用 Monita-CS80 当副屏 (sysfs 找 2c7c:0901 接口 07)
+  python3 dash_service.py --display cs80 --cs80-port /dev/ttys012          # 指定节点 (fwsim 的 PTY / udev 链接)
+  python3 dash_service.py --once --display cs80 --preview /tmp/d.png       # 导出 CS80 要推的竖屏图
 """
 
 import argparse
@@ -38,14 +43,28 @@ def _view_key(view):
                       sort_keys=True, ensure_ascii=False)
 
 
-def _connect(factory, out):
+def _connect(factory, out, quiet=False):
+    """quiet: 上一次已经报过没插了. 每 3 s 重试一次, 连续失败只在第一次打日志, 不刷 journal."""
     try:
         disp = factory().open_display()
         print("副屏已连接 %r" % (getattr(disp, "cfg_text", "") or "").strip("\x00"), file=out)
         return disp
     except Exception as e:                     # 没插 / 权限 / libusb 忙
-        print("副屏没插/打不开: %s" % type(e).__name__, file=out)
+        if not quiet:
+            print("副屏没插/打不开: %s" % type(e).__name__, file=out)
         return None
+
+
+def pick_display(display, cs80_port=None, out=sys.stdout):
+    """--display 选出来的副屏模块: 有 open_display() 就行. 进程起来就定了, 重连只重连同一种屏."""
+    if display == "cs80":
+        class _Cs80:
+            @staticmethod
+            def open_display():
+                import monita_cs80
+                return monita_cs80.open_display(port=cs80_port, log=lambda s: print(s, file=out))
+        return _Cs80
+    return lambda: __import__("udisp_usb")
 
 
 def _start_lldp(factory, out):
@@ -67,7 +86,7 @@ def _make_pet():
 
 def run(once=False, preview=None, fps=DEFAULT_FPS, state_path=dc.STATE_PATH,
         sample_s=SAMPLE_S, out=sys.stdout, ctx=None, display_factory=None,
-        render=None, lldp_factory=None, pet=None, stage=None, want_pet=False):
+        render=None, lldp_factory=None, pet=None, stage=None, want_pet=False, display="udisp", cs80_port=None):
     """主循环. 依赖都可注入, 测试里用假的. 返回推了几帧.
     ctx 不注入时 (真机) 才起 LLDP 监听, 退出时关掉."""
     watcher = None
@@ -79,33 +98,50 @@ def run(once=False, preview=None, fps=DEFAULT_FPS, state_path=dc.STATE_PATH,
     if ctx is None:
         watcher = _start_lldp(lldp_factory or lldp_core.Watcher, out)
         ctx = dc.default_ctx(lldp=watcher.snapshot if watcher else None)
+    factory = display_factory or pick_display(display, cs80_port, out)
     try:
-        return _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, render, pet, stage)
+        return _loop(once, preview, fps, state_path, sample_s, out, ctx, factory, render, pet, stage,
+                     images=display == "cs80")
     finally:
         if watcher is not None:
             watcher.close()
 
 
-def _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, render, pet=None, stage=None):
-    """采集 → 落盘 → 版面变了才推屏. 拔屏重连. 有猫时采集间隙按猫的节奏再推几帧."""
+def _loop(once, preview, fps, state_path, sample_s, out, ctx, factory, render, pet=None, stage=None, images=False):
+    """采集 → 落盘 → 版面变了才推屏. 拔屏重连. 有猫时采集间隙按猫的节奏再推几帧.
+    images: 出竖屏 PIL 图而不是 JPEG (CS80); 连上的显示对象自己声明 wants_image 也算."""
     box = {"pet": pet}                      # 猫出错就摘掉, 闭包里看得见
 
     def paint(v):
+        img = images or getattr(disp, "wants_image", False)
         if box["pet"] is None or stage is None or render_given:
-            return plain(v)
+            return plain(v, img)
         try:
-            return stage.frame(v, box["pet"])
+            return stage.image(v, box["pet"]) if img else stage.frame(v, box["pet"])
         except Exception as e:
             _drop_pet(box, out, e)
-            return plain(v)
+            return plain(v, img)
+
+    def plain(v, img):
+        if render_given:
+            return render(v)
+        import dash_render
+        return dash_render.render(v) if img else dash_render.make_frame(v)
+
+    def drop(why, e, at):
+        print("%s, 稍后重连: %s" % (why, type(e).__name__), file=out)
+        try:
+            disp.close()
+        except Exception:
+            pass
+        return None, at + RECONNECT_S
 
     render_given = render is not None
-    plain = render or (lambda v: __import__("dash_render").make_frame(v))
-    factory = display_factory or (lambda: __import__("udisp_usb"))
 
     seq = pushed = 0
     last_key = last_clock = last_view = None
-    retry = False
+    retry = False                           # 刚连上: 不管版面变没变都推一帧
+    quiet = False                           # 已经报过没插了, 连续失败不再打
     last_push = 0.0
     disp = None
     next_try = 0.0
@@ -125,29 +161,37 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, r
         key = _view_key(view)
         _pet_sync(box, view, out)
 
-        want = (key != last_key or view.get("clock") != last_clock or view.get("stale")
-                or (retry and now >= next_try))
-        if want and now - last_push >= max_gap:
-            last_key, last_clock, last_push, last_view, retry = key, view.get("clock"), now, view, False
-            if preview:
-                with open(preview, "wb") as f:
-                    f.write(paint(view))
-                print("preview -> %s" % preview, file=out)
+        if not preview and disp is None and now >= next_try:      # 重连按时间走, 不等版面变 (设计稿第 8 节)
+            disp = _connect(factory, out, quiet)
+            if disp is None:
+                next_try, quiet = now + RECONNECT_S, True
             else:
-                if disp is None and now >= next_try:
-                    disp = _connect(factory, out)
-                    if disp is None:
-                        next_try = now + RECONNECT_S
-                if disp is not None:
-                    try:
-                        disp.send(paint(view))
-                        pushed += 1
-                    except Exception as e:
-                        print("推送失败, 稍后重连: %s" % type(e).__name__, file=out)
-                        try:
-                            disp.close()
-                        finally:
-                            disp, next_try = None, now + RECONNECT_S
+                retry, quiet = True, False
+
+        want = key != last_key or view.get("clock") != last_clock or view.get("stale") or retry
+        if want and now - last_push >= max_gap:
+            last_key, last_clock, last_push, last_view = key, view.get("clock"), now, view
+            if preview:
+                frame = paint(view)
+                if hasattr(frame, "save"):
+                    frame.save(preview, format="PNG")
+                else:
+                    with open(preview, "wb") as f:
+                        f.write(frame)
+                print("preview -> %s" % preview, file=out)
+                retry = False
+            elif disp is not None:
+                retry = False
+                try:
+                    disp.send(paint(view))
+                    pushed += 1
+                except Exception as e:
+                    disp, next_try = drop("推送失败", e, now)
+        if disp is not None and hasattr(disp, "tick"):          # CS80: 保活 / 段码屏 / 灯 / 按键, 每轮都要
+            try:
+                disp.tick(now, snap, view)
+            except Exception as e:
+                disp, next_try = drop("副屏出错", e, now)
 
         if once:
             break
@@ -157,11 +201,7 @@ def _loop(once, preview, fps, state_path, sample_s, out, ctx, display_factory, r
         try:
             pushed += _pet_frames(box["pet"], sample_s, lambda: disp.send(paint(last_view)))
         except Exception as e:              # 这里多半是 USB; 猫自己的错 paint 已经接住了
-            print("推送失败, 稍后重连: %s" % type(e).__name__, file=out)
-            try:
-                disp.close()
-            finally:
-                disp, next_try, retry = None, time.time() + RECONNECT_S, True   # 到点重连一次, 不用等时钟跳分钟
+            disp, next_try = drop("推送失败", e, time.time())
 
     return pushed
 
@@ -218,7 +258,7 @@ def _pet_frames(pet, span, push):
         time.sleep(max(0.0, min(end, pet.next_at) - now))
 
 
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="cart-dash: 采集 + 副屏")
     ap.add_argument("--once", action="store_true", help="只跑一轮")
     ap.add_argument("--preview", help="把这一帧写到文件而不是推屏")
@@ -226,8 +266,16 @@ def main():
     ap.add_argument("--no-pet", action="store_true", help="不要副屏桌宠")
     ap.add_argument("--state", default=dc.STATE_PATH)
     ap.add_argument("--sample", type=float, default=SAMPLE_S, help="采集间隔秒")
-    a = ap.parse_args()
-    run(once=a.once, preview=a.preview, fps=a.fps, state_path=a.state, sample_s=a.sample, want_pet=not a.no_pet)
+    ap.add_argument("--display", choices=("udisp", "cs80"), default="udisp",
+                    help="副屏: udisp (默认, xfz1986 USB 屏) 或 cs80 (Monita-CS80)")
+    ap.add_argument("--cs80-port", help="CS80 串口节点 (不给就按 sysfs 找 2c7c:0901 接口 07)")
+    return ap.parse_args(argv)
+
+
+def main():
+    a = parse_args()
+    run(once=a.once, preview=a.preview, fps=a.fps, state_path=a.state, sample_s=a.sample, want_pet=not a.no_pet,
+        display=a.display, cs80_port=a.cs80_port)
 
 
 if __name__ == "__main__":
