@@ -37,7 +37,7 @@
 udisp_usb.Display          send(jpeg_bytes) / close() / cfg_text          # 不动
 monita_cs80.Display        wants_image = True
                            send(img)        # img: 竖屏 800×1280 PIL RGB 图
-                           tick(now, snap, view) -> [按键事件]   # 每轮采集都调
+                           tick(now, snap, view) -> None   # 每轮采集都调；按键在后端内部消化
                            close()
                            cfg_text
 ```
@@ -82,10 +82,13 @@ monita_cs80.Display        wants_image = True
 
 要点：
 
-- 等应答时按 type 分流：KEY 进按键队列，其余按 type+seq 匹配；对不上的丢掉。
-- RECT 载荷必须正好 `8 + w*h*2` 且 ≤ HELLO_ACK 的 `max_payload`（不写死 32768；测试里用 16384 验证）。
-- `caps` 按位开功能：bit4 KEYS、bit5 LED、bit7 SLEEP / 主机走了。没有的位就不发对应消息（fw v8 之前的固件只当屏用）。
-- PRESENT 的 ACK 里 `crc_err + len_err + bad_param` 比上一次大，说明之前的 RECT 有被拒的，下一帧推整帧。
+- 等应答时按 type 分流：KEY 进按键队列，其余按 type+seq 匹配；对不上的丢掉。拆设备回包时坏帧前进 1 字节重新找 `A5 5A`。每次打开节点后先 `tcflush(TCIOFLUSH)`，丢掉上一次会话残留的字节和迟到的 ACK。
+- RECT 载荷必须正好 `8 + w*h*2` 且 ≤ HELLO_ACK 的 `max_payload`（不写死 32768；测试里用 16384 验证）。`max_payload < 8 + 32*16*2 = 1032`（一个 tile 都放不下）当不兼容处理，不为它做行数退化（fwsim 允许 16 起，只在这里拒）。
+- 一个协议帧必须一次写完：设备侧半截帧 0.5 s 没后续就丢。
+- HELLO_ACK 还要校验 `seg_bytes == 72`；不是 72 就不发 SEG，保活全靠 PING。
+- `caps` 按位开功能：bit4 KEYS、bit5 LED、bit7 SLEEP / 主机走了。没有的位就不发对应消息（fw v8 之前的固件只当屏用）。PRESENT 在 v0 起就有，单 / 双 / 三缓冲都照样发、照样等 ACK，主机侧不按 bit1 / bit3 分支。
+- 非 RECT 消息的 ACK `status != 0`（1 参数错、3 不支持）：不当断线，打一次日志、这一项功能本次会话停用（比如 LED 回 3 就不再发 LED）。
+- PRESENT 的 ACK 里 `crc_err + len_err + bad_param` 比上一次大，说明之前的 RECT 有被拒的，下一帧推整帧。HELLO 会把计数清零，所以基线在每次 HELLO_ACK 之后重置为 0。
 
 ## 4. 推送策略：脏区 + PRESENT
 
@@ -96,6 +99,8 @@ monita_cs80.Display        wants_image = True
 3. 转 RGB565 用 Pillow 的通道查表：`split()` → `point()` 做高 / 低字节 → `ImageChops.add` → `Image.merge("LA", (lo, hi)).tobytes()`，不用逐像素 Python 循环，也不依赖各版本不一致的 16 位 raw 模式。
 4. 发完这批 RECT，发 PRESENT，等 ACK 才返回（这是唯一的等待，也是流控）。
 5. 下列情况推整帧：刚 HELLO、上次 ACK 报错数增加、上次 `send` 失败。
+6. 只有 PRESENT 的 ACK 回来后才把这张图记成“已提交”；ACK 超时则不更新缓存，并按断线处理（关掉、3 s 后重连、HELLO、整帧）。协议文档对坏帧的建议就是“等应答超时后重发整帧”，重连路径正好覆盖，不另写重发逻辑。
+7. 后端只读 `send(img)` 收到的图，不在上面画东西。没猫时 `Stage.image` 会把缓存底图原样交出来，和上一帧是同一个对象，差分结果是 0 个 RECT，这是对的；后端一旦往这张图上画，缓存就坏了。
 
 Mac 上实测（Pillow 11.1，800×1280）：整帧转 RGB565 约 8 ms，差分 + 找条带约 5 ms。推车 CPU 更慢，按数倍估算仍在几十毫秒内；实现时在推车上量一次再定猫的帧率。
 
@@ -141,12 +146,14 @@ Mac 上实测（Pillow 11.1，800×1280）：整帧转 RGB565 约 8 ms，差分 
 
 | 状态 | 条件（按优先级） | 灯 |
 |---|---|---|
-| 自检中 | `view.boot` 或 `view.stale` | 蓝闪（1 s 周期） |
+| 自检中 | `view.boot` 或 `view.stale` | 蓝常亮（不用蓝闪：固件“主机走了”的心跳就是蓝灯 2 s 亮 1 s 灭，闪起来分不清是推车在自检还是 cart-dash 掉了） |
 | 告警 | 自检有 FAIL；`ups_alert.level == "bad"`；`serve.level == "bad"`；急停 | 红闪（0.5 s 周期） |
 | 注意 | 自检有 WARN；`ups_alert.level == "warn"`；`serve.level == "warn"`；有待确认 | 黄常亮（红 + 绿） |
 | 正常 | 其他 | 绿常亮 |
 
 只在状态变化时和每次 HELLO 之后发 LED（HELLO 会把灯灭掉）。
+
+开机自检页的 view 是 `BootTracker.view()` 整个换掉的，没有 `checks`、`ups_alert`、`serve`、`agent`、`net` 这些键；`seg_state` / `led_state` 一律用 `.get()` 取，缺键按“没数据”处理，测试里要有一条喂自检页 view 的用例。
 
 ### 按键（`caps` bit4）
 
@@ -165,9 +172,17 @@ Mac 上实测（Pillow 11.1，800×1280）：整帧转 RGB565 约 8 ms，差分 
 
 ## 7. 热插拔、SLEEP
 
-**发现设备。** Linux 上 CS80 是 Quectel 模组口 `2c7c:0901`，协议走接口 7（厂商类 0xFF，bulk IN 0x8A / OUT 0x07）。v1 选**串口节点**这一条路：扫 `/sys/class/tty/ttyUSB*` 和 `ttyACM*`，从各节点的 `device` 往上走到 USB 接口和 USB 设备两层，比对接口号 `bInterfaceNumber == 07` 和设备的 `idVendor` / `idProduct`（ttyUSB 和 ttyACM 在 sysfs 里的层级不同，按目录里有没有这些文件判断，不写死相对路径；未在推车上验证），用标准库 `os.open` + `termios` 设 raw（不设波特率、不要 DTR）。也接受 `--cs80-port PATH` 直接指定（fwsim 开的是 PTY，联调必须走这条）。不加 pyserial。
+**发现设备。** Linux 上 CS80 是 Quectel 模组口 `2c7c:0901`，协议走接口 7（厂商类 0xFF，bulk IN 0x8A / OUT 0x07）。v1 选**串口节点**这一条路：扫 `/sys/class/tty/ttyUSB*` 和 `ttyACM*`，从各节点的 `device` 往上走到 USB 接口和 USB 设备两层，比对接口号 `bInterfaceNumber == 07` 和设备的 `idVendor` / `idProduct`（ttyUSB 和 ttyACM 在 sysfs 里的层级不同，按目录里有没有这些文件判断，不写死相对路径；未在推车上验证），用标准库 `os.open` + `termios` 设 raw（不设波特率、不要 DTR）。
 
-推车上没验证的：Rocky 9 是 `option` 驱动绑成 `ttyUSB*` 还是别的；ModemManager 会不会去探这个口（会发 AT 命令，打乱协议帧）。上车时要补一条 udev 规则（`ENV{ID_MM_DEVICE_IGNORE}="1"`，可选 `SYMLINK+="monita-cs80"`），仓库里目前没有 udev 目录，放哪里见第 12 节。备选是 pyusb 直接 claim 接口 7（venv 里已有 pyusb），v1 不做。
+串口细节（Python 3.9）：
+
+- `os.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)`，读写都用 `select` 带超时，不靠阻塞 I/O。
+- raw 要手写完整的 cfmakeraw 标志：`iflag` 清 `IGNBRK BRKINT PARMRK ISTRIP INLCR IGNCR ICRNL IXON`，`oflag` 清 `OPOST`，`lflag` 清 `ECHO ECHONL ICANON ISIG IEXTEN`，`cflag` 清 `CSIZE PARENB`、置 `CS8 CLOCAL CREAD`。`tty.cfmakeraw` 是 3.12 才有的，3.9 不能用；`tty.setraw` 在 3.9 上不清 `INLCR` / `IGNCR`，会把 0x0A / 0x0D 改掉，不用。ttyUSB 默认开着 `ECHO`，不设 raw 就会把设备的回包原样回显给设备，表现是 `crc_err` 一直涨、每帧都推整帧。
+- **只打开 sysfs 比对通过（`2c7c:0901` 且接口号 07）的节点**，或者 `--cs80-port` 显式给的路径。推车上还有 `/dev/con-1..4`（FTDI 串口头，接着交换机 / 防火墙的 console，conbroker 在用），绝不能为了“探一下”往别的 tty 写 HELLO。
+
+也接受 `--cs80-port PATH` 直接指定（fwsim 开的是 PTY，联调必须走这条）。不加 pyserial。
+
+推车上没验证的：Rocky 9 是 `option` 驱动绑成 `ttyUSB*` 还是别的（内核的 `option` 设备表里不一定有 `2c7c:0901` 的接口 7；没有的话就不会出现任何 tty 节点，只能 `new_id` 手动绑或者走 pyusb，见第 12 节）；ModemManager 会不会去探这个口（会发 AT 命令，打乱协议帧）。上车时要补一条 udev 规则（`ENV{ID_MM_DEVICE_IGNORE}="1"`，可选 `SYMLINK+="monita-cs80"`），仓库里目前没有 udev 目录，放哪里见第 12 节。备选是 pyusb 直接 claim 接口 7（venv 里已有 pyusb），v1 不做。
 
 **本机能测到哪。** macOS 不给这个接口建串口设备（厂商类 0xFF，系统不绑驱动，协议文档原话），Mac 参考上位机是用 IOKit 直接开接口 7 的。所以在 Mac 上，ops-cart 的串口后端**只能对 fwsim 的 PTY 测**；真机那一遍要在一台 Linux 机器上跑（任意 Linux 主机或 Linux 虚拟机直通 USB，不是推车），顺带验证 sysfs 发现和 ModemManager 的问题。若届时不方便找 Linux，再把 pyusb claim 接口 7 从备选提成第二个传输（Mac 上也能用）。
 
@@ -181,11 +196,12 @@ Mac 上实测（Pillow 11.1，800×1280）：整帧转 RGB565 约 8 ms，差分 
 
 实现时先写一条假时钟红测试复现，再改成：`disp is None and now >= next_try` 时就尝试连，连上后把 `want` 置真推一帧。udisp 的推帧内容和日志措辞不变，只是重连更及时。
 
+回归风险：改成每 3 s 试一次以后，udisp 没插时“副屏没插/打不开”会每 3 s 打一行，journal 一天约 2.9 万行（现在是每分钟一行）。所以同时改成**只在状态变化时打日志**：已连接 → 打不开打一行，之后连续失败不再打，直到连上（打“副屏已连接”）。现有 `assert "副屏没插" in out` 那条测试仍然成立（第一次失败照打）。
+
 ## 9. 配置
 
-- `dash_service.py --display udisp|cs80|auto`，**默认 `udisp`**，推车现有行为不变，`cart-dash.service` 不用改。
-  - `cs80`：只用 CS80。
-  - `auto`：先找 CS80，找不到再找 udisp；每次重连重新选。
+- `dash_service.py --display udisp|cs80`，**默认 `udisp`**，推车现有行为不变，`cart-dash.service` 不用改。二选一，进程起来就定了，重连只重连同一种屏。
+  - `auto` 不做（YAGNI）：车上只会接一块屏，显式指定就够；`auto` 每次重连换后端还会让日志和状态来回跳。
 - `--cs80-port PATH`：指定串口节点（fwsim 的 PTY、或 udev 符号链接）。
 - 新模块进下一版的 install / pack 清单（`scripts/install-*.sh`、`pack-*.sh`）。
 - 不做两块屏同时出。
@@ -199,7 +215,7 @@ TDD，假设备，不打真机。每一步 3.13 全绿，`tests/test_py39_compat
 3. `monita_cs80.Display` + 假时钟：`tick` 节奏（SEG 1 s、≥3.5 s 重新 HELLO + 灯 + 整帧）、LED 只在变化和 HELLO 后发、ACK 错数增加后整帧、`caps` 缺位时不发 KEY / LED。
 4. `dash_service`：先修第 8 节（红测试）；`wants_image` 分支、`tick` 每轮调用且异常走重连、`--display`；`Stage.image` 加测试，`Stage.frame` 原测试不动。
 5. 按键：背光开关；第二阶段做明细页（`dash_render` 加一个只吃 `view` 的页面函数 + 预览测试）。
-6. 预览：`--preview out.png --display cs80` 把要推的竖屏图存成 PNG；再加一个小脚本把 72 字节段码屏状态画成文字（`88:88:88` 样式）方便看。
+6. 预览：`--preview out.png --display cs80` 把要推的竖屏图存成 PNG。段码屏不另写画图脚本，`seg_state` 的单测按段位断言就够。
 7. fwsim 联调（**可选、不进仓库**）：环境变量 `CS80_FWSIM` 指向本机自行编译的 fwsim 时才跑，否则 skip。用例：HELLO caps、整帧 80 RECT + PRESENT 后 `bad_param == 0`、差分帧、SEG / LED 内容和 `stat` 对上、`tap 3` 收到 KEY、停发 5.6 s 后 `boot_screen == 1` 而后端能自愈、关掉再开 PTY 后重连、`--max-payload 16384`。fwsim 是 PolyForm Noncommercial，不 vendor、不在 CI 跑。
 
 ## 11. 明确不做
@@ -218,9 +234,50 @@ TDD，假设备，不打真机。每一步 3.13 全绿，`tests/test_py39_compat
 ## 12. 待维护者决定
 
 1. **许可证。** ops-cart 是 MIT，Monita 是 PolyForm Noncommercial。本稿选择在 ops-cart 里按协议文档独立实现最小编码器（第 3 节），不依赖 Monita 代码。是否把两边的协议参考实现统一到同一许可证（比如 Monita 的协议文档和 host-ref 改成 MIT，或单独抽一个 MIT 的协议包做可选依赖），待定。
-2. **默认用哪块屏。** 本稿默认 `udisp`，CS80 要显式 `--display cs80` 或 `auto`。上车后是否改默认值。
+2. **默认用哪块屏。** 本稿默认 `udisp`，CS80 要显式 `--display cs80`。上车后是否改默认值。
 3. **屏怎么装。** 竖装则版面直接用；横装要在 CS80 出口加转向，并重新确认桌宠坐标。
 4. **上车时机。** 固件 v8–v10 的 KEY / LED / SLEEP / 主机走了在协议文档里标着“未上真机测”。建议先在 Mac 上过 fwsim，再在一台 Linux 机器上接真机过一遍（Mac 上没有串口节点，见第 7 节），再上车。
 5. **udev 规则放哪。** 仓库里还没有 `deploy/udev/`；CS80 需要屏蔽 ModemManager 的规则，要不要连同 udisp、UPS、串口头的规则一起收进仓库。
 6. **空闲关屏 / SLEEP。** 要不要在某种条件下（夜间、长时间锁屏）主动关背光或 SLEEP；需要先有一个可靠的信号。
 7. **正常时灯亮不亮。** 本稿正常时绿常亮；若嫌晃眼，可改成正常时灭灯、只在注意 / 告警时亮。
+8. **Rocky 9 上没有 tty 节点怎么办。** 若 `option` 驱动不认 `2c7c:0901` 接口 7，可以选：udev 里 `new_id` 绑上去（还是走串口后端），或者把 pyusb claim 接口 7 做成第二个传输（venv 已有 pyusb，Mac 上也能用）。先在 Linux 机器上接真机看一眼再定。
+
+## 评审修订
+
+独立评审（2026-11-19），对照协议文档 `fw-v10-hostlost:docs/protocol.md` 和 main 上的 `dash_service.py` / `pet_render.py`。上面正文已直接改，这里列改了什么、为什么。
+
+协议约束：
+
+- 补 `seg_bytes == 72` 校验，不符就不发 SEG（第 3 节）。
+- 补 `max_payload` 下限：小于 1032 放不下一个 32×16 tile，原来的“按宽度切块”公式会算出宽 0；直接当不兼容（第 3 节）。
+- 补“一个协议帧一次写完”（设备半截帧 0.5 s 丢弃）、打开后 `tcflush`、回包坏帧前进 1 字节重新同步（第 3 节）。
+- 写清 PRESENT 从 v0 就有，单 / 双 / 三缓冲主机侧同一套发法，不按 bit1 / bit3 分支（第 3 节）。
+- 写清 ACK 错误计数的基线在 HELLO 后归零，否则重连后第一次比较会误判（第 3 节）。
+- 非 RECT 消息回 `status` 1 / 3 时不当断线，停用该项（旧固件或没灯的设备不至于反复重连，第 3 节）。
+- 写清 PRESENT ACK 超时的处理：不更新已提交缓存，走重连 + 整帧，对上协议文档“坏帧表现为等应答超时，重发整帧即可”（第 4 节）。
+
+对 udisp 路径的回归：
+
+- 第 8 节的重连修复会让“副屏没插”日志从每分钟一行变成每 3 s 一行，补“只在状态变化时打日志”。
+- 第 4 节补后端只读输入图：没猫时 `Stage.image` 交出的是缓存底图本身。
+- `Stage.frame` 输出逐字节不变、`FakeDisp` 没有 `wants_image` / `tick` 照旧走旧路径，原稿已写，未改。
+
+Python 3.9 / 推车环境：
+
+- 串口 raw 改成手写完整 cfmakeraw 标志，点名不能用 `tty.cfmakeraw`（3.12+），也不用 `tty.setraw`（3.9 上不清 `INLCR` / `IGNCR`）；不设 raw 的后果是 ttyUSB 默认回显，表现为 `crc_err` 一直涨（第 7 节）。
+- `O_NOCTTY | O_NONBLOCK` + `CLOCAL`：root 跑、无 seat 会话时不会把这个口变成控制终端，也不会因为没有载波卡在 open（第 7 节）。
+- 设备发现只开 sysfs 比对通过的节点：推车上有接着网络设备 console 的 `/dev/con-*`，往错的 tty 写 HELLO 是真会出事的（第 7 节）。
+- 补“`option` 驱动可能不认这个口、根本没 tty”的风险，列为待定第 8 条。
+
+灯：
+
+- 自检中从“蓝闪”改成“蓝常亮”，和固件“主机走了”的蓝灯心跳分开（第 6 节）。
+- 补自检页 view 缺键的处理（第 6 节）。
+
+去掉的过度设计：
+
+- `--display auto`：车上只接一块屏，显式指定就够（第 9 节）。
+- `tick()` 返回按键事件：v1 按键只开关背光，在后端内部消化，不给 dash_service 加输入路径（第 2 节）。
+- 段码屏文字渲染脚本：单测按段位断言就够（第 10 节）。
+
+保留未改、留给实现时确认的：采集线程一轮（`dc.collect`）如果在推车上偶尔超过 2 s，保活会漏拍；靠“≥ 3.5 s 先 HELLO + 整帧”兜底，开机页可能闪一下。上车前在推车上量一次 `dc.collect` 的最长耗时。
