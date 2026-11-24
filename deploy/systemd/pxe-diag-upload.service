@@ -1,0 +1,30 @@
+[Unit]
+Description=ops-cart 收 ARM64 诊断包 (装机口 :8081, 只收 PUT /diag/*.tar.gz)
+After=network.target
+
+[Service]
+# 被测 ARM64 板子在推车 PXE 起的 Alpine 内存系统里收集完, 往这里传 (docs/ARM64_PXE.md).
+# 包落在 /var/lib/ops-cart-arm64-diag (DynamicUser: 实际在 /var/lib/private/ 下, 这个路径是 systemd 建的链接).
+EnvironmentFile=/etc/ops-cart/pxe.env
+ExecStart=/usr/bin/python3 /opt/pxe/diag_upload.py --bind ${PXE_IP} --dir /var/lib/ops-cart-arm64-diag
+DynamicUser=yes
+StateDirectory=ops-cart-arm64-diag
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+UMask=0027
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

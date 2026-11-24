@@ -33,7 +33,8 @@ import sys
 import time
 
 from pxeserver import (MENU_MAX, PXE_MODE, bind_retry, cart_event, install_allowed, menu_mac, norm_mac, norm_name,
-                       private_name, pxe_mode, pxelinux_cfg_gate, rescue_default_menu, unlock_only_menu)
+                       private_name, pxe_mode, pxelinux_cfg_gate, rescue_default_menu, unlock_only_menu,
+                       arm64_cfg_gate)
 
 log = logging.getLogger("httpserve")
 
@@ -76,7 +77,8 @@ class GuardedHandler(http.server.SimpleHTTPRequestHandler):
         if private_name(base) or base.startswith("grub.cfg."):
             self.send_error(404, "File not found")
             return None
-        if pxelinux_cfg_gate(os.path.abspath(self.directory), path) is not None:
+        root = os.path.abspath(self.directory)
+        if pxelinux_cfg_gate(root, path) is not None or arm64_cfg_gate(root, path) is not None:
             self.send_error(404, "File not found")
             return None
         if is_ks(base):

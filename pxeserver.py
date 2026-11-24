@@ -6,8 +6,9 @@
       --tftp-root D:/pxe/tftp --log D:/pxe/pxeserver.log
 
 DHCP: 按 option 93 (client system architecture) 分发 bootloader:
-  0007/0009 -> shimx64.efi (UEFI x86-64),  0000 -> pxelinux.0 (BIOS)
-  option 77 带 iPXE (GRUB 链式加载的 iPXE) -> http://<ip>/boot.ipxe
+  0007/0009 -> shimx64.efi (UEFI x86-64),  0000 -> pxelinux.0 (BIOS),  000b -> aa64/grubaa64.efi (UEFI ARM64)
+  别的架构 (UEFI HTTP boot、32 位、RISC-V...) 一个包都不回; 没带 option 93 的照旧给 UEFI x86-64
+  option 77 带 iPXE (GRUB 链式加载的 iPXE) 且是 x86-64 UEFI -> http://<ip>/boot.ipxe
 TFTP: 支持 blksize / tsize 协商, octet 模式, 拒绝根目录穿越.
 """
 
@@ -89,15 +90,30 @@ def parse_dhcp(msg):
     return xid, mac, opts
 
 
-def arch_bootfile(opts, uefi_file, bios_file):
-    """按 option 93 / 60 选 bootloader 文件名."""
+ARCH_BIOS, ARCH_X64_UEFI, ARCH_ARM64_UEFI = (0,), (7, 9), (11,)    # option 93 (RFC 4578 / IANA)
+ARM64_DIR = "aa64"
+ARM64_EFI = f"{ARM64_DIR}/grubaa64.efi"     # Rocky 的 grubaa64.efi, 不过 shim (ARM 板子一般不开安全启动, 见 docs/ARM64_PXE.md)
+
+
+def client_arch(opts):
+    """option 93 -> 第一个架构号 (RFC 4578 允许列多个); 没带 None; 长度不对 -1 (当不认识)."""
     arch = opts.get(93)
     if arch is None:
+        return None
+    return struct.unpack("!H", arch[:2])[0] if len(arch) >= 2 else -1
+
+
+def arch_bootfile(opts, uefi_file, bios_file, arm64_file=None):
+    """按 option 93 精确选 bootloader 文件名; 不认识的架构 (或 arm64_file 没给) -> None, 调用方一个包都不回.
+    没带 option 93 照旧给 UEFI x86-64 (老行为, 不是 PXE 固件的普通 DHCP 客户端也走这条)."""
+    kind = client_arch(opts)
+    if kind is None or kind in ARCH_X64_UEFI:
         return uefi_file
-    kind = struct.unpack("!H", arch)[0]
-    if kind == 0:  # 0000: BIOS x86
+    if kind in ARCH_BIOS:
         return bios_file
-    return uefi_file  # 0007/0009: EFI x86-64
+    if kind in ARCH_ARM64_UEFI:
+        return arm64_file or None
+    return None
 
 
 def is_ipxe(opts):
@@ -475,7 +491,7 @@ class DhcpServer:
     DECLINE_HOLD_S = 600    # 客户端 DECLINE (ARP 发现有人占着) 的地址隔离这么久
 
     def __init__(self, ip, pool_start, pool_end, uefi_file, bios_file, log, port=67, iface=None,
-                 prefix=24):
+                 prefix=24, arm64_file=ARM64_EFI):
         self.ip = ip
         self.iface = iface
         net = ipaddress.ip_interface(f"{ip}/{prefix}").network
@@ -488,7 +504,7 @@ class DhcpServer:
         self.net = net
         self.netmask, self.broadcast = str(net.netmask), str(net.broadcast_address)
         self.port = port
-        self.uefi_file, self.bios_file = uefi_file, bios_file
+        self.uefi_file, self.bios_file, self.arm64_file = uefi_file, bios_file, arm64_file
         self.ipxe_script = f"http://{ip}/{IPXE_SCRIPT}"
         self.log = log
         self.leases = {}        # mac(bytes) -> [ip, 到期时间]
@@ -542,10 +558,19 @@ class DhcpServer:
         return None             # 池子用完: 宁可不回, 也不把同一个地址发给两台机器
 
     def _bootfile(self, opts):
-        # iPXE 再要地址时给脚本, 不然又拿到 shim 绕回 GRUB (Windows PE 走 GRUB -> iPXE -> wimboot)
-        if is_ipxe(opts):
+        """-> 引导文件; None = 不认识的架构, 不回. iPXE 再要地址时给脚本, 不然又拿到 shim 绕回 GRUB
+        (Windows PE 走 GRUB -> iPXE -> wimboot); boot.ipxe 是 x86 的, 只给 x86-64 UEFI (或没报架构) 的 iPXE."""
+        if is_ipxe(opts) and (client_arch(opts) is None or client_arch(opts) in ARCH_X64_UEFI):
             return self.ipxe_script
-        return arch_bootfile(opts, self.uefi_file, self.bios_file)
+        return arch_bootfile(opts, self.uefi_file, self.bios_file, self.arm64_file)
+
+    def _unsupported(self, opts, mac, where):
+        """不认识的架构: 记一笔, 调用方不回 (不发地址也不给引导文件, 免得固件拿 x86 的文件去起)."""
+        if self._bootfile(opts) is not None:
+            return False
+        self.log.info("%s %s arch=%s vendor=%r: 架构不支持, 不回", where, mac.hex(":", 1),
+                      opts.get(93, b"").hex(), opts.get(60, b"").decode("ascii", "replace"))
+        return True
 
     def _reply(self, msg, kind, ip, opts):
         bootfile = self._bootfile(opts)
@@ -577,6 +602,8 @@ class DhcpServer:
                 and sid != socket.inet_aton(self.ip):
             # SELECTING 时才带 server-id: 客户端在这个网段上收到过别人的 OFFER
             self.guard.foreign(socket.inet_ntoa(sid), "客户端选了")
+        if self._unsupported(parsed[2], parsed[1], "DHCP"):
+            return None
         now = time.time() if now is None else now
         if not self._leasing():
             if self._renewing() and parsed[2].get(53, b"")[0:1] == b"\x03" and msg[12:16] != bytes(4):
@@ -646,7 +673,7 @@ class DhcpServer:
                     self.log.info("DHCP RELEASE %s %s", mac_hex, ip)
         return None
 
-    PROXY_ARCHES = (7, 9)   # option 93: x86-64 UEFI. 只有 shimx64 能引导的才答, BIOS/ARM 给了也起不来
+    PROXY_ARCHES = ARCH_X64_UEFI + ARCH_ARM64_UEFI   # option 93: x86-64 / ARM64 UEFI. BIOS 不答 (代理模式下 pxelinux 没试过)
 
     def _proxy_offer(self, msg, parsed):
         """代理模式下的 67 口, 照 dnsmasq dhcp-range=...,proxy 对 UEFI 客户端的做法:
@@ -660,6 +687,8 @@ class DhcpServer:
                 or len(arch) != 2 or struct.unpack("!H", arch)[0] not in self.PROXY_ARCHES:
             return None
         bootfile = self._bootfile(opts)
+        if bootfile is None:            # ARM64 但没配引导文件
+            return None
         extra = [encode_opt(97, opts[97])] if 97 in opts else []    # 规范: 客户端带了 UUID 就原样带回
         self.log.info("DHCP DISCOVER %s -> 代理 OFFER (不发地址) bootfile=%s", mac.hex(":", 1), bootfile)
         return build_dhcp_reply(msg, 2, "0.0.0.0", self.ip, [
@@ -683,6 +712,8 @@ class DhcpServer:
         xid, mac, opts = parsed
         msg_type = opts.get(53, b"")[0:1]
         if msg_type not in (b"\x01", b"\x03"):
+            return None
+        if self._unsupported(opts, mac, "proxyDHCP"):     # 不按 PROXY_ARCHES 卡: 自己发地址时 BIOS 的 ROM 也会来
             return None
         reply_type = b"\x02" if msg_type == b"\x01" else b"\x05"
         kind = "OFFER" if msg_type == b"\x01" else "ACK"
@@ -773,9 +804,18 @@ LOCAL_ENTRY = f"menuentry '{LOCAL_TITLE}' {{\n    exit\n}}\n"
 MEMTEST_EFI = "memtest/memtest64.efi"
 MEMTEST_TITLE = "Memtest86+ memory test (HTTP; turn Secure Boot OFF first)"
 
+# PassMark MemTest86 Site Edition: 商业授权, 要自备, 文件一律不进仓库 (docs/ARM64_PXE.md). 解压出的 EFI/BOOT/* 放 tftp 根下
+# mt86site/, GRUB 经 TFTP chainloader (留着 PXE 的 DHCP 信息给它找 TFTP 服务器). 只能手选, 不在装机菜单里.
+MT86_SITE_DIR = "mt86site"
+MT86_SITE_TITLE = "MemTest86 (PassMark Site)"
+
+
+def _mt86_site_entry(efi):
+    return f"menuentry '{MT86_SITE_TITLE}' {{\n    chainloader /{MT86_SITE_DIR}/{efi}\n}}\n"
+
 
 def grub_menu(ip, install=False):
-    """GRUB 菜单: 默认 (第 0 项本地盘, 后面救援, 最后 Memtest86+) / 自动装机. 救援是 root 带 sshd (可能无密码),
+    """GRUB 菜单: 默认 (第 0 项本地盘, 后面救援、MemTest86 Site, 最后 Memtest86+) / 自动装机. 救援是 root 带 sshd (可能无密码),
     只能人在屏幕前手选 (#70); Memtest 同样手选 (chainloader, 只走 HTTP). Linux 项都给 HTTP (快) 和 TFTP (慢) 两条路.
     装机菜单倒计时短, 不加 Memtest.
     装机项带 inst.ks.sendmac: anaconda 取 ks 时报 MAC, httpserve 据此核对是不是解锁的那台
@@ -786,7 +826,42 @@ def grub_menu(ip, install=False):
                 _linux_entries(ip, "Rocky 9.8 auto install",
                                f"inst.repo={repo}/rocky inst.ks={repo}/ks.cfg inst.ks.sendmac"))
     return ("set default=0\nset timeout=10\n\n" + LOCAL_ENTRY + "\n" + _rescue_entries(ip) +
+            "\n" + _mt86_site_entry("BOOTX64.efi") +
             f"\nmenuentry '{MEMTEST_TITLE}' {{\n    chainloader (http,{ip})/{MEMTEST_EFI}\n}}\n")
+
+
+# ARM64 UEFI (#ARM64): 固件 TFTP 取 aa64/grubaa64.efi (Rocky 签名的 GRUB), GRUB 按自己所在目录取 aa64/grub.cfg.
+# aa64/grub.cfg 不读盘, TFTP 发 grub_menu_arm64 生成的 (arm64_cfg_gate); aa64/ 下按 MAC 的菜单一律找不到:
+# ARM 板子没有装机 / 解锁用途, x86 的 grub.cfg-01-<mac> 在根下, ARM 的 GRUB 不会去取.
+# 诊断 Linux = Alpine aarch64 netboot (整个跑在内存 tmpfs 里), 包从推车上的本地子集仓库装, 不连外网.
+ARM64_DIAG = f"{ARM64_DIR}/alpine"
+ARM64_DIAG_FILES = ("vmlinuz-lts", "initramfs-lts", "modloop-lts")
+# 包都在推车上的本地子集仓库 (arm64_diag_core.py fetch 备料), 装机口那边不保证能上外网
+ARM64_DIAG_PKGS = ("python3", "acpica", "iasl", "dmidecode", "pciutils", "usbutils", "lsblk", "nvme-cli",
+                   "smartmontools", "efibootmgr", "lshw", "ethtool", "iproute2")
+ARM64_APKOVL = f"{ARM64_DIAG}/ops-diag.apkovl.tar.gz"    # 收集脚本 + 开机自启 (arm64_diag_core.build_apkovl)
+DIAG_UPLOAD_PORT = 8081                                  # diag_upload.py 收诊断包
+ARM64_DIAG_TITLE = "Diagnostic Linux in RAM (Alpine aarch64, console login root)"
+# 串口: 显式给 PL011 的 ttyAMA0 (最后一个 console= 当 /dev/console), tty0 给屏幕; earlycon 无参数 = 按 ACPI SPCR / DT 自动.
+# 实际是 ttyAMA 几要实机核对, 不对就在 GRUB 里按 e 改.
+ARM64_CONSOLE = "earlycon console=tty0 console=ttyAMA0,115200"
+
+
+def grub_menu_arm64(ip):
+    """aa64/grub.cfg: 第 0 项本地盘 (exit 退回固件按 BootOrder 往下走), 超时 10 秒; 后面诊断 Linux 两条路 (HTTP 快 / TFTP 慢,
+    modloop 和包总是 HTTP). 诊断项只能手选 (_manual_only 认 aa64/alpine), 不带 ssh_key (不开 sshd).
+    起来后 apkovl 里的 ops-diag-collect 自动只读收集一遍, 打包 PUT 到 ops_diag= 给的推车地址."""
+    http = f"http://{ip}/{ARM64_DIAG}"
+    args = (f"ip=dhcp alpine_repo={http}/repo/main,{http}/repo/community modloop={http}/modloop-lts "
+            f"pkgs={','.join(ARM64_DIAG_PKGS)} apkovl=http://{ip}/{ARM64_APKOVL} "
+            f"ops_diag=http://{ip}:{DIAG_UPLOAD_PORT}/diag/ {ARM64_CONSOLE}")
+    out = []
+    for src, label in ((f"(http,{ip})", "HTTP fast"), ("", "TFTP slow")):
+        out.append(f"menuentry '{ARM64_DIAG_TITLE} ({label})' {{\n"
+                   f"    linux {src}/{ARM64_DIAG}/vmlinuz-lts {args}\n"
+                   f"    initrd {src}/{ARM64_DIAG}/initramfs-lts\n}}\n")
+    return ("set default=0\nset timeout=10\n\n" + LOCAL_ENTRY + "\n" + "\n".join(out) +
+            "\n" + _mt86_site_entry("BOOTAA64.efi"))
 
 
 def pxelinux_menu(ip):
@@ -897,10 +972,11 @@ _RESCUE_KW = ("inst.rescue", "inst.sshd")
 
 
 def _manual_only(text):
-    """只能手选的项: 救援 (inst.rescue / inst.sshd, 区分大小写同 GRUB 参数) 或 Memtest86+ (#58 审查; 不分大小写,
-    认 memtest 这个词, 路径 memtest/memtest64.efi、mt86plus 都算)."""
+    """只能手选的项: 救援 (inst.rescue / inst.sshd, 区分大小写同 GRUB 参数)、Memtest86+ (#58 审查; 不分大小写,
+    认 memtest 这个词, 路径 memtest/memtest64.efi、mt86plus 都算) 、ARM64 诊断 Linux (路径 aa64/alpine) 或 MemTest86 Site (路径 mt86site; 后两者不分大小写)."""
     low = text.lower()
-    return any(k in text for k in _RESCUE_KW) or "memtest" in low or "mt86plus" in low
+    return (any(k in text for k in _RESCUE_KW) or "memtest" in low or "mt86plus" in low or ARM64_DIAG in low
+            or MT86_SITE_DIR in low)
 
 
 MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 不发 (TFTP 换默认菜单, HTTP 403), 上锁时删
@@ -982,6 +1058,22 @@ def pxelinux_cfg_gate(root, path):
         return "default"
     real = parts(os.path.realpath(path), os.path.realpath(root))
     return "deny" if "pxelinux.cfg" in rel or "pxelinux.cfg" in real else None
+
+
+def arm64_cfg_gate(root, path):
+    """ARM64 菜单门禁 (白名单, 同 pxelinux_cfg_gate): "default" = 根下 aa64/grub.cfg (发 grub_menu_arm64 生成的, 不读盘);
+    "deny" = aa64/ 下 (请求路径或解开符号链接后的真实路径) 任何一级以 grub.cfg 开头的别的名字
+    (grub.cfg-01-<mac>、grub.cfg-<IP 十六进制>、子目录里的、备份); None = 无关."""
+    def parts(p, r):
+        return [norm_name(c) for c in os.path.relpath(p, r).replace(os.sep, "/").split("/")]
+    rel = parts(path, root)
+    if rel == [ARM64_DIR, "grub.cfg"]:
+        return "default"
+    real = parts(os.path.realpath(path), os.path.realpath(root))
+    for ps in (rel, real):
+        if ps[0] == ARM64_DIR and any(c.startswith("grub.cfg") for c in ps[1:]):
+            return "deny"
+    return None
 
 
 def norm_mac(mac):
@@ -1147,6 +1239,12 @@ class TftpServer:
             return io.BytesIO(data), len(data), f"TFTP RRQ {name} (推车生成)"
         if cfg == "deny":
             raise FileNotFoundError(f"{name} 不发 (pxelinux 只出推车生成的 default)")
+        arm = arm64_cfg_gate(self.root, path)
+        if arm == "default":
+            data = grub_menu_arm64(self.ip).encode()
+            return io.BytesIO(data), len(data), f"TFTP RRQ {name} (推车生成, ARM64)"
+        if arm == "deny":
+            raise FileNotFoundError(f"{name} 不发 (aa64/ 只出推车生成的 grub.cfg)")
         base = norm_name(os.path.basename(path))
         if private_name(base) or base.startswith("grub.cfg."):
             raise FileNotFoundError(f"{name} 不发 (备份 / 临时文件)")
@@ -1222,6 +1320,11 @@ class TftpServer:
 
 # ---------------------------------------------------------------- main
 
+def _env_arm64_file(default=ARM64_EFI):
+    """pxe.env 里的 PXE_ARM64_FILE: ARM64 UEFI 的引导文件 (相对 tftp 根); 没写用 aa64/grubaa64.efi."""
+    return os.environ.get("PXE_ARM64_FILE") or default
+
+
 def _env_minutes(default=SERVE_S // 60):
     """pxe.env 里的 PXE_SERVE_MINUTES (单元的 EnvironmentFile 带进来); 没写/写坏了用默认."""
     try:
@@ -1240,6 +1343,8 @@ def parse_args(argv):
     p.add_argument("--tftp-root", required=True)
     p.add_argument("--uefi-file", default="shimx64.efi")
     p.add_argument("--bios-file", default="pxelinux.0")
+    p.add_argument("--arm64-file", default=_env_arm64_file(),
+                   help="ARM64 UEFI (option 93 = 000b) 的引导文件; 默认取 PXE_ARM64_FILE 或 aa64/grubaa64.efi")
     p.add_argument("--log", default=None)
     p.add_argument("--iface", default=None, help="装机口网卡名 (Linux 必填, 否则收不到 DHCP 广播)")
     p.add_argument("--guard-state", default=GUARD_STATE, help="守卫状态文件 (JSON)")
@@ -1264,7 +1369,7 @@ def main(argv=None):
 
     try:
         dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log,
-                          iface=args.iface, prefix=args.prefix)
+                          iface=args.iface, prefix=args.prefix, arm64_file=args.arm64_file)
     except (ValueError, TypeError) as e:
         log.error("参数不对: %s", e)
         sys.exit(EXIT_CONFIG)

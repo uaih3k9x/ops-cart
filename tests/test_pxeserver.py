@@ -902,7 +902,7 @@ def test_proxy_mode_67_ignores_everything_but_pxe_discover(tmp_path):
                 make_discover(mac=M2),                                   # 没有 option 60
                 make_pxe_discover(with_arch=False),                      # 没有 option 93 (dnsmasq 也不回)
                 make_pxe_discover(arch=0),                               # BIOS: 仓库里没有 BIOS 引导
-                make_pxe_discover(arch=11)):                             # ARM64: shimx64 给了也起不来
+                make_pxe_discover(arch=0x13)):                           # ARM64 HTTP boot: 不支持 (ARM64 PXE 见 test_arm64_pxe)
         assert d.handle(msg, None) is None
     assert d.leases == {}
 
