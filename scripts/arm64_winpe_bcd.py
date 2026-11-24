@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """ARM64 WinPE 网络启动用的 BCD: 拿 ADK 自带的 arm64\\Media\\EFI\\Microsoft\\Boot\\BCD (本来就是 ramdisk 写法,
-device = ramdisk=[boot]\\sources\\boot.wim,{ramdiskoptions}) 改几处:
+device = ramdisk=[boot]\\sources\\boot.wim,{7619dcc8-...}) 改几处:
   - boot.sdi / boot.wim 的路径指到 TFTP 根下的 \\aa64\\winpe\\<build>\\ (两个版本并排放, 互不干扰);
   - 开 EMS: {emssettings} bootems (启动管理器和 winload 继承) + osloader ems (内核 / SAC);
     默认不写口号和波特率 = 用固件 ACPI SPCR 描述的口 (D2000: PL011 115200); --ems-port/--ems-baud 可强行指定.
@@ -18,7 +18,8 @@ import uuid
 
 BUILDS = ("22621", "26100")
 TFTP_DIR = "\\aa64\\winpe"                       # 跟 pxeserver.ARM64_WINPE_DIR 一致 (反斜杠写法)
-RAMDISK_OPTIONS_ID = "{7619dcc8-fafe-11d9-b411-000476eba25f}"   # {ramdiskoptions}
+# ADK 模板自定义的 ramdisk 选项对象; 保留名 {ramdiskoptions} 是 {ae5534e0-...}, 不是它
+RAMDISK_OPTIONS_ID = "{7619dcc8-fafe-11d9-b411-000476eba25f}"
 OSLOADER_ID = "{7619dcc9-fafe-11d9-b411-000476eba25f}"          # ADK 模板里 WinPE 那一项 (Windows Setup)
 EMS_ID = "{0ce4991b-e6b3-4b16-b23c-5e0d9250e5d9}"               # {emssettings}
 
@@ -49,6 +50,13 @@ def ramdisk_device(path, options_id):
     return uuid.UUID(options_id).bytes_le + outer
 
 
+def check_template(blob):
+    """模板原有的 device 必须跟自己拼的 ramdisk=[boot]\\sources\\boot.wim,{7619dcc8-...} 逐字节相同:
+    运行时证明 ramdisk_device 的拼装格式对 (ADK 换了格式就停下, 不写出坏 BCD)."""
+    if blob != ramdisk_device("\\sources\\boot.wim", RAMDISK_OPTIONS_ID):
+        raise SystemExit("ADK 模板的 device 跟 ramdisk_device 拼的不一致, 格式变了? 不改写")
+
+
 def edits(build, ems_port=None, ems_baud=None):
     """{对象 GUID: {元素号: (注册表类型, 数据)}}: 在 ADK 模板上要写的元素 (没有的新建, 有的覆盖)."""
     if build not in BUILDS:
@@ -72,6 +80,11 @@ def apply(src, dst, build, ems_port=None, ems_baud=None):  # pragma: no cover - 
     import hivex
     h = hivex.Hivex(src, write=True)
     objects = h.node_get_child(h.root(), "Objects")
+    loader = h.node_get_child(objects, OSLOADER_ID)
+    dev = loader and h.node_get_child(h.node_get_child(loader, "Elements"), EL_DEVICE)
+    if not dev:
+        raise SystemExit(f"模板里没有 {OSLOADER_ID} 的 device, 不是 ADK 的 WinPE BCD?")
+    check_template(h.value_value(h.node_get_value(dev, "Element"))[1])
     for obj_id, elements in edits(build, ems_port, ems_baud).items():
         obj = h.node_get_child(objects, obj_id)
         if not obj:

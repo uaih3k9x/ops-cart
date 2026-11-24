@@ -23,7 +23,7 @@ def u32(b, off):
 @pytest.mark.parametrize("path", ["\\sources\\boot.wim", "\\aa64\\winpe\\22621\\sources\\boot.wim"])
 def test_ramdisk_device_layout(path):
     blob = bcd.ramdisk_device(path, RAMDISK_OPTIONS)
-    assert blob[:16] == uuid.UUID(RAMDISK_OPTIONS).bytes_le           # 附加选项 = {ramdiskoptions}
+    assert blob[:16] == uuid.UUID(RAMDISK_OPTIONS).bytes_le           # 附加选项 = ADK 的 ramdisk 选项对象 {7619dcc8-...}
     assert u32(blob, 24) == len(blob) - 16                            # 两层长度字段都是"从这里到末尾"
     assert u32(blob, 32) == 3                                          # 设备类型 ramdisk
     assert u32(blob, 60) == len(blob) - 56
@@ -70,3 +70,19 @@ def test_edits_never_weaken_signing():
 def test_unknown_build_rejected():
     with pytest.raises(ValueError):
         bcd.edits("19041")
+
+
+def test_check_template_accepts_adk_layout():
+    """apply() 改写前先拿模板原有的 device 跟自己拼的 \\sources\\boot.wim 比, 一致才证明拼装格式对."""
+    bcd.check_template(bcd.ramdisk_device("\\sources\\boot.wim", RAMDISK_OPTIONS))
+
+
+@pytest.mark.parametrize("blob", [b"", bytes(176)])
+def test_check_template_rejects_other_layout(blob):
+    with pytest.raises(SystemExit):
+        bcd.check_template(blob)
+
+
+def test_check_template_rejects_other_path():
+    with pytest.raises(SystemExit):
+        bcd.check_template(bcd.ramdisk_device("\\x\\boot.wim", RAMDISK_OPTIONS))

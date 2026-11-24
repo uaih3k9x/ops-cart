@@ -93,6 +93,19 @@ def test_arm_rejects_unknown_build_or_bad_minutes(state, build, minutes):
         ps.arm64_winpe_arm(state, "02:00:00:00:0b:01", build, minutes=minutes, now=NOW)
 
 
+@pytest.mark.parametrize("until", [float("nan"), float("inf"), NOW + 61 * 60])
+def test_nonfinite_or_too_long_window_is_not_armed(state, until):
+    """until 是 NaN / Infinity (now > nan 恒假), 或比上限还远 (推车时钟回跳、手写的文件): 都不算开着."""
+    open(state, "w").write(json.dumps({"mac": "02:00:00:00:0b:01", "build": "22621", "since": NOW, "until": until}))
+    assert ps.arm64_winpe_armed(state, "02:00:00:00:0b:01", NOW) is None
+    assert ps.arm64_winpe_armed(state, "02:00:00:00:0b:01", 1e12) is None
+
+
+def test_clock_jumped_back_closes(state):
+    ps.arm64_winpe_arm(state, "02:00:00:00:0b:01", "22621", minutes=15, now=NOW)
+    assert ps.arm64_winpe_armed(state, "02:00:00:00:0b:01", NOW - 3600) is None
+
+
 def test_disarm(state):
     ps.arm64_winpe_arm(state, "02:00:00:00:0b:01", "22621", minutes=15, now=NOW)
     assert ps.arm64_winpe_disarm(state) is True
@@ -117,7 +130,7 @@ def test_armed_mac_gets_bootmgr_and_bcd_path(state):
     d = armed_dhcp(state)
     offer = d.handle(packet(), None)
     assert bootfile_of(offer) == ("aa64/winpe/22621/bootaa64.efi",) * 2
-    assert opt252(offer) == b"\\aa64\\winpe\\22621\\boot\\bcd"
+    assert opt252(offer) == b"\\aa64\\winpe\\22621\\boot\\bcd\0"
     req = packet(msg_type=3, extra=encode_opt(50, ("192.0.2.10",)) + encode_opt(54, (IP,)))
     ack = d.handle(req, None)
     assert parse_dhcp(ack)[2][53] == b"\x05"
@@ -127,7 +140,7 @@ def test_armed_mac_gets_bootmgr_and_bcd_path(state):
 def test_armed_26100(state):
     offer = armed_dhcp(state, build="26100").handle(packet(), None)
     assert bootfile_of(offer)[0] == "aa64/winpe/26100/bootaa64.efi"
-    assert opt252(offer) == b"\\aa64\\winpe\\26100\\boot\\bcd"
+    assert opt252(offer) == b"\\aa64\\winpe\\26100\\boot\\bcd\0"
 
 
 def test_other_machines_unchanged_while_armed(state):
@@ -159,6 +172,44 @@ def test_armed_proxy_and_4011(state):
     assert bootfile_of(offer)[0] == "aa64/winpe/22621/bootaa64.efi" and opt252(offer) is not None
     ack = d.handle_proxy(packet(msg_type=3, ciaddr="192.0.2.10"), ("192.0.2.10", 4011))
     assert bootfile_of(ack)[0] == "aa64/winpe/22621/bootaa64.efi" and opt252(ack) is not None
+
+
+class Flaky:
+    """状态文件在一个回包的两次读之间被关掉: 第一次读到开着, 之后都是关的."""
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, path, mac, now):
+        self.calls += 1
+        return "22621" if self.calls == 1 else None
+
+
+def consistent(reply):
+    boot = bootfile_of(reply)[0]
+    if boot == "aa64/winpe/22621/bootaa64.efi":
+        return opt252(reply) is not None
+    return boot == ARM_FILE and opt252(reply) is None
+
+
+def test_one_state_read_per_reply_dhcp(state, monkeypatch):
+    d = armed_dhcp(state)
+    req = packet(msg_type=3, extra=encode_opt(50, ("192.0.2.10",)) + encode_opt(54, (IP,)))
+    d.handle(packet(), None)
+    flaky = Flaky()
+    monkeypatch.setattr(ps, "arm64_winpe_armed", flaky)
+    ack = d.handle(req, None)
+    assert flaky.calls == 1 and bootfile_of(ack)[0] == "aa64/winpe/22621/bootaa64.efi" and opt252(ack)
+
+
+def test_one_state_read_per_reply_proxy(state, monkeypatch):
+    d = armed_dhcp(state)
+    d.guard = ProxyGuard()
+    for send in (lambda: d.handle(packet(), ("0.0.0.0", 68)),
+                 lambda: d.handle_proxy(packet(msg_type=3, ciaddr="192.0.2.10"), ("192.0.2.10", 4011))):
+        flaky = Flaky()
+        monkeypatch.setattr(ps, "arm64_winpe_armed", flaky)
+        reply = send()
+        assert consistent(reply) and opt252(reply) is not None
 
 
 def test_default_state_path_is_under_opt_pxe():

@@ -49,9 +49,11 @@ sudo python3 /opt/pxe/pxeserver.py arm64-winpe --mac <板子 MAC> --build 22621 
 sudo python3 /opt/pxe/pxeserver.py arm64-winpe --off
 ```
 
-- 写 `/opt/pxe/arm64-winpe.json`（`mac`、`build`、`until`）。有效期 1–60 分钟，默认 15。
+- 写 `/opt/pxe/arm64-winpe.json`（`mac`、`build`、`until`）。有效期 1–60 分钟，默认 15；`until` 不是有限数、
+  或比"现在 + 60 分钟"还远（时钟回跳、手改的文件）都当没开。
+- **只有一个状态文件：同时只能对一块板开开关，再开会覆盖前一块。**
 - 开着时，**只有这台 MAC、且报 ARM64 UEFI（option 93 = 000b）** 的 DHCP（自己发地址、代理模式 67 口、4011 口）
-  拿到 `aa64/winpe/<build>/bootaa64.efi` 和 option 252 `\aa64\winpe\<build>\boot\bcd`。别的机器、
+  拿到 `aa64/winpe/<build>/bootaa64.efi` 和 option 252 `\aa64\winpe\<build>\boot\bcd`（结尾带 NUL，同 WDS）。每个回包只读一次状态文件，引导文件和 252 一致。别的机器、
   同一 MAC 报 x86 的，一律照旧。
 - 一次性：TFTP 把某个 build 的 `bootaa64.efi` **完整传完**一次就删状态文件（只问 tsize 就断开的那次不算），
   events.log 记一笔。过期、坏文件也当没开。之后板子再 PXE 回到 GRUB 菜单（默认本地盘）。
@@ -60,20 +62,21 @@ sudo python3 /opt/pxe/pxeserver.py arm64-winpe --off
 ### 1.3 BCD 怎么来的
 
 不用 bcdedit（要 Windows）。ADK 自带的 `arm64\Media\EFI\Microsoft\Boot\BCD` 本来就是 ramdisk 写法
-（`device/osdevice = ramdisk=[boot]\sources\boot.wim,{ramdiskoptions}`，`winpe Yes`，`detecthal Yes`），
+（`device/osdevice = ramdisk=[boot]\sources\boot.wim,{7619dcc8-…}`，`winpe Yes`，`detecthal Yes`），
 `[boot]` = 启动管理器自己来的设备，网络启动时就是 TFTP 根。[`scripts/arm64_winpe_bcd.py`](../scripts/arm64_winpe_bcd.py)
 用 hivex 在它上面改：
 
 | 对象 | 元素 | 改成 |
 |---|---|---|
-| `{ramdiskoptions}` | `32000004` ramdisksdipath | `\aa64\winpe\<build>\boot\boot.sdi` |
-| WinPE 项 `{7619dcc9-…}` | `11000001`/`21000001` device/osdevice | `ramdisk=[boot]\aa64\winpe\<build>\sources\boot.wim,{ramdiskoptions}` |
+| ramdisk 选项 `{7619dcc8-…}` | `32000004` ramdisksdipath | `\aa64\winpe\<build>\boot\boot.sdi` |
+| WinPE 项 `{7619dcc9-…}` | `11000001`/`21000001` device/osdevice | `ramdisk=[boot]\aa64\winpe\<build>\sources\boot.wim,{7619dcc8-…}` |
 | 同上 | `260000b0` ems | Yes（内核 EMS / SAC） |
 | 同上 | `12000004` description | `Windows PE ARM64 <build> (cart smoke test)` |
 | `{emssettings}` | `16000020` bootems | Yes（启动管理器、winload 经 `{globalsettings}` 继承） |
 
-- 设备元素是二进制：脚本从头拼（`ramdisk_device`），对 `\sources\boot.wim` 拼出来跟 ADK 模板逐字节相同，
-  两个长度字段随路径变。
+- `{7619dcc8-…}` 是 ADK 模板自己建的 ramdisk 选项对象，不是保留名 `{ramdiskoptions}`（那个是 `{ae5534e0-…}`），沿用即可。
+- 设备元素是二进制：脚本从头拼（`ramdisk_device`），两个长度字段随路径变。改写前先拿模板原有的 device 跟自己拼的
+  `\sources\boot.wim` 比，逐字节相同才往下写（`check_template`），不同就报错退出。
 - EMS 口：默认**不写口号**，让 Windows 按 ACPI SPCR 找口（D2000：PL011 @ 0x28000000，115200，ANSI）。
   `boot/bcd.com1` 是备用版，强写 EMS port 1 / 115200；ARM 上"COM1"怎么映射不确定，默认版不出字再换它。
 - 不开 `testsigning` / `nointegritychecks`：PE 和启动管理器都是微软签名的，用不着。板子没开安全启动。

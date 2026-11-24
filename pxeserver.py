@@ -18,6 +18,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -569,23 +570,23 @@ class DhcpServer:
         """-> 引导文件; None = 不认识的架构, 不回. iPXE 再要地址时给脚本, 不然又拿到 shim 绕回 GRUB
         (Windows PE 走 GRUB -> iPXE -> wimboot); boot.ipxe 是 x86 的, 只给 x86-64 UEFI (或没报架构) 的 iPXE.
         ARM64 WinPE 开关对这台 MAC 打开时 (_winpe_build) 给 Windows 启动管理器."""
+        return self._boot(opts, mac)[0]
+
+    def _boot(self, opts, mac):
+        """-> (引导文件, 多带的 option). 状态文件每个回包只读一次: 引导文件和 option 252 用同一个结果,
+        不会读两次之间开关被关, 发出"bootaa64.efi 但没有 252"的包."""
         if is_ipxe(opts) and (client_arch(opts) is None or client_arch(opts) in ARCH_X64_UEFI):
-            return self.ipxe_script
+            return self.ipxe_script, []
         build = self._winpe_build(opts, mac)
-        if build:
-            return arm64_winpe_efi(build)
-        return arch_bootfile(opts, self.uefi_file, self.bios_file, self.arm64_file)
+        if build:       # option 252: WDS 用来告诉启动管理器 BCD 在 TFTP 上的路径 (不带就去取 \\Boot\\BCD), 结尾带 NUL 同 WDS
+            return arm64_winpe_efi(build), [encode_opt(252, arm64_winpe_bcd(build) + "\0")]
+        return arch_bootfile(opts, self.uefi_file, self.bios_file, self.arm64_file), []
 
     def _winpe_build(self, opts, mac):
         """报 ARM64 UEFI、且 ARM64 WinPE 开关正对这台 MAC 打开 (没过期) -> build 号; 否则 None."""
         if mac is None or client_arch(opts) not in ARCH_ARM64_UEFI or not self.arm64_file:
             return None
         return arm64_winpe_armed(self.arm64_winpe_path, mac.hex(":"), self.now())
-
-    def _winpe_opts(self, opts, mac):
-        """开关打开时多带 option 252 (WDS 用来告诉启动管理器 BCD 在 TFTP 上的路径; 不带就去取 \\Boot\\BCD)."""
-        build = self._winpe_build(opts, mac)
-        return [encode_opt(252, arm64_winpe_bcd(build))] if build else []
 
     def _unsupported(self, opts, mac, where):
         """不认识的架构: 记一笔, 调用方不回 (不发地址也不给引导文件, 免得固件拿 x86 的文件去起)."""
@@ -597,7 +598,7 @@ class DhcpServer:
 
     def _reply(self, msg, kind, ip, opts):
         mac = msg[28:34]
-        bootfile = self._bootfile(opts, mac)
+        bootfile, winpe = self._boot(opts, mac)
         return build_dhcp_reply(msg, 2, ip, self.ip, [
             encode_opt(53, kind),
             encode_opt(60, "PXEClient"),
@@ -607,7 +608,7 @@ class DhcpServer:
             encode_opt(3, (self.ip,)),
             encode_opt(66, self.ip),
             encode_opt(67, bootfile),
-        ] + self._winpe_opts(opts, mac), bootfile)
+        ] + winpe, bootfile)
 
     def handle(self, msg, addr, now=None):
         parsed = parse_dhcp(msg)
@@ -710,7 +711,7 @@ class DhcpServer:
         if opts.get(53, b"")[0:1] != b"\x01" or not opts.get(60, b"").startswith(b"PXEClient") \
                 or len(arch) != 2 or struct.unpack("!H", arch)[0] not in self.PROXY_ARCHES:
             return None
-        bootfile = self._bootfile(opts, mac)
+        bootfile, winpe = self._boot(opts, mac)
         if bootfile is None:            # ARM64 但没配引导文件
             return None
         extra = [encode_opt(97, opts[97])] if 97 in opts else []    # 规范: 客户端带了 UUID 就原样带回
@@ -722,7 +723,7 @@ class DhcpServer:
         ] + extra + [
             encode_opt(66, self.ip),
             encode_opt(67, bootfile),
-        ] + self._winpe_opts(opts, mac), bootfile)
+        ] + winpe, bootfile)
 
     def handle_proxy(self, msg, addr):
         """proxyDHCP (UDP 4011): PXE 二阶段, 只回引导信息不租 IP (yiaddr=0).
@@ -741,7 +742,7 @@ class DhcpServer:
             return None
         reply_type = b"\x02" if msg_type == b"\x01" else b"\x05"
         kind = "OFFER" if msg_type == b"\x01" else "ACK"
-        bootfile = self._bootfile(opts, mac)
+        bootfile, winpe = self._boot(opts, mac)
         self.log.info("proxyDHCP %s %s -> %s:%s bootfile=%s", kind, mac.hex(":", 1),
                       addr[0], addr[1], bootfile)
         return build_dhcp_reply(msg, 2, "0.0.0.0", self.ip, [
@@ -750,7 +751,7 @@ class DhcpServer:
             encode_opt(54, (self.ip,)),
             encode_opt(66, self.ip),
             encode_opt(67, bootfile),
-        ] + self._winpe_opts(opts, mac), bootfile)
+        ] + winpe, bootfile)
 
     def serve_proxy(self, ready_event=None, sock=None):
         if sock is None:
@@ -906,12 +907,15 @@ def arm64_winpe_bcd(build):
 
 
 def arm64_winpe_armed(path, mac, now):
-    """ARM64 WinPE 一次性开关: 正对这台 MAC 打开、没过期 -> build 号; 别的 (没有、坏了、过期、别的 MAC) None."""
+    """ARM64 WinPE 一次性开关: 正对这台 MAC 打开、没过期 -> build 号; 别的 (没有、坏了、过期、别的 MAC) None.
+    只有一个状态文件: 同时只能对一块板开, 再开会覆盖前一块."""
     try:
         with open(path) as f:
             st = json.load(f)
         build, until = st["build"], float(st["until"])
-        if norm_mac(st["mac"]) != norm_mac(mac) or build not in ARM64_WINPE_BUILDS or now > until:
+        # NaN / Infinity 时 now > until 恒假; 推车时钟回跳会把窗口拉长: 只认 [now, now + 上限] 里的 until
+        if norm_mac(st["mac"]) != norm_mac(mac) or build not in ARM64_WINPE_BUILDS \
+                or not (math.isfinite(until) and now <= until <= now + ARM64_WINPE_MAX_MIN * 60):
             return None
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
