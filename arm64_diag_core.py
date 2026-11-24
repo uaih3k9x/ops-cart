@@ -29,6 +29,14 @@ ALPINE_REPOS = ("main", "community")
 ROCKY_TREE = "https://download.rockylinux.org/pub/rocky/9/BaseOS/aarch64/os"
 BASE_PKGS = ("alpine-base", "openssl")      # initramfs 总会装 alpine-base; modloop 验签要 openssl
 
+# openrc 的 hwclock 默认关机时把系统时间写回 RTC (clock_systohc 默认 YES); 诊断系统不改板子 RTC
+HWCLOCK = """# ops-cart: 开机读 RTC, 关机不写回 (不改板子的 RTC)
+clock="UTC"
+clock_hctosys="YES"
+clock_systohc="NO"
+clock_args=""
+"""
+
 START = """#!/bin/sh
 # ops-cart: 开机后在后台只读收集一遍 ARM64 诊断信息并传回推车 (内核参数没有 ops_diag= 就什么都不做).
 # 输出同时到 /dev/console 和 /tmp/ops-diag.log; 手动再跑: ops-diag-collect
@@ -123,13 +131,15 @@ def _member(name, kind=tarfile.REGTYPE, mode=0o644, data=b"", link=""):
 
 
 def build_apkovl(out, collector=COLLECTOR):
-    """Alpine apkovl (initramfs 解到内存根上): 收集脚本 + local 服务开机跑它. 同样输入出同样字节 (可复现)."""
+    """Alpine apkovl (initramfs 解到内存根上): 收集脚本 + local 服务开机跑它 + 关机不写 RTC. 同样输入出同样字节 (可复现)."""
     with open(collector, "rb") as f:
         script = f.read()
     d = tarfile.DIRTYPE
     members = [
         _member("etc/", d, 0o755),
         _member("etc/.default_boot_services"),          # 带 apkovl 时 initramfs 仍加 devfs/mdev/modloop... 默认服务
+        _member("etc/conf.d/", d, 0o755),
+        _member("etc/conf.d/hwclock", data=HWCLOCK.encode()),   # 先于 openrc 包解开, apk 保留它 (新的落成 .apk-new)
         _member("etc/local.d/", d, 0o755),
         _member("etc/local.d/ops-diag.start", mode=0o755, data=START.encode()),
         _member("etc/runlevels/", d, 0o755),

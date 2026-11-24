@@ -4,7 +4,8 @@
 被测板子 (Alpine 内存系统里的 arm64_diag_collect.py) 收集完往这里传. 只收这一种请求:
   名字白名单 (字母数字开头, 只含字母数字 . _ -, 以 .tar.gz 结尾, 不超过 128 字符), 不带目录;
   必须带 Content-Length, 不超过 --max-mb; 内容得是 gzip (1f 8b); 剩余空间不到 1 GB 不收;
-  同名不覆盖, 加 -1 -2 ...; 先写隐藏临时文件, 收全了再改名 (O_EXCL 抢名字).
+  同名不覆盖, 加 -1 -2 ...; 先写隐藏临时文件, 收全了再改名 (O_EXCL 抢名字);
+  同时最多 2 个上传 (多了 503), 余量检查算上正在传的; 套接字 60 秒超时.
 GET / POST / DELETE 一律 405, 不列目录、不往外发文件 (取包在推车本机看 --dir)."""
 
 import argparse
@@ -14,6 +15,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 
 import pxeserver
 
@@ -47,13 +49,16 @@ def _claim(directory, name):
     raise UploadError(409, "同名文件太多")
 
 
-def store(directory, name, stream, length, max_bytes, min_free=MIN_FREE):
-    """从 stream 读 length 字节存成 directory/name (重名加后缀) -> 存下的名字. 出错抛 UploadError, 不留文件."""
+def store(directory, name, stream, length, max_bytes, min_free=MIN_FREE, inflight=0):
+    """从 stream 读 length 字节存成 directory/name (重名加后缀) -> 存下的名字. 出错抛 UploadError, 不留文件.
+    inflight = 别的正在传的包已占的字节数, 余量检查算进去."""
     if safe_name(name) is None:
         raise UploadError(400, "文件名不合规")
+    if not isinstance(length, int) or length < 0:          # read(-1) 会一直读到断开, 绕过上限
+        raise UploadError(400, "Content-Length 不对")
     if length > max_bytes:
         raise UploadError(413, "太大")
-    if shutil.disk_usage(directory).free - length < min_free:
+    if shutil.disk_usage(directory).free - inflight - length < min_free:
         raise UploadError(507, "推车磁盘空间不够")
     tmp = os.path.join(directory, f".{name}.part-{os.getpid()}-{id(stream)}")
     try:
@@ -81,7 +86,11 @@ def store(directory, name, stream, length, max_bytes, min_free=MIN_FREE):
 class Handler(http.server.BaseHTTPRequestHandler):
     directory = DIAG_DIR
     max_bytes = 64 << 20
+    timeout = 60                        # 套接字超时: 慢连接 / 只发头不发内容的, 到点断开
     server_version = "ops-cart-diag/1"
+    slots = threading.BoundedSemaphore(2)       # 同时最多几个上传, 多了 503 (make_server 按实例换)
+    _lock = threading.Lock()
+    _inflight = [0]                             # 正在传的字节数 (余量检查用)
 
     def _reply(self, status, text):
         body = (text + "\n").encode()
@@ -106,10 +115,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             return self._reply(411, "Content-Length required")
+        if length < 0:
+            return self._reply(400, "bad Content-Length")
+        if not self.slots.acquire(blocking=False):
+            log.warning("诊断包 %s from %s 不收: 同时上传太多", parts[2], self.client_address[0])
+            return self._reply(503, "busy, retry later")
         try:
-            final = store(self.directory, parts[2], self.rfile, length, self.max_bytes)
+            self._put(parts[2], length)
+        finally:
+            self.slots.release()
+
+    def _put(self, name, length):
+        with self._lock:
+            inflight = self._inflight[0]
+            self._inflight[0] += length
+        try:
+            final = store(self.directory, name, self.rfile, length, self.max_bytes, inflight=inflight)
+        except OSError as e:            # 超时 / 断连: 临时文件 store 已删
+            log.warning("诊断包 %s from %s 没收完: %s", name, self.client_address[0], e)
+            return
         except UploadError as e:
-            log.warning("诊断包 %s from %s 不收: %s", parts[2], self.client_address[0], e)
+            log.warning("诊断包 %s from %s 不收: %s", name, self.client_address[0], e)
             if e.status == 413 and length <= 2 * self.max_bytes:     # 读掉 (不存), 客户端才收得到 413 而不是断连
                 left = length
                 while left > 0:
@@ -118,6 +144,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         break
                     left -= len(chunk)
             return self._reply(e.status, str(e))
+        finally:
+            with self._lock:
+                self._inflight[0] -= length
         log.info("诊断包收下 %s (%d bytes) from %s", final, length, self.client_address[0])
         self._reply(201, final)
 
@@ -125,14 +154,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         log.info("%s %s", self.client_address[0], fmt % args)
 
 
-def make_server(bind, port, directory, max_bytes=64 << 20):
-    handler = type("BoundHandler", (Handler,), {"directory": directory, "max_bytes": max_bytes})
+def make_server(bind, port, directory, max_bytes=64 << 20, max_concurrent=2, timeout=60):
+    handler = type("BoundHandler", (Handler,), {
+        "directory": directory, "max_bytes": max_bytes, "timeout": timeout,
+        "slots": threading.BoundedSemaphore(max_concurrent), "_lock": threading.Lock(), "_inflight": [0]})
     return http.server.ThreadingHTTPServer((bind, port), handler)
+
+
+def _bind_addr(text):
+    """只认一个具体地址: 空、0.0.0.0、:: 这种全网卡监听一律不要 (只该在装机口上收)."""
+    text = text.strip()
+    if text in ("", "0.0.0.0", "::", "*"):
+        raise argparse.ArgumentTypeError("要给装机口地址 (PXE_IP), 不能监听所有网卡")
+    return text
 
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--bind", required=True, help="装机口地址 (PXE_IP)")
+    p.add_argument("--bind", required=True, type=_bind_addr, help="装机口地址 (PXE_IP)")
     p.add_argument("--port", type=int, default=pxeserver.DIAG_UPLOAD_PORT)
     p.add_argument("--dir", default=DIAG_DIR)
     p.add_argument("--max-mb", type=int, default=64)

@@ -2,7 +2,9 @@
 
 给 ARM64 UEFI 板子 (首个目标: 飞腾 D2000, 固件基于 EDK2) 用推车 PXE 起一个**整个跑在内存里**的诊断 Linux,
 自动只读收集 ACPI / SMBIOS / PCI / USB / 网卡 / 盘 / EFI 变量等信息, 打成一个包传回推车,
-用来摸底 "Windows on ARM 兼容性" 之类的问题. **不装系统、不写板子硬盘.**
+用来摸底 "Windows on ARM 兼容性" 之类的问题. **不装系统; 收集阶段不写板子硬盘.**
+唯一会碰本地盘的是 Alpine initramfs 启动时只读挂载本地文件系统找 `*.apkovl.tar.gz` (nlplug-findfs, `MS_RDONLY`):
+不写文件, 但只读挂载 ext4/XFS 时内核仍可能回放日志 (见第 8 节第 5 步). 诊断系统关机时也不把时间写回板子 RTC.
 
 > 状态: 代码和测试在仓库里; 引导文件在开发机的暂存目录里备好; **还没上车、没在实机上跑过.**
 > 下面 "首次实机验证" 要人在板子前面做.
@@ -118,7 +120,9 @@ D2000 走 ACPI 时 PCIe 是标准 ECAM (`PCI_HOST_GENERIC=y`), 一般通用发�
 
 开机后 apkovl 里的 `/etc/local.d/ops-diag.start` 在后台调 `ops-diag-collect --auto` (= 仓库的 `arm64_diag_collect.py`):
 
-- 只写 `/tmp` (先检查所在文件系统是 tmpfs/ramfs, 不是就退出码 3, 一个文件都不建); 不挂载、不分区; 命令都是查询类.
+- 只写 `/tmp` (先检查所在文件系统是 tmpfs/ramfs/rootfs, 不是就退出码 3, 一个文件都不建); 不挂载、不分区;
+  命令都在只读白名单里 (`tests/test_arm64_diag_collect.py` 锁着, 以后加 `smartctl -t`、`efibootmgr -o/-b` 这类写操作测试会红).
+- apkovl 里带 `/etc/conf.d/hwclock` (`clock_systohc="NO"`): 关机不写 RTC.
 - 收: `uname -a`、`/proc/{cpuinfo,meminfo,cmdline,iomem,interrupts,version}` (cpuinfo 的 Features 看 atomics 等)、`ls -la /sys/firmware` (ACPI 还是 DT)、
   `dmidecode`、`lspci -nnvvv` / `-tvnn`、`lsusb -v` / `-t`、`lsblk -a -O`、`nvme list` / `id-ctrl` / `smart-log`、`smartctl -a`、`dmesg`、`lsmod`、
   `efibootmgr -v`、`ip -d addr` / `ip route`、每块网卡 `ethtool` / `ethtool -i`、`lshw`;
@@ -132,8 +136,10 @@ D2000 走 ACPI 时 PCIe 是标准 ECAM (`PCI_HOST_GENERIC=y`), 一般通用发�
 
 推车接收端 `diag_upload.py` (单元 `pxe-diag-upload.service`, **默认不开**):
 
-- 只绑 `PXE_IP:8081`, 只收 `PUT /diag/<名字>.tar.gz`: 名字白名单, 必须有 `Content-Length`, ≤ 64 MB, 内容得是 gzip, 推车剩余空间 < 1 GB 不收;
-  同名不覆盖 (加 `-1`...); 先写隐藏临时文件再改名. GET/POST/DELETE 一律 405, 不列目录.
+- 只绑 `PXE_IP:8081` (`--bind` 不接受空、`0.0.0.0`、`::`), 只收 `PUT /diag/<名字>.tar.gz`: 名字白名单, 必须有非负的 `Content-Length`, ≤ 64 MB,
+  内容得是 gzip, 推车剩余空间 (扣掉正在传的) < 1 GB 不收; 同名不覆盖 (加 `-1`...); 先写隐藏临时文件再改名.
+  同时最多 2 个上传 (多了 503), 套接字 60 秒超时. GET/POST/DELETE 一律 405, 不列目录.
+- 单元加固: DynamicUser、无能力 (`CapabilityBoundingSet=` 空)、`SystemCallFilter=@system-service`、`MemoryMax=256M`、`TasksMax=16`、`ProtectSystem=strict` 等.
 - 存在 `/var/lib/ops-cart-arm64-diag/` (DynamicUser, 实际目录在 `/var/lib/private/` 下). 取包: `sudo ls /var/lib/ops-cart-arm64-diag/`.
 - 选 HTTP PUT 而不是 tftp put / nc: 现有 TFTP 服务只读 (加 WRQ 等于给引导服务开写口), nc 要人每次手开监听;
   单独一个只能收文件的小服务、单独端口, 跟出引导文件的 80 口分开, 停掉它不影响引导.

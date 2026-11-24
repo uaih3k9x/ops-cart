@@ -220,3 +220,36 @@ def test_resend_only_uploads(tmp_path, monkeypatch):
     monkeypatch.setattr(dc, "run_cmd", None)                     # 不许收集
     assert dc.main(["--resend", str(f), "--url", "http://192.0.2.1:8081/diag/"]) == 0
     assert sent == [(str(f), "http://192.0.2.1:8081/diag/")]
+
+
+# ---- 审查 (17d608b) 补的
+
+@pytest.mark.parametrize("text", ["rootfs / rootfs rw 0 0\ntmpfs / tmpfs rw 0 0\n",
+                                  "tmpfs / tmpfs rw 0 0\nrootfs / rootfs rw 0 0\n",
+                                  "rootfs / rootfs rw 0 0\n"])
+def test_require_ram_accepts_rootfs(tmp_path, text):
+    m = tmp_path / "mounts"
+    m.write_text(text)
+    dc.require_ram("/tmp/x", str(m))
+
+
+def test_require_ram_later_overmount_wins(tmp_path):
+    m = tmp_path / "mounts"
+    m.write_text("rootfs / rootfs rw 0 0\n/dev/sda2 / ext4 rw 0 0\n")
+    with pytest.raises(dc.NotInRam):
+        dc.require_ram("/tmp/x", str(m))
+
+
+# 允许的命令 (整条 argv 用空格连起来全匹配). 加新命令先在这里加, 并确认它只读.
+_READ_ONLY = [r"uname -a", r"cat /proc/[a-z]+", r"ls -la /sys/firmware", r"dmidecode", r"lspci -nnvvv", r"lspci -tvnn",
+              r"lsusb -v", r"lsusb -t", r"lsblk -a -O", r"nvme list", r"nvme (id-ctrl|smart-log) /dev/nvme\d+",
+              r"dmesg", r"lsmod", r"efibootmgr -v", r"ip -d addr", r"ip route", r"lshw", r"acpidump", r"acpidump -b",
+              r"smartctl -a /dev/[a-z0-9]+", r"ethtool (-i )?[A-Za-z0-9._-]+"]
+
+
+def test_plan_only_whitelisted_read_only_commands(sysfs):
+    import re
+    net, _ = sysfs
+    for _, argv, _ in dc.plan(str(net), ["sda", "nvme0n1"], ["/dev/nvme0", "/dev/nvme1"]):
+        line = " ".join(argv)
+        assert any(re.fullmatch(p, line) for p in _READ_ONLY), line

@@ -115,3 +115,99 @@ def test_unit_binds_install_address_and_is_confined():
     for k in ("DynamicUser=yes", "StateDirectory=ops-cart-arm64-diag", "ProtectSystem=strict", "NoNewPrivileges=yes"):
         assert k in u, k
     assert 'port="8081" protocol="tcp"' in (root / "deploy" / "firewalld" / "pxe.xml").read_text()
+
+
+# ---- 审查 (17d608b) 补的
+
+def test_store_rejects_negative_length(tmp_path):
+    """Content-Length: -1 以前会让 read(-1) 读到连接关闭, 绕过大小上限和余量检查."""
+    big = io.BytesIO(GZ + b"0" * 4096)
+    with pytest.raises(du.UploadError) as e:
+        du.store(str(tmp_path), "a.tar.gz", big, -1, 16)
+    assert e.value.status == 400 and big.tell() == 0
+    assert os.listdir(tmp_path) == []
+
+
+def test_store_counts_inflight_uploads_against_free_space(tmp_path):
+    free = du.shutil.disk_usage(str(tmp_path)).free
+    with pytest.raises(du.UploadError) as e:
+        du.store(str(tmp_path), "a.tar.gz", io.BytesIO(GZ), len(GZ), 1 << 20, min_free=1, inflight=free)
+    assert e.value.status == 507
+
+
+def _raw_put(port, length_header, body=b""):
+    import http.client
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.putrequest("PUT", "/diag/neg.tar.gz")
+    c.putheader("Content-Length", length_header)
+    c.endheaders()
+    if body:
+        c.send(body)
+    r = c.getresponse()
+    return r.status
+
+
+def test_put_negative_content_length_rejected(tmp_path):
+    root = tmp_path
+    srv = du.make_server("127.0.0.1", 0, str(root), max_bytes=1 << 20)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert _raw_put(srv.server_address[1], "-1", GZ + b"0" * 100) in (400, 411)
+        assert _raw_put(srv.server_address[1], "abc") == 411
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert list(root.iterdir()) == []
+
+
+def test_concurrency_limit_returns_503(tmp_path):
+    srv = du.make_server("127.0.0.1", 0, str(tmp_path), max_bytes=1 << 20, max_concurrent=1)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert srv.RequestHandlerClass.slots.acquire(blocking=False)      # 占满
+        assert _raw_put(srv.server_address[1], str(len(GZ)), GZ) == 503
+        srv.RequestHandlerClass.slots.release()
+        assert _raw_put(srv.server_address[1], str(len(GZ)), GZ) == 201
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_slow_client_times_out(tmp_path):
+    """只发头不发内容的连接, 超时后断开, 不留文件、不占名额."""
+    import socket
+    import time
+    srv = du.make_server("127.0.0.1", 0, str(tmp_path), max_bytes=1 << 20, timeout=1, max_concurrent=1)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        s = socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=10)
+        s.sendall(b"PUT /diag/slow.tar.gz HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n\x1f\x8b")
+        t0 = time.time()
+        s.recv(4096)                 # 服务端超时后回错误或直接关
+        assert time.time() - t0 < 8
+        s.close()
+        time.sleep(0.3)
+        assert [p for p in os.listdir(tmp_path)] == []
+        assert _raw_put(srv.server_address[1], str(len(GZ)), GZ) == 201       # 名额已还
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_handler_default_timeout():
+    assert du.Handler.timeout == 60
+
+
+@pytest.mark.parametrize("bind", ["", "0.0.0.0", "::", " "])
+def test_cli_refuses_wildcard_bind(bind):
+    with pytest.raises(SystemExit):
+        du.parse_args(["--bind", bind])
+
+
+def test_unit_tightened():
+    import pathlib
+    u = (pathlib.Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "pxe-diag-upload.service").read_text()
+    lines = u.splitlines()
+    for k in ("MemoryMax=256M", "CapabilityBoundingSet=", "SystemCallFilter=@system-service"):
+        assert k in lines, k
+    assert any(l.startswith("TasksMax=") for l in lines)

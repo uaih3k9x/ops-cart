@@ -5,8 +5,9 @@
 ACPI 全表 (acpidump 文本 + acpidump -b 二进制 + iasl -d 反编译)、efibootmgr -v、/sys/firmware/efi 下的文件 (含 efivars)、
 网卡 (ip / ethtool)、lshw. 打成 ops-diag-<MAC>[-sn-<SMBIOS 序列号>]-<UTC 时间>.tar.gz, PUT 到推车 diag_upload.py.
 
-只读: 只往内存里的目录写 (--out-dir 默认 /tmp, 所在文件系统必须是 tmpfs/ramfs, 否则退出码 3, 一个文件都不建);
-不挂载、不分区、不写任何块设备; 跑的命令都是查询类 (见 plan).
+收集阶段不写盘: 只往内存里的目录写 (--out-dir 默认 /tmp, 所在文件系统必须是 tmpfs/ramfs/rootfs, 否则退出码 3, 一个文件都不建);
+不挂载、不分区、不写任何块设备; 跑的命令都是白名单里的查询类 (见 plan, 测试锁着).
+(收集之前, Alpine initramfs 启动时会只读挂一下本地盘找 *.apkovl.tar.gz; 只读挂载 ext4/XFS 时内核仍可能回放日志 —— 那一步不归本脚本管.)
 开机自启: apkovl 里的 /etc/local.d/ops-diag.start 调 --auto: 内核参数没有 ops_diag=<URL> 就什么都不做.
 手动: ops-diag-collect [--url http://<推车>:8081/diag/] [--no-upload];  重传: ops-diag-collect --resend <包>
 退出码: 0 好了; 3 输出目录不在内存里; 4 上传失败 (包留在 --out-dir, 屏幕上有手动重传的命令)."""
@@ -22,7 +23,7 @@ import tarfile
 import time
 import urllib.request
 
-RAM_FS = ("tmpfs", "ramfs")
+RAM_FS = ("tmpfs", "ramfs", "rootfs")       # rootfs: initramfs 阶段的根, 也在内存里
 CMD_TIMEOUT = 180
 MAX_FILE = 1 << 20
 _PLACEHOLDER = {"", "to be filled by o.e.m.", "default string", "none", "not specified", "not applicable",
@@ -281,7 +282,7 @@ def main(argv=None, now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     name = archive_name(board_mac(a.sys_net), board_serial(a.dmi), now)
     work = os.path.join(a.out_dir, name[:-len(".tar.gz")])
-    print(f"ops-diag: 收集到 {work} (只读, 不碰硬盘)", flush=True)
+    print(f"ops-diag: 收集到 {work} (收集阶段不写盘)", flush=True)
     copies = [] if a.no_copies else [("/sys/firmware/efi", "sys-firmware-efi"), (a.dmi, "dmi-id")]
     collect(work, run_cmd, plan(a.sys_net, disks(), nvme_ctrls()), copies, log=lambda m: print(m, flush=True))
     out = pack(work, os.path.join(a.out_dir, name))

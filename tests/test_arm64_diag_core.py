@@ -141,3 +141,11 @@ def test_verify_sha256(tmp_path):
     core.verify_sha256(str(p), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     with pytest.raises(ValueError):
         core.verify_sha256(str(p), "00")
+
+
+def test_apkovl_never_writes_rtc(tmp_path):
+    """关机时 hwclock 不把系统时间写回板子 RTC (同 MemTest86 的 RTCSYNC=0)."""
+    out = core.build_apkovl(str(tmp_path / "o.tar.gz"))
+    with tarfile.open(out) as t:
+        conf = t.extractfile("etc/conf.d/hwclock").read().decode()
+    assert 'clock_systohc="NO"' in conf and 'clock_systohc="YES"' not in conf
