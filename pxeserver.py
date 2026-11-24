@@ -93,6 +93,13 @@ def parse_dhcp(msg):
 ARCH_BIOS, ARCH_X64_UEFI, ARCH_ARM64_UEFI = (0,), (7, 9), (11,)    # option 93 (RFC 4578 / IANA)
 ARM64_DIR = "aa64"
 ARM64_EFI = f"{ARM64_DIR}/grubaa64.efi"     # Rocky 的 grubaa64.efi, 不过 shim (ARM 板子一般不开安全启动, 见 docs/ARM64_PXE.md)
+# ARM64 Windows PE 冒烟测试 (docs/ARM64_WINPE.md): 微软的文件放 aa64/winpe/<build>/, 不进仓库.
+# 按 MAC 一次性开关 (arm64-winpe 子命令写这个文件): 那台 ARM64 下次 PXE 时固件直接拿 Windows 启动管理器.
+ARM64_WINPE_DIR = f"{ARM64_DIR}/winpe"
+ARM64_WINPE_STATE = "/opt/pxe/arm64-winpe.json"
+ARM64_WINPE_BUILDS = {"22621": "Windows PE ARM64 23H2 (smoke test)",
+                      "26100": "Windows PE ARM64 24H2 (expect fail: no LSE)"}
+ARM64_WINPE_MAX_MIN = 60
 
 
 def client_arch(opts):
@@ -491,7 +498,7 @@ class DhcpServer:
     DECLINE_HOLD_S = 600    # 客户端 DECLINE (ARP 发现有人占着) 的地址隔离这么久
 
     def __init__(self, ip, pool_start, pool_end, uefi_file, bios_file, log, port=67, iface=None,
-                 prefix=24, arm64_file=ARM64_EFI):
+                 prefix=24, arm64_file=ARM64_EFI, arm64_winpe_path=ARM64_WINPE_STATE, now=time.time):
         self.ip = ip
         self.iface = iface
         net = ipaddress.ip_interface(f"{ip}/{prefix}").network
@@ -505,6 +512,7 @@ class DhcpServer:
         self.netmask, self.broadcast = str(net.netmask), str(net.broadcast_address)
         self.port = port
         self.uefi_file, self.bios_file, self.arm64_file = uefi_file, bios_file, arm64_file
+        self.arm64_winpe_path, self.now = arm64_winpe_path, now
         self.ipxe_script = f"http://{ip}/{IPXE_SCRIPT}"
         self.log = log
         self.leases = {}        # mac(bytes) -> [ip, 到期时间]
@@ -557,12 +565,27 @@ class DhcpServer:
                 return ip
         return None             # 池子用完: 宁可不回, 也不把同一个地址发给两台机器
 
-    def _bootfile(self, opts):
+    def _bootfile(self, opts, mac=None):
         """-> 引导文件; None = 不认识的架构, 不回. iPXE 再要地址时给脚本, 不然又拿到 shim 绕回 GRUB
-        (Windows PE 走 GRUB -> iPXE -> wimboot); boot.ipxe 是 x86 的, 只给 x86-64 UEFI (或没报架构) 的 iPXE."""
+        (Windows PE 走 GRUB -> iPXE -> wimboot); boot.ipxe 是 x86 的, 只给 x86-64 UEFI (或没报架构) 的 iPXE.
+        ARM64 WinPE 开关对这台 MAC 打开时 (_winpe_build) 给 Windows 启动管理器."""
         if is_ipxe(opts) and (client_arch(opts) is None or client_arch(opts) in ARCH_X64_UEFI):
             return self.ipxe_script
+        build = self._winpe_build(opts, mac)
+        if build:
+            return arm64_winpe_efi(build)
         return arch_bootfile(opts, self.uefi_file, self.bios_file, self.arm64_file)
+
+    def _winpe_build(self, opts, mac):
+        """报 ARM64 UEFI、且 ARM64 WinPE 开关正对这台 MAC 打开 (没过期) -> build 号; 否则 None."""
+        if mac is None or client_arch(opts) not in ARCH_ARM64_UEFI or not self.arm64_file:
+            return None
+        return arm64_winpe_armed(self.arm64_winpe_path, mac.hex(":"), self.now())
+
+    def _winpe_opts(self, opts, mac):
+        """开关打开时多带 option 252 (WDS 用来告诉启动管理器 BCD 在 TFTP 上的路径; 不带就去取 \\Boot\\BCD)."""
+        build = self._winpe_build(opts, mac)
+        return [encode_opt(252, arm64_winpe_bcd(build))] if build else []
 
     def _unsupported(self, opts, mac, where):
         """不认识的架构: 记一笔, 调用方不回 (不发地址也不给引导文件, 免得固件拿 x86 的文件去起)."""
@@ -573,7 +596,8 @@ class DhcpServer:
         return True
 
     def _reply(self, msg, kind, ip, opts):
-        bootfile = self._bootfile(opts)
+        mac = msg[28:34]
+        bootfile = self._bootfile(opts, mac)
         return build_dhcp_reply(msg, 2, ip, self.ip, [
             encode_opt(53, kind),
             encode_opt(60, "PXEClient"),
@@ -583,7 +607,7 @@ class DhcpServer:
             encode_opt(3, (self.ip,)),
             encode_opt(66, self.ip),
             encode_opt(67, bootfile),
-        ], bootfile)
+        ] + self._winpe_opts(opts, mac), bootfile)
 
     def handle(self, msg, addr, now=None):
         parsed = parse_dhcp(msg)
@@ -645,7 +669,7 @@ class DhcpServer:
                 self.log.warning("DHCP DISCOVER %s: 地址池已用完, 不回 OFFER", mac_hex)
                 return None
             self.log.info("DHCP DISCOVER %s -> OFFER %s bootfile=%s", mac_hex, ip,
-                          self._bootfile(opts))
+                          self._bootfile(opts, mac))
             return self._reply(msg, b"\x02", ip, opts)
         if msg_type == b"\x03":  # REQUEST
             if server_id and not ours:
@@ -686,7 +710,7 @@ class DhcpServer:
         if opts.get(53, b"")[0:1] != b"\x01" or not opts.get(60, b"").startswith(b"PXEClient") \
                 or len(arch) != 2 or struct.unpack("!H", arch)[0] not in self.PROXY_ARCHES:
             return None
-        bootfile = self._bootfile(opts)
+        bootfile = self._bootfile(opts, mac)
         if bootfile is None:            # ARM64 但没配引导文件
             return None
         extra = [encode_opt(97, opts[97])] if 97 in opts else []    # 规范: 客户端带了 UUID 就原样带回
@@ -698,7 +722,7 @@ class DhcpServer:
         ] + extra + [
             encode_opt(66, self.ip),
             encode_opt(67, bootfile),
-        ], bootfile)
+        ] + self._winpe_opts(opts, mac), bootfile)
 
     def handle_proxy(self, msg, addr):
         """proxyDHCP (UDP 4011): PXE 二阶段, 只回引导信息不租 IP (yiaddr=0).
@@ -717,7 +741,7 @@ class DhcpServer:
             return None
         reply_type = b"\x02" if msg_type == b"\x01" else b"\x05"
         kind = "OFFER" if msg_type == b"\x01" else "ACK"
-        bootfile = self._bootfile(opts)
+        bootfile = self._bootfile(opts, mac)
         self.log.info("proxyDHCP %s %s -> %s:%s bootfile=%s", kind, mac.hex(":", 1),
                       addr[0], addr[1], bootfile)
         return build_dhcp_reply(msg, 2, "0.0.0.0", self.ip, [
@@ -726,7 +750,7 @@ class DhcpServer:
             encode_opt(54, (self.ip,)),
             encode_opt(66, self.ip),
             encode_opt(67, bootfile),
-        ], bootfile)
+        ] + self._winpe_opts(opts, mac), bootfile)
 
     def serve_proxy(self, ready_event=None, sock=None):
         if sock is None:
@@ -861,7 +885,67 @@ def grub_menu_arm64(ip):
                    f"    linux {src}/{ARM64_DIAG}/vmlinuz-lts {args}\n"
                    f"    initrd {src}/{ARM64_DIAG}/initramfs-lts\n}}\n")
     return ("set default=0\nset timeout=10\n\n" + LOCAL_ENTRY + "\n" + "\n".join(out) +
-            "\n" + _mt86_site_entry("BOOTAA64.efi"))
+            "\n" + _mt86_site_entry("BOOTAA64.efi") + "\n" + _arm64_winpe_entries())
+
+
+def _arm64_winpe_entries():
+    """ARM64 WinPE 冒烟测试 (只能手选, _manual_only 认 aa64/winpe): GRUB 经 TFTP 链式加载 Windows 启动管理器.
+    启动管理器能不能认出自己是网络启动、接着经 TFTP 取 BCD / boot.wim, 要实机验 (docs/ARM64_WINPE.md);
+    走不通就用 arm64-winpe 一次性开关让固件直接拿它."""
+    return "\n".join(f"menuentry '{title}' {{\n    chainloader /{arm64_winpe_efi(build)}\n}}\n"
+                     for build, title in ARM64_WINPE_BUILDS.items())
+
+
+def arm64_winpe_efi(build):
+    return f"{ARM64_WINPE_DIR}/{build}/bootaa64.efi"
+
+
+def arm64_winpe_bcd(build):
+    """option 252 里的 BCD 路径 (启动管理器的写法: 反斜杠, 从 TFTP 根算); 跟 scripts/arm64_winpe_bcd.py 生成的布局一致."""
+    return "\\" + f"{ARM64_WINPE_DIR}/{build}/boot/bcd".replace("/", "\\")
+
+
+def arm64_winpe_armed(path, mac, now):
+    """ARM64 WinPE 一次性开关: 正对这台 MAC 打开、没过期 -> build 号; 别的 (没有、坏了、过期、别的 MAC) None."""
+    try:
+        with open(path) as f:
+            st = json.load(f)
+        build, until = st["build"], float(st["until"])
+        if norm_mac(st["mac"]) != norm_mac(mac) or build not in ARM64_WINPE_BUILDS or now > until:
+            return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return build
+
+
+def arm64_winpe_arm(path, mac, build, minutes=15, now=None):
+    """打开开关: 这台 MAC 在 minutes 分钟内下一次 ARM64 PXE 拿 Windows 启动管理器 (传完一次自动关)."""
+    if build not in ARM64_WINPE_BUILDS:
+        raise ValueError(f"build 只能是 {'/'.join(ARM64_WINPE_BUILDS)}: {build!r}")
+    if not 1 <= minutes <= ARM64_WINPE_MAX_MIN:
+        raise ValueError(f"分钟数 1..{ARM64_WINPE_MAX_MIN}: {minutes}")
+    now = time.time() if now is None else now
+    doc = {"mac": norm_mac(mac), "build": build, "since": now, "until": now + minutes * 60}
+    tmp = f"{path}.tmp"                 # 单文件可用, 不依赖 atomicfile; 改名是原子的
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    os.replace(tmp, path)
+    return doc
+
+
+def arm64_winpe_disarm(path):
+    """关掉开关; 本来就没开返回 False."""
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def arm64_winpe_fetched(name):
+    """TFTP 请求名是不是某个 build 的 Windows 启动管理器 (正反斜杠、大小写都认)."""
+    n = name.replace("\\", "/").lstrip("/").lower()
+    return any(n == arm64_winpe_efi(b) for b in ARM64_WINPE_BUILDS)
 
 
 def pxelinux_menu(ip):
@@ -973,10 +1057,11 @@ _RESCUE_KW = ("inst.rescue", "inst.sshd")
 
 def _manual_only(text):
     """只能手选的项: 救援 (inst.rescue / inst.sshd, 区分大小写同 GRUB 参数)、Memtest86+ (#58 审查; 不分大小写,
-    认 memtest 这个词, 路径 memtest/memtest64.efi、mt86plus 都算) 、ARM64 诊断 Linux (路径 aa64/alpine) 或 MemTest86 Site (路径 mt86site; 后两者不分大小写)."""
+    认 memtest 这个词, 路径 memtest/memtest64.efi、mt86plus 都算) 、ARM64 诊断 Linux (路径 aa64/alpine)、MemTest86 Site (路径 mt86site)
+    或 ARM64 WinPE (路径 aa64/winpe; 后三者不分大小写)."""
     low = text.lower()
     return (any(k in text for k in _RESCUE_KW) or "memtest" in low or "mt86plus" in low or ARM64_DIAG in low
-            or MT86_SITE_DIR in low)
+            or MT86_SITE_DIR in low or ARM64_WINPE_DIR in low)
 
 
 MENU_MAX = 64 * 1024        # GRUB 菜单是小文本; 比这大的 grub.cfg* 不发 (TFTP 换默认菜单, HTTP 403), 上锁时删
@@ -1201,12 +1286,14 @@ class TftpServer:
     MENU_MAX = MENU_MAX
 
     def __init__(self, ip, root, log, blksize=1428, timeout=2.0, retries=5, port=69,
-                 sock_factory=None, pxe_mode_path=PXE_MODE, now=time.time, event=cart_event):
+                 sock_factory=None, pxe_mode_path=PXE_MODE, now=time.time, event=cart_event,
+                 arm64_winpe_path=ARM64_WINPE_STATE):
         self.ip, self.root, self.log = ip, os.path.abspath(root), log
         self.blksize, self.timeout, self.retries = blksize, timeout, retries
         self.port = port
         self.sock_factory = sock_factory or (lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         self.pxe_mode_path, self.now, self.event = pxe_mode_path, now, event
+        self.arm64_winpe_path = arm64_winpe_path
 
     def serve(self, ready_event=None, sock=None):
         if sock is None:
@@ -1316,6 +1403,8 @@ class TftpServer:
                 self.log.info("TFTP %s 客户端中止: %s", name, e)   # PXE ROM 先问 tsize 再断开是常态
                 return
         self.log.info("TFTP %s %s", name, "传输完成" if done else "无 ACK, 放弃")
+        if done and arm64_winpe_fetched(name) and arm64_winpe_disarm(self.arm64_winpe_path):
+            self.event(f"ARM64 WinPE 启动管理器已传给 {client[0]}, 一次性开关已关")
 
 
 # ---------------------------------------------------------------- main
@@ -1352,11 +1441,35 @@ def parse_args(argv):
                    help="网络里没别的 DHCP 时自己发地址的限时 (分钟, 0 = 不限时); 默认取 PXE_SERVE_MINUTES 或 30")
     p.add_argument("--renew-file", default=RENEW_PATH, help="车机写续期请求的文件")
     p.add_argument("--pxe-mode", default=PXE_MODE, help="装机模式状态文件 (kiosk 解锁时写)")
-    return ap.parse_args(argv)
+    p.add_argument("--arm64-winpe-state", default=ARM64_WINPE_STATE, help="ARM64 WinPE 一次性开关的状态文件")
+    w = sub.add_parser("arm64-winpe", help="按 MAC 一次性: 那台 ARM64 下次 PXE 直接拿 Windows 启动管理器 (docs/ARM64_WINPE.md)")
+    w.add_argument("--mac")
+    w.add_argument("--build", choices=list(ARM64_WINPE_BUILDS))
+    w.add_argument("--minutes", type=int, default=15, help=f"多久内有效 (1..{ARM64_WINPE_MAX_MIN}), 默认 15")
+    w.add_argument("--off", action="store_true", help="关掉开关")
+    w.add_argument("--state", default=ARM64_WINPE_STATE)
+    args = ap.parse_args(argv)
+    if args.cmd == "arm64-winpe" and not args.off and not (args.mac and args.build):
+        ap.error("arm64-winpe 要 --mac 和 --build (或 --off)")
+    return args
+
+
+def arm64_winpe_cli(args):
+    if args.off:
+        print("已关" if arm64_winpe_disarm(args.state) else "本来就没开")
+        return
+    try:
+        doc = arm64_winpe_arm(args.state, args.mac, args.build, args.minutes)
+    except ValueError as e:
+        sys.exit(f"参数不对: {e}")
+    print(f"已开: {doc['mac']} 下次 ARM64 PXE 拿 {arm64_winpe_efi(doc['build'])} "
+          f"(BCD {arm64_winpe_bcd(doc['build'])}), {args.minutes} 分钟内有效, 传完一次自动关")
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.cmd == "arm64-winpe":
+        return arm64_winpe_cli(args)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(message)s",
@@ -1369,7 +1482,8 @@ def main(argv=None):
 
     try:
         dhcp = DhcpServer(args.ip, *args.pool.split(","), args.uefi_file, args.bios_file, log,
-                          iface=args.iface, prefix=args.prefix, arm64_file=args.arm64_file)
+                          iface=args.iface, prefix=args.prefix, arm64_file=args.arm64_file,
+                          arm64_winpe_path=args.arm64_winpe_state)
     except (ValueError, TypeError) as e:
         log.error("参数不对: %s", e)
         sys.exit(EXIT_CONFIG)
@@ -1382,7 +1496,8 @@ def main(argv=None):
                      serve_s=max(0, args.serve_minutes) * 60, renew_path=args.renew_file)
     dhcp.guard = guard
     guard.tick()                    # 先探测: 探明之前一个包都不发, 有别人的 DHCP 就只当代理
-    tftp = TftpServer(args.ip, args.tftp_root, log, pxe_mode_path=args.pxe_mode)
+    tftp = TftpServer(args.ip, args.tftp_root, log, pxe_mode_path=args.pxe_mode,
+                      arm64_winpe_path=args.arm64_winpe_state)
     ev1, ev2, ev3 = threading.Event(), threading.Event(), threading.Event()
     threads = [threading.Thread(target=dhcp.serve, args=(ev1,), name="dhcp", daemon=True),
                threading.Thread(target=tftp.serve, args=(ev2,), name="tftp", daemon=True),

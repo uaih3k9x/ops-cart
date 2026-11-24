@@ -77,7 +77,17 @@ menuentry '... (TFTP slow)' { 同上, linux/initrd 走 TFTP; modloop、包、apk
 menuentry 'MemTest86 (PassMark Site)' {
     chainloader /mt86site/BOOTAA64.efi
 }
+
+menuentry 'Windows PE ARM64 23H2 (smoke test)' {
+    chainloader /aa64/winpe/22621/bootaa64.efi
+}
+
+menuentry 'Windows PE ARM64 24H2 (expect fail: no LSE)' {
+    chainloader /aa64/winpe/26100/bootaa64.efi
+}
 ```
+
+- 两个 WinPE 项是 Windows ARM64 内核的启动冒烟测试, 只能手选 (`_manual_only` 认 `aa64/winpe`), 见 [ARM64_WINPE.md](ARM64_WINPE.md).
 
 - **默认 = 第 0 项本地盘** (`exit` 退回固件按 BootOrder 往下走), 10 秒超时. 诊断项只能手选:
   `_manual_only` 认 `aa64/alpine`, 默认项要是诊断项, TFTP 门禁换成默认菜单 (测试锁着).

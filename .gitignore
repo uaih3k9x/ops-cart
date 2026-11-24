@@ -31,3 +31,9 @@ video-names.json
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# 微软的 WinPE 文件 (ARM64 冒烟测试, docs/ARM64_WINPE.md) 只在开发机暂存目录和推车上, 不进仓库
+*.wim
+*.sdi
+bootaa64.efi
+aa64/winpe/

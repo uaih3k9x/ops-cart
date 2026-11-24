@@ -216,7 +216,7 @@ def test_arm64_menu_diag_entries():
     assert f"ops_diag=http://{IP}:8081/diag/" in menu                          # 收集完传回推车
     assert "ssh_key" not in menu                                # 不开 sshd: 只有屏幕前 / 串口上的人能登
     assert "earlycon console=tty0 console=ttyAMA0,115200" in menu
-    assert menu.count("menuentry ") == 4
+    assert menu.count("menuentry ") == 6                        # + 两个 ARM64 WinPE 手动项 (test_arm64_winpe.py)
 
 
 def test_arm64_menu_passes_gates():
