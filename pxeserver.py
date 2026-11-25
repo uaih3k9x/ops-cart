@@ -865,6 +865,9 @@ ARM64_DIAG_FILES = ("vmlinuz-lts", "initramfs-lts", "modloop-lts")
 ARM64_DIAG_PKGS = ("python3", "acpica", "iasl", "dmidecode", "pciutils", "usbutils", "lsblk", "nvme-cli",
                    "smartmontools", "efibootmgr", "lshw", "ethtool", "iproute2")
 ARM64_APKOVL = f"{ARM64_DIAG}/ops-diag.apkovl.tar.gz"    # 收集脚本 + 开机自启 (arm64_diag_core.build_apkovl)
+# 飞腾 D2000 板载网卡 (ACPI FTGM0001) 驱动的附加 initrd (#119, scripts/arm64_nic_initrd.py 生成, 不进 git):
+# 级联在 initramfs-lts 后面, initramfs 阶段取网前由 Alpine init 的 /etc/modules 加载. 别的板子上只是多装几个用不上的模块.
+ARM64_NIC_INITRD = f"{ARM64_DIAG}/ftgm-initrd.cpio.gz"
 DIAG_UPLOAD_PORT = 8081                                  # diag_upload.py 收诊断包
 ARM64_DIAG_TITLE = "Diagnostic Linux in RAM (Alpine aarch64, console login root)"
 # 串口: 显式给 PL011 的 ttyAMA0 (最后一个 console= 当 /dev/console), tty0 给屏幕; earlycon 无参数 = 按 ACPI SPCR / DT 自动.
@@ -874,7 +877,7 @@ ARM64_CONSOLE = "earlycon console=tty0 console=ttyAMA0,115200"
 
 def grub_menu_arm64(ip):
     """aa64/grub.cfg: 第 0 项本地盘 (exit 退回固件按 BootOrder 往下走), 超时 10 秒; 后面诊断 Linux 两条路 (HTTP 快 / TFTP 慢,
-    modloop 和包总是 HTTP). 诊断项只能手选 (_manual_only 认 aa64/alpine), 不带 ssh_key (不开 sshd).
+    modloop 和包总是 HTTP; initrd 级联 ARM64_NIC_INITRD 带飞腾板载网卡驱动). 诊断项只能手选 (_manual_only 认 aa64/alpine), 不带 ssh_key (不开 sshd).
     起来后 apkovl 里的 ops-diag-collect 自动只读收集一遍, 打包 PUT 到 ops_diag= 给的推车地址."""
     http = f"http://{ip}/{ARM64_DIAG}"
     args = (f"ip=dhcp alpine_repo={http}/repo/main,{http}/repo/community modloop={http}/modloop-lts "
@@ -884,7 +887,7 @@ def grub_menu_arm64(ip):
     for src, label in ((f"(http,{ip})", "HTTP fast"), ("", "TFTP slow")):
         out.append(f"menuentry '{ARM64_DIAG_TITLE} ({label})' {{\n"
                    f"    linux {src}/{ARM64_DIAG}/vmlinuz-lts {args}\n"
-                   f"    initrd {src}/{ARM64_DIAG}/initramfs-lts\n}}\n")
+                   f"    initrd {src}/{ARM64_DIAG}/initramfs-lts {src}/{ARM64_NIC_INITRD}\n}}\n")
     return ("set default=0\nset timeout=10\n\n" + LOCAL_ENTRY + "\n" + "\n".join(out) +
             "\n" + _mt86_site_entry("BOOTAA64.efi") + "\n" + _arm64_winpe_entries())
 

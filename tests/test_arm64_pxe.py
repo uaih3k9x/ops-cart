@@ -219,6 +219,17 @@ def test_arm64_menu_diag_entries():
     assert menu.count("menuentry ") == 6                        # + 两个 ARM64 WinPE 手动项 (test_arm64_winpe.py)
 
 
+def test_arm64_menu_diag_loads_ftgm_initrd():
+    """#119: 两个 Alpine 诊断项都在 initramfs-lts 后面级联 ftgm-initrd (飞腾板载网卡驱动, initramfs 阶段取网前加载);
+    顺序要紧 (后解开的覆盖先解开的: 附加 cpio 里的 modules.dep 要盖住 initramfs-lts 自带的)."""
+    menu = ps.grub_menu_arm64(IP)
+    lines = [l.strip() for l in menu.splitlines() if l.strip().startswith("initrd ")]
+    assert lines == [f"initrd (http,{IP})/aa64/alpine/initramfs-lts (http,{IP})/aa64/alpine/ftgm-initrd.cpio.gz",
+                     "initrd /aa64/alpine/initramfs-lts /aa64/alpine/ftgm-initrd.cpio.gz"]
+    assert ps.ARM64_NIC_INITRD == "aa64/alpine/ftgm-initrd.cpio.gz"
+    assert "modules=" not in menu                               # 加载清单在 cpio 的 /etc/modules 里, 菜单不重复写
+
+
 def test_arm64_menu_passes_gates():
     menu = ps.grub_menu_arm64(IP)
     assert not ps.unlock_only_menu(menu)

@@ -69,7 +69,7 @@ menuentry 'Boot from local disk' {
 
 menuentry 'Diagnostic Linux in RAM (Alpine aarch64, console login root) (HTTP fast)' {
     linux (http,192.0.2.1)/aa64/alpine/vmlinuz-lts ip=dhcp alpine_repo=http://192.0.2.1/aa64/alpine/repo/main,http://192.0.2.1/aa64/alpine/repo/community modloop=http://192.0.2.1/aa64/alpine/modloop-lts pkgs=python3,acpica,iasl,dmidecode,pciutils,usbutils,lsblk,nvme-cli,smartmontools,efibootmgr,lshw,ethtool,iproute2 apkovl=http://192.0.2.1/aa64/alpine/ops-diag.apkovl.tar.gz ops_diag=http://192.0.2.1:8081/diag/ earlycon console=tty0 console=ttyAMA0,115200
-    initrd (http,192.0.2.1)/aa64/alpine/initramfs-lts
+    initrd (http,192.0.2.1)/aa64/alpine/initramfs-lts (http,192.0.2.1)/aa64/alpine/ftgm-initrd.cpio.gz
 }
 
 menuentry '... (TFTP slow)' { 同上, linux/initrd 走 TFTP; modloop、包、apkovl 仍走 HTTP }
@@ -86,6 +86,8 @@ menuentry 'Windows PE ARM64 24H2 (expect fail: no LSE)' {
     chainloader /aa64/winpe/26100/bootaa64.efi
 }
 ```
+
+- 两个 Alpine 项的 `initrd` 都在 `initramfs-lts` 后面级联 `ftgm-initrd.cpio.gz` (飞腾 D2000 板载网卡驱动, 第 10 节).
 
 - 两个 WinPE 项是 Windows ARM64 内核的启动冒烟测试, 只能手选 (`_manual_only` 认 `aa64/winpe`), 见 [ARM64_WINPE.md](ARM64_WINPE.md).
 
@@ -164,6 +166,7 @@ aa64/alpine/modloop-lts
 aa64/alpine/repo/main/aarch64/APKINDEX.tar.gz + *.apk          官方索引 (签名在里面) + 依赖闭包
 aa64/alpine/repo/community/aarch64/APKINDEX.tar.gz + *.apk
 aa64/alpine/ops-diag.apkovl.tar.gz     arm64_diag_core.build_apkovl 生成 (收集脚本 + 开机自启)
+aa64/alpine/ftgm-initrd.cpio.gz        scripts/arm64_nic_initrd.py 生成 (飞腾板载网卡驱动, 见第 10 节)
 (aa64/grub.cfg 不放文件: TFTP 生成)
 ```
 
@@ -265,3 +268,93 @@ curl -s -o /dev/null -w '%{http_code}\n' http://<PXE_IP>/aa64/grub.cfg          
 
 **实机要记的**: MemTest86 识别到几个核 (屏幕上 CPU 一栏 / 结果页; 飞腾上 UEFI 工具可能只认到 1 核, 此前鲲鹏上就这样 —— 多核靠固件的 MP Services);
 它 RRQ 了哪些文件、路径是什么; 能不能读到内存条 SPD. 跑之前一样先确认菜单默认项是本地盘.
+
+## 10. 飞腾 D2000 板载网卡驱动: 附加 initrd (#119)
+
+D2000 板载网卡是 ACPI `FTGM0001` (Synopsys DWMAC1000), 主线 `stmmac` 没有这个 ACPI 匹配, Alpine 认不到 ->
+initramfs 阶段没网卡 -> 拿不到 modloop 和 apkovl -> 掉进应急 shell. 胶水驱动 `dwmac-ftgm.ko` 在单独的 ftgm-glue 仓库 (GPL-2.0),
+实测 insmod 后 Link 1Gbps/Full、PHY RTL8211F. 这里把它做成一个附加 initrd, 让 Alpine 开机在取网之前自己加载, 不用再串口手动灌.
+
+### 10.1 原理
+
+- GRUB `initrd A B` 把几个文件首尾相接 (各自 4 字节对齐) 交给内核, 内核依次解开, 后面同名的文件盖住前面的.
+  所以菜单写 `initrd .../initramfs-lts .../ftgm-initrd.cpio.gz`, **顺序不能反**.
+- Alpine init (mkinitfs 3.14 的 `/init`) 的顺序: `Loading boot drivers` (按 `modules=` 内核参数和 `/etc/modules` 逐行 `modprobe`)
+  -> `Mounting boot media` (`nlplug-findfs` 冷插拔, 按 uevent 的 `MODALIAS` modprobe) -> `configure_ip` (`ip=dhcp`, udhcpc)
+  -> 下 apkovl / modloop. 驱动只要在 `configure_ip` 之前装上就行.
+- 选的做法 = 走它的正常路径:
+  - 新模块放 `/lib/modules/6.18.60-0-lts/extra/`, 再用 depmod 重算 `modules.dep(.bin)` / `modules.alias(.bin)`, 盖住 initramfs-lts 自带的.
+    initramfs 里的 `modprobe` 是 kmod, 只认 `.bin` 索引, 所以索引必须由真 depmod 生成 (不能手写文本).
+  - `/etc/modules` (initramfs-lts 里原来没有这个文件) 列出加载顺序, 同 ftgm-glue 的 `load.sh`: PHY 驱动先于 MAC 胶水,
+    MDIO 扫描时绑具体 PHY 驱动而不是 Generic PHY. 不写它 `nlplug-findfs` 也会按 `acpi:FTGM0001:` 别名自动 modprobe, 写上是为了固定顺序.
+  - 没用 `modules=` 内核参数: 加载清单跟驱动包放在一起, 菜单里不重复写; 别的 ARM 板子上只是多装几个用不上的模块 (不绑设备).
+- 只放 initramfs-lts 里没有的: `dwmac-ftgm.ko`、`motorcomm.ko`. `stmmac`/`stmmac-platform`/`phylink`/`pcs_xpcs` 和 `realtek` 等 PHY 驱动
+  initramfs-lts 里本来就有, 而且跟 bundle 里的逐字节相同 (构建时核对, 不同就报错).
+- Alpine 3.24 initramfs 是 usr 合并的 (`/lib -> usr/lib`): cpio 里的路径写 `usr/lib/...`, 不带 `lib` 目录项
+  (带了的话内核解包会把符号链接删掉换成空目录, 整个 initramfs 就坏了; 测试锁着). 已有目录的属性不改 (构建时核对).
+- 进系统后模块已经在内核里, 网卡留着 initramfs 配好的地址; modloop 里没有 `dwmac_ftgm` 不影响 (`lsmod` 看得到, `modinfo` 看不到).
+  Alpine 内核开了模块签名但不强制: dmesg 有一行 `module verification failed ... tainting kernel`, 正常.
+
+cpio 内容 (6.18.60-0-lts):
+
+```
+etc/  usr/  usr/lib/  usr/lib/modules/  usr/lib/modules/6.18.60-0-lts/  .../extra/      目录 0755 root:root
+etc/modules                                         0644  phy_package ... stmmac-platform dwmac-ftgm (13 行, 无注释)
+usr/lib/modules/6.18.60-0-lts/extra/dwmac-ftgm.ko   0644  别名 acpi*:FTGM0001:*、acpi*:PHYT0004:*
+usr/lib/modules/6.18.60-0-lts/extra/motorcomm.ko    0644  裕太 PHY (Alpine 没编)
+usr/lib/modules/6.18.60-0-lts/modules.{dep,dep.bin,alias,alias.bin}   depmod 重算后变了的那几个
+```
+
+### 10.2 构建 (开发机, 要 docker)
+
+```sh
+python3 scripts/arm64_nic_initrd.py --staging ~/code/pxeserver-arm64-staging     # [--bundle <ftgm-bundle 目录>]
+```
+
+- 读 `<staging>/ftgm-bundle/*.ko` 和 `<staging>/tftp/aa64/alpine/initramfs-lts`, 写 `<staging>/tftp/aa64/alpine/ftgm-initrd.cpio.gz`,
+  更新 `SOURCES.tsv` 那一行 (来源列记 initramfs-lts 和两个新模块的 sha256 前 16 位). bundle 里的 `load.sh`、`memdump` 不进 initrd.
+- depmod: `docker run --network none --platform linux/arm64 alpine:3.24`, 容器里解开 initramfs-lts、拷进新模块,
+  `chroot` 进去用 **initramfs 自己的 kmod** 跑 depmod (索引格式跟板子上的 modprobe 一致), 只把 `modules.*` 打包带出来. 不联网.
+- 检查: vermagic 的内核版本 = initramfs-lts 的 (`usr/lib/modules/` 下唯一的目录); 加载清单里每个模块都找得到;
+  depmod 结果里有 `extra/dwmac-ftgm.ko` 和 `alias acpi*:FTGM0001:* dwmac_ftgm`; 不覆盖 initramfs-lts 里除 depmod 索引外的任何文件.
+- 可复现: 排序、属主 0:0、时间戳固定、gzip 头 mtime=0; 同样输入两次输出逐字节相同 (`tests/test_arm64_nic_initrd.py` 锁着, 开发机上实跑过两次 cmp 相同).
+- `.ko` 和 cpio 都**不进 git**; 本仓库只有构建脚本和这份说明.
+- `arm64_diag_core.py fetch` 会整个重写 `SOURCES.tsv`: fetch 之后要再跑一次这个脚本.
+
+开发机上验过 (qemu-system-aarch64 `virt`, cortex-a72, TCG; 内核 `vmlinuz-lts` + `initramfs-lts` 按 GRUB 的方式 4 字节对齐接上 cpio, 参数 `single`):
+`Loading boot drivers` 阶段 13 个模块全部装上 (`lsmod` 有 `dwmac_ftgm`、`motorcomm`、`stmmac_platform`、`realtek`...),
+`modprobe -R acpi:FTGM0001:` -> `dwmac_ftgm`, `modprobe -R acpi:PHYT0004:` -> `dwmac_ftgm`, 裕太 PHY 的 `mdio:` 别名 -> `motorcomm`;
+initramfs-lts 自带的 `loop`/`squashfs`/`af_packet`/`virtio_net` 照常能装 (索引没被盖坏). qemu 里没有 FTGM0001 设备, **网卡真正起来要实机看**.
+
+### 10.3 上车
+
+先放文件、再上代码: 新菜单的 `initrd` 引用了 `ftgm-initrd.cpio.gz`, 文件不在的话 GRUB 报找不到文件, Alpine 诊断项就起不来 (默认本地盘项不受影响).
+
+```sh
+rsync -a ~/code/pxeserver-arm64-staging/tftp/aa64/alpine/ftgm-initrd.cpio.gz <推车>:/tmp/
+sudo install -o root -g root -m 0644 /tmp/ftgm-initrd.cpio.gz /opt/pxe/tftp/aa64/alpine/
+sudo restorecon /opt/pxe/tftp/aa64/alpine/ftgm-initrd.cpio.gz
+sha256sum /opt/pxe/tftp/aa64/alpine/ftgm-initrd.cpio.gz          # 对 SOURCES.tsv
+curl -s -o /dev/null -w '%{http_code}\n' http://<PXE_IP>/aa64/alpine/ftgm-initrd.cpio.gz   # 200
+# 然后照常规发布流程上 pxeserver.py, restart pxe-server
+```
+
+实机看 (串口 115200): `Loading boot drivers` 后 dmesg 有 `dwmac-ftgm`/`stmmac` 和 PHY 绑定 (应是 `RTL8211F` 而不是 `Generic PHY`),
+`Obtaining IP via DHCP` 拿到地址, 往后同第 8 节 (下 modloop、装包、收集上传). 收集包里 `lsmod`、`ethtool -i` 能看到 `dwmac_ftgm`.
+
+### 10.4 回滚
+
+- 回上一版 `pxeserver.py` (菜单不再带 `ftgm-initrd.cpio.gz`), restart pxe-server; 文件留着无害.
+- **新代码在跑的时候别删 `ftgm-initrd.cpio.gz`** (删了 Alpine 项起不来). 只想临时不加载驱动: 在 GRUB 里按 `e` 把 `initrd` 行后半截删掉.
+
+### 10.5 内核版本升级时要重建驱动
+
+`dwmac-ftgm.ko`/`motorcomm.ko` 的 vermagic 和符号版本绑死 `6.18.60-0-lts`. Alpine 换版本 (哪怕只是 `-r1` 重编, `uname -r` 变成 `6.18.60-1-lts`)
+重新 fetch 之后:
+
+1. 在 ftgm-glue 按新内核源码 + Alpine 的 `lts.aarch64.config` + 新的 Module.symvers 重编 `dwmac-ftgm.ko`/`motorcomm.ko`, 更新 ftgm-bundle
+   (bundle 里其余 `.ko` 换成新 initramfs 里的, 或干脆删掉: 构建只用 initramfs 里没有的那几个).
+2. 再跑 `scripts/arm64_nic_initrd.py`. 版本对不上时它直接报 vermagic 错, 不会出一个装不上的 initrd.
+3. 没重建就上了新 initramfs: 旧 cpio 的文件落在 `usr/lib/modules/<旧版本>/` 下, 新内核不看那里, 只是认不到板载网卡 (回到没这个功能时的样子);
+   `/etc/modules` 里的名字 modprobe 找不到, `-q` 不报错.
+
