@@ -86,3 +86,21 @@ def test_check_template_rejects_other_layout(blob):
 def test_check_template_rejects_other_path():
     with pytest.raises(SystemExit):
         bcd.check_template(bcd.ramdisk_device("\\x\\boot.wim", RAMDISK_OPTIONS))
+
+
+def test_edits_local_disk_layout():
+    """本地盘 (docs/ARM64_WINPE.md 第 7 节): [boot] = ESP, 路径同 WinPE U 盘 (\\sources\\boot.wim、\\boot\\boot.sdi)."""
+    e = bcd.edits("22621", local=True)
+    assert e[bcd.RAMDISK_OPTIONS_ID]["32000004"] == (1, "\\boot\\boot.sdi".encode("utf-16le") + b"\0\0")
+    dev = e[bcd.OSLOADER_ID]["11000001"]
+    assert dev == (3, bcd.ramdisk_device("\\sources\\boot.wim", RAMDISK_OPTIONS))
+    assert e[bcd.OSLOADER_ID]["260000b0"] == (3, b"\x01") and e[bcd.EMS_ID]["16000020"] == (3, b"\x01")
+    assert "local disk" in e[bcd.OSLOADER_ID]["12000004"][1].decode("utf-16le")
+
+
+def test_parse_args_local_flag():
+    assert bcd.parse_args(["a", "b", "22621"]) == ("a", "b", "22621", None, None, False)
+    assert bcd.parse_args(["a", "b", "22621", "--local"]) == ("a", "b", "22621", None, None, True)
+    assert bcd.parse_args(["--local", "a", "b", "22621", "1", "115200"]) == ("a", "b", "22621", 1, 115200, True)
+    with pytest.raises(SystemExit):
+        bcd.parse_args(["a", "b"])

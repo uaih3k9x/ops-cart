@@ -57,11 +57,13 @@ def check_template(blob):
         raise SystemExit("ADK 模板的 device 跟 ramdisk_device 拼的不一致, 格式变了? 不改写")
 
 
-def edits(build, ems_port=None, ems_baud=None):
-    """{对象 GUID: {元素号: (注册表类型, 数据)}}: 在 ADK 模板上要写的元素 (没有的新建, 有的覆盖)."""
+def edits(build, ems_port=None, ems_baud=None, local=False):
+    """{对象 GUID: {元素号: (注册表类型, 数据)}}: 在 ADK 模板上要写的元素 (没有的新建, 有的覆盖).
+    local=True: 板子本地盘 (ESP) 用 (docs/ARM64_WINPE.md 第 7 节), [boot] = ESP, 路径同 WinPE U 盘 (\\sources、\\boot)."""
     if build not in BUILDS:
         raise ValueError(f"build 只能是 {'/'.join(BUILDS)}: {build!r}")
-    base = f"{TFTP_DIR}\\{build}"
+    base = "" if local else f"{TFTP_DIR}\\{build}"
+    how = "cart local disk" if local else "cart smoke test"
     dev = (REG_BINARY, ramdisk_device(f"{base}\\sources\\boot.wim", RAMDISK_OPTIONS_ID))
     ems = {EL_EMS_ENABLED: (REG_BINARY, b"\x01")}
     if ems_port is not None:
@@ -71,12 +73,12 @@ def edits(build, ems_port=None, ems_baud=None):
     return {
         RAMDISK_OPTIONS_ID: {EL_SDIPATH: _sz(f"{base}\\boot\\boot.sdi")},
         OSLOADER_ID: {EL_DEVICE: dev, EL_OSDEVICE: dev, EL_OSLOADER_EMS: (REG_BINARY, b"\x01"),
-                      EL_DESCRIPTION: _sz(f"Windows PE ARM64 {build} (cart smoke test)")},
+                      EL_DESCRIPTION: _sz(f"Windows PE ARM64 {build} ({how})")},
         EMS_ID: ems,
     }
 
 
-def apply(src, dst, build, ems_port=None, ems_baud=None):  # pragma: no cover - 要 hivex, docker 里跑
+def apply(src, dst, build, ems_port=None, ems_baud=None, local=False):  # pragma: no cover - 要 hivex, docker 里跑
     import hivex
     h = hivex.Hivex(src, write=True)
     objects = h.node_get_child(h.root(), "Objects")
@@ -85,7 +87,7 @@ def apply(src, dst, build, ems_port=None, ems_baud=None):  # pragma: no cover - 
     if not dev:
         raise SystemExit(f"模板里没有 {OSLOADER_ID} 的 device, 不是 ADK 的 WinPE BCD?")
     check_template(h.value_value(h.node_get_value(dev, "Element"))[1])
-    for obj_id, elements in edits(build, ems_port, ems_baud).items():
+    for obj_id, elements in edits(build, ems_port, ems_baud, local).items():
         obj = h.node_get_child(objects, obj_id)
         if not obj:
             raise SystemExit(f"模板里没有 {obj_id}, 不是 ADK 的 WinPE BCD?")
@@ -96,11 +98,17 @@ def apply(src, dst, build, ems_port=None, ems_baud=None):  # pragma: no cover - 
     h.commit(dst)
 
 
-def main(argv):  # pragma: no cover
+def parse_args(argv):
+    local = "--local" in argv
+    argv = [a for a in argv if a != "--local"]
     if len(argv) not in (3, 5):
-        raise SystemExit("用法: arm64_winpe_bcd.py <ADK 的 BCD> <输出> <22621|26100> [EMS 口号 波特率]")
+        raise SystemExit("用法: arm64_winpe_bcd.py <ADK 的 BCD> <输出> <22621|26100> [EMS 口号 波特率] [--local]")
     port, baud = (int(argv[3]), int(argv[4])) if len(argv) == 5 else (None, None)
-    apply(argv[0], argv[1], argv[2], port, baud)
+    return argv[0], argv[1], argv[2], port, baud, local
+
+
+def main(argv):  # pragma: no cover
+    apply(*parse_args(argv))
 
 
 if __name__ == "__main__":  # pragma: no cover

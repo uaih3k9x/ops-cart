@@ -149,3 +149,33 @@ def test_apkovl_never_writes_rtc(tmp_path):
     with tarfile.open(out) as t:
         conf = t.extractfile("etc/conf.d/hwclock").read().decode()
     assert 'clock_systohc="NO"' in conf and 'clock_systohc="YES"' not in conf
+
+
+def test_tool_packages_in_repo_but_not_installed_at_boot():
+    """本地盘 WinPE (docs/ARM64_WINPE.md 第 7 节) 要 sgdisk、mkfs.vfat: 进子集仓库, 手动 apk add; 开机不装 (诊断系统不写盘)."""
+    assert {"sgdisk", "dosfstools"} <= set(core.wanted())
+    assert not {"sgdisk", "dosfstools"} & set(ps.ARM64_DIAG_PKGS)
+
+
+def test_repo_sync_downloads_only_missing(tmp_path):
+    staging = tmp_path
+    diag = staging / "tftp" / ps.ARM64_DIAG
+    for repo, text in (("main", INDEX), ("community", COMMUNITY)):
+        d = diag / "repo" / repo / "aarch64"
+        d.mkdir(parents=True)
+        (d / "APKINDEX.tar.gz").write_bytes(tgz(text))
+    (diag / "repo/main/aarch64/busybox-1.37.0-r31.apk").write_bytes(b"have")
+    got = []
+
+    def fake_get(url, dest):
+        got.append(url)
+        open(dest, "wb").write(b"apk")
+        return dest
+    new = core.repo_sync(str(staging), ["pciutils", "lshw"], get=fake_get, log=lambda *_: None)
+    names = sorted(os.path.basename(u) for u in got)
+    assert names == ["hwdata-pci-0.408-r0.apk", "libcap2-2.78-r0.apk", "lshw-02.20-r1.apk",
+                     "pciutils-3.15.0-r0.apk", "pciutils-libs-3.15.0-r0.apk"]
+    assert all(u.startswith(core.ALPINE_MIRROR) for u in got)
+    assert any("/community/aarch64/lshw-" in u for u in got)
+    assert sorted(os.path.basename(p) for p in new) == names
+    assert core.repo_sync(str(staging), ["pciutils", "lshw"], get=fake_get, log=lambda *_: None) == []

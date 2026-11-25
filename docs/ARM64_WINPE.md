@@ -176,3 +176,88 @@ tftp <推车装机地址> -c get aa64/grub.cfg /dev/stdout | head
      还不行就当"内核没起来"记，配合 26100/22621 对照判断。
 5. 26100 同样做一遍（开关 `--build 26100`，或手选菜单 24H2 项），记现象和停止码。
 6. 结果、日志、停止码和参数写回板子的兼容性报告；用完 `arm64-winpe --off`。
+
+## 6. 实测结果（首块飞腾 D2000，2026-11-24/25）
+
+- A 路不通（Rocky 签名 GRUB 没编 `chainloader`）；B 路通。启动管理器**不认 option 252**，先取 `\BCD` 再取 `\Boot\BCD`，
+  当时临时在 TFTP 根放了 `Boot/BCD`。现在本地盘路线（第 7 节）取代了网络起 WinPE，那份临时文件已删；
+  以后还要网络起，照第 5 节第 3 步临时放、测完删。
+- 26100：启动管理器交权后黑屏卡死、串口无 EMS（无 LSE，符合预期）。
+- 22621：内核起来，加载 ACPI.sys 后蓝屏 `0x7E` / `0xC0000005`，参数 2 页内偏移 `0x294`。
+  原因（静态分析）：DSDT 的 `Field (GNVS, AnyAcc, Lock, Preserve)` 要全局锁，板子是 Hardware-Reduced、没有 FACS，
+  ACPI.sys 释放全局锁时先解引用 NULL（`ACPIReleaseHardwareGlobalLock+0x1c`，RVA `0x1C294`）。
+
+## 7. 本地盘 WinPE + UEFI Shell 内存里补 DSDT（`arm64_winpe_local.py`）
+
+目的：不碰 SPI 固件、不改 BIOS 设置，验证 "Lock → NoLock" 能不能让 22621 过 ACPI.sys。补丁只在内存里（断电就没），
+所以必须**同一次开机**里补完就起 WinPE —— 网络起 WinPE 要重启进 PXE，补丁会丢，于是把 WinPE 放到板子本地盘上，
+由固件自带的 UEFI Shell 跑 `startup.nsh`。
+
+```
+推车 PXE ─► GRUB 手选 Alpine ─► arm64_winpe_local.py prepare: 备份 -> 清盘 -> 建 ESP -> 拷 WinPE
+重启 ─► PXE ─► GRUB 默认 "本地盘" (exit) ─► 固件落到内置 UEFI Shell ─► fs0:\startup.nsh
+   dsdtguard.efi 核对 -> mm 写 2 字节 -> dsdtguard.efi 再核 -> \EFI\cart\bootaa64.efi (启动管理器) -> WinPE ramdisk
+```
+
+### 7.1 补丁和守卫
+
+- 运行时 DSDT 在 `0xF19F0000`（FADT 的 DSDT / X_DSDT 都指这里）。改两个字节：`0xF19F003A` `0x10 → 0x00`（Field 标志 Lock → NoLock），
+  `0xF19F0009` `0x6F → 0x7F`（表校验和 +0x10）。
+- **守卫 `efi/dsdtguard/`**：一个只读的小 UEFI 程序（AArch64 PE，docker 里 clang + lld-link 编，不依赖 EDK2），给脚本当判断用：
+  `orig` / `patched` 两个模式，成功返回 `EFI_SUCCESS`，否则 `EFI_ABORTED`。判定（`dsdtguard_core.h`，跟 Python 版 `classify` 对拍）：
+  RSDP(2.0) → XSDT → FACP 找到的 DSDT 地址 = 脚本里 `mm` 写死的地址；签名、长度 4176、整表字节和为 0、`0x33..0x39` 是 `Field "GNVS"`
+  的操作码和名字（证明 0x3A 确实是那个标志字节）、除两个要改的字节外整表 FNV-1a 64 指纹跟 11-24 从 Linux 读出的表相同、两个字节是原值 / 补丁值。
+  **任何一条不对都不写、不起 WinPE，停在 Shell 里并打印原因。**
+- `startup.nsh`（`arm64_winpe_local.py nsh` 生成，纯 ASCII + CRLF）先跑 `selftest-fail` / `selftest-ok`（必败 / 必成）确认这个 Shell 的
+  `%lasterror%` 判断真能分辨成败，再：已补过 → 直接起；否则核原表 → `mm` 写 → 核补丁 → 起。写过一次再进 Shell 不会重写。
+- 开发机 QEMU（`virt` + Homebrew 的 EDK2，同为 UEFI Shell v2.2）实跑过：板子参数的守卫在 QEMU 上正确拒绝（地址不对，停）；
+  另编一份按 QEMU 自己 DSDT 取参数的守卫，整条 "核 → mm → 核 → 起" 走通。
+- 固件对没有启动项的盘会去跑 `\EFI\Boot\bootaa64.efi`（等于绕过守卫起没补的 WinPE），所以**启动管理器放 `\EFI\cart\bootaa64.efi`，
+  ESP 上没有 `\EFI\Boot\`**（测试锁着）。
+
+### 7.2 盘的布局（1 GiB FAT32 ESP，卷标 WINPE，其余空着）
+
+```
+\startup.nsh                         \EFI\cart\dsdtguard.efi
+\EFI\cart\bootaa64.efi               \EFI\cart\en-US\bootaa64.efi.mui
+\EFI\Microsoft\Boot\BCD              \EFI\Microsoft\Boot\Fonts\*.ttf
+\boot\boot.sdi                       \sources\boot.wim
+```
+
+BCD：`scripts/arm64_winpe_bcd.py <bcd.adk> <输出> 22621 --local`，即 ADK 模板原样的 `ramdisk=[boot]\sources\boot.wim` + `\boot\boot.sdi`
+（`[boot]` = ESP），加 EMS。
+
+### 7.3 备料（开发机）
+
+```sh
+sh efi/dsdtguard/build.sh <dir>                                   # dsdtguard.efi
+python3 arm64_winpe_local.py nsh --out <dir>/startup.nsh
+docker run --rm --network none -v $PWD/scripts:/s:ro -v <staging>/winpe/22621/boot:/i:ro -v <dir>:/d local/hivex:bookworm \
+    python3 -I /s/arm64_winpe_bcd.py /i/bcd.adk /d/bcd 22621 --local
+python3 arm64_winpe_local.py manifest --winpe <staging>/winpe/22621 --local <dir> --out <dir>/files.tsv
+cp arm64_winpe_local.py <dir>/
+python3 arm64_diag_core.py repo-sync --staging <staging>          # 子集仓库补 sgdisk、dosfstools (开机不装)
+```
+
+推车上放 `tftp/aa64/winpe-local/`（`bcd dsdtguard.efi startup.nsh files.tsv arm64_winpe_local.py`），WinPE 本体仍用 `aa64/winpe/22621/`。
+
+### 7.4 板子上（推车 PXE 起的 Alpine，串口 root 登录）
+
+```sh
+apk add sgdisk dosfstools
+wget -O /tmp/wl.py http://<推车>/aa64/winpe-local/arm64_winpe_local.py
+python3 /tmp/wl.py check                                           # 只读: 这次开机的 DSDT 认不认识
+cat /sys/block/nvme0n1/device/serial                               # 确认是要清的盘
+python3 /tmp/wl.py prepare --disk nvme0n1 --serial <序列号> --server http://<推车>        # 只核对, 不动盘
+python3 /tmp/wl.py prepare --disk nvme0n1 --serial <序列号> --server http://<推车> --yes  # 真清
+```
+
+`prepare` 的顺序：根在内存里、DSDT 认识、序列号对、盘没挂载、`--yes` → 下载全部文件到内存并核 sha256 → 备份（前 1 MiB、末 1 MiB、
+`sgdisk --backup`、`sgdisk -p`）打包 **PUT 到推车收包服务**（`:8081/diag/nvme-backup-<MAC>-<序列号>-<时间>.tar.gz`，传不上去就停）→
+`sgdisk --zap-all` → 建 ESP → `mkfs.vfat -F 32` → 拷文件 → 只读重挂再核一遍 sha256。任何一步之前的检查不过都不动盘。
+
+### 7.5 回滚 / 关掉
+
+- 不想开机自动跑：Shell 倒计时按 ESC；或删 `fs0:\startup.nsh`。补丁本身断电即失。
+- 盘恢复原样：`sgdisk --load-backup=<备份里的 sgdisk.backup> /dev/nvme0n1`，前 1 MiB 用 `dd` 写回（ESP 里的文件不会回来，原盘内容已清）。
+- 推车：`sudo rm -rf /opt/pxe/tftp/aa64/winpe-local`；子集仓库多出来的 3 个 apk 留着无害。

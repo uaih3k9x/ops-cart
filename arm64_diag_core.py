@@ -28,6 +28,9 @@ ALPINE_MIRROR = "https://dl-cdn.alpinelinux.org/alpine"
 ALPINE_REPOS = ("main", "community")
 ROCKY_TREE = "https://download.rockylinux.org/pub/rocky/9/BaseOS/aarch64/os"
 BASE_PKGS = ("alpine-base", "openssl")      # initramfs 总会装 alpine-base; modloop 验签要 openssl
+# 进子集仓库但开机不装 (不在 pxeserver.ARM64_DIAG_PKGS / 菜单 pkgs= 里): 要写盘的活登录后手动 apk add.
+# sgdisk、mkfs.vfat: 本地盘 WinPE (arm64_winpe_local.py prepare, docs/ARM64_WINPE.md 第 7 节)
+TOOL_PKGS = ("sgdisk", "dosfstools")
 
 # openrc 的 hwclock 默认关机时把系统时间写回 RTC (clock_systohc 默认 YES); 诊断系统不改板子 RTC
 HWCLOCK = """# ops-cart: 开机读 RTC, 关机不写回 (不改板子的 RTC)
@@ -115,7 +118,7 @@ def resolve(indexes, wanted):
 
 
 def wanted():
-    return list(BASE_PKGS) + list(pxeserver.ARM64_DIAG_PKGS)
+    return list(BASE_PKGS) + list(pxeserver.ARM64_DIAG_PKGS) + list(TOOL_PKGS)
 
 
 # ---------------------------------------------------------------- apkovl
@@ -271,16 +274,36 @@ def fetch(staging, log=print):
     return rows
 
 
+def repo_sync(staging, pkgs=None, get=None, log=print):
+    """不重下索引: 按暂存里已有的 APKINDEX 解 pkgs (默认 wanted()) 的闭包, 只下缺的 .apk. 返回新下的文件.
+    给已上车的子集仓库补包用 (索引不变, 车上原有的包不用重传); 官方镜像只留最新版, 索引太旧下不到就重新 fetch."""
+    get = get or _get
+    repo_dir = os.path.join(staging, "tftp", pxeserver.ARM64_DIAG, "repo")
+    indexes = [(r, load_index(os.path.join(repo_dir, r, "aarch64", "APKINDEX.tar.gz"))) for r in ALPINE_REPOS]
+    new = []
+    for repo, apk in resolve(indexes, wanted() if pkgs is None else pkgs):
+        dest = os.path.join(repo_dir, repo, "aarch64", apk)
+        if not os.path.exists(dest):
+            get(f"{ALPINE_MIRROR}/{ALPINE_BRANCH}/{repo}/aarch64/{apk}", dest)
+            new.append(dest)
+            log(f"+ {repo}/{apk}")
+    return new
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="arm64_diag_core.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fetch")
     f.add_argument("--staging", required=True)
+    rs = sub.add_parser("repo-sync", help="按已有索引补下缺的包 (不重下索引)")
+    rs.add_argument("--staging", required=True)
     o = sub.add_parser("apkovl")
     o.add_argument("--out", required=True)
     a = ap.parse_args(sys.argv[1:] if argv is None else argv)
     if a.cmd == "fetch":
         fetch(os.path.expanduser(a.staging))
+    elif a.cmd == "repo-sync":
+        repo_sync(os.path.expanduser(a.staging))
     else:
         print(build_apkovl(a.out))
     return 0
