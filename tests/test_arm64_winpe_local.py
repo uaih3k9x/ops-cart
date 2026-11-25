@@ -481,7 +481,7 @@ def esp_box(tmp_path, label="WINPE"):
     def run(argv):
         box.cmds.append(list(argv))
         if argv[0] == "blkid":
-            return 0, blkid["label"] + "\n"
+            return 0, f'{argv[1]}: LABEL="{blkid["label"]}" UUID="9A4C-1AE9" TYPE="vfat"\n'      # busybox 格式
         return 0, ""
     box.run = run
     return box

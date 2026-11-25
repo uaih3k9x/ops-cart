@@ -440,9 +440,11 @@ def update_esp(disk, serial, server, root="/", run=None, get=None, log=print):
     got_serial = _read(root, f"/sys/block/{disk}/device/serial").strip()
     if got_serial != serial:
         raise Stop(f"{disk} 序列号是 {got_serial!r}, 不是 --serial {serial!r}")
-    rc, label = run(["blkid", "-s", "LABEL", "-o", "value", part])
-    if rc != 0 or label.strip() != "WINPE":
-        raise Stop(f"{part} 卷标是 {label.strip()!r}, 不是 WINPE (先 prepare)")
+    rc, out = run(["blkid", part])        # busybox blkid 不认 -s/-o, 只能整行解析
+    m = re.search(r'\bLABEL="([^"]*)"', out)
+    label = m.group(1) if m else ""
+    if rc != 0 or label != "WINPE":
+        raise Stop(f"{part} 卷标是 {label!r}, 不是 WINPE (先 prepare)")
     if _mounted(root, disk):
         raise Stop(f"{disk} 有分区挂载着; 先卸载")
     rows = parse_manifest(get(f"{server}/aa64/winpe-local/files.tsv").decode())
