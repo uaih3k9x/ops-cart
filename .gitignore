@@ -37,3 +37,4 @@ video-names.json
 *.sdi
 bootaa64.efi
 aa64/winpe/
+efi/dsdtguard/dsdt_tables.h

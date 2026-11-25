@@ -121,6 +121,44 @@ def test_board_expect_is_consistent():
     assert (wl.LOCK_OFF, wl.LOCK_OLD, wl.LOCK_NEW, wl.CSUM_OFF) == (0x3A, 0x10, 0x00, 9)
 
 
+def fake_fadt(d32, x, length=276):
+    f = bytearray(length)
+    f[0:4] = b"FACP"
+    f[4:8] = length.to_bytes(4, "little")
+    struct.pack_into("<I", f, 40, d32)
+    struct.pack_into("<Q", f, 140, x)
+    f[9] = (-sum(f)) & 0xFF
+    return bytes(f)
+
+
+def test_fadt_retarget():
+    f = fake_fadt(0xF19F0000, 0xF19F0000)
+    g = wl.fadt_retarget(f, 0xE0001000)
+    assert wl.fadt_dsdt(g) == 0xE0001000 and sum(g) % 256 == 0
+    assert struct.unpack_from("<I", g, 40)[0] == 0xE0001000
+    assert [i for i in range(len(f)) if f[i] != g[i] and not 40 <= i < 44 and not 140 <= i < 148] == [9]
+    assert wl.fadt_retarget(f, 0x100000000) is None                # 32 位指针放不下
+    only_x = wl.fadt_retarget(fake_fadt(0, 0xF19F0000), 0x100000000)
+    assert struct.unpack_from("<I", only_x, 40)[0] == 0 and wl.fadt_dsdt(only_x) == 0x100000000
+    assert wl.fadt_retarget(fake_fadt(0, 0), 0x1000) is None
+    bad = bytearray(f)
+    bad[100] ^= 1
+    assert wl.fadt_retarget(bytes(bad), 0x1000) is None           # 原来的校验和就不对: 不碰
+
+
+def test_startup_nsh_swap_mode():
+    s = wl.startup_nsh(wl.BOARD, "adr")
+    lines = [ln.strip() for ln in s.splitlines()]
+    assert not any(ln.startswith("mm ") for ln in lines)
+    g = wl.ESP_GUARD_SHELL
+    i = lines.index(f"{g} swap adr")
+    assert lines.index(f"{g} selftest-ok") < i < lines.index(wl.ESP_BOOTMGR_SHELL)
+    assert lines[i + 1:i + 5] == ["if %lasterror% ne 0 then", lines[i + 2], "exit /b 1", "endif"]
+    assert "STOP" in lines[i + 2]
+    with pytest.raises(ValueError):
+        wl.startup_nsh(wl.BOARD, "adr; reset")
+
+
 def test_fadt_dsdt_addr():
     f = bytearray(276)
     f[0:4] = b"FACP"
@@ -213,8 +251,24 @@ def test_c_core_agrees_with_python(tmp_path):
     for name, data in cases.items():
         p = tmp_path / name
         p.write_bytes(data)
-        out = subprocess.run([str(exe), str(p)], capture_output=True, text=True, check=True).stdout.strip()
+        out = subprocess.run([str(exe), "classify", str(p)], capture_output=True, text=True, check=True).stdout.strip()
         assert int(out) == wl.classify(data, e), name
+        out = subprocess.run([str(exe), "sha256", str(p)], capture_output=True, text=True, check=True).stdout.strip()
+        assert out == hashlib.sha256(data).hexdigest(), name
+    for n in (0, 1, 55, 56, 63, 64, 65, 119, 120, 4187):              # SHA-256 填充的边界
+        p = tmp_path / f"len{n}"
+        p.write_bytes(bytes((i * 7 + 3) & 0xFF for i in range(n)))
+        out = subprocess.run([str(exe), "sha256", str(p)], capture_output=True, text=True, check=True).stdout.strip()
+        assert out == hashlib.sha256(p.read_bytes()).hexdigest(), n
+    for f, addr in ((fake_fadt(0xF19F0000, 0xF19F0000), 0xE0001000), (fake_fadt(0, 0xF19F0000), 0x123456789000),
+                    (fake_fadt(0xF19F0000, 0), 0xE0001000), (fake_fadt(0xF19F0000, 0xF19F0000), 0x100000000),
+                    (fake_fadt(0, 0), 0x1000), (b"XXXX" + fake_fadt(1, 1)[4:], 0x1000)):
+        p = tmp_path / "fadt"
+        p.write_bytes(f)
+        out = subprocess.run([str(exe), "retarget", str(p), hex(addr)], capture_output=True, text=True,
+                             check=True).stdout.strip()
+        want = wl.fadt_retarget(f, addr)
+        assert out == ("-1" if want is None else want.hex()), (f[:4], addr)
 
 
 def test_efi_source_uses_expect_and_core():
@@ -222,8 +276,9 @@ def test_efi_source_uses_expect_and_core():
     assert '#include "dsdt_expect.h"' in src and '#include "dsdtguard_core.h"' in src
     # 守卫本身只读: 写交给 startup.nsh 里的 mm, 写前写后都由它核
     assert "= DG_LOCK_NEW" not in src and "= DG_CSUM_NEW" not in src
-    for word in ("selftest-ok", "selftest-fail", "orig", "patched"):
-        assert f'L"{word}"' in src
+    for word in ("selftest-ok", "selftest-fail", "orig", "patched", "status", "swap"):
+        assert f'"{word}"' in src
+    assert '#include "dsdt_tables.h"' in src and "EFI_ACPI_RECLAIM" in src and "dg_fadt_retarget" in src
 
 
 # ---------------------------------------------------------------- 清单
@@ -414,3 +469,51 @@ def test_prepare_writes_files_into_mount(tmp_path):
     assert mounts[0][-2:] == [str(tmp_path / "dev/nvme0n1p1"), str(mnt)]
     assert any("ro" in c for c in mounts[1:])            # 写完以只读重挂再核一遍
     assert box.cmds[-1][0] == "umount"
+
+
+# ---------------------------------------------------------------- 板子上: 只更新 ESP 上变了的文件 (迭代 DSDT 变体用)
+
+def esp_box(tmp_path, label="WINPE"):
+    box = Box(tmp_path)
+    (tmp_path / "dev/nvme0n1p1").write_bytes(b"")
+    blkid = {"label": label}
+
+    def run(argv):
+        box.cmds.append(list(argv))
+        if argv[0] == "blkid":
+            return 0, blkid["label"] + "\n"
+        return 0, ""
+    box.run = run
+    return box
+
+
+def test_update_esp_rewrites_only_changed(tmp_path):
+    box = esp_box(tmp_path)
+    rows = manifest_for(box)
+    mnt = tmp_path / "mnt/winpe-esp"
+    for r in rows:                                            # 盘上已有旧版
+        (mnt / r.esp).parent.mkdir(parents=True, exist_ok=True)
+        (mnt / r.esp).write_bytes(box.files[f"http://192.0.2.1/{r.url}"])
+    (mnt / "startup.nsh").write_bytes(b"old nsh")
+    fetched = []
+    get = lambda u: (fetched.append(u), box.get(u))[1]
+    changed = wl.update_esp("nvme0n1", "S123", "http://192.0.2.1", root=str(tmp_path), run=box.run, get=get,
+                            log=lambda *_: None)
+    assert changed == ["startup.nsh"]
+    assert (mnt / "startup.nsh").read_bytes() == b"nsh"
+    assert not any(u.endswith("sources_boot.wim") for u in fetched)       # 没变的大文件不下
+    mounts = [c for c in box.cmds if c[0] == "mount"]
+    assert mounts[0][-2:] == [str(tmp_path / "dev/nvme0n1p1"), str(mnt)] and "ro" in mounts[-1]
+    assert not any(c[0] in ("sgdisk", "mkfs.vfat") for c in box.cmds)
+
+
+@pytest.mark.parametrize("kw,why", [({"label": "OTHER"}, "卷标"), ({}, "序列号")])
+def test_update_esp_refuses(tmp_path, kw, why):
+    box = esp_box(tmp_path, **kw)
+    manifest_for(box)
+    serial = "S123" if kw else "WRONG"
+    with pytest.raises(wl.Stop) as ei:
+        wl.update_esp("nvme0n1", serial, "http://192.0.2.1", root=str(tmp_path), run=box.run, get=box.get,
+                      log=lambda *_: None)
+    assert why in str(ei.value)
+    assert not any(c[0] == "mount" for c in box.cmds)

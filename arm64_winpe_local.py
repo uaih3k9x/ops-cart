@@ -102,6 +102,24 @@ def fadt_dsdt(f):
     return x or d32 or None
 
 
+def fadt_retarget(f, addr):
+    """跟 dsdtguard_core.h 的 dg_fadt_retarget 一样: 原来非 0 的指针改成 addr (32 位的要 < 4 GiB), 重算校验和. 拒绝 -> None."""
+    f = bytearray(f)
+    n = int.from_bytes(f[4:8], "little") if len(f) >= 8 else 0
+    if len(f) < 148 or f[:4] != b"FACP" or n < 148 or n > len(f) or sum(f[:n]) & 0xFF:
+        return None
+    d32, x = int.from_bytes(f[40:44], "little"), int.from_bytes(f[140:148], "little")
+    if not (d32 or x) or (d32 and addr > 0xFFFFFFFF):
+        return None
+    if d32:
+        f[40:44] = addr.to_bytes(4, "little")
+    if x:
+        f[140:148] = addr.to_bytes(8, "little")
+    f[9] = 0
+    f[9] = (-sum(f[:n])) & 0xFF
+    return bytes(f)
+
+
 def c_header(e):
     ctx = ", ".join(f"0x{b:02X}" for b in CTX)
     return (
@@ -147,15 +165,18 @@ def esp_layout(rel_files):
     return out
 
 
-def startup_nsh(e):
-    """固件 UEFI Shell 开机自动跑 (fs0:\\startup.nsh). 先拿两个必成/必败的空跑确认 %lasterror% 真能分辨成败,
-    再核原表 -> mm 写 -> 核补丁; 任何一步不对就 exit /b, 不写 (或不再写)、不起 WinPE, 停在 Shell."""
+def startup_nsh(e, swap=None):
+    """固件 UEFI Shell 开机自动跑 (fs0:\\startup.nsh). 先拿两个必成/必败的空跑确认 %lasterror% 真能分辨成败, 然后
+    swap=None (第 7 节, 第 0 轮): 核原表 -> mm 写 2 字节 -> 核补丁;
+    swap=<变体> (第 8 节): dsdtguard.efi swap <变体> 自己核原表、申请内存放新表、改 FADT、再核.
+    任何一步不对就 exit /b, 不写 (或不再写)、不起 WinPE, 停在 Shell."""
     g, a_lock, a_sum = ESP_GUARD_SHELL, e.addr + LOCK_OFF, e.addr + CSUM_OFF
+    what = f"DSDT swap ({swap})" if swap else "DSDT GNVS Lock->NoLock RAM-only patch"
     lines = [
         "@echo -off",
-        "# ops-cart (arm64_winpe_local.py nsh): DSDT GNVS Lock->NoLock RAM-only patch, then WinPE from this disk.",
+        f"# ops-cart (arm64_winpe_local.py nsh): {what}, then WinPE from this disk.",
         "# Nothing is written to flash or BIOS settings; a power cycle restores the original table.",
-        "echo \"ops-cart: DSDT guard + RAM patch + WinPE (ESC at the countdown skips this script)\"",
+        f"echo \"ops-cart: {what} + WinPE (ESC at the countdown skips this script)\"",
         "fs0:",
         f"if not exist {g} then",
         "  echo \"ops-cart: STOP: fs0: is not the cart WinPE disk, nothing written\"",
@@ -171,25 +192,38 @@ def startup_nsh(e):
         "  echo \"ops-cart: STOP: lasterror check does not work in this shell, nothing written\"",
         "  exit /b 1",
         "endif",
-        f"{g} patched",
-        "if %lasterror% ne 0 then",
-        f"  {g} orig",
-        "  if %lasterror% ne 0 then",
-        "    echo \"ops-cart: STOP: DSDT is not the known table, nothing written, WinPE not started\"",
-        "    exit /b 1",
-        "  endif",
-        f"  mm {a_lock:X} {LOCK_NEW:02X} -w 1 -n",
-        f"  mm {a_sum:X} {e.csum_new:02X} -w 1 -n",
-        f"  {g} patched",
-        "  if %lasterror% ne 0 then",
-        "    echo \"ops-cart: STOP: DSDT check after mm failed, WinPE not started (power cycle restores it)\"",
-        "    exit /b 1",
-        "  endif",
-        "endif",
-        "echo \"ops-cart: DSDT is NoLock in RAM, starting WinPE\"",
-        ESP_BOOTMGR_SHELL,
-        "echo \"ops-cart: boot manager returned %lasterror%\"",
     ]
+    if swap:
+        if not re.fullmatch(r"[a-z0-9-]+", swap):
+            raise ValueError(f"变体名不对: {swap!r}")
+        lines += [
+            f"{g} swap {swap}",
+            "if %lasterror% ne 0 then",
+            "  echo \"ops-cart: STOP: DSDT swap refused or failed, WinPE not started\"",
+            "  exit /b 1",
+            "endif",
+            f"echo \"ops-cart: DSDT replaced ({swap}), starting WinPE\"",
+        ]
+    else:
+        lines += [
+            f"{g} patched",
+            "if %lasterror% ne 0 then",
+            f"  {g} orig",
+            "  if %lasterror% ne 0 then",
+            "    echo \"ops-cart: STOP: DSDT is not the known table, nothing written, WinPE not started\"",
+            "    exit /b 1",
+            "  endif",
+            f"  mm {a_lock:X} {LOCK_NEW:02X} -w 1 -n",
+            f"  mm {a_sum:X} {e.csum_new:02X} -w 1 -n",
+            f"  {g} patched",
+            "  if %lasterror% ne 0 then",
+            "    echo \"ops-cart: STOP: DSDT check after mm failed, WinPE not started (power cycle restores it)\"",
+            "    exit /b 1",
+            "  endif",
+            "endif",
+            "echo \"ops-cart: DSDT is NoLock in RAM, starting WinPE\"",
+        ]
+    lines += [ESP_BOOTMGR_SHELL, "echo \"ops-cart: boot manager returned %lasterror%\""]
     return "\r\n".join(lines) + "\r\n"
 
 
@@ -396,6 +430,56 @@ def prepare(disk, serial, server, upload, yes, root="/", expect=BOARD, mac="unkn
     log(f"完成: {part} (FAT32 WINPE) 上 {len(rows)} 个文件, 只读重挂核对一致. 重启后 GRUB 默认本地盘 -> Shell 跑 startup.nsh")
 
 
+def update_esp(disk, serial, server, root="/", run=None, get=None, log=print):
+    """已经 prepare 过的盘: 只把 ESP 上跟推车 files.tsv 不一致的文件换掉 (换 DSDT 变体时 dsdtguard.efi / startup.nsh 会变).
+    不分区、不格式化. 核序列号、分区卷标 WINPE; 先把要换的文件下到内存核 sha256, 写完只读重挂再核全部. 返回换了的文件."""
+    run = run or _run
+    get = get or _get
+    part = os.path.join(root, "dev", disk + ("p1" if disk[-1].isdigit() else "1"))
+    mnt = os.path.join(root, "mnt", "winpe-esp")
+    got_serial = _read(root, f"/sys/block/{disk}/device/serial").strip()
+    if got_serial != serial:
+        raise Stop(f"{disk} 序列号是 {got_serial!r}, 不是 --serial {serial!r}")
+    rc, label = run(["blkid", "-s", "LABEL", "-o", "value", part])
+    if rc != 0 or label.strip() != "WINPE":
+        raise Stop(f"{part} 卷标是 {label.strip()!r}, 不是 WINPE (先 prepare)")
+    if _mounted(root, disk):
+        raise Stop(f"{disk} 有分区挂载着; 先卸载")
+    rows = parse_manifest(get(f"{server}/aa64/winpe-local/files.tsv").decode())
+    for argv in (["mkdir", "-p", mnt], ["mount", "-t", "vfat", part, mnt]):
+        rc, out = run(argv)
+        if rc != 0:
+            raise Stop(f"{' '.join(argv)} 失败 ({rc}): {out.strip()}")
+    os.makedirs(mnt, exist_ok=True)
+    try:
+        todo = [r for r in rows if not os.path.exists(os.path.join(mnt, r.esp))
+                or _sha256_file(os.path.join(mnt, r.esp)) != r.sha256]
+        blobs = {}
+        for r in todo:
+            data = get(f"{server}/{r.url}")
+            if len(data) != r.size or hashlib.sha256(data).hexdigest() != r.sha256:
+                raise Stop(f"{r.url} sha256/大小不对; ESP 没动")
+            blobs[r.esp] = data
+        for esp, data in blobs.items():
+            p = os.path.join(mnt, esp)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+            log(f"换了 {esp}")
+    finally:
+        run(["sync"])
+        run(["umount", mnt])
+    rc, out = run(["mount", "-t", "vfat", "-o", "ro", part, mnt])
+    if rc != 0:
+        raise Stop(f"只读重挂失败 ({rc}): {out.strip()}")
+    bad = [r.esp for r in rows if _sha256_file(os.path.join(mnt, r.esp)) != r.sha256]
+    run(["umount", mnt])
+    if bad:
+        raise Stop(f"只读重挂后这些文件 sha256 不对: {bad}")
+    log(f"ESP 已跟推车一致 ({len(rows)} 个文件, 换了 {len(todo)} 个)")
+    return [r.esp for r in todo]
+
+
 def _run(argv):  # pragma: no cover - 板子上
     p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return p.returncode, p.stdout
@@ -430,6 +514,7 @@ def main(argv=None):  # pragma: no cover - 薄壳
     sub.add_parser("header", help="打印 efi/dsdtguard/dsdt_expect.h")
     n = sub.add_parser("nsh", help="写 startup.nsh")
     n.add_argument("--out", required=True)
+    n.add_argument("--swap", help="整表换 DSDT 的变体 (arm64_dsdt_fix.VARIANTS); 不给 = 第 0 轮的 mm 两字节补丁")
     m = sub.add_parser("manifest", help="写推车上的 files.tsv")
     m.add_argument("--winpe", required=True, help="暂存的 winpe/<build> 目录")
     m.add_argument("--local", required=True, help="放 bcd、dsdtguard.efi、startup.nsh 的目录")
@@ -437,6 +522,10 @@ def main(argv=None):  # pragma: no cover - 薄壳
     m.add_argument("--url-local", default="aa64/winpe-local")
     m.add_argument("--out", required=True)
     sub.add_parser("check", help="板子上: 只读核这次开机的 DSDT")
+    u = sub.add_parser("update-esp", help="板子上: 只换 ESP 上跟推车不一致的文件 (不分区不格式化)")
+    u.add_argument("--disk", default="nvme0n1")
+    u.add_argument("--serial", required=True)
+    u.add_argument("--server", required=True)
     p = sub.add_parser("prepare", help="板子上: 备份 -> 清盘 -> 建 ESP -> 拷 WinPE")
     p.add_argument("--disk", default="nvme0n1")
     p.add_argument("--serial", required=True, help="要清的盘的序列号 (/sys/block/<盘>/device/serial), 防清错盘")
@@ -448,7 +537,7 @@ def main(argv=None):  # pragma: no cover - 薄壳
         sys.stdout.write(c_header(BOARD))
     elif a.cmd == "nsh":
         with open(a.out, "w", newline="", encoding="ascii") as f:
-            f.write(startup_nsh(BOARD))
+            f.write(startup_nsh(BOARD, a.swap))
     elif a.cmd == "manifest":
         with open(a.out, "w", encoding="utf-8") as f:
             f.write(format_manifest(build_manifest(a.winpe, a.local, a.url_winpe, a.url_local)))
@@ -456,6 +545,12 @@ def main(argv=None):  # pragma: no cover - 薄壳
         addr, r = check_dsdt("/")
         print(f"DSDT @ {addr and hex(addr)}: {NAMES.get(r, r)}")
         return 0 if addr == BOARD.addr and r in (ORIG, PATCHED) else 1
+    elif a.cmd == "update-esp":
+        try:
+            update_esp(a.disk, a.serial, a.server.rstrip("/"))
+        except Stop as ex:
+            print(f"停: {ex}", file=sys.stderr)
+            return 2
     else:
         try:
             prepare(a.disk, a.serial, a.server.rstrip("/"), a.upload or f"{a.server.rstrip('/')}:8081/diag/",

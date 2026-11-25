@@ -261,3 +261,47 @@ python3 /tmp/wl.py prepare --disk nvme0n1 --serial <序列号> --server http://<
 - 不想开机自动跑：Shell 倒计时按 ESC；或删 `fs0:\startup.nsh`。补丁本身断电即失。
 - 盘恢复原样：`sgdisk --load-backup=<备份里的 sgdisk.backup> /dev/nvme0n1`，前 1 MiB 用 `dd` 写回（ESP 里的文件不会回来，原盘内容已清）。
 - 推车：`sudo rm -rf /opt/pxe/tftp/aa64/winpe-local`；子集仓库多出来的 3 个 apk 留着无害。
+
+## 8. 整表换 DSDT（`arm64_dsdt_fix.py` + `dsdtguard.efi swap`）
+
+第 7 节的两字节补丁把 0x7E 修掉了，下一个蓝屏是 `0xA5 ACPI_BIOS_ERROR`（参数 `0xD`、第三个参数 `0x5244415F` = `"_ADR"`）：
+`GPI0.GP00` / `GPI1.GP00` 既没有 `_HID` 也没有 `_ADR`。补 `_ADR` 要往表里加字节，于是改成在 Shell 里整表换。
+
+### 8.1 新表怎么来
+
+`python3 arm64_dsdt_fix.py build --dsdt <板子读出的原表> --out <目录>`（docker 里 iasl 20250807）：
+原表 `iasl -d` → 文本上做精确改动（每个锚点必须恰好匹配预期次数，不然停）→ `iasl -oa`（关优化）编译，要求 0 错误 0 警告 →
+再反编译，跟原表的反编译逐行比，**只允许预期的那几行不同**；同时核表头 OEM 字段不变、字节和为 0。产物：每个变体的 `.asl/.aml/.diff`
+和 `efi/dsdtguard/dsdt_tables.h`（内嵌新表 + 写死的 sha256；含固件厂商的 AML，**不进 git**）。
+
+| 变体 | 改动 | 依据 |
+|---|---|---|
+| `adr` | `Field (GNVS, …, Lock → NoLock, …)`；两个 `GP00` 加 `Name (_ADR, Zero)` | 0x7E 的分析；0xA5 参数 "_ADR"。`_ADR` 取 0 = 端口子设备 `_DSD` 的 `"reg"` 值（DesignWare GPIO 端口 A，Linux gpio-dwapb 在 ACPI 下就按 `"reg"` 取端口号）；同一张表里 `CK10` 也是这么写的 |
+| `adr-noprw` | `adr` + 删 PWRB 的 `_PRW {GPE 0, S4}` | HW-Reduced 没有 GPE 块；Windows 会不会因此停机没把握，单独一档，看到相关停机码再换 |
+
+另有一处必然的差异：`OperationRegion (GNVS, …, 0x000A)` 原表编成 WordConst，iasl 一律编成最短的 ByteConst，值不变（`.diff` 里能看到）。
+没动的候选：`_OSC` Else 分支（Windows 不走）、`_PRT` 链接设备（属 PCI 阶段，等看到现象再说）。
+
+### 8.2 守卫怎么换
+
+`dsdtguard.efi swap <变体>`：
+1. 核内嵌新表：sha256 跟写死的值相同、签名、长度、字节和。
+2. 从 RSDP 收集所有 FADT（XSDT 的；RSDP 有 RSDT 指针也收），每张表头完整、校验和对，DSDT 指针一致。
+3. 指针 = `0xF19F0000` 且原表核对过（同第 7 节：长度、字节和、Field GNVS 上下文、指纹、两字节原值/补丁值）→ 往下；
+   指针已经指向内嵌的同一变体 → "已换过"，直接成功，**不再申请内存**；指向别的变体或不认识的表 → 拒绝（断电重来）。
+4. `AllocatePages(AllocateMaxAddress ≤ 4 GiB, EfiACPIReclaimMemory)`，拷过去再核 sha256。
+5. 每个 FADT：原来非 0 的 `X_DSDT` / 32 位 `DSDT` 改成新地址，重算 FADT 校验和。
+6. 重新走一遍 RSDP 核：所有 FADT 指向新地址，新地址上的表 sha256 对得上内嵌的那个。
+
+不用 `EFI_ACPI_TABLE_PROTOCOL.InstallAcpiTable`：EDK2 对"已有 DSDT 再装一张"的处理在不同版本里不一样，这块固件是百敖改的，
+看不到源码；直接改 FADT 指针只依赖 ACPI 规范，行为可预期、能逐项核。原表留在原处不动，断电一切复原。
+
+开发机 QEMU（`virt` + EDK2）实跑：拿 QEMU 自己 DSDT 编的守卫，`swap` 成功、重复 `swap` 不再申请内存、换别的变体被拒、
+`memmap` 只多 2 页 ACPI_Recl；接着从 Shell 起 Alpine 内核，dmesg 里 `ACPI: DSDT` 已是新地址和新 OEM revision。
+板子参数编的守卫在 QEMU 上拒绝（不认识的表，WinPE 不启动）。
+
+### 8.3 换变体 / 迭代
+
+`python3 arm64_winpe_local.py nsh --swap <变体>` 生成 startup.nsh；推车上换 `aa64/winpe-local/` 的 `dsdtguard.efi`、`startup.nsh`、`files.tsv`；
+板子 PXE 进 Alpine 跑 `python3 /tmp/wl.py update-esp --serial <序列号> --server http://<推车>`（核序列号、卷标 WINPE，只换 sha256 变了的文件，
+不分区不格式化）。临时试别的变体：Shell 倒计时按 ESC，手敲 `fs0:\EFI\cart\dsdtguard.efi swap adr-noprw` 再 `fs0:\EFI\cart\bootaa64.efi`。
